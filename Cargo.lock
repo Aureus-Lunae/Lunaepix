@@ -1832,6 +1832,7 @@ dependencies = [
 name = "lunaepix-core"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "image",
  "mozjpeg-sys",
  "oxipng",

@@ -25,3 +25,5 @@ mozjpeg-sys = { version = "=2.2.3", default-features = false, features = ["paral
 # (standard Huffman tables, so there is something to optimise).
 png = "0.17.16"
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
+# Valid chunk CRCs for hand-made hostile PNGs (already in the tree via `png`).
+crc32fast = "1.5.4"

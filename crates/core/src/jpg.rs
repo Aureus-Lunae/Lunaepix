@@ -21,13 +21,13 @@ use std::ptr::{self, NonNull};
 use std::slice;
 
 use mozjpeg_sys::{
-    JCOPY_OPTION, JCOPY_OPTION_JCOPYOPT_ALL, JCP_FASTEST, JINT_COMPRESS_PROFILE, boolean,
-    jcopy_markers_execute, jcopy_markers_setup, jpeg_c_set_int_param, jpeg_common_struct,
-    jpeg_compress_struct, jpeg_copy_critical_parameters, jpeg_create_compress,
-    jpeg_create_decompress, jpeg_decompress_struct, jpeg_destination_mgr, jpeg_destroy_compress,
-    jpeg_destroy_decompress, jpeg_error_mgr, jpeg_finish_compress, jpeg_finish_decompress,
-    jpeg_mem_src, jpeg_read_coefficients, jpeg_read_header, jpeg_simple_progression,
-    jpeg_std_error, jpeg_write_coefficients, jvirt_barray_control,
+    JCOPY_OPTION, JCOPY_OPTION_JCOPYOPT_ALL, JCP_FASTEST, JCP_MAX_COMPRESSION,
+    JINT_COMPRESS_PROFILE, boolean, jcopy_markers_execute, jcopy_markers_setup,
+    jpeg_c_set_int_param, jpeg_common_struct, jpeg_compress_struct, jpeg_copy_critical_parameters,
+    jpeg_create_compress, jpeg_create_decompress, jpeg_decompress_struct, jpeg_destination_mgr,
+    jpeg_destroy_compress, jpeg_destroy_decompress, jpeg_error_mgr, jpeg_finish_compress,
+    jpeg_finish_decompress, jpeg_mem_src, jpeg_read_coefficients, jpeg_read_header,
+    jpeg_simple_progression, jpeg_std_error, jpeg_write_coefficients, jvirt_barray_control,
 };
 
 /// Every JPEG starts with the SOI marker, followed by the next marker's 0xFF.
@@ -37,14 +37,18 @@ const SOI: [u8; 3] = [0xFF, 0xD8, 0xFF];
 /// XMP, comments), as jpegoptim keeps by default.
 const COPY_MARKERS: JCOPY_OPTION = JCOPY_OPTION_JCOPYOPT_ALL;
 
-/// libjpeg's `JMSG_LENGTH_MAX`: the buffer size `format_message` writes into.
-const MESSAGE_BYTES: usize = 80;
+/// libjpeg's `JMSG_LENGTH_MAX` (jpeglib.h): `format_message` writes up to
+/// this many bytes, NUL included (jerror.c passes it to `snprintf`). The
+/// binding's `&[u8; 80]` parameter type is wrong: 80 is `JMSG_STR_PARM_MAX`,
+/// the size of a message's string parameter, not of the message.
+const JMSG_LENGTH_MAX: usize = 200;
 
 /// Most memory libjpeg may use for its image arrays (1 GiB, which fits the
-/// 32-bit `c_long` of Windows). A 100-megapixel image needs at most 800 MB of
-/// coefficients (four components, no subsampling), so this only stops what
-/// the pixel limit did not foresee: libjpeg then fails through `error_exit`
-/// instead of overcommitting.
+/// 32-bit `c_long` of Windows). The coefficients take 2 bytes per sample. A
+/// 100-megapixel CMYK image without subsampling (four components, the most a
+/// real-world JPEG has) needs 800 MB, within the cap. libjpeg allows up to 10
+/// components (`MAX_COMPONENTS`), and such a file at 100 megapixels would need
+/// 2 GB: the cap refuses it through `error_exit` instead of overcommitting.
 const MAX_LIBJPEG_MEMORY: c_long = 1 << 30;
 
 /// First size of the output buffer. It doubles whenever libjpeg fills it.
@@ -179,12 +183,15 @@ unsafe fn write_candidate(
     // which it destroys. `source` and `coefficients` are valid for the whole
     // call (this function's contract).
     unsafe {
-        if let Coding::LikeJpegoptim { .. } = coding {
-            // Before `jpeg_copy_critical_parameters`: it calls
-            // `jpeg_set_defaults`, which applies the profile. Set afterwards,
-            // mozjpeg's default (progressive, `optimize_scans`) is already in.
-            jpeg_c_set_int_param(output, JINT_COMPRESS_PROFILE, JCP_FASTEST as c_int);
-        }
+        // Before `jpeg_copy_critical_parameters`: it calls
+        // `jpeg_set_defaults`, which applies the profile; set afterwards, it
+        // would come too late. B's profile is mozjpeg's default today, but it
+        // is set explicitly so a version bump cannot change it silently.
+        let profile = match coding {
+            Coding::LikeJpegoptim { .. } => JCP_FASTEST,
+            Coding::MaxCompression => JCP_MAX_COMPRESSION,
+        };
+        jpeg_c_set_int_param(output, JINT_COMPRESS_PROFILE, profile as c_int);
         jpeg_copy_critical_parameters(source, output);
         // libjpeg turns a JFIF APP0 on for every YCbCr or greyscale output;
         // jpegoptim and jpegtran write one only when the source had one. A
@@ -276,23 +283,26 @@ fn error_manager() -> jpeg_error_mgr {
 ///
 /// `cinfo.err` must point to an error manager set up by [`error_manager`].
 unsafe fn libjpeg_message(cinfo: &mut jpeg_common_struct) -> String {
-    let mut buffer = [0u8; MESSAGE_BYTES];
+    let mut buffer = [0u8; JMSG_LENGTH_MAX];
     // SAFETY: `err` is valid (this function's contract).
     if let Some(format) = unsafe { (*cinfo.err).format_message } {
-        // The binding types the buffer as `&[u8; 80]`, but libjpeg writes into
-        // it: writing through a shared reference is undefined behaviour, and
-        // the compiler may assume the buffer is still all zeros afterwards.
-        // Calling through a signature with `*mut u8` makes the write
-        // legitimate; both signatures have the same ABI (one thin pointer).
+        // The binding types the buffer as `&[u8; 80]`, which is wrong twice:
+        // libjpeg writes into it, and writing through a shared reference is
+        // undefined behaviour (the compiler may assume the buffer is still all
+        // zeros afterwards); and it writes up to `JMSG_LENGTH_MAX` (200)
+        // bytes, not 80. Calling through a signature with `*mut u8` makes the
+        // write legitimate and carries no size, so the buffer passed can be
+        // the 200 bytes libjpeg needs. Both signatures have the same ABI (one
+        // thin pointer).
         // SAFETY: as just described, an ABI-compatible function pointer type.
         let format = unsafe {
             mem::transmute::<
-                unsafe extern "C-unwind" fn(&mut jpeg_common_struct, &[u8; MESSAGE_BYTES]),
+                unsafe extern "C-unwind" fn(&mut jpeg_common_struct, &[u8; 80]),
                 unsafe extern "C-unwind" fn(&mut jpeg_common_struct, *mut u8),
             >(format)
         };
         // SAFETY: libjpeg writes a NUL-terminated string of at most
-        // `MESSAGE_BYTES` bytes into the buffer.
+        // `JMSG_LENGTH_MAX` bytes, and `buffer` holds that many.
         unsafe { format(cinfo, buffer.as_mut_ptr()) };
     }
     let len = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
@@ -779,12 +789,86 @@ mod tests {
         assert!(candidates(&baseline_jpeg()).is_ok());
     }
 
+    /// Format libjpeg message `code` with `text` as its `%s` parameter, or
+    /// with `number` as its first `%d`, through `libjpeg_message`.
+    fn format_message(code: c_int, text: &str, number: c_int) -> String {
+        assert!(text.len() < 80, "the string parameter holds 80 bytes");
+        let mut err = error_manager();
+        err.msg_code = code;
+        // SAFETY: `s()` and `i()` view the 80-byte parameter union; the text
+        // and its NUL fit (checked above), and one integer fits.
+        unsafe {
+            let s = &mut *err.msg_parm.s();
+            for (slot, byte) in s.iter_mut().zip(text.bytes().chain([0])) {
+                *slot = byte as i8;
+            }
+            if text.is_empty() {
+                (*err.msg_parm.i())[0] = number;
+            }
+        }
+        // SAFETY: all-zero is a valid `jpeg_common_struct` (null pointers).
+        let mut common: jpeg_common_struct = unsafe { mem::zeroed() };
+        common.err = &mut err;
+        // SAFETY: `err` was set up by `error_manager` and outlives the call;
+        // `format_message` reads nothing from the common struct but `err`.
+        unsafe { libjpeg_message(&mut common) }
+    }
+
     #[test]
-    fn turns_a_libjpeg_error_into_an_error_value() {
+    fn formats_a_libjpeg_message_longer_than_80_bytes_in_full() {
+        // "Failed to create temporary file %s" with a 79-byte name: 111
+        // bytes, which libjpeg writes in full (it allows JMSG_LENGTH_MAX).
+        let name = "x".repeat(79);
+        let message = format_message(mozjpeg_sys::JERR_TFILE_CREATE, &name, 0);
+        assert_eq!(message, format!("Failed to create temporary file {name}"));
+        assert!(message.len() > 80);
+        assert!(message.len() < JMSG_LENGTH_MAX);
+    }
+
+    #[test]
+    fn formats_a_short_libjpeg_message_exactly() {
+        let message = format_message(mozjpeg_sys::JERR_BAD_PRECISION, "", 12);
+        assert_eq!(message, "Unsupported JPEG data precision 12");
+    }
+
+    #[test]
+    fn turns_a_libjpeg_warning_into_an_error_value() {
+        // Garbage after an APP0: libjpeg skips it with a warning
+        // ("extraneous bytes"), which goes through `emit_message`.
         let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
         bytes.extend_from_slice(&[0x5A; 64]);
         let err = candidates(&bytes).unwrap_err();
-        assert!(!err.is_empty());
+        assert!(err.starts_with("the JPEG data is damaged"), "{err}");
+    }
+
+    /// A 16x16 greyscale header whose SOF declares `bits` of precision.
+    fn header_with_precision(bits: u8) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x43, 0x00];
+        bytes.extend_from_slice(&[1; 64]);
+        bytes.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, bits, 0x00, 0x10, 0x00, 0x10]);
+        bytes.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+        bytes.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+        bytes.extend_from_slice(&[0x00, 0x00, 0xFF, 0xD9]);
+        bytes
+    }
+
+    #[test]
+    fn turns_a_libjpeg_error_exit_into_an_error_value() {
+        // 12-bit precision is not built in: `jpeg_read_header` raises
+        // JERR_BAD_PRECISION through `error_exit`, not a warning.
+        let err = candidates(&header_with_precision(12)).unwrap_err();
+        assert_eq!(
+            err,
+            "could not read the JPEG data: Unsupported JPEG data precision 12"
+        );
+    }
+
+    #[test]
+    fn an_8_bit_header_passes_the_precision_check() {
+        // The counterpart: the same header at 8 bits fails later, for its
+        // token scan, and not for its precision.
+        let err = candidates(&header_with_precision(8)).unwrap_err();
+        assert!(!err.contains("precision"), "{err}");
     }
 
     #[test]
