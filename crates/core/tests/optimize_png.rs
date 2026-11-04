@@ -277,9 +277,9 @@ fn rejects_a_gif_as_unsupported_and_writes_nothing() {
 }
 
 #[test]
-fn rejects_jpg_and_svg_with_a_clear_error_until_they_are_built() {
+fn rejects_svg_with_a_clear_error_until_it_is_built() {
     let tmp = TempDir::new().unwrap();
-    for name in ["a.jpg", "a.JPEG", "a.svg"] {
+    for name in ["a.svg", "a.SVG"] {
         let src = write(tmp.path(), name, b"data");
         let dest = tmp.path().join(format!("optimized-{name}"));
         let err = optimize_file(&src, &dest).unwrap_err();

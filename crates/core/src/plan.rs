@@ -14,6 +14,11 @@ pub const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 /// Most files a single run optimises. Further optimisable files are skipped.
 pub const MAX_RUN_FILES: usize = 2000;
 
+/// Most pixels (width times height) an image may declare: 100 megapixels. A
+/// small file can declare huge dimensions, and decoding it would allocate for
+/// all of them, so a larger image is refused before it is decoded.
+pub const MAX_PIXELS: u64 = 100_000_000;
+
 /// Name of the output folder used when a whole folder is planned.
 pub(crate) const OUTPUT_DIR: &str = "optimized";
 
@@ -171,10 +176,43 @@ pub(crate) fn resolve(path: &Path) -> PathBuf {
     resolve(parent).join(name)
 }
 
+/// Refuse an image whose declared dimensions exceed [`MAX_PIXELS`]. The error
+/// is a message for the user.
+pub(crate) fn check_pixels(width: u32, height: u32) -> Result<(), String> {
+    // Both factors fit in 32 bits, so the product cannot overflow 64.
+    if u64::from(width) * u64::from(height) <= MAX_PIXELS {
+        return Ok(());
+    }
+    Err(format!(
+        "image too large: {width}×{height} exceeds {} megapixels",
+        MAX_PIXELS / 1_000_000
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Skip;
+
+    #[test]
+    fn accepts_an_image_of_exactly_the_pixel_limit() {
+        assert_eq!(check_pixels(10_000, 10_000), Ok(()));
+        assert_eq!(check_pixels(1, 1), Ok(()));
+        assert_eq!(check_pixels(100_000_000, 1), Ok(()));
+    }
+
+    #[test]
+    fn refuses_an_image_one_row_over_the_pixel_limit() {
+        let err = check_pixels(10_000, 10_001).unwrap_err();
+        assert_eq!(err, "image too large: 10000×10001 exceeds 100 megapixels");
+        assert!(check_pixels(100_000_001, 1).is_err());
+    }
+
+    #[test]
+    fn refuses_the_largest_declarable_dimensions_without_overflowing() {
+        assert!(check_pixels(65_535, 65_535).is_err());
+        assert!(check_pixels(u32::MAX, u32::MAX).is_err());
+    }
     use std::ffi::OsString;
     use std::fs::{self, File};
     use tempfile::TempDir;
