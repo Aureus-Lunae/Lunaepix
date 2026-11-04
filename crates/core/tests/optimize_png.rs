@@ -644,6 +644,78 @@ fn strips_text_chunks_but_keeps_display_chunks() {
     assert!(types.contains(b"pHYs"), "{types:?}");
 }
 
+// --- decompression bomb -------------------------------------------------------------
+
+/// The CRC-32 a PNG chunk carries over its type and data.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut out = (data.len() as u32).to_be_bytes().to_vec();
+    let mut body = kind.to_vec();
+    body.extend_from_slice(data);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&crc32(&body).to_be_bytes());
+    out
+}
+
+/// A tiny but well-formed PNG (correct CRCs) whose IHDR declares `w`x`h`
+/// RGBA pixels, with a token IDAT.
+fn png_declaring(w: u32, h: u32) -> Vec<u8> {
+    let mut ihdr = w.to_be_bytes().to_vec();
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    bytes.extend(chunk(b"IHDR", &ihdr));
+    bytes.extend(chunk(
+        b"IDAT",
+        &[0x78, 0x9C, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+    ));
+    bytes.extend(chunk(b"IEND", &[]));
+    bytes
+}
+
+#[test]
+fn the_crc_helper_matches_the_known_iend_checksum() {
+    // Proof that the fixture's CRCs are real: IEND's CRC is fixed.
+    assert_eq!(crc32(b"IEND"), 0xAE42_6082);
+}
+
+#[test]
+fn refuses_a_tiny_png_that_declares_65535_by_65535_pixels_and_writes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let bomb = png_declaring(65_535, 65_535);
+    assert!(bomb.len() < 100, "the fixture must be tiny");
+    let src = write(tmp.path(), "bomb.png", &bomb);
+    let dest = tmp.path().join("optimized-bomb.png");
+    let before = listing(tmp.path());
+
+    let started = std::time::Instant::now();
+    let err = optimize_file(&src, &dest).unwrap_err();
+
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains("image too large: 65535×65535 exceeds 100 megapixels"),
+        "{err}"
+    );
+    assert!(!dest.exists());
+    assert_eq!(listing(tmp.path()), before);
+}
+
 // --- error text ---------------------------------------------------------------------
 
 #[test]

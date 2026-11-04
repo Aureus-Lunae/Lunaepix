@@ -15,7 +15,7 @@
 //! `panic = "unwind"`, the default: never set `panic = "abort"`.
 
 use std::mem;
-use std::os::raw::{c_int, c_ulong};
+use std::os::raw::{c_int, c_long, c_ulong};
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr::{self, NonNull};
 use std::slice;
@@ -39,6 +39,13 @@ const COPY_MARKERS: JCOPY_OPTION = JCOPY_OPTION_JCOPYOPT_ALL;
 
 /// libjpeg's `JMSG_LENGTH_MAX`: the buffer size `format_message` writes into.
 const MESSAGE_BYTES: usize = 80;
+
+/// Most memory libjpeg may use for its image arrays (1 GiB, which fits the
+/// 32-bit `c_long` of Windows). A 100-megapixel image needs at most 800 MB of
+/// coefficients (four components, no subsampling), so this only stops what
+/// the pixel limit did not foresee: libjpeg then fails through `error_exit`
+/// instead of overcommitting.
+const MAX_LIBJPEG_MEMORY: c_long = 1 << 30;
 
 /// First size of the output buffer. It doubles whenever libjpeg fills it.
 const INITIAL_OUTPUT_BYTES: usize = 64 * 1024;
@@ -64,8 +71,7 @@ pub(crate) fn optimize(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if !bytes.starts_with(&SOI) {
         return Err("not a JPEG file (the content is not JPEG data)".to_owned());
     }
-    let candidates =
-        candidates(bytes).map_err(|error| format!("could not read the JPEG data: {error}"))?;
+    let candidates = candidates(bytes)?;
     Ok(smallest(bytes, &candidates).to_vec())
 }
 
@@ -126,9 +132,15 @@ unsafe fn transcode(bytes: &[u8], len: c_ulong) -> [Vec<u8>; 2] {
         // With `require_image` set, a file without an image fails inside; a
         // memory source never suspends, so the header is read when it returns.
         jpeg_read_header(source, 1);
+        // Refuse a decompression bomb before `jpeg_read_coefficients`
+        // allocates arrays for every declared block. Failing here unwinds
+        // through `decompress`, whose guard destroys the decompressor.
+        if let Err(message) = crate::plan::check_pixels(source.image_width, source.image_height) {
+            fail(message);
+        }
         let coefficients = jpeg_read_coefficients(source);
         if coefficients.is_null() {
-            fail("libjpeg returned no coefficients".to_owned());
+            fail("could not read the JPEG data: libjpeg returned no coefficients".to_owned());
         }
         // `coef_bits` is documented as NULL for a non-progressive file
         // (`progressive_mode` itself is private in mozjpeg-sys).
@@ -291,7 +303,7 @@ unsafe fn libjpeg_message(cinfo: &mut jpeg_common_struct) -> String {
 unsafe extern "C-unwind" fn error_exit(cinfo: &mut jpeg_common_struct) {
     // SAFETY: libjpeg calls this only on an object whose `err` is one of ours.
     let message = unsafe { libjpeg_message(cinfo) };
-    fail(message)
+    fail(format!("could not read the JPEG data: {message}"))
 }
 
 /// libjpeg's hook for warnings (level -1) and trace messages (level 0 and
@@ -304,7 +316,7 @@ unsafe extern "C-unwind" fn emit_message(cinfo: &mut jpeg_common_struct, level: 
     if level < 0 {
         // SAFETY: as in `error_exit`.
         let message = unsafe { libjpeg_message(cinfo) };
-        fail(format!("the data is damaged ({message})"));
+        fail(format!("the JPEG data is damaged ({message})"));
     }
 }
 
@@ -350,6 +362,8 @@ impl Decompress {
         unsafe {
             (*state).cinfo.common.err = &raw mut (*state).err;
             jpeg_create_decompress(&raw mut (*state).cinfo);
+            // `mem` is set by a successful `jpeg_create_decompress`.
+            (*(*state).cinfo.common.mem).max_memory_to_use = MAX_LIBJPEG_MEMORY;
         }
         guard
     }
@@ -429,6 +443,7 @@ impl Compress {
         unsafe {
             (*state).cinfo.common.err = &raw mut (*state).err;
             jpeg_create_compress(&raw mut (*state).cinfo);
+            (*(*state).cinfo.common.mem).max_memory_to_use = MAX_LIBJPEG_MEMORY;
             (*state).cinfo.dest = (&raw mut (*state).dest).cast::<jpeg_destination_mgr>();
         }
         guard
@@ -770,6 +785,52 @@ mod tests {
         bytes.extend_from_slice(&[0x5A; 64]);
         let err = candidates(&bytes).unwrap_err();
         assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn caps_the_memory_of_both_libjpeg_objects() {
+        let (decompressor, compressor) = run_libjpeg(|| {
+            let mut decompress = Decompress::new();
+            let mut compress = Compress::new();
+            // SAFETY: `mem` is set by `jpeg_create_*` and lives until drop.
+            unsafe {
+                (
+                    (*decompress.cinfo().common.mem).max_memory_to_use,
+                    (*compress.cinfo().common.mem).max_memory_to_use,
+                )
+            }
+        })
+        .unwrap();
+        assert_eq!(decompressor, MAX_LIBJPEG_MEMORY);
+        assert_eq!(compressor, MAX_LIBJPEG_MEMORY);
+    }
+
+    #[test]
+    fn refuses_a_header_over_the_pixel_limit_before_reading_coefficients() {
+        // 20000x20000 greyscale: 400 MP, a header of a few bytes. libjpeg
+        // accepts the dimensions, so only the pixel limit refuses it.
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x43, 0x00];
+        bytes.extend_from_slice(&[1; 64]);
+        bytes.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x4E, 0x20, 0x4E, 0x20]);
+        bytes.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+        bytes.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+        bytes.extend_from_slice(&[0x00, 0x00, 0xFF, 0xD9]);
+        let err = candidates(&bytes).unwrap_err();
+        assert_eq!(err, "image too large: 20000×20000 exceeds 100 megapixels");
+    }
+
+    #[test]
+    fn passes_a_header_within_the_pixel_limit_on_to_libjpeg() {
+        // The same header at 64x64: not refused for size, but for its
+        // missing scan data.
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x43, 0x00];
+        bytes.extend_from_slice(&[1; 64]);
+        bytes.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x40, 0x00, 0x40]);
+        bytes.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+        bytes.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+        bytes.extend_from_slice(&[0x00, 0x00, 0xFF, 0xD9]);
+        let err = candidates(&bytes).unwrap_err();
+        assert!(!err.contains("image too large"), "{err}");
     }
 
     #[test]

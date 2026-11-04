@@ -434,6 +434,79 @@ fn the_marker_helpers_see_an_inserted_segment_and_a_removed_jfif_header() {
     assert!(!has_jfif(&without_jfif(&plain)));
 }
 
+// --- decompression bomb -------------------------------------------------------------
+
+/// A hand-made baseline JPEG header that declares `w`x`h` greyscale pixels:
+/// SOI, one quantisation table, SOF0, SOS, a few bytes of scan, EOI.
+fn jpeg_declaring(w: u16, h: u16) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xD8];
+    // DQT: table 0, 8-bit, all ones.
+    bytes.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
+    bytes.extend_from_slice(&[1; 64]);
+    // SOF0: precision 8, height, width, one component (id 1, 1x1, table 0).
+    bytes.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08]);
+    bytes.extend_from_slice(&h.to_be_bytes());
+    bytes.extend_from_slice(&w.to_be_bytes());
+    bytes.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+    // SOS: one component, tables 0/0, full spectrum.
+    bytes.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+    bytes.extend_from_slice(&[0x00; 8]);
+    bytes.extend_from_slice(&[0xFF, 0xD9]);
+    bytes
+}
+
+#[test]
+fn the_handmade_header_declares_the_dimensions_it_is_given() {
+    // Proof that the fixture says what the test below relies on.
+    let header = jpeg_declaring(65_500, 1234);
+    let sof = segments(&header)
+        .into_iter()
+        .find(|(m, _)| *m == 0xC0)
+        .unwrap()
+        .1;
+    assert_eq!(u16::from_be_bytes([sof[1], sof[2]]), 1234, "height");
+    assert_eq!(u16::from_be_bytes([sof[3], sof[4]]), 65_500, "width");
+}
+
+#[test]
+fn refuses_a_tiny_jpeg_that_declares_65500_by_65500_pixels_and_writes_nothing() {
+    // 65500 is the largest side libjpeg accepts itself, so only the pixel
+    // limit can refuse this one (65535 would be refused by libjpeg first).
+    let tmp = TempDir::new().unwrap();
+    let bomb = jpeg_declaring(65_500, 65_500);
+    assert!(bomb.len() < 200, "the fixture must be tiny");
+    let src = write(tmp.path(), "bomb.jpg", &bomb);
+    let dest = tmp.path().join("optimized-bomb.jpg");
+    let before = listing(tmp.path());
+
+    let started = std::time::Instant::now();
+    let err = optimize_file(&src, &dest).unwrap_err();
+
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains("image too large: 65500×65500 exceeds 100 megapixels"),
+        "{err}"
+    );
+    assert!(!dest.exists());
+    assert_eq!(listing(tmp.path()), before);
+}
+
+#[test]
+fn refuses_a_tiny_jpeg_that_declares_65535_by_65535_pixels_and_writes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "bomb.jpg", &jpeg_declaring(65_535, 65_535));
+    let dest = tmp.path().join("optimized-bomb.jpg");
+    let before = listing(tmp.path());
+
+    let err = optimize_file(&src, &dest).unwrap_err();
+
+    assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
+    assert!(!dest.exists());
+    assert_eq!(listing(tmp.path()), before);
+}
+
 // --- replacing, and nothing left after a failure ----------------------------------------
 
 #[test]

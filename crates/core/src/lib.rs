@@ -22,7 +22,7 @@ mod jpg;
 mod plan;
 mod png;
 
-pub use plan::{MAX_FILE_BYTES, MAX_RUN_FILES, plan_files, plan_folder};
+pub use plan::{MAX_FILE_BYTES, MAX_PIXELS, MAX_RUN_FILES, plan_files, plan_folder};
 
 /// Result of optimising one file. Sizes are in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
