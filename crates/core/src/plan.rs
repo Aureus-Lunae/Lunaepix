@@ -15,7 +15,7 @@ pub const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_RUN_FILES: usize = 2000;
 
 /// Name of the output folder used when a whole folder is planned.
-const OUTPUT_DIR: &str = "optimized";
+pub(crate) const OUTPUT_DIR: &str = "optimized";
 
 /// Prefix of the output name used when a single file is planned.
 const OUTPUT_PREFIX: &str = "optimized-";

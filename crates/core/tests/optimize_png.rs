@@ -359,13 +359,13 @@ fn does_not_create_the_destination_folder_when_the_source_is_rejected() {
 
 #[test]
 fn fails_cleanly_when_the_destination_folder_cannot_be_created() {
-    // `blocker` is a file, so `blocker/out.png` can never be written.
+    // `optimized` is a file, so `optimized/out.png` can never be written.
     let tmp = TempDir::new().unwrap();
     let src = write(tmp.path(), "a.png", &wasteful_png());
-    write(tmp.path(), "blocker", b"a file");
+    write(tmp.path(), "optimized", b"a file");
     let before = listing(tmp.path());
 
-    let err = optimize_file(&src, &tmp.path().join("blocker").join("out.png")).unwrap_err();
+    let err = optimize_file(&src, &tmp.path().join("optimized").join("out.png")).unwrap_err();
 
     assert!(matches!(err, OptimizeError::Io { .. }), "{err:?}");
     assert_eq!(listing(tmp.path()), before);
@@ -482,22 +482,128 @@ fn optimizes_into_the_same_file_name_in_another_folder() {
     assert!(dest.is_file());
 }
 
+// --- the destination folder must be the source's folder or its `optimized/` --------
+
 #[cfg(unix)]
 #[test]
-fn refuses_a_destination_folder_that_is_a_symlink_and_writes_nothing_behind_it() {
+fn writes_beside_a_source_that_is_reached_through_a_symlinked_folder() {
+    // The user's own folder may be a symlink (`~/Pictures -> /data/pictures`).
     let tmp = TempDir::new().unwrap();
-    let src = write(tmp.path(), "a.png", &wasteful_png());
-    let elsewhere = tmp.path().join("elsewhere");
-    fs::create_dir(&elsewhere).unwrap();
-    std::os::unix::fs::symlink(&elsewhere, tmp.path().join("optimized")).unwrap();
+    let real = tmp.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    write(&real, "a.png", &wasteful_png());
 
-    let result = optimize_file(&src, &tmp.path().join("optimized").join("a.png"));
+    optimize_file(&link.join("a.png"), &link.join("optimized-a.png")).unwrap();
+
+    assert!(real.join("optimized-a.png").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn writes_into_optimized_under_a_source_folder_reached_through_a_symlink() {
+    let tmp = TempDir::new().unwrap();
+    let real = tmp.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    write(&real, "a.png", &wasteful_png());
+
+    optimize_file(&link.join("a.png"), &link.join("optimized").join("a.png")).unwrap();
+
+    assert!(real.join("optimized").join("a.png").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_an_optimized_folder_that_is_a_symlink_elsewhere_and_writes_nothing_there() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("dir");
+    let elsewhere = tmp.path().join("elsewhere");
+    fs::create_dir(&dir).unwrap();
+    fs::create_dir(&elsewhere).unwrap();
+    let src = write(&dir, "a.png", &wasteful_png());
+    std::os::unix::fs::symlink(&elsewhere, dir.join("optimized")).unwrap();
+
+    let result = optimize_file(&src, &dir.join("optimized").join("a.png"));
 
     assert!(
-        matches!(result, Err(OptimizeError::Io { .. })),
+        matches!(result, Err(OptimizeError::Invalid { .. })),
         "{result:?}"
     );
     assert!(listing(&elsewhere).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_an_optimized_folder_that_is_a_symlink_to_a_sibling_folder() {
+    // It resolves to `other`, which is neither the source folder nor
+    // `<source folder>/optimized`.
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("dir");
+    fs::create_dir(&dir).unwrap();
+    let src = write(&dir, "a.png", &wasteful_png());
+    let other = dir.join("other");
+    fs::create_dir(&other).unwrap();
+    std::os::unix::fs::symlink(&other, dir.join("optimized")).unwrap();
+
+    let result = optimize_file(&src, &dir.join("optimized").join("a.png"));
+
+    assert!(
+        matches!(result, Err(OptimizeError::Invalid { .. })),
+        "{result:?}"
+    );
+    assert!(listing(&other).is_empty());
+}
+
+#[test]
+fn refuses_a_destination_in_an_unrelated_folder_and_does_not_create_it() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("dir");
+    fs::create_dir(&dir).unwrap();
+    let src = write(&dir, "a.png", &wasteful_png());
+    let unrelated = tmp.path().join("unrelated");
+
+    let result = optimize_file(&src, &unrelated.join("a.png"));
+
+    assert!(
+        matches!(result, Err(OptimizeError::Invalid { .. })),
+        "{result:?}"
+    );
+    assert!(!unrelated.exists());
+}
+
+#[test]
+fn refuses_a_destination_in_an_existing_unrelated_folder_and_a_nested_one() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &wasteful_png());
+    let unrelated = tmp.path().join("unrelated");
+    fs::create_dir(&unrelated).unwrap();
+
+    assert!(optimize_file(&src, &unrelated.join("a.png")).is_err());
+    // Deeper than `optimized/` is not `optimized/` either.
+    let nested = tmp.path().join("optimized").join("deeper").join("a.png");
+    assert!(optimize_file(&src, &nested).is_err());
+
+    assert!(listing(&unrelated).is_empty());
+    assert!(!tmp.path().join("optimized").exists());
+}
+
+#[test]
+fn accepts_a_relative_source_and_destination_in_the_current_folder_layout() {
+    // Both paths are relative to the process's current folder; the folder of
+    // `a.png` has an empty parent path, which must still resolve.
+    let name = format!("lunaepix-rel-{}.png", std::process::id());
+    let src = Path::new(&name);
+    fs::write(src, wasteful_png()).unwrap();
+    let dest_name = format!("optimized-{name}");
+
+    let result = optimize_file(src, Path::new(&dest_name));
+
+    let _ = fs::remove_file(src);
+    let _ = fs::remove_file(&dest_name);
+    result.unwrap();
 }
 
 // --- chunk stripping (strip = Safe) -----------------------------------------------------

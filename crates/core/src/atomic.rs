@@ -6,6 +6,14 @@ use std::path::Path;
 
 use tempfile::NamedTempFile;
 
+/// The folder a file sits in. A bare file name (`a.png`) sits in `.`.
+pub(crate) fn folder_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
 /// Write `bytes` to `dest` so that `dest` is either the complete new file or
 /// untouched. The bytes go to a temporary file in `dest`'s own folder (same
 /// filesystem, so the rename is atomic), which is then renamed onto `dest`.
@@ -13,9 +21,9 @@ use tempfile::NamedTempFile;
 /// - The parent folder is created if it is missing, and only now, once there
 ///   is something to write. A folder created here is left in place if the
 ///   write then fails: an empty `optimized/` folder is harmless.
-/// - The parent folder must be a real directory. If it is a symlink (or
-///   anything else), the write is refused: a link planted at `optimized/`
-///   would otherwise send the output to wherever it points.
+/// - The parent folder may be reached through a symlink: this helper does not
+///   decide where output may go. `optimize_file` checks that the folder is the
+///   source's own folder or its `optimized/` before calling this.
 /// - A symlink at `dest` itself is replaced, never followed: the rename swaps
 ///   the directory entry, so the link's target is not written to.
 /// - The file gets exactly `permissions` (the caller passes the source's, so
@@ -28,18 +36,8 @@ pub(crate) fn write_atomically(
     bytes: &[u8],
     permissions: fs::Permissions,
 ) -> io::Result<()> {
-    let parent = match dest.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
+    let parent = folder_of(dest);
     fs::create_dir_all(parent)?;
-    // `symlink_metadata` does not follow a link, so a symlink reports as one.
-    if !fs::symlink_metadata(parent)?.file_type().is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the destination folder is a symbolic link or not a folder",
-        ));
-    }
 
     // Dropping a `NamedTempFile` deletes it, so every early return below
     // (including a failed `persist`) leaves no temporary file behind.
@@ -137,17 +135,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn refuses_a_destination_folder_that_is_a_symlink_and_writes_nothing_behind_it() {
+    fn writes_into_a_folder_reached_through_a_symlink() {
+        // Where output may go is `optimize_file`'s decision, not this helper's.
         let tmp = TempDir::new().unwrap();
-        let elsewhere = tmp.path().join("elsewhere");
-        fs::create_dir(&elsewhere).unwrap();
-        let link = tmp.path().join("optimized");
-        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let result = write_atomically(&link.join("a.png"), b"x", perms(tmp.path()));
+        write_atomically(&link.join("a.png"), b"x", perms(tmp.path())).unwrap();
 
-        assert!(result.is_err());
-        assert_eq!(listing(&elsewhere), Vec::<OsString>::new());
+        assert_eq!(listing(&real), [OsString::from("a.png")]);
+    }
+
+    #[test]
+    fn names_the_current_folder_for_a_bare_file_name() {
+        assert_eq!(folder_of(Path::new("a.png")), Path::new("."));
+        assert_eq!(folder_of(Path::new("dir/a.png")), Path::new("dir"));
     }
 
     #[cfg(unix)]

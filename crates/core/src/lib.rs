@@ -94,7 +94,9 @@ pub enum OptimizeError {
 /// when there is a result to write. If anything fails, `dest` is not touched
 /// and no temporary file is left behind. The output gets the source's
 /// permissions. A `dest` that is the same file as `src` (after resolving
-/// symlinks and `.`/`..`) is refused. `Outcome::millis` is the wall time of
+/// symlinks and `.`/`..`) is refused, and so is a `dest` whose folder is not
+/// the source's folder or its `optimized/` subfolder (checked before anything
+/// is created). `Outcome::millis` is the wall time of
 /// the whole call: read, optimise and write.
 pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> {
     let started = Instant::now();
@@ -138,12 +140,38 @@ pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> 
         path: src.to_path_buf(),
         message,
     })?;
+    ensure_destination_folder(src, dest)?;
     atomic::write_atomically(dest, &optimized, permissions).map_err(io_error(dest))?;
 
     Ok(Outcome {
         before: original.len() as u64,
         after: optimized.len() as u64,
         millis: started.elapsed().as_millis() as u64,
+    })
+}
+
+/// Output may only go to the source's own folder (`optimized-<name>` beside
+/// it) or to its `optimized/` subfolder, which are the two places the planner
+/// chooses. Both folders are compared after resolving symlinks, so the user's
+/// own folder may itself be reached through a link, but an `optimized` that is
+/// a link to anywhere else is refused. Nothing is created or written here: a
+/// folder that does not exist yet is resolved through its nearest existing
+/// parent.
+///
+/// The check and the write are two steps, so a link swapped in between them is
+/// not caught; the folders are the user's own.
+fn ensure_destination_folder(src: &Path, dest: &Path) -> Result<(), OptimizeError> {
+    let source_folder = plan::resolve(atomic::folder_of(src));
+    let dest_folder = plan::resolve(atomic::folder_of(dest));
+    if dest_folder == source_folder || dest_folder == source_folder.join(plan::OUTPUT_DIR) {
+        return Ok(());
+    }
+    Err(OptimizeError::Invalid {
+        path: dest.to_path_buf(),
+        message: format!(
+            "the destination must be the source's folder or its '{}' folder",
+            plan::OUTPUT_DIR
+        ),
     })
 }
 
