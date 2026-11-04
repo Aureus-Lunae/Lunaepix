@@ -16,6 +16,8 @@ Everything decided in conversation is in the spec's Handoff. Do not re-open it. 
 - The compressor evaluation (Step 2) runs **before** any other code and is a hard gate.
 - The plan names no crate versions. The implementer picks current versions and records them.
 
+**Execution (2026-11-04):** Step 2 ran before Step 1, because both handoffs say the gate comes before any other code. The gate rulings (SVG edge-noise tolerance, JPG always smallest-lossless, MPL-2.0 allowed) are in the spec's Handoff.
+
 Not in scope: macOS, auto-update, code signing, lossy modes, recursive folders, WebP.
 
 ## Execution
