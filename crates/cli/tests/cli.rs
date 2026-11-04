@@ -177,6 +177,12 @@ fn a_corrupt_png_fails_alone_with_a_stderr_line_and_exit_1() {
         "{stderr:?}"
     );
     assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
+    // The path is named once, at the end; the reason does not repeat it.
+    assert_eq!(
+        stderr.matches(&bad.display().to_string()).count(),
+        1,
+        "{stderr:?}"
+    );
     // The good files around it are done, and printed.
     assert_eq!(
         blocks(&text(&output.stdout)),
@@ -370,6 +376,11 @@ fn an_svg_that_crashes_the_optimiser_fails_alone_and_the_exit_code_is_1() {
     );
     assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
     assert_eq!(
+        stderr.matches(&bad.display().to_string()).count(),
+        1,
+        "{stderr:?}"
+    );
+    assert_eq!(
         blocks(&text(&output.stdout)),
         vec![
             expected_block("a.png", &first, &tmp.path().join("optimized-a.png")),
@@ -405,4 +416,119 @@ fn a_normal_svg_with_css_succeeds() {
     assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
     assert_eq!(text(&output.stderr), "");
     assert!(tmp.path().join("optimized-css.svg").is_file());
+}
+
+// --- control characters in names ---------------------------------------------
+
+/// No character a terminal acts on, except exactly `lines` newlines.
+fn assert_no_control_characters(output: &str, lines: usize) {
+    assert_eq!(output.matches('\n').count(), lines, "{output:?}");
+    for c in output.chars().filter(|&c| c != '\n') {
+        assert!(!c.is_control(), "raw {c:?} in {output:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_name_with_terminal_escape_codes_is_printed_escaped() {
+    let tmp = TempDir::new().unwrap();
+    let hostile = "\x1b]0;pwned\x07a.png";
+    let png = write(tmp.path(), hostile, &png_bytes());
+    let bad = write(tmp.path(), "\x1b[2Jbad.png", b"this is not a png");
+    let skipped = write(tmp.path(), "\x1b[31mnotes.txt", b"hello");
+
+    let output = run_on(tmp.path(), &[&png, &bad, &skipped]);
+
+    assert_eq!(output.status.code(), Some(1));
+    // The success block: four lines, the name escaped, the codes visible.
+    let stdout = text(&output.stdout);
+    assert_no_control_characters(&stdout, 4);
+    assert!(
+        stdout.starts_with("\\x1b]0;pwned\\x07a.png:\nDone in "),
+        "{stdout:?}"
+    );
+    // The failure and the skip: one line each, nothing raw.
+    let stderr = text(&output.stderr);
+    assert_no_control_characters(&stderr, 2);
+    assert!(stderr.contains("\\x1b[2Jbad.png\n"), "{stderr:?}");
+    assert!(
+        stderr.contains("lunaepix: skipped (Not a PNG, JPG or SVG file): ")
+            && stderr.contains("\\x1b[31mnotes.txt\n"),
+        "{stderr:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dir_name_with_terminal_escape_codes_is_printed_escaped() {
+    let tmp = TempDir::new().unwrap();
+    let missing = tmp.path().join("\x1b[2Jnone");
+
+    let output = run_on(tmp.path(), &[Path::new("--dir"), &missing]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = text(&output.stderr);
+    assert_no_control_characters(&stderr, 1);
+    assert!(stderr.ends_with("\\x1b[2Jnone\n"), "{stderr:?}");
+}
+
+#[test]
+fn a_normal_non_ascii_name_is_printed_as_it_is() {
+    let tmp = TempDir::new().unwrap();
+    let name = "Mobilis Logo – zwart é.png";
+    let png = write(tmp.path(), name, &png_bytes());
+
+    let output = run_on(tmp.path(), &[&png]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert!(text(&output.stdout).starts_with(&format!("{name}:\n")));
+}
+
+// --- a --dir that is not a folder --------------------------------------------
+
+#[test]
+fn a_dir_that_does_not_exist_fails_with_exit_1_and_writes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let missing = tmp.path().join("none");
+
+    let output = run_on(tmp.path(), &[Path::new("--dir"), &missing]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(
+        text(&output.stderr),
+        format!("lunaepix: failed (not a folder): {}\n", missing.display())
+    );
+    assert_eq!(listing(tmp.path()), names(&[]));
+}
+
+#[test]
+fn a_dir_that_is_a_file_fails_with_exit_1_and_writes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let file = write(tmp.path(), "a.png", &png_bytes());
+
+    let output = run_on(tmp.path(), &[Path::new("--dir"), &file]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(
+        text(&output.stderr),
+        format!("lunaepix: failed (not a folder): {}\n", file.display())
+    );
+    assert_eq!(listing(tmp.path()), names(&["a.png"]));
+}
+
+#[test]
+fn an_existing_empty_dir_exits_0_with_no_output() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("pics");
+    fs::create_dir(&dir).unwrap();
+
+    let output = run_on(tmp.path(), &[Path::new("--dir"), &dir]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(text(&output.stderr), "");
+    // No `optimized/` folder is made for nothing.
+    assert_eq!(listing(&dir), names(&[]));
 }

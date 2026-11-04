@@ -36,7 +36,12 @@ fn main() -> ExitCode {
     };
     let jobs = match &request {
         Request::Files(files) => plan_files(files),
-        Request::Dir(dir) => plan_folder(dir),
+        Request::Dir(dir) if dir.is_dir() => plan_folder(dir),
+        // A folder the user named that is not there is a failure, not a skip.
+        Request::Dir(dir) => {
+            report::report_not_a_folder(dir, &mut io::stderr().lock());
+            return ExitCode::FAILURE;
+        }
     };
     let worker = match Worker::current_exe() {
         Ok(worker) => worker,
@@ -47,11 +52,9 @@ fn main() -> ExitCode {
     };
 
     let colour = io::stdout().is_terminal();
-    let mut stdout = io::stdout().lock();
-    let mut stderr = io::stderr().lock();
     let mut failed = false;
     run(&jobs, &worker, |_, src, result| {
-        failed |= report::report(src, result, colour, &mut stdout, &mut stderr);
+        failed |= report::report(src, result, colour);
     });
     if failed {
         ExitCode::FAILURE

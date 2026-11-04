@@ -98,6 +98,19 @@ pub enum OptimizeError {
     Invalid { path: PathBuf, message: String },
 }
 
+impl OptimizeError {
+    /// The reason alone, without the leading `"<path>: "` that `Display`
+    /// adds, for a caller that already shows the path. `Display` is always
+    /// `"<path>: <reason>"`.
+    pub fn reason(&self) -> String {
+        match self {
+            OptimizeError::Io { cause, .. } => cause.to_string(),
+            OptimizeError::UnsupportedType { .. } => "unsupported file type".to_owned(),
+            OptimizeError::Invalid { message, .. } => message.clone(),
+        }
+    }
+}
+
 /// Optimise `src` losslessly and write the result to `dest`.
 ///
 /// The format is chosen by the extension, case-insensitively, exactly as the
@@ -188,6 +201,45 @@ mod tests {
         );
         assert_eq!(Skip::NotAFile.to_string(), "Not a readable file");
         assert_ne!(Skip::TooLarge.to_string(), Skip::OverRunLimit.to_string());
+    }
+
+    fn optimize_errors() -> Vec<OptimizeError> {
+        vec![
+            OptimizeError::Io {
+                path: PathBuf::from("dir/a.png"),
+                cause: io::Error::other("disk full"),
+            },
+            OptimizeError::UnsupportedType {
+                path: PathBuf::from("dir/a.txt"),
+            },
+            OptimizeError::Invalid {
+                path: PathBuf::from("dir/b.svg"),
+                message: "nested too deeply".to_owned(),
+            },
+        ]
+    }
+
+    #[test]
+    fn an_optimize_error_gives_its_reason_without_the_path() {
+        let reasons: Vec<String> = optimize_errors().iter().map(|e| e.reason()).collect();
+        assert_eq!(
+            reasons,
+            ["disk full", "unsupported file type", "nested too deeply"]
+        );
+    }
+
+    #[test]
+    fn an_optimize_errors_display_is_its_path_then_its_reason() {
+        for error in optimize_errors() {
+            let path = match &error {
+                OptimizeError::Io { path, .. }
+                | OptimizeError::UnsupportedType { path }
+                | OptimizeError::Invalid { path, .. } => path.display().to_string(),
+            };
+            assert_eq!(error.to_string(), format!("{path}: {}", error.reason()));
+            // The reason alone does not carry the path.
+            assert!(!error.reason().contains("dir/"), "{}", error.reason());
+        }
     }
 
     #[test]
