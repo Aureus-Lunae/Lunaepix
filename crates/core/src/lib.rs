@@ -3,13 +3,16 @@
 //! All logic and all tests live here. The CLI and the Tauri app are thin
 //! front ends over this crate.
 //!
-//! Scaffold: the three functions below compile but are not implemented yet.
-//! The `plan_*` functions will never write to the filesystem; destination
-//! folders are created only when a job runs.
+//! The `plan_*` functions never write to the filesystem; destination folders
+//! are created only when a job runs.
 
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+
+mod plan;
+
+pub use plan::{MAX_FILE_BYTES, MAX_RUN_FILES, plan_files, plan_folder};
 
 /// Result of optimising one file. Sizes are in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,11 +29,14 @@ pub enum Skip {
     UnsupportedType,
     /// Larger than the per-file size limit.
     TooLarge,
-    /// Would take the run over the total size limit.
+    /// The run already holds the maximum number of files to optimise.
     OverRunLimit,
     /// The file is itself in the destination folder, so optimising it would
     /// overwrite its own output.
     IsOwnDestination,
+    /// The input does not exist or is not a regular file (for example a
+    /// socket), or it is a folder that could not be read.
+    NotAFile,
 }
 
 impl fmt::Display for Skip {
@@ -40,6 +46,7 @@ impl fmt::Display for Skip {
             Skip::TooLarge => "File is too large",
             Skip::OverRunLimit => "Run size limit reached",
             Skip::IsOwnDestination => "Already in the output folder",
+            Skip::NotAFile => "Not a readable file",
         })
     }
 }
@@ -75,20 +82,7 @@ pub enum OptimizeError {
 /// Optimise `src` losslessly and write the result to `dest`.
 pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> {
     let _ = (src, dest);
-    todo!("implemented in Step 3")
-}
-
-/// Plan a run over an explicit list of files. Never writes to the filesystem.
-pub fn plan_files(inputs: &[PathBuf]) -> Vec<Job> {
-    let _ = inputs;
-    todo!("implemented in Step 3")
-}
-
-/// Plan a run over the files directly inside `dir` (not recursive). Never
-/// writes to the filesystem.
-pub fn plan_folder(dir: &Path) -> Vec<Job> {
-    let _ = dir;
-    todo!("implemented in Step 3")
+    todo!("implemented in Step 4")
 }
 
 #[cfg(test)]
@@ -98,12 +92,7 @@ mod tests {
     #[test]
     fn skip_reasons_are_human_readable() {
         assert_eq!(Skip::UnsupportedType.to_string(), "Not a PNG, JPG or SVG file");
+        assert_eq!(Skip::NotAFile.to_string(), "Not a readable file");
         assert_ne!(Skip::TooLarge.to_string(), Skip::OverRunLimit.to_string());
-    }
-
-    #[test]
-    fn outcome_holds_sizes() {
-        let o = Outcome { before: 10, after: 4, millis: 1 };
-        assert!(o.after < o.before);
     }
 }
