@@ -9,7 +9,8 @@ authors.workspace = true
 
 [lib]
 name = "lunaepix_app_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Desktop only: no mobile build, so no staticlib or cdylib.
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = "2"
@@ -17,3 +18,15 @@ tauri-build = "2"
 [dependencies]
 lunaepix-core = { workspace = true }
 tauri = "2"
+# Both plugins are called from Rust only; the window gets none of their
+# permissions (see capabilities/default.json). The 3.0 alphas need Tauri 3.
+tauri-plugin-dialog = "2.8.4"
+tauri-plugin-opener = "2.7.2"
+serde = { version = "1.0.229", features = ["derive"] }
+
+[dev-dependencies]
+# The event payloads are checked as the JSON the window receives.
+serde_json = "1.0.154"
+# Test fixtures for the worker-mode smoke test, as in the CLI's tests.
+png = "0.17.16"
+tempfile = "3.27.0"

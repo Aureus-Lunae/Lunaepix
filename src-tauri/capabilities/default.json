@@ -1,11 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "enables the default permissions",
+  "description": "The main window: the three Lunaepix commands, and listening to their events. No dialog, file, shell or opener permission: those plugins are used from Rust only.",
   "windows": [
     "main"
   ],
   "permissions": [
-    "core:default"
+    "allow-choose-files",
+    "allow-choose-folder",
+    "allow-open-output-folder",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
   ]
 }
