@@ -77,6 +77,11 @@ or "Open folder" works as soon as it arrives.
 { "optimised": 2, "saved_bytes": 341210, "has_output": true }
 ```
 
+Every `run-started` is followed by exactly one `run-finished`. That holds
+even when the run breaks off inside the backend. Then fewer than `total`
+`file-done` events arrive, and the summary counts only those. `has_output`
+is true exactly when `open_output_folder` has a folder.
+
 ### `run-busy`
 
 A drop or a pick was refused because a run, or a dialog for one, is active.
@@ -99,6 +104,15 @@ its run starts.
 
 ## Rules for the window
 
+- **Handle events in the order they arrive, and keep no assumptions across
+  runs.** The guard is freed just before `run-finished` goes out. A drop at
+  that moment can therefore start run N+1, and its `run-started` may arrive
+  before run N's `run-finished`. Do not assume that run N's `run-finished`
+  comes before run N+1's `run-started`. A `run-started` always begins a new
+  run: clear the table and reset the counters, whatever state the page is
+  in. The payloads carry no run number, so in that rare overlap the page
+  cannot tell whose `run-finished` arrives late. It shows that summary for
+  the new run until the new run's own `run-finished` replaces it.
 - **Listen only to the events above.** Do not listen to Tauri's own
   `tauri://drag-enter`, `tauri://drag-over` or `tauri://drag-drop`: Tauri
   puts the dropped paths in them, and they reach the page only when a

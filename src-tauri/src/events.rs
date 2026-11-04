@@ -53,7 +53,8 @@ pub struct RunFinished {
     pub optimised: usize,
     /// Bytes saved over the optimised files. A file that grew counts 0.
     pub saved_bytes: u64,
-    /// Whether the run wrote any output, so "Open folder" has a folder.
+    /// Whether `open_output_folder` now has a folder to open: the same
+    /// output folder the backend stores (see `session::Tally`).
     pub has_output: bool,
 }
 
@@ -125,23 +126,6 @@ pub fn file_done(index: usize, src: &Path, result: &FileResult) -> FileDone {
         }
     }
     payload
-}
-
-/// The `run-finished` payload for the results of a whole run.
-pub fn run_finished(results: &[FileResult]) -> RunFinished {
-    let mut summary = RunFinished {
-        optimised: 0,
-        saved_bytes: 0,
-        has_output: false,
-    };
-    for result in results {
-        if let FileResult::Optimized(outcome) = result {
-            summary.optimised += 1;
-            summary.saved_bytes += outcome.before.saturating_sub(outcome.after);
-        }
-    }
-    summary.has_output = summary.optimised > 0;
-    summary
 }
 
 #[cfg(test)]
@@ -237,49 +221,6 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         let src = Path::new(OsStr::from_bytes(b"/tmp/caf\xe9.png"));
         assert_eq!(file_done(0, src, &optimized(2, 1)).name, "caf\u{fffd}.png");
-    }
-
-    #[test]
-    fn the_summary_counts_the_optimised_files_and_their_saving() {
-        let results = [
-            optimized(100, 60),
-            optimized(50, 50),
-            FileResult::Skipped(Skip::TooLarge),
-            FileResult::Failed(RunError::TimedOut {
-                path: PathBuf::from("/x/c.png"),
-                limit: std::time::Duration::from_secs(600),
-            }),
-        ];
-        assert_eq!(
-            run_finished(&results),
-            RunFinished {
-                optimised: 2,
-                saved_bytes: 40,
-                has_output: true,
-            }
-        );
-    }
-
-    #[test]
-    fn a_file_that_grew_saves_nothing_rather_than_wrapping() {
-        let results = [optimized(10, 12), optimized(100, 90)];
-        assert_eq!(run_finished(&results).saved_bytes, 10);
-    }
-
-    #[test]
-    fn an_all_skipped_run_has_nothing_optimised_and_no_output() {
-        let results = [
-            FileResult::Skipped(Skip::UnsupportedType),
-            FileResult::Skipped(Skip::NotAFile),
-        ];
-        assert_eq!(
-            run_finished(&results),
-            RunFinished {
-                optimised: 0,
-                saved_bytes: 0,
-                has_output: false,
-            }
-        );
     }
 
     #[test]

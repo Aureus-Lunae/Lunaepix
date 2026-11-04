@@ -1,14 +1,31 @@
 //! One run at a time: the busy guard, what a pick or a drop turns into, the
-//! run itself with its events, and the output folder it leaves behind. No
-//! Tauri here, so all of it is tested without a window.
+//! run itself with its events, the output folder it leaves behind, and what
+//! each command gives back. No Tauri here: the side effects (the window's
+//! events, the system opener, the runner) come in as closures, so all of it
+//! is tested without a window, failures included.
 
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use lunaepix_core::{FileResult, Job, Worker};
+use serde::Serialize;
 
-use crate::events::{Event, RunStarted, file_done, run_finished};
+use crate::events::{Event, RunFinished, RunStarted, file_done};
+
+/// Why a command did nothing. Serialised as a bare string: `"busy"`,
+/// `"no-output"` or `"open-failed"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommandError {
+    /// A run (or a dialog for one) is already active.
+    Busy,
+    /// No completed run has written output yet.
+    NoOutput,
+    /// The system could not open the folder (for example, it was removed).
+    OpenFailed,
+}
 
 /// Allows one run at a time. A run holds a [`RunTicket`] from the moment it
 /// is asked for (before a dialog opens) until it is over.
@@ -40,6 +57,34 @@ impl Drop for RunTicket {
     }
 }
 
+/// A ticket for a new run; or, while a run is active, `run-busy` to the
+/// window and [`CommandError::Busy`] to the caller.
+pub fn claim_run(
+    guard: &RunGuard,
+    emit: &mut impl FnMut(Event),
+) -> Result<RunTicket, CommandError> {
+    guard.try_start().ok_or_else(|| {
+        emit(Event::RunBusy);
+        CommandError::Busy
+    })
+}
+
+/// Open the output folder of the last completed run with `open` (the system
+/// file manager). [`CommandError::NoOutput`] without calling `open` if there
+/// is none; [`CommandError::OpenFailed`] if `open` fails. The lock is not
+/// held while `open` runs.
+pub fn open_last_output<E>(
+    last_output: &Mutex<Option<PathBuf>>,
+    open: impl FnOnce(&Path) -> Result<(), E>,
+) -> Result<(), CommandError> {
+    let folder = last_output
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+        .ok_or(CommandError::NoOutput)?;
+    open(&folder).map_err(|_| CommandError::OpenFailed)
+}
+
 /// The jobs for what a dialog or a drop gave: `None` (a cancelled dialog) or
 /// an empty list plans nothing and runs nothing; otherwise `plan` is called
 /// once with exactly those paths.
@@ -51,24 +96,85 @@ pub fn plan_pick(
     Some(plan(&picked))
 }
 
-/// The folder "Open folder" opens after this run: the folder of the first
-/// file that was written. For a folder run that is `<dir>/optimized`; for a
-/// file run, the folder of that file. `None` if nothing was written.
-pub fn output_folder(jobs: &[Job], results: &[FileResult]) -> Option<PathBuf> {
-    jobs.iter()
-        .zip(results)
-        .find_map(|(job, result)| match (job, result) {
-            (Job::Optimize { dest, .. }, FileResult::Optimized(_)) => dest.parent(),
-            _ => None,
-        })
-        .filter(|folder| !folder.as_os_str().is_empty())
-        .map(Path::to_path_buf)
+/// What a dialog's answer leads to. A cancelled or empty answer frees the
+/// ticket and then sends `run-cancelled`, running nothing. Otherwise `run`
+/// gets the ticket and the planned jobs, and no `run-cancelled` goes out.
+pub fn answer_dialog(
+    ticket: RunTicket,
+    picked: Option<Vec<PathBuf>>,
+    plan: impl FnOnce(&[PathBuf]) -> Vec<Job>,
+    emit: &mut impl FnMut(Event),
+    run: impl FnOnce(RunTicket, Vec<Job>),
+) {
+    match plan_pick(picked, plan) {
+        Some(jobs) => run(ticket, jobs),
+        None => {
+            drop(ticket);
+            emit(Event::RunCancelled);
+        }
+    }
 }
 
-/// Run `jobs` on this thread and tell the window: `run-started`, one
-/// `file-done` per job, then `run-finished`. Before `run-finished` the output
-/// folder is stored in `last_output` and the ticket is given back, so the
-/// window may open the folder or start the next run as soon as it hears it.
+/// What a run has done so far, kept up to date file by file so that a run
+/// that ends early still has a summary. The output folder it records is the
+/// one source of both `has_output` and the folder "Open folder" opens.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tally {
+    optimised: usize,
+    saved_bytes: u64,
+    output: Option<PathBuf>,
+}
+
+impl Tally {
+    /// The tally of a whole list of results, `results[i]` being the result
+    /// of `jobs[i]`.
+    pub fn of(jobs: &[Job], results: &[FileResult]) -> Self {
+        let mut tally = Tally::default();
+        for (index, result) in results.iter().enumerate() {
+            tally.record(jobs.get(index), result);
+        }
+        tally
+    }
+
+    /// Count one finished file. A file that grew saves 0. The first written
+    /// file sets the output folder: the folder of its destination, so
+    /// `<dir>/optimized` for a folder run and the file's own folder for a
+    /// file run. A destination with no folder sets none.
+    pub fn record(&mut self, job: Option<&Job>, result: &FileResult) {
+        let FileResult::Optimized(outcome) = result else {
+            return;
+        };
+        self.optimised += 1;
+        self.saved_bytes += outcome.before.saturating_sub(outcome.after);
+        if self.output.is_none()
+            && let Some(Job::Optimize { dest, .. }) = job
+        {
+            self.output = dest
+                .parent()
+                .filter(|folder| !folder.as_os_str().is_empty())
+                .map(Path::to_path_buf);
+        }
+    }
+
+    /// The folder "Open folder" opens after this run, if anything was written
+    /// to a known folder.
+    pub fn output_folder(&self) -> Option<&Path> {
+        self.output.as_deref()
+    }
+
+    /// The `run-finished` payload. `has_output` is exactly
+    /// `output_folder().is_some()`.
+    pub fn finished(&self) -> RunFinished {
+        RunFinished {
+            optimised: self.optimised,
+            saved_bytes: self.saved_bytes,
+            has_output: self.output.is_some(),
+        }
+    }
+}
+
+/// Run `jobs` on this thread with the real runner and `worker`; see
+/// [`run_session_with`].
 pub fn run_session(
     ticket: RunTicket,
     jobs: &[Job],
@@ -76,32 +182,66 @@ pub fn run_session(
     last_output: &Mutex<Option<PathBuf>>,
     emit: &mut impl FnMut(Event),
 ) {
-    emit(Event::RunStarted(RunStarted { total: jobs.len() }));
-    let results = lunaepix_core::run(jobs, worker, |index, src, result| {
-        emit(Event::FileDone(file_done(index, src, result)));
+    run_session_with(ticket, jobs, last_output, emit, |jobs, progress| {
+        lunaepix_core::run(jobs, worker, progress);
     });
-    *last_output.lock().unwrap_or_else(PoisonError::into_inner) = output_folder(jobs, &results);
+}
+
+/// Run `jobs` through `run` and tell the window: `run-started`, one
+/// `file-done` per finished file, then exactly one `run-finished`.
+///
+/// Before `run-finished` goes out, the output folder is stored in
+/// `last_output` and the ticket is given back, so the window may open the
+/// folder or start the next run as soon as it hears it. If `run` or `emit`
+/// panics during the run, `run-finished` still goes out once, with what was
+/// counted so far, and then the panic carries on.
+pub fn run_session_with(
+    ticket: RunTicket,
+    jobs: &[Job],
+    last_output: &Mutex<Option<PathBuf>>,
+    emit: &mut impl FnMut(Event),
+    run: impl FnOnce(&[Job], &mut dyn FnMut(usize, &Path, &FileResult)),
+) {
+    emit(Event::RunStarted(RunStarted { total: jobs.len() }));
+    let mut tally = Tally::default();
+    // Caught so that the window always hears the end of a run it saw start.
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        run(jobs, &mut |index, src, result| {
+            tally.record(jobs.get(index), result);
+            emit(Event::FileDone(file_done(index, src, result)));
+        });
+    }));
+    *last_output.lock().unwrap_or_else(PoisonError::into_inner) =
+        tally.output_folder().map(Path::to_path_buf);
     drop(ticket);
-    emit(Event::RunFinished(run_finished(&results)));
+    emit(Event::RunFinished(tally.finished()));
+    if let Err(payload) = outcome {
+        panic::resume_unwind(payload);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::fs;
+    use std::io;
 
     use lunaepix_core::{OptimizeError, Outcome, RunError, Skip, plan_files, plan_folder};
     use tempfile::TempDir;
 
     use super::*;
-    use crate::events::{RunFinished, Status};
+    use crate::events::Status;
 
-    fn written() -> FileResult {
+    fn optimized(before: u64, after: u64) -> FileResult {
         FileResult::Optimized(Outcome {
-            before: 10,
-            after: 5,
+            before,
+            after,
             millis: 1,
         })
+    }
+
+    fn written() -> FileResult {
+        optimized(10, 5)
     }
 
     fn failed(path: &Path) -> FileResult {
@@ -111,6 +251,20 @@ mod tests {
         }))
     }
 
+    fn optimize(dest: &str) -> Job {
+        Job::Optimize {
+            src: PathBuf::from("/srv/in.png"),
+            dest: PathBuf::from(dest),
+        }
+    }
+
+    fn skip(src: &str) -> Job {
+        Job::Skip {
+            src: PathBuf::from(src),
+            reason: Skip::UnsupportedType,
+        }
+    }
+
     /// A folder holding `a.png` (its bytes do not matter to the planner).
     fn folder_with_a_png() -> (TempDir, PathBuf) {
         let dir = TempDir::new().unwrap();
@@ -118,6 +272,21 @@ mod tests {
         fs::write(&png, b"png").unwrap();
         (dir, png)
     }
+
+    fn output_folder(jobs: &[Job], results: &[FileResult]) -> Option<PathBuf> {
+        Tally::of(jobs, results)
+            .output_folder()
+            .map(Path::to_path_buf)
+    }
+
+    fn count_finished(events: &[Event]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::RunFinished(_)))
+            .count()
+    }
+
+    // --- the busy guard -----------------------------------------------------
 
     #[test]
     fn refuses_a_second_start_while_a_run_is_active() {
@@ -135,6 +304,133 @@ mod tests {
         drop(guard.try_start().unwrap());
         let second = guard.try_start();
         assert!(second.is_some());
+    }
+
+    #[test]
+    fn claiming_a_run_while_one_is_active_is_busy_and_tells_the_window_once() {
+        let guard = RunGuard::new();
+        let _active = guard.try_start().unwrap();
+        let mut events = Vec::new();
+        let claimed = claim_run(&guard, &mut |event| events.push(event));
+        assert_eq!(claimed.err(), Some(CommandError::Busy));
+        assert_eq!(events, [Event::RunBusy]);
+    }
+
+    #[test]
+    fn claiming_a_run_when_none_is_active_gives_a_ticket_and_no_busy_event() {
+        let guard = RunGuard::new();
+        let mut events = Vec::new();
+        let ticket = claim_run(&guard, &mut |event| events.push(event));
+        assert!(ticket.is_ok());
+        assert_eq!(events, []);
+        // The ticket is real: the guard is now taken.
+        assert!(guard.try_start().is_none());
+    }
+
+    #[test]
+    fn command_errors_reach_the_window_as_bare_strings() {
+        let errors = [
+            CommandError::Busy,
+            CommandError::NoOutput,
+            CommandError::OpenFailed,
+        ];
+        let json: Vec<String> = errors
+            .iter()
+            .map(|error| serde_json::to_string(error).unwrap())
+            .collect();
+        assert_eq!(json, [r#""busy""#, r#""no-output""#, r#""open-failed""#]);
+    }
+
+    // --- open the last output -----------------------------------------------
+
+    #[test]
+    fn opening_with_no_last_output_is_no_output_and_never_calls_the_opener() {
+        let last_output = Mutex::new(None);
+        let called = Cell::new(false);
+        let opened = open_last_output(&last_output, |_| {
+            called.set(true);
+            Ok::<(), io::Error>(())
+        });
+        assert_eq!(opened, Err(CommandError::NoOutput));
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn opening_a_last_output_the_system_cannot_open_is_open_failed() {
+        let last_output = Mutex::new(Some(PathBuf::from("/srv/photos/optimized")));
+        let opened = open_last_output(&last_output, |_| {
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        });
+        assert_eq!(opened, Err(CommandError::OpenFailed));
+    }
+
+    #[test]
+    fn opening_a_last_output_opens_exactly_that_folder() {
+        let folder = PathBuf::from("/srv/photos/optimized");
+        let last_output = Mutex::new(Some(folder.clone()));
+        let given = RefCell::new(Vec::new());
+        let opened = open_last_output(&last_output, |path| {
+            given.borrow_mut().push(path.to_path_buf());
+            // The lock is not held while the opener runs.
+            assert!(last_output.try_lock().is_ok());
+            Ok::<(), io::Error>(())
+        });
+        assert_eq!(opened, Ok(()));
+        assert_eq!(*given.borrow(), [folder]);
+    }
+
+    // --- picks and drops ------------------------------------------------------
+
+    #[test]
+    fn a_cancelled_dialog_frees_the_run_and_tells_the_window_without_running() {
+        let guard = RunGuard::new();
+        let ran = Cell::new(false);
+        let planned = Cell::new(false);
+        let mut events = Vec::new();
+        let mut free_at_cancel = None;
+        answer_dialog(
+            guard.try_start().unwrap(),
+            None,
+            |_| {
+                planned.set(true);
+                Vec::new()
+            },
+            &mut |event| {
+                free_at_cancel = Some(guard.try_start().is_some());
+                events.push(event);
+            },
+            |_, _| ran.set(true),
+        );
+        assert_eq!(events, [Event::RunCancelled]);
+        assert!(!planned.get() && !ran.get());
+        // The ticket was given back before `run-cancelled` went out.
+        assert_eq!(free_at_cancel, Some(true));
+    }
+
+    #[test]
+    fn an_answered_dialog_runs_the_planned_jobs_with_the_ticket_and_sends_no_cancel() {
+        let guard = RunGuard::new();
+        let picked = vec![PathBuf::from("/srv/a.png")];
+        let job = optimize("/srv/optimized-a.png");
+        let mut events = Vec::new();
+        let ran_with = RefCell::new(Vec::new());
+        answer_dialog(
+            guard.try_start().unwrap(),
+            Some(picked.clone()),
+            |paths| {
+                assert_eq!(paths, picked.as_slice());
+                vec![job.clone()]
+            },
+            &mut |event| events.push(event),
+            |_ticket, jobs| {
+                // The run holds the ticket: the guard is taken while it runs.
+                assert!(guard.try_start().is_none());
+                ran_with.borrow_mut().push(jobs);
+            },
+        );
+        assert_eq!(events, []);
+        assert_eq!(*ran_with.borrow(), [vec![job]]);
+        assert!(guard.try_start().is_some());
     }
 
     #[test]
@@ -176,6 +472,8 @@ mod tests {
         assert_eq!(calls.get(), 1);
     }
 
+    // --- the tally: summary and output folder ---------------------------------
+
     #[test]
     fn a_folder_run_opens_the_optimized_folder_inside_it() {
         let (dir, _) = folder_with_a_png();
@@ -210,19 +508,121 @@ mod tests {
     }
 
     #[test]
+    fn the_first_written_file_sets_the_output_folder() {
+        let jobs = [
+            optimize("/one/optimized/a.png"),
+            optimize("/two/optimized/b.png"),
+        ];
+        let results = [failed(Path::new("/one/a.png")), written()];
+        assert_eq!(
+            output_folder(&jobs, &results),
+            Some(PathBuf::from("/two/optimized"))
+        );
+    }
+
+    #[test]
+    fn the_summary_counts_the_optimised_files_and_their_saving() {
+        let jobs = [
+            optimize("/x/optimized-a.png"),
+            optimize("/x/optimized-b.png"),
+            skip("/x/big.png"),
+            optimize("/x/optimized-c.png"),
+        ];
+        let results = [
+            optimized(100, 60),
+            optimized(50, 50),
+            FileResult::Skipped(Skip::TooLarge),
+            FileResult::Failed(RunError::TimedOut {
+                path: PathBuf::from("/x/c.png"),
+                limit: std::time::Duration::from_secs(600),
+            }),
+        ];
+        assert_eq!(
+            Tally::of(&jobs, &results).finished(),
+            RunFinished {
+                optimised: 2,
+                saved_bytes: 40,
+                has_output: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_file_that_grew_saves_nothing_rather_than_wrapping() {
+        let jobs = [
+            optimize("/x/optimized-a.png"),
+            optimize("/x/optimized-b.png"),
+        ];
+        let results = [optimized(10, 12), optimized(100, 90)];
+        assert_eq!(Tally::of(&jobs, &results).finished().saved_bytes, 10);
+    }
+
+    #[test]
+    fn an_all_skipped_run_has_nothing_optimised_and_no_output() {
+        let jobs = [skip("/x/notes.txt"), skip("/x/missing.png")];
+        let results = [
+            FileResult::Skipped(Skip::UnsupportedType),
+            FileResult::Skipped(Skip::NotAFile),
+        ];
+        assert_eq!(
+            Tally::of(&jobs, &results).finished(),
+            RunFinished {
+                optimised: 0,
+                saved_bytes: 0,
+                has_output: false,
+            }
+        );
+    }
+
+    #[test]
+    fn an_optimised_file_with_no_known_folder_is_counted_but_has_no_output() {
+        // A destination with no folder part (never planned for a real pick or
+        // drop, whose paths are absolute) and a result that does not match an
+        // optimise job: both are optimised files with no folder to open.
+        let jobs = [optimize("optimized-a.png"), skip("/x/b.png")];
+        let tally = Tally::of(&jobs, &[optimized(10, 4), optimized(10, 4)]);
+        assert_eq!(tally.output_folder(), None);
+        assert_eq!(
+            tally.finished(),
+            RunFinished {
+                optimised: 2,
+                saved_bytes: 12,
+                has_output: false,
+            }
+        );
+    }
+
+    #[test]
+    fn has_output_agrees_with_the_output_folder_on_every_fixture() {
+        let (dir, png) = folder_with_a_png();
+        let cases: Vec<(Vec<Job>, Vec<FileResult>)> = vec![
+            (plan_folder(dir.path()), vec![written()]),
+            (plan_files(std::slice::from_ref(&png)), vec![written()]),
+            (plan_files(std::slice::from_ref(&png)), vec![failed(&png)]),
+            (
+                vec![skip("/x/a.txt")],
+                vec![FileResult::Skipped(Skip::UnsupportedType)],
+            ),
+            (vec![optimize("optimized-a.png")], vec![written()]),
+            (Vec::new(), Vec::new()),
+        ];
+        let mut seen = Vec::new();
+        for (jobs, results) in &cases {
+            let tally = Tally::of(jobs, results);
+            assert_eq!(tally.finished().has_output, tally.output_folder().is_some());
+            seen.push(tally.finished().has_output);
+        }
+        // Both answers occur, so the agreement is not trivially all-false.
+        assert!(seen.contains(&true) && seen.contains(&false));
+    }
+
+    // --- a whole session ----------------------------------------------------
+
+    #[test]
     fn a_session_emits_start_one_file_done_per_job_then_finish() {
         let guard = RunGuard::new();
         let ticket = guard.try_start().unwrap();
-        let jobs = vec![
-            Job::Skip {
-                src: PathBuf::from("/srv/notes.txt"),
-                reason: Skip::UnsupportedType,
-            },
-            Job::Optimize {
-                src: PathBuf::from("/srv/a.png"),
-                dest: PathBuf::from("/srv/optimized-a.png"),
-            },
-        ];
+        let jobs = vec![skip("/srv/notes.txt"), optimize("/srv/optimized-a.png")];
         // A worker that cannot be started fails its file without running.
         let worker = Worker::new("/nonexistent/lunaepix-worker-for-tests");
         let last_output = Mutex::new(Some(PathBuf::from("/from/an/earlier/run")));
@@ -240,6 +640,7 @@ mod tests {
             names,
             ["run-started", "file-done", "file-done", "run-finished"]
         );
+        assert_eq!(count_finished(&events), 1);
         assert_eq!(events[0], Event::RunStarted(RunStarted { total: 2 }));
         let statuses: Vec<(usize, Status)> = events
             .iter()
@@ -267,10 +668,7 @@ mod tests {
     fn a_session_keeps_the_guard_busy_until_it_finishes() {
         let guard = RunGuard::new();
         let ticket = guard.try_start().unwrap();
-        let jobs = vec![Job::Skip {
-            src: PathBuf::from("/srv/notes.txt"),
-            reason: Skip::UnsupportedType,
-        }];
+        let jobs = vec![skip("/srv/notes.txt")];
         let worker = Worker::new("/nonexistent/lunaepix-worker-for-tests");
         let last_output = Mutex::new(None);
         let mut busy_during_file = None;
@@ -280,5 +678,106 @@ mod tests {
             }
         });
         assert_eq!(busy_during_file, Some(true));
+    }
+
+    #[test]
+    fn a_session_stores_the_output_folder_its_finish_event_announces() {
+        let guard = RunGuard::new();
+        let jobs = vec![optimize("/srv/photos/optimized/a.png")];
+        let last_output = Mutex::new(None);
+        let mut events = Vec::new();
+        let mut stored_at_finish = None;
+        run_session_with(
+            guard.try_start().unwrap(),
+            &jobs,
+            &last_output,
+            &mut |event| {
+                if let Event::RunFinished(_) = event {
+                    stored_at_finish = last_output.lock().unwrap().clone();
+                }
+                events.push(event);
+            },
+            |_, progress| progress(0, Path::new("/srv/photos/a.png"), &written()),
+        );
+        assert_eq!(
+            stored_at_finish,
+            Some(PathBuf::from("/srv/photos/optimized"))
+        );
+        assert_eq!(
+            events.last(),
+            Some(&Event::RunFinished(RunFinished {
+                optimised: 1,
+                saved_bytes: 5,
+                has_output: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn a_session_whose_run_panics_still_finishes_once_and_frees_the_guard() {
+        let guard = RunGuard::new();
+        let jobs = vec![
+            optimize("/srv/photos/optimized/a.png"),
+            optimize("/srv/photos/optimized/b.png"),
+        ];
+        let last_output = Mutex::new(None);
+        let mut events = Vec::new();
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            run_session_with(
+                guard.try_start().unwrap(),
+                &jobs,
+                &last_output,
+                &mut |event| events.push(event),
+                |_, progress| {
+                    progress(0, Path::new("/srv/photos/a.png"), &written());
+                    panic!("the runner failed half-way");
+                },
+            );
+        }));
+        // The panic is not swallowed.
+        assert!(outcome.is_err());
+        assert_eq!(count_finished(&events), 1);
+        // The summary is what was counted before the panic.
+        assert_eq!(
+            events.last(),
+            Some(&Event::RunFinished(RunFinished {
+                optimised: 1,
+                saved_bytes: 5,
+                has_output: true,
+            }))
+        );
+        assert_eq!(
+            *last_output.lock().unwrap(),
+            Some(PathBuf::from("/srv/photos/optimized"))
+        );
+        assert!(guard.try_start().is_some());
+    }
+
+    #[test]
+    fn a_session_whose_window_sink_panics_on_a_file_still_finishes_once() {
+        let guard = RunGuard::new();
+        let jobs = vec![skip("/srv/notes.txt")];
+        let worker = Worker::new("/nonexistent/lunaepix-worker-for-tests");
+        let last_output = Mutex::new(None);
+        let mut events = Vec::new();
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            run_session(
+                guard.try_start().unwrap(),
+                &jobs,
+                &worker,
+                &last_output,
+                &mut |event| {
+                    let is_file = matches!(event, Event::FileDone(_));
+                    events.push(event);
+                    if is_file {
+                        panic!("the window sink failed");
+                    }
+                },
+            );
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(count_finished(&events), 1);
+        assert_eq!(events.last().map(Event::name), Some("run-finished"));
+        assert!(guard.try_start().is_some());
     }
 }
