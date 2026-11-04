@@ -19,6 +19,30 @@ pub const MAX_RUN_FILES: usize = 2000;
 /// all of them, so a larger image is refused before it is decoded.
 pub const MAX_PIXELS: u64 = 100_000_000;
 
+/// Deepest element nesting an SVG may have: the root `<svg>` is level 1. oxvg
+/// walks the tree recursively (parse, every job, the writer), so a deeper
+/// file could overflow the stack, which aborts the process. Measured with
+/// nested groups: about 7.3 KiB of stack per level in a debug build and
+/// 2 KiB in release, so 128 levels need about 1 MiB and 0.25 MiB, within the
+/// 2 MiB a spawned thread gets by default. oxvg's own limit, 1024 levels,
+/// would need 7.4 MiB in debug and 2 MiB in release: too much for such a
+/// thread. Real drawings rarely nest more than a few dozen levels.
+pub const MAX_SVG_DEPTH: usize = 128;
+
+/// Most nodes (elements, text, comments) an SVG may parse into: roxmltree's
+/// own `nodes_limit`. Memory and time in oxvg grow with the node count
+/// (measured: about 3 KiB and 75 µs per element in release), so this caps
+/// one file at about 3 GB and a minute and a quarter. It also caps the
+/// markup that entity references can add.
+pub const MAX_SVG_NODES: u32 = 1_000_000;
+
+/// Most bytes the entity references of an SVG may expand to (16 MiB),
+/// estimated from above before the file is parsed. roxmltree refuses a
+/// "billion laughs" (more than 255 references inside one reference), but not
+/// many references to one large entity, which grow quadratically: an 11 KB
+/// file expanded to 200 MB in a measurement. See `svg::check_entities`.
+pub const MAX_SVG_ENTITY_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Name of the output folder used when a whole folder is planned.
 pub(crate) const OUTPUT_DIR: &str = "optimized";
 

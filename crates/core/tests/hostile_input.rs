@@ -2,15 +2,21 @@
 //!
 //! Every refusal here must be an error that leaves no output file and no
 //! temporary file, and comes back quickly: a refusal that first allocates for
-//! the declared image is the defect these tests exist to catch. Step 6 (SVG)
-//! adds its crafted inputs here too.
+//! the declared image is the defect these tests exist to catch. For SVG the
+//! same holds for entity expansion and nesting, and an SVG must never make
+//! the optimiser open a file or a connection it names.
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::ErrorKind;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
-use lunaepix_core::{OptimizeError, optimize_file};
+use lunaepix_core::{MAX_SVG_DEPTH, MAX_SVG_NODES, OptimizeError, Outcome, optimize_file};
 use tempfile::TempDir;
 
 /// Generous: a refusal takes milliseconds; allocating and touching gigabytes
@@ -271,4 +277,369 @@ fn refuses_a_jpeg_that_declares_65535_by_65535_pixels() {
         message.contains("could not read the JPEG data"),
         "{message}"
     );
+}
+
+// --- SVG ----------------------------------------------------------------------------
+
+const SVG_NS: &str = r#"xmlns="http://www.w3.org/2000/svg""#;
+
+/// Optimise `svg` as `a.svg` in a fresh folder; the output and its folder.
+fn optimise_svg(svg: &str) -> (Result<Outcome, OptimizeError>, PathBuf, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.svg", svg.as_bytes());
+    let dest = tmp.path().join("optimized-a.svg");
+    (optimize_file(&src, &dest), dest, tmp)
+}
+
+/// Optimise `svg`, which must succeed, and return the output as text after
+/// checking that it parses as an SVG.
+fn optimised_text(svg: &str) -> String {
+    let (result, dest, _tmp) = optimise_svg(svg);
+    result.expect("a normal SVG must optimise");
+    let text = fs::read_to_string(dest).unwrap();
+    let doc = roxmltree::Document::parse(&text).expect("output is XML");
+    assert_eq!(doc.root_element().tag_name().name(), "svg");
+    text
+}
+
+/// An Illustrator export of the older kind: a DOCTYPE with an internal subset
+/// of namespace and style entities, entity references in attributes, and
+/// Illustrator's private data.
+const ILLUSTRATOR: &str = r##"<?xml version="1.0" encoding="utf-8"?>
+<!-- Generator: Adobe Illustrator 16.0.0, SVG Export Plug-In . SVG Version: 6.00 Build 0)  -->
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd" [
+	<!ENTITY ns_extend "http://ns.adobe.com/Extensibility/1.0/">
+	<!ENTITY ns_ai "http://ns.adobe.com/AdobeIllustrator/10.0/">
+	<!ENTITY ns_graphs "http://ns.adobe.com/Graphs/1.0/">
+	<!ENTITY ns_vars "http://ns.adobe.com/Variables/1.0/">
+	<!ENTITY ns_imrep "http://ns.adobe.com/ImageReplacement/1.0/">
+	<!ENTITY ns_sfw "http://ns.adobe.com/SaveForWeb/1.0/">
+	<!ENTITY ns_custom "http://ns.adobe.com/GenericCustomNamespace/1.0/">
+	<!ENTITY ns_adobe_xpath "http://ns.adobe.com/XPath/1.0/">
+	<!ENTITY st0 "fill:#E30613;">
+	<!ENTITY st1 "fill:#FFFFFF;stroke:#1D1D1B;stroke-width:2;stroke-miterlimit:10;">
+]>
+<svg version="1.1" id="Layer_1" xmlns:x="&ns_extend;" xmlns:i="&ns_ai;" xmlns:graph="&ns_graphs;"
+	 xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" x="0px" y="0px" width="100px"
+	 height="100px" viewBox="0 0 100 100" enable-background="new 0 0 100 100" xml:space="preserve">
+<switch>
+	<foreignObject requiredExtensions="&ns_ai;" x="0" y="0" width="1" height="1">
+		<i:pgfRef  xlink:href="#adobe_illustrator_pgf">
+		</i:pgfRef>
+	</foreignObject>
+	<g i:extraneous="self">
+		<rect x="10.000" y="10.000" style="&st0;" width="80.000" height="80.000"/>
+		<circle style="&st1;" cx="50.000" cy="50.000" r="25.000"/>
+	</g>
+</switch>
+<i:pgf  id="adobe_illustrator_pgf">
+	<![CDATA[
+	eJzLSM3JyVcozy/KSQEAGgQEXQ==
+	]]>
+</i:pgf>
+</svg>
+"##;
+
+// Entity expansion.
+
+#[test]
+fn still_optimises_an_illustrator_svg_with_a_doctype_and_internal_entities() {
+    let text = optimised_text(ILLUSTRATOR);
+    assert!(text.len() < ILLUSTRATOR.len());
+    // The style entities were expanded, not dropped.
+    let lower = text.to_ascii_lowercase();
+    assert!(lower.contains("e30613"), "{text}");
+    assert!(lower.contains("1d1d1b"), "{text}");
+}
+
+#[test]
+fn still_optimises_an_svg_whose_entities_reference_a_few_other_entities() {
+    let svg = format!(
+        "<!DOCTYPE svg [<!ENTITY red \"#E30613\"><!ENTITY st0 \"fill:&red;;\">]>\
+         <svg {SVG_NS} viewBox=\"0 0 10 10\"><rect style=\"&st0;\" width=\"5.000\" height=\"5.000\"/></svg>"
+    );
+    let text = optimised_text(&svg);
+    assert!(text.to_ascii_lowercase().contains("e30613"), "{text}");
+}
+
+#[test]
+fn refuses_a_billion_laughs_svg() {
+    // Ten levels of ten references each: 10^9 copies of "lol". roxmltree
+    // itself refuses more than 255 references inside one reference.
+    let mut decls = String::from("<!ENTITY l0 \"lol\">");
+    for i in 1..10 {
+        let refs = format!("&l{};", i - 1).repeat(10);
+        decls.push_str(&format!("<!ENTITY l{i} \"{refs}\">"));
+    }
+    let svg = format!("<!DOCTYPE svg [{decls}]><svg {SVG_NS}><desc>&l9;</desc></svg>");
+    assert!(svg.len() < 1024, "the fixture must be tiny");
+
+    let message = assert_refused("laughs.svg", svg.as_bytes());
+
+    assert!(message.contains("entity reference loop"), "{message}");
+}
+
+#[test]
+fn refuses_an_svg_with_many_references_to_a_nested_entity() {
+    // Within roxmltree's own limits per reference (250 inner references),
+    // but 4000 of them: 10 GB of text from a 23 KB file.
+    let decls = format!(
+        "<!ENTITY a \"{}\"><!ENTITY b \"{}\">",
+        "x".repeat(10_000),
+        "&a;".repeat(250)
+    );
+    let svg = format!(
+        "<!DOCTYPE svg [{decls}]><svg {SVG_NS}><desc>{}</desc></svg>",
+        "&b;".repeat(4000)
+    );
+    assert!(svg.len() < 32 * 1024, "the fixture must be small");
+
+    let message = assert_refused("quadratic.svg", svg.as_bytes());
+
+    assert!(message.contains("entity references"), "{message}");
+}
+
+#[test]
+fn refuses_an_svg_with_many_references_to_one_large_flat_entity() {
+    // No nesting at all: 2000 references to 50 KB is 100 MB of text.
+    let svg = format!(
+        "<!DOCTYPE svg [<!ENTITY a \"{}\">]><svg {SVG_NS}><desc>{}</desc></svg>",
+        "x".repeat(50_000),
+        "&a;".repeat(2000)
+    );
+
+    let message = assert_refused("flat.svg", svg.as_bytes());
+
+    assert!(message.contains("entity references"), "{message}");
+}
+
+// External entities and references.
+
+/// Contents of a file the SVGs below point at. It must never reach the
+/// output or an error message.
+const SECRET: &str = "LUNAEPIX-SECRET-7f3a91";
+
+fn secret_file(dir: &Path) -> PathBuf {
+    write(dir, "secret.txt", SECRET.as_bytes())
+}
+
+#[test]
+fn refuses_an_svg_that_references_an_external_entity_and_never_includes_it() {
+    let dir = TempDir::new().unwrap();
+    let secret = secret_file(dir.path());
+    let uri = format!("file://{}", secret.display());
+    let general = format!(
+        "<!DOCTYPE svg [<!ENTITY x SYSTEM \"{uri}\">]><svg {SVG_NS}><desc>&x;</desc></svg>"
+    );
+    let parameter = format!("<!DOCTYPE svg [<!ENTITY % x SYSTEM \"{uri}\"> %x;]><svg {SVG_NS}/>");
+
+    for svg in [general, parameter] {
+        let message = assert_refused("xxe.svg", svg.as_bytes());
+        assert!(!message.contains(SECRET), "{message}");
+    }
+}
+
+#[test]
+fn optimises_an_svg_that_only_declares_an_external_entity_and_leaves_it_out() {
+    let dir = TempDir::new().unwrap();
+    let secret = secret_file(dir.path());
+    let svg = format!(
+        "<!DOCTYPE svg [<!ENTITY x SYSTEM \"file://{}\">]>\
+         <svg {SVG_NS}><rect width=\"5.000\" height=\"5.000\"/></svg>",
+        secret.display()
+    );
+
+    let text = optimised_text(&svg);
+
+    assert!(!text.contains(SECRET), "{text}");
+}
+
+/// How long a job may take before it counts as blocked on the trap.
+const TRAP_WAIT: Duration = Duration::from_secs(2);
+
+/// A named pipe that nothing writes to: opening it for reading blocks until
+/// a writer comes, so a job that tries to read it cannot finish.
+#[cfg(unix)]
+fn trap(dir: &Path) -> PathBuf {
+    let path = dir.join("trap.svg");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo failed");
+    path
+}
+
+/// Run `job` on its own thread. `Some(result)` if it finishes within
+/// [`TRAP_WAIT`], which proves it never opened `trap` for reading; `None` if
+/// it is still blocked. Then a writer opens the trap, so a reader stuck in
+/// it can finish instead of hanging the test run.
+#[cfg(unix)]
+fn without_opening<T: Send + 'static>(
+    trap: &Path,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(job());
+    });
+    match rx.recv_timeout(TRAP_WAIT) {
+        Ok(result) => Some(result),
+        Err(_) => {
+            let trap = trap.to_path_buf();
+            // Blocks until a reader is there, so it gets its own thread.
+            thread::spawn(move || drop(fs::OpenOptions::new().write(true).open(trap)));
+            None
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_file_trap_catches_a_job_that_reads_the_file() {
+    // Proof that the trap can spring.
+    let dir = TempDir::new().unwrap();
+    let trap = trap(dir.path());
+    let reader = trap.clone();
+    assert!(without_opening(&trap, move || fs::read(reader)).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn never_opens_the_file_an_external_entity_names() {
+    let dir = TempDir::new().unwrap();
+    let trap = trap(dir.path());
+    let svg = format!(
+        "<!DOCTYPE svg [<!ENTITY x SYSTEM \"file://{}\">]><svg {SVG_NS}><desc>&x;</desc></svg>",
+        trap.display()
+    );
+
+    let result = without_opening(&trap, move || {
+        optimise_svg(&svg).0.map_err(|e| e.to_string())
+    });
+
+    let message = result
+        .expect("must finish without opening the file")
+        .expect_err("a reference to an external entity is refused");
+    // Refused because the entity has no content, not for another reason.
+    assert!(
+        message.contains("unknown entity reference 'x'"),
+        "{message}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn never_opens_a_file_that_an_image_or_use_element_points_at() {
+    let dir = TempDir::new().unwrap();
+    let trap = trap(dir.path());
+    let svg = format!(
+        "<svg {SVG_NS} xmlns:xlink=\"http://www.w3.org/1999/xlink\" viewBox=\"0 0 10 10\">\
+         <image href=\"file://{path}\" width=\"5\" height=\"5\"/>\
+         <image xlink:href=\"trap.svg\" width=\"5\" height=\"5\"/>\
+         <use href=\"trap.svg#a\"/><use xlink:href=\"file://{path}#b\"/></svg>",
+        path = trap.display()
+    );
+
+    let result = without_opening(&trap, move || optimise_svg(&svg).0.is_ok());
+
+    assert_eq!(
+        result,
+        Some(true),
+        "must finish, optimised, without opening it"
+    );
+}
+
+/// A listener on a free local port that accepts without blocking.
+fn listener() -> (TcpListener, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    (listener, base)
+}
+
+fn assert_nobody_connected(listener: &TcpListener) {
+    match listener.accept() {
+        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+        other => panic!("something connected: {other:?}"),
+    }
+}
+
+#[test]
+fn the_connection_check_sees_a_connection() {
+    // Proof that `assert_nobody_connected` can fail.
+    let (listener, _) = listener();
+    let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    assert!(listener.accept().is_ok());
+}
+
+#[test]
+fn never_connects_to_a_url_in_a_doctype_image_use_script_or_css_and_keeps_the_script() {
+    let (listener, base) = listener();
+    let svg = format!(
+        "<!DOCTYPE svg SYSTEM \"{base}/svg11.dtd\">\
+         <svg {SVG_NS} xmlns:xlink=\"http://www.w3.org/1999/xlink\" viewBox=\"0 0 10 10\">\
+         <style>@import url(\"{base}/a.css\");\
+         .c {{ background: url({base}/b.png); }}</style>\
+         <script>fetch(\"{base}/script\")</script>\
+         <image href=\"{base}/x.png\" width=\"5\" height=\"5\"/>\
+         <use xlink:href=\"{base}/ext.svg#a\"/>\
+         <rect class=\"c\" style=\"fill:url({base}/p#x)\" width=\"5\" height=\"5\"/>\
+         <rect fill=\"url({base}/q#y)\" x=\"5\" width=\"5\" height=\"5\"/></svg>"
+    );
+
+    let text = optimised_text(&svg);
+
+    assert_nobody_connected(&listener);
+    // Kept, as svgo's preset-default keeps it; the optimiser never runs it.
+    assert!(text.contains("<script"), "{text}");
+    // The CSS was parsed, not dropped unread: the import survives as text.
+    assert!(text.contains("a.css"), "{text}");
+}
+
+// Nesting and size.
+
+/// `<svg>` holding `groups` nested groups around one rectangle.
+fn nested_svg(groups: usize) -> String {
+    format!(
+        "<svg {SVG_NS} viewBox=\"0 0 10 10\">{}<rect width=\"5\" height=\"5\"/>{}</svg>",
+        "<g fill=\"red\">".repeat(groups),
+        "</g>".repeat(groups)
+    )
+}
+
+#[test]
+fn refuses_an_svg_nested_100000_levels_deep_without_crashing() {
+    let message = assert_refused("deep.svg", nested_svg(100_000).as_bytes());
+
+    assert!(message.contains("nested too deeply"), "{message}");
+}
+
+#[test]
+fn still_optimises_an_svg_nested_to_the_depth_limit_on_a_default_thread_stack() {
+    // <svg>, MAX_SVG_DEPTH - 2 groups and the rectangle: exactly the limit.
+    // On a 2 MiB thread, the default for a spawned thread.
+    let svg = nested_svg(MAX_SVG_DEPTH - 2);
+    let text = thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || optimised_text(&svg))
+        .unwrap()
+        .join()
+        .unwrap();
+    // oxvg collapses the groups onto the shape (a path now); the fill stays.
+    assert!(text.contains(r#"fill="red""#), "{text}");
+    assert!(!text.contains("<g"), "{text}");
+}
+
+#[test]
+fn refuses_an_svg_with_more_nodes_than_the_limit() {
+    let svg = format!(
+        "<svg {SVG_NS}>{}</svg>",
+        "<g/>".repeat(MAX_SVG_NODES as usize)
+    );
+
+    let message = assert_refused("wide.svg", svg.as_bytes());
+
+    assert!(message.contains("too large"), "{message}");
 }

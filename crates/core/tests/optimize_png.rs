@@ -276,22 +276,6 @@ fn rejects_a_gif_as_unsupported_and_writes_nothing() {
     assert!(!dest.exists());
 }
 
-#[test]
-fn rejects_svg_with_a_clear_error_until_it_is_built() {
-    let tmp = TempDir::new().unwrap();
-    for name in ["a.svg", "a.SVG"] {
-        let src = write(tmp.path(), name, b"data");
-        let dest = tmp.path().join(format!("optimized-{name}"));
-        let err = optimize_file(&src, &dest).unwrap_err();
-        assert!(
-            matches!(err, OptimizeError::NotYetSupported { .. }),
-            "{name}: {err:?}"
-        );
-        assert!(err.to_string().contains("cannot be optimised yet"), "{err}");
-        assert!(!dest.exists());
-    }
-}
-
 // --- replacing and the destination folder ---------------------------------------------
 
 #[test]
