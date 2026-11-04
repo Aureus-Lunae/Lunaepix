@@ -5,11 +5,16 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+// Only the tests that run a fake worker script (a shell script, so unix only)
+// use these; on Windows they would be unused imports.
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use lunaepix_core::{Crash, MAX_WORKER_OUTPUT_BYTES};
 use lunaepix_core::{
-    Crash, FileResult, Job, MAX_WORKER_OUTPUT_BYTES, OptimizeError, Outcome, RunError, Skip,
-    WORKER_FLAG, WORKER_TIMEOUT, Worker, plan_files, plan_folder, run,
+    FileResult, Job, OptimizeError, Outcome, RunError, Skip, WORKER_FLAG, WORKER_TIMEOUT, Worker,
+    plan_files, plan_folder, run,
 };
 use tempfile::TempDir;
 
@@ -87,6 +92,7 @@ fn failure(result: &FileResult) -> &RunError {
     }
 }
 
+#[cfg(unix)]
 fn crash(result: &FileResult) -> Crash {
     match failure(result) {
         RunError::Crashed { cause, .. } => *cause,

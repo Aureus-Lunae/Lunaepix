@@ -420,7 +420,9 @@ fn a_normal_svg_with_css_succeeds() {
 
 // --- control characters in names ---------------------------------------------
 
-/// No character a terminal acts on, except exactly `lines` newlines.
+/// No character a terminal acts on, except exactly `lines` newlines. Only the
+/// unix tests below use it: Windows does not allow such characters in a name.
+#[cfg(unix)]
 fn assert_no_control_characters(output: &str, lines: usize) {
     assert_eq!(output.matches('\n').count(), lines, "{output:?}");
     for c in output.chars().filter(|&c| c != '\n') {

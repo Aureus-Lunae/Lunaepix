@@ -23,7 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lunaepix_core::{
-    Crash, FileResult, MAX_SVG_DEPTH, MAX_SVG_NODES, OptimizeError, Outcome, RunError, Worker,
+    FileResult, MAX_SVG_DEPTH, MAX_SVG_NODES, OptimizeError, Outcome, RunError, Worker,
     optimize_file, plan_files, run,
 };
 use tempfile::TempDir;
@@ -463,7 +463,9 @@ fn optimises_an_svg_that_only_declares_an_external_entity_and_leaves_it_out() {
     assert!(!text.contains(SECRET), "{text}");
 }
 
-/// How long a job may take before it counts as blocked on the trap.
+/// How long a job may take before it counts as blocked on the trap. The trap
+/// is a named pipe, so only the unix tests that use it need this.
+#[cfg(unix)]
 const TRAP_WAIT: Duration = Duration::from_secs(2);
 
 /// A named pipe that nothing writes to: opening it for reading blocks until
@@ -741,7 +743,10 @@ fn assert_crashed_alone(svg: &str) {
             // handler reports it on stderr and aborts (a signal on unix).
             assert!(stderr.contains("overflowed its stack"), "{stderr}");
             #[cfg(unix)]
-            assert!(matches!(cause, Crash::Signal(_)), "{cause:?}");
+            assert!(
+                matches!(cause, lunaepix_core::Crash::Signal(_)),
+                "{cause:?}"
+            );
             #[cfg(not(unix))]
             let _ = cause;
         }
