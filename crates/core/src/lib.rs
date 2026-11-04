@@ -4,7 +4,9 @@
 //! front ends over this crate.
 //!
 //! The `plan_*` functions never write to the filesystem; destination folders
-//! are created only when a job runs.
+//! are created only when a job runs. [`run`] runs the planned jobs, each file
+//! in its own worker process ([`worker`]), so a library that crashes the
+//! process fails only that file.
 //!
 //! `unsafe` code is denied everywhere but in `jpg`, the libjpeg FFI.
 
@@ -21,12 +23,16 @@ mod atomic;
 mod jpg;
 mod plan;
 mod png;
+mod run;
 mod svg;
+pub mod worker;
 
 pub use plan::{
     MAX_FILE_BYTES, MAX_PIXELS, MAX_RUN_FILES, MAX_SVG_DEPTH, MAX_SVG_ENTITY_BYTES, MAX_SVG_NODES,
-    plan_files, plan_folder,
+    MAX_WORKER_MESSAGE_BYTES, MAX_WORKER_OUTPUT_BYTES, WORKER_TIMEOUT, plan_files, plan_folder,
 };
+pub use run::{Crash, FileResult, RunError, Worker, run};
+pub use worker::WORKER_FLAG;
 
 /// Result of optimising one file. Sizes are in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::{Job, Skip};
 
@@ -42,6 +43,30 @@ pub const MAX_SVG_NODES: u32 = 1_000_000;
 /// many references to one large entity, which grow quadratically: an 11 KB
 /// file expanded to 200 MB in a measurement. See `svg::check_entities`.
 pub const MAX_SVG_ENTITY_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Longest the worker process may spend on one file before the runner stops
+/// it: 10 minutes.
+///
+/// The slowest file within the limits is a PNG of [`MAX_PIXELS`] at oxipng
+/// `-o 4`. Measured in release on a 10-core machine: a 25-megapixel
+/// photo-like RGB PNG took 15.6 s wall (19.7 s CPU, so mostly one core) and
+/// 0.5 GB; time grows with the pixel count, so 100 megapixels is about 65 s.
+/// A laptop with slow cores may be three times slower: about 3 to 4
+/// minutes. An SVG at [`MAX_SVG_NODES`] takes about 75 s. Ten minutes leaves
+/// room above both, and still ends a hung worker within one coffee break.
+pub const WORKER_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Most bytes the runner reads from a worker's stdout, and separately from
+/// its stderr: 64 KiB. A result record is at most a few KiB (the worker cuts
+/// a message to [`MAX_WORKER_MESSAGE_BYTES`]), and a crash report on stderr
+/// is a few lines. A worker that writes more is stopped and its file counts
+/// as crashed, so a runaway child cannot fill the parent's memory.
+pub const MAX_WORKER_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// Longest error message a worker puts in its result record, in bytes
+/// (4 KiB), so that the record always fits in [`MAX_WORKER_OUTPUT_BYTES`]. A
+/// longer message is cut at a character boundary and ends in `…`.
+pub const MAX_WORKER_MESSAGE_BYTES: usize = 4 * 1024;
 
 /// Name of the output folder used when a whole folder is planned.
 pub(crate) const OUTPUT_DIR: &str = "optimized";

@@ -5,6 +5,12 @@
 //! the declared image is the defect these tests exist to catch. For SVG the
 //! same holds for entity expansion and nesting, and an SVG must never make
 //! the optimiser open a file or a connection it names.
+//!
+//! Some input still crashes a library outright (a stack overflow aborts the
+//! process, and cannot be caught). Those files go through the batch runner,
+//! which optimises each file in its own worker process: the crash must fail
+//! only that file. Never pass them to `optimize_file` here, in the test
+//! process itself.
 
 use std::ffi::OsString;
 use std::fs;
@@ -16,7 +22,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lunaepix_core::{MAX_SVG_DEPTH, MAX_SVG_NODES, OptimizeError, Outcome, optimize_file};
+use lunaepix_core::{
+    Crash, FileResult, MAX_SVG_DEPTH, MAX_SVG_NODES, OptimizeError, Outcome, RunError, Worker,
+    optimize_file, plan_files, run,
+};
 use tempfile::TempDir;
 
 /// Generous: a refusal takes milliseconds; allocating and touching gigabytes
@@ -642,4 +651,135 @@ fn refuses_an_svg_with_more_nodes_than_the_limit() {
     let message = assert_refused("wide.svg", svg.as_bytes());
 
     assert!(message.contains("too large"), "{message}");
+}
+
+// --- Crashes, isolated by the worker process ---------------------------------------
+
+/// About 200 KB of CSS brackets nested 100,000 deep: enough to overflow the
+/// stack of the recursive CSS parser inside oxvg.
+const CSS_DEPTH: usize = 100_000;
+
+/// Nested rules in a `<style>` element: `a{a{a{…}}}`.
+fn svg_with_nested_style_rules() -> String {
+    format!(
+        r#"<svg {SVG_NS}><style>{}{}</style><rect width="1" height="1"/></svg>"#,
+        "a{".repeat(CSS_DEPTH),
+        "}".repeat(CSS_DEPTH)
+    )
+}
+
+/// Nested `calc()` in a `style` attribute.
+fn svg_with_nested_calc_in_a_style_attribute() -> String {
+    format!(
+        r#"<svg {SVG_NS}><rect width="1" height="1" style="stroke-width:{}1{}"/></svg>"#,
+        "calc(".repeat(CSS_DEPTH),
+        ")".repeat(CSS_DEPTH)
+    )
+}
+
+/// A normal SVG with CSS in both places.
+fn svg_with_normal_css() -> String {
+    format!(
+        r#"<svg {SVG_NS} viewBox="0 0 10 10"><style>.a {{ fill: #ff0000; }}</style><rect class="a" width="10" height="10" style="stroke-width: calc(1px + 1px)"/></svg>"#
+    )
+}
+
+/// A small baseline JPEG from the `image` crate's encoder.
+fn normal_jpeg() -> Vec<u8> {
+    let (w, h) = (48, 32);
+    let pixels: Vec<u8> = (0..w * h * 3).map(|i| (i * 13 % 241) as u8).collect();
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
+        .encode(&pixels, w, h, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    out
+}
+
+/// Run [good PNG, `svg`, good JPG] through the worker binary, and check that
+/// the PNG and the JPG were optimised. Returns the SVG's result and the
+/// folder's listing afterwards.
+fn run_between_two_good_files(svg: &str) -> (FileResult, Vec<OsString>) {
+    let tmp = TempDir::new().unwrap();
+    let srcs = [
+        write(tmp.path(), "a.png", &normal_png_with_text()),
+        write(tmp.path(), "b.svg", svg.as_bytes()),
+        write(tmp.path(), "c.jpg", &normal_jpeg()),
+    ];
+    let worker = Worker::new(env!("CARGO_BIN_EXE_lunaepix-worker"));
+
+    let mut results = run(&plan_files(&srcs), &worker, |_, _, _| {});
+
+    assert_eq!(results.len(), 3);
+    for (i, name) in [(0, "optimized-a.png"), (2, "optimized-c.jpg")] {
+        assert!(
+            matches!(results[i], FileResult::Optimized(_)),
+            "{name}: {:?}",
+            results[i]
+        );
+        assert!(tmp.path().join(name).is_file(), "{name}");
+    }
+    let svg_result = results.remove(1);
+    (svg_result, listing(tmp.path()))
+}
+
+/// The crash contract: the SVG crashed, the files around it were optimised,
+/// and nothing else (no `optimized-b.svg`, no temporary file) is left.
+fn assert_crashed_alone(svg: &str) {
+    let (result, listing) = run_between_two_good_files(svg);
+
+    let FileResult::Failed(error) = &result else {
+        panic!("expected a failure, got {result:?}");
+    };
+    match error {
+        RunError::Crashed {
+            path,
+            cause,
+            stderr,
+        } => {
+            assert!(path.ends_with("b.svg"), "{path:?}");
+            // The crash is the stack overflow, not some other failure: Rust's
+            // handler reports it on stderr and aborts (a signal on unix).
+            assert!(stderr.contains("overflowed its stack"), "{stderr}");
+            #[cfg(unix)]
+            assert!(matches!(cause, Crash::Signal(_)), "{cause:?}");
+            #[cfg(not(unix))]
+            let _ = cause;
+        }
+        other => panic!("expected a crash, got {other:?}"),
+    }
+    let message = error.to_string();
+    assert!(
+        message.contains("the optimiser crashed on this file"),
+        "{message}"
+    );
+    let mut expected: Vec<OsString> = [
+        "a.png",
+        "b.svg",
+        "c.jpg",
+        "optimized-a.png",
+        "optimized-c.jpg",
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    expected.sort();
+    assert_eq!(listing, expected);
+}
+
+#[test]
+fn an_svg_whose_nested_style_rules_crash_the_optimiser_fails_alone() {
+    assert_crashed_alone(&svg_with_nested_style_rules());
+}
+
+#[test]
+fn an_svg_whose_nested_calc_in_a_style_attribute_crashes_the_optimiser_fails_alone() {
+    assert_crashed_alone(&svg_with_nested_calc_in_a_style_attribute());
+}
+
+#[test]
+fn a_normal_svg_with_css_succeeds_through_the_worker_between_two_good_files() {
+    let (result, listing) = run_between_two_good_files(&svg_with_normal_css());
+
+    assert!(matches!(result, FileResult::Optimized(_)), "{result:?}");
+    assert!(listing.contains(&OsString::from("optimized-b.svg")));
 }
