@@ -33,6 +33,11 @@ fn wasteful_png() -> Vec<u8> {
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_compression(png::Compression::Fast);
     encoder.set_filter(png::FilterType::NoFilter);
+    encoder.set_pixel_dims(Some(png::PixelDimensions {
+        xppu: 2835,
+        yppu: 2835,
+        unit: png::Unit::Meter,
+    }));
     encoder
         .add_text_chunk("Comment".to_string(), "x".repeat(2000))
         .unwrap();
@@ -350,14 +355,128 @@ fn replaces_a_symlink_at_the_destination_instead_of_writing_through_it() {
 }
 
 #[cfg(unix)]
-#[test]
-fn writes_the_output_readable_by_others_like_a_normal_file() {
+fn optimize_with_source_mode(mode: u32) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     let tmp = TempDir::new().unwrap();
     let src = write(tmp.path(), "a.png", &wasteful_png());
+    fs::set_permissions(&src, fs::Permissions::from_mode(mode)).unwrap();
     let dest = tmp.path().join("optimized-a.png");
     optimize_file(&src, &dest).unwrap();
-    assert_eq!(fs::metadata(&dest).unwrap().permissions().mode() & 0o777, 0o644);
+    fs::metadata(&dest).unwrap().permissions().mode() & 0o777
+}
+
+#[cfg(unix)]
+#[test]
+fn gives_the_output_the_permissions_of_a_private_source() {
+    assert_eq!(optimize_with_source_mode(0o600), 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn gives_the_output_the_permissions_of_a_world_readable_source() {
+    // The counterpart of the test above: the output follows the source, it is
+    // not fixed to the private mode either.
+    assert_eq!(optimize_with_source_mode(0o644), 0o644);
+}
+
+// --- source and destination are the same file ---------------------------------------
+
+#[test]
+fn refuses_to_optimize_a_file_onto_itself_and_keeps_it_byte_identical() {
+    let tmp = TempDir::new().unwrap();
+    let original = wasteful_png();
+    let src = write(tmp.path(), "a.png", &original);
+
+    let err = optimize_file(&src, &src).unwrap_err();
+
+    assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
+    assert!(err.to_string().contains("same file"), "{err}");
+    assert_eq!(fs::read(&src).unwrap(), original);
+    assert_eq!(listing(tmp.path()), [OsString::from("a.png")]);
+}
+
+#[test]
+fn refuses_the_same_file_spelled_with_a_different_path() {
+    let tmp = TempDir::new().unwrap();
+    let original = wasteful_png();
+    let src = write(tmp.path(), "a.png", &original);
+    let spelled = tmp.path().join(".").join("a.png");
+
+    assert!(optimize_file(&src, &spelled).is_err());
+
+    assert_eq!(fs::read(&src).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_a_destination_that_is_a_symlink_to_the_source() {
+    let tmp = TempDir::new().unwrap();
+    let original = wasteful_png();
+    let src = write(tmp.path(), "a.png", &original);
+    let dest = tmp.path().join("optimized-a.png");
+    std::os::unix::fs::symlink(&src, &dest).unwrap();
+
+    assert!(optimize_file(&src, &dest).is_err());
+
+    assert_eq!(fs::read(&src).unwrap(), original);
+    assert!(fs::symlink_metadata(&dest).unwrap().file_type().is_symlink());
+}
+
+#[test]
+fn optimizes_into_the_same_file_name_in_another_folder() {
+    // Same name, different folder: not the same file, so it must work.
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &wasteful_png());
+    let dest = tmp.path().join("optimized").join("a.png");
+    optimize_file(&src, &dest).unwrap();
+    assert!(dest.is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_a_destination_folder_that_is_a_symlink_and_writes_nothing_behind_it() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &wasteful_png());
+    let elsewhere = tmp.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, tmp.path().join("optimized")).unwrap();
+
+    let result = optimize_file(&src, &tmp.path().join("optimized").join("a.png"));
+
+    assert!(matches!(result, Err(OptimizeError::Io { .. })), "{result:?}");
+    assert!(listing(&elsewhere).is_empty());
+}
+
+// --- chunk stripping (strip = Safe) -----------------------------------------------------
+
+/// The chunk types of a PNG file, in order.
+fn chunk_types(png: &[u8]) -> Vec<[u8; 4]> {
+    let mut types = Vec::new();
+    let mut at = 8;
+    while at + 8 <= png.len() {
+        let len = u32::from_be_bytes(png[at..at + 4].try_into().unwrap()) as usize;
+        types.push(png[at + 4..at + 8].try_into().unwrap());
+        at += 12 + len;
+    }
+    types
+}
+
+#[test]
+fn strips_text_chunks_but_keeps_display_chunks() {
+    let tmp = TempDir::new().unwrap();
+    let original = wasteful_png();
+    assert!(chunk_types(&original).contains(b"tEXt"), "fixture must carry a tEXt chunk");
+    assert!(chunk_types(&original).contains(b"pHYs"), "fixture must carry a pHYs chunk");
+    let src = write(tmp.path(), "a.png", &original);
+    let dest = tmp.path().join("optimized-a.png");
+
+    optimize_file(&src, &dest).unwrap();
+
+    let types = chunk_types(&fs::read(&dest).unwrap());
+    // Positive: metadata that does not affect display is gone.
+    assert!(!types.contains(b"tEXt"), "{types:?}");
+    // Negative: a chunk that does affect display (pixel density) is kept.
+    assert!(types.contains(b"pHYs"), "{types:?}");
 }
 
 // --- error text ---------------------------------------------------------------------
@@ -365,9 +484,12 @@ fn writes_the_output_readable_by_others_like_a_normal_file() {
 #[test]
 fn shows_the_io_cause_once_in_the_message_and_not_again_as_a_source() {
     let tmp = TempDir::new().unwrap();
-    let err = optimize_file(&tmp.path().join("gone.png"), &tmp.path().join("out.png")).unwrap_err();
+    let missing = tmp.path().join("gone.png");
+    // The platform's own wording of the cause, whatever the OS.
+    let cause = fs::read(&missing).unwrap_err().to_string();
+    let err = optimize_file(&missing, &tmp.path().join("out.png")).unwrap_err();
     let message = err.to_string();
-    assert_eq!(message.matches("No such file").count(), 1, "{message}");
+    assert_eq!(message.matches(&cause).count(), 1, "{message}");
     assert!(message.contains("gone.png"), "{message}");
     assert!(err.source().is_none());
 }

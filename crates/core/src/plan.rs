@@ -150,7 +150,7 @@ fn has_supported_extension(path: &Path) -> bool {
 /// canonicalised whole, which resolves a symlink at the destination. Otherwise
 /// the nearest existing parent is canonicalised and the remaining names are
 /// joined back on.
-fn resolve(path: &Path) -> PathBuf {
+pub(crate) fn resolve(path: &Path) -> PathBuf {
     if let Ok(canonical) = fs::canonicalize(path) {
         return canonical;
     }
@@ -212,7 +212,7 @@ mod tests {
     fn plans_an_uppercase_extension_to_optimized_prefix_in_the_same_folder() {
         let tmp = TempDir::new().unwrap();
         let src = touch(tmp.path(), "a.PNG");
-        let jobs = plan_files(&[src.clone()]);
+        let jobs = plan_files(std::slice::from_ref(&src));
         assert_eq!(jobs, vec![optimize(src, tmp.path().join("optimized-a.PNG"))]);
     }
 
@@ -252,7 +252,7 @@ mod tests {
     fn plans_a_name_with_spaces_and_non_ascii_characters() {
         let tmp = TempDir::new().unwrap();
         let src = touch(tmp.path(), "Mobilis Logo – zwart é.png");
-        let jobs = plan_files(&[src.clone()]);
+        let jobs = plan_files(std::slice::from_ref(&src));
         assert_eq!(
             jobs,
             vec![optimize(src, tmp.path().join("optimized-Mobilis Logo – zwart é.png"))]
@@ -423,7 +423,7 @@ mod tests {
     fn skips_a_missing_path_as_not_a_file() {
         let tmp = TempDir::new().unwrap();
         let missing = tmp.path().join("gone.png");
-        assert_eq!(plan_files(&[missing.clone()]), vec![skip(missing, Skip::NotAFile)]);
+        assert_eq!(plan_files(std::slice::from_ref(&missing)), vec![skip(missing, Skip::NotAFile)]);
     }
 
     #[cfg(unix)]
@@ -433,7 +433,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("s.png");
         let _listener = UnixListener::bind(&path).unwrap();
-        assert_eq!(plan_files(&[path.clone()]), vec![skip(path, Skip::NotAFile)]);
+        assert_eq!(plan_files(std::slice::from_ref(&path)), vec![skip(path, Skip::NotAFile)]);
     }
 
     // --- size limit -------------------------------------------------------
@@ -444,7 +444,7 @@ mod tests {
         assert_eq!(MAX_FILE_BYTES, 104_857_600);
         let src = sized(tmp.path(), "edge.png", 104_857_600);
         assert_eq!(
-            plan_files(&[src.clone()]),
+            plan_files(std::slice::from_ref(&src)),
             vec![optimize(src, tmp.path().join("optimized-edge.png"))]
         );
     }
@@ -453,7 +453,7 @@ mod tests {
     fn skips_a_file_one_byte_over_the_size_limit_as_too_large() {
         let tmp = TempDir::new().unwrap();
         let src = sized(tmp.path(), "big.png", 104_857_601);
-        assert_eq!(plan_files(&[src.clone()]), vec![skip(src, Skip::TooLarge)]);
+        assert_eq!(plan_files(std::slice::from_ref(&src)), vec![skip(src, Skip::TooLarge)]);
     }
 
     #[test]
@@ -551,7 +551,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let src = touch(tmp.path(), "a.png");
         symlink(&src, tmp.path().join("optimized-a.png")).unwrap();
-        assert_eq!(plan_files(&[src.clone()]), vec![skip(src, Skip::IsOwnDestination)]);
+        assert_eq!(plan_files(std::slice::from_ref(&src)), vec![skip(src, Skip::IsOwnDestination)]);
     }
 
     #[cfg(unix)]
@@ -572,7 +572,7 @@ mod tests {
         let src = touch(tmp.path(), "a.png");
         let other = touch(tmp.path(), "other.png");
         symlink(&other, tmp.path().join("optimized-a.png")).unwrap();
-        let jobs = plan_files(&[src.clone()]);
+        let jobs = plan_files(std::slice::from_ref(&src));
         assert_eq!(jobs, vec![optimize(src, tmp.path().join("optimized-a.png"))]);
     }
 

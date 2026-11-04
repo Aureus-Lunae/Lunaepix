@@ -8,7 +8,7 @@
 
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -92,7 +92,9 @@ pub enum OptimizeError {
 /// planner does. `src` is only ever read. `dest` is written atomically (the
 /// `write_atomically` helper) and its folder is created if missing, only
 /// when there is a result to write. If anything fails, `dest` is not touched
-/// and no temporary file is left behind. `Outcome::millis` is the wall time of
+/// and no temporary file is left behind. The output gets the source's
+/// permissions. A `dest` that is the same file as `src` (after resolving
+/// symlinks and `.`/`..`) is refused. `Outcome::millis` is the wall time of
 /// the whole call: read, optimise and write.
 pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> {
     let started = Instant::now();
@@ -108,12 +110,26 @@ pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> 
         }
     };
 
-    let original = fs::read(src)
-        .map_err(|cause| OptimizeError::Io { path: src.to_path_buf(), cause })?;
+    let io_error = |path: &Path| {
+        let path = path.to_path_buf();
+        move |cause| OptimizeError::Io { path, cause }
+    };
+    // Writing the output over the source would destroy the original.
+    if plan::resolve(src) == plan::resolve(dest) {
+        return Err(OptimizeError::Invalid {
+            path: src.to_path_buf(),
+            message: "the source and the destination are the same file".to_owned(),
+        });
+    }
+    // Opened read-only; the same handle gives the size, the permissions and
+    // the bytes, so they all describe one file.
+    let mut file = fs::File::open(src).map_err(io_error(src))?;
+    let permissions = file.metadata().map_err(io_error(src))?.permissions();
+    let mut original = Vec::new();
+    file.read_to_end(&mut original).map_err(io_error(src))?;
     let optimized = optimize(&original)
         .map_err(|message| OptimizeError::Invalid { path: src.to_path_buf(), message })?;
-    atomic::write_atomically(dest, &optimized)
-        .map_err(|cause| OptimizeError::Io { path: dest.to_path_buf(), cause })?;
+    atomic::write_atomically(dest, &optimized, permissions).map_err(io_error(dest))?;
 
     Ok(Outcome {
         before: original.len() as u64,
