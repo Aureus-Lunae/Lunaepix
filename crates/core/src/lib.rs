@@ -21,8 +21,12 @@ mod atomic;
 mod jpg;
 mod plan;
 mod png;
+mod svg;
 
-pub use plan::{MAX_FILE_BYTES, MAX_PIXELS, MAX_RUN_FILES, plan_files, plan_folder};
+pub use plan::{
+    MAX_FILE_BYTES, MAX_PIXELS, MAX_RUN_FILES, MAX_SVG_DEPTH, MAX_SVG_ENTITY_BYTES, MAX_SVG_NODES,
+    plan_files, plan_folder,
+};
 
 /// Result of optimising one file. Sizes are in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,10 +86,6 @@ pub enum OptimizeError {
     /// The file is not a PNG, JPG or SVG.
     #[error("{path}: unsupported file type", path = path.display())]
     UnsupportedType { path: PathBuf },
-    /// A supported format whose optimiser is not built yet (SVG: Step 6).
-    /// Nothing is written.
-    #[error("{path}: {format} files cannot be optimised yet", path = path.display())]
-    NotYetSupported { path: PathBuf, format: &'static str },
     /// The file has a supported extension but its content could not be
     /// parsed, or the optimised result did not pass the lossless check.
     #[error("{path}: {message}", path = path.display())]
@@ -129,12 +129,7 @@ pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> 
     let optimized = match format {
         plan::Format::Png => png::optimize(&original),
         plan::Format::Jpg => jpg::optimize(&original),
-        plan::Format::Svg => {
-            return Err(OptimizeError::NotYetSupported {
-                path: src.to_path_buf(),
-                format: "SVG",
-            });
-        }
+        plan::Format::Svg => svg::optimize(&original),
     }
     .map_err(|message| OptimizeError::Invalid {
         path: src.to_path_buf(),
