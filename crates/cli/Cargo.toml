@@ -13,3 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 lunaepix-core = { workspace = true }
+
+[dev-dependencies]
+# Test fixtures: `png` makes the PNGs, `tempfile` the folders they live in.
+png = "0.17.16"
+tempfile = "3.27.0"

@@ -96,6 +96,27 @@ pub enum RunError {
     Spawn { path: PathBuf, cause: io::Error },
 }
 
+impl RunError {
+    /// The reason alone, without the leading `"<path>: "` that `Display`
+    /// adds, for a caller that already shows the path. `Display` is always
+    /// `"<path>: <reason>"`, where the path is the one in the error (for an
+    /// optimiser error that can be the output file rather than the source).
+    pub fn reason(&self) -> String {
+        match self {
+            RunError::Optimize(error) => error.reason(),
+            RunError::Crashed { cause, .. } => {
+                format!("the optimiser crashed on this file ({cause})")
+            }
+            RunError::TimedOut { limit, .. } => {
+                format!("the optimiser timed out after {limit:?} and was stopped")
+            }
+            RunError::Spawn { cause, .. } => {
+                format!("the optimiser could not be started: {cause}")
+            }
+        }
+    }
+}
+
 /// How a worker ended without a valid result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Crash {
@@ -354,6 +375,58 @@ mod tests {
     #[test]
     fn gives_only_the_number_of_a_signal_it_does_not_know() {
         assert_eq!(Crash::Signal(15).to_string(), "killed by signal 15");
+    }
+
+    fn run_errors() -> Vec<RunError> {
+        vec![
+            RunError::Optimize(OptimizeError::Invalid {
+                path: PathBuf::from("dir/a.png"),
+                message: "not a PNG".to_owned(),
+            }),
+            RunError::Crashed {
+                path: PathBuf::from("dir/b.svg"),
+                cause: Crash::Signal(6),
+                stderr: "dir/b.svg overflowed".to_owned(),
+            },
+            RunError::TimedOut {
+                path: PathBuf::from("dir/c.png"),
+                limit: Duration::from_secs(600),
+            },
+            RunError::Spawn {
+                path: PathBuf::from("dir/d.jpg"),
+                cause: io::Error::other("no such program"),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_run_error_gives_its_reason_without_the_path() {
+        let reasons: Vec<String> = run_errors().iter().map(RunError::reason).collect();
+        assert_eq!(
+            reasons,
+            [
+                "not a PNG",
+                "the optimiser crashed on this file (killed by signal 6, SIGABRT, for example a stack overflow)",
+                "the optimiser timed out after 600s and was stopped",
+                "the optimiser could not be started: no such program",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_run_errors_display_is_its_path_then_its_reason() {
+        for error in run_errors() {
+            let displayed = error.to_string();
+            let reason = error.reason();
+            assert!(displayed.ends_with(&format!(": {reason}")), "{displayed}");
+            let path = displayed.strip_suffix(&format!(": {reason}")).unwrap();
+            assert!(
+                path.starts_with("dir/") && !path.contains(": "),
+                "{displayed}"
+            );
+            // The reason alone does not carry the path, nor the worker's stderr.
+            assert!(!reason.contains("dir/"), "{reason}");
+        }
     }
 
     #[test]
