@@ -155,22 +155,43 @@ fn the_window_is_lunaepix_with_the_global_api_and_native_drag_and_drop() {
 // keep the page's structure as the accessibility rules need it.
 // ---------------------------------------------------------------------
 
-/// The files of the window: everything directly in `ui/` (not the node
-/// tests in `ui/tests`), as `(file name, text)`.
-fn ui_files() -> Vec<(String, String)> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui");
-    let mut files = Vec::new();
-    for entry in fs::read_dir(&dir).unwrap() {
-        let path = entry.unwrap().path();
-        let is_source = matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("html" | "css" | "js")
-        );
-        if path.is_file() && is_source {
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            files.push((name, fs::read_to_string(&path).unwrap()));
+/// Every file under `ui/`, at any depth, as `(path relative to ui/, bytes)`.
+/// Nothing is excluded: `ui/` is what Tauri embeds in the app, so whatever
+/// sits there ships.
+fn ui_entries() -> Vec<(String, Vec<u8>)> {
+    entries_under(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui"))
+}
+
+/// Every file under `root`, at any depth, as `(relative path, bytes)`.
+fn entries_under(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = format!("{prefix}{}", path.file_name().unwrap().to_string_lossy());
+            if path.is_dir() {
+                walk(&path, &format!("{name}/"), out);
+            } else {
+                out.push((name, fs::read(&path).unwrap()));
+            }
         }
     }
+    let mut out = Vec::new();
+    walk(root, "", &mut out);
+    out
+}
+
+/// The text files among `entries` (any extension; a file that is not UTF-8
+/// text, such as an image, cannot hold code and is skipped).
+fn text_files(entries: Vec<(String, Vec<u8>)>) -> Vec<(String, String)> {
+    entries
+        .into_iter()
+        .filter_map(|(name, bytes)| String::from_utf8(bytes).ok().map(|text| (name, text)))
+        .collect()
+}
+
+/// The text files under `ui/`, as `(path, text)`.
+fn ui_files() -> Vec<(String, String)> {
+    let files = text_files(ui_entries());
     assert!(
         files.iter().any(|(name, _)| name == "index.html"),
         "ui/index.html is missing"
@@ -186,15 +207,61 @@ fn index_html() -> String {
         .1
 }
 
+/// The paths among `paths` that are node test files. They live in
+/// `tests/ui/`, not in `ui/`, so they do not ship inside the app.
+fn test_files_in(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            name.contains(".test.")
+        })
+        .cloned()
+        .collect()
+}
+
+/// The ids that `getElementById` asks for in a script.
+fn requested_ids(js: &str) -> Vec<String> {
+    js.split("getElementById(")
+        .skip(1)
+        .filter_map(|rest| {
+            let quote = rest.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
+            let inner = &rest[1..];
+            inner.find(quote).map(|end| inner[..end].to_owned())
+        })
+        .collect()
+}
+
+/// The ids a script asks for that `html` does not have.
+fn missing_ids(js: &str, html: &str) -> Vec<String> {
+    requested_ids(js)
+        .into_iter()
+        .filter(|id| !html.contains(&format!("id=\"{id}\"")))
+        .collect()
+}
+
 /// Text that must appear nowhere in the window's files, in any case.
-/// `tauri://` events carry dropped paths; the others write server or file
-/// data into the page as markup.
+/// `tauri://` events carry dropped paths; the others write file data into
+/// the page as markup, or set a `title`, a `style` or a whole class list
+/// (which the CSP, the accessibility rules or the class rules forbid), or run
+/// code from a string.
 const FORBIDDEN_TEXT: &[&str] = &[
     "tauri://",
     "innerhtml",
     "outerhtml",
     "insertadjacenthtml",
     "autofocus",
+    ".title =",
+    ".title=",
+    "setattribute('title'",
+    "setattribute(\"title\"",
+    "setattribute('style'",
+    "setattribute(\"style\"",
+    "classname =",
+    "classname=",
+    "document.write",
+    "eval(",
+    "new function",
 ];
 
 fn forbidden_text(text: &str) -> Vec<&'static str> {
@@ -283,10 +350,131 @@ fn forbidden_text_is_caught_in_a_fixture() {
         "row.insertAdjacentHTML('beforeend', name)",
         "<button AUTOFOCUS>",
         "el.InnerHTML = x",
+        "el.title = 'Open'",
+        "el.title='Open'",
+        "el.setAttribute('title', text)",
+        "el.setAttribute(\"title\", text)",
+        "el.setAttribute('style', 'color: red')",
+        "el.setAttribute(\"style\", css)",
+        "el.className = 'a b'",
+        "el.className='a b'",
+        "document.write(html)",
+        "eval(code)",
+        "new Function('return 1')",
     ] {
         assert_eq!(forbidden_text(bad).len(), 1, "{bad}");
     }
     assert!(forbidden_text("row.textContent = name; tbody.replaceChildren(row)").is_empty());
+    // Safe ways of doing the same things are not flagged.
+    assert!(
+        forbidden_text(
+            "tr.classList.add('-failed'); tr.setAttribute('aria-disabled', 'true'); \
+             el.style.color = 'red'; const retrieved = items;"
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn the_scan_reads_the_real_window_files() {
+    let scanned: Vec<String> = ui_files().into_iter().map(|(name, _)| name).collect();
+    for needed in ["index.html", "app.css", "app.js", "format.js", "state.js"] {
+        assert!(scanned.contains(&needed.to_owned()), "{needed} not scanned");
+    }
+}
+
+#[test]
+fn the_scan_reads_every_depth_and_every_text_extension_but_not_binary_files() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("a/b")).unwrap();
+    fs::write(root.path().join("x.mjs"), "m").unwrap();
+    fs::write(root.path().join("y.svg"), "<svg/>").unwrap();
+    fs::write(root.path().join("notes"), "no extension").unwrap();
+    fs::write(root.path().join("a/b/deep.js"), "d").unwrap();
+    fs::write(root.path().join("a/pic.png"), [0xff, 0xd8, 0x00, 0xfe]).unwrap();
+    let mut names: Vec<String> = entries_under(root.path())
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["a/b/deep.js", "a/pic.png", "notes", "x.mjs", "y.svg"]
+    );
+    let mut texts: Vec<String> = text_files(entries_under(root.path()))
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    texts.sort();
+    assert_eq!(texts, ["a/b/deep.js", "notes", "x.mjs", "y.svg"]);
+}
+
+#[test]
+fn no_node_test_file_sits_under_ui() {
+    // The tests are in tests/ui/. Under ui/ they would ship inside the app.
+    let paths: Vec<String> = ui_entries().into_iter().map(|(name, _)| name).collect();
+    assert_eq!(test_files_in(&paths), Vec::<String>::new());
+}
+
+#[test]
+fn a_node_test_file_under_ui_is_flagged_in_a_fixture() {
+    let paths = [
+        "index.html".to_owned(),
+        "app.js".to_owned(),
+        "tests/format.test.js".to_owned(),
+        "state.test.mjs".to_owned(),
+    ];
+    assert_eq!(
+        test_files_in(&paths),
+        vec!["tests/format.test.js", "state.test.mjs"]
+    );
+    assert!(test_files_in(&paths[..2]).is_empty());
+}
+
+#[test]
+fn every_element_the_scripts_ask_for_is_in_the_page() {
+    let html = index_html();
+    let mut asked = 0;
+    for (name, text) in ui_files() {
+        asked += requested_ids(&text).len();
+        assert_eq!(
+            missing_ids(&text, &html),
+            Vec::<String>::new(),
+            "in ui/{name}"
+        );
+    }
+    // Not vacuous: app.js does ask for elements.
+    assert!(asked >= 10, "only {asked} getElementById calls were found");
+}
+
+#[test]
+fn a_missing_element_id_is_caught_in_a_fixture() {
+    let html = "<p id=\"yes\"></p><p id=\"also\"></p>";
+    assert_eq!(
+        missing_ids("document.getElementById('nope')", html),
+        vec!["nope"]
+    );
+    assert_eq!(
+        missing_ids(
+            "a = document.getElementById(\"yes\"); b = document.getElementById(\"gone\")",
+            html
+        ),
+        vec!["gone"]
+    );
+    // An id that only appears as text, or as part of another id, is missing.
+    assert_eq!(
+        missing_ids("document.getElementById('ye')", "<p id=\"yes\">ye</p>"),
+        vec!["ye"]
+    );
+    assert!(
+        missing_ids(
+            "document.getElementById('yes'); document.getElementById('also')",
+            html
+        )
+        .is_empty()
+    );
+    // A call with a variable is not an id the check can read.
+    assert!(missing_ids("document.getElementById(name)", html).is_empty());
 }
 
 #[test]

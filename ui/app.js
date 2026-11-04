@@ -3,7 +3,15 @@
 // `render` shows it. File names and reasons are written with textContent only.
 
 import { formatProgress, formatTotal } from './format.js';
-import { initialState, reduce, rowView } from './state.js';
+import {
+  canChoose,
+  canOpenFolder,
+  classifyRejection,
+  initialState,
+  reduce,
+  rowView,
+  settledFailures,
+} from './state.js';
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -70,8 +78,8 @@ function render() {
   if (state.running) {
     progress.textContent = formatProgress(state.rows.length, state.total);
   }
-  setDisabled(chooseFiles, state.running);
-  setDisabled(chooseFolder, state.running);
+  setDisabled(chooseFiles, !canChoose(state));
+  setDisabled(chooseFolder, !canChoose(state));
 
   if (state.rows.length < renderedRows) {
     resultsBody.replaceChildren();
@@ -81,11 +89,16 @@ function render() {
   renderedRows = state.rows.length;
   results.hidden = state.rows.length === 0;
 
+  // A new run hides the summary. If focus is inside it (on Open folder),
+  // move focus to a button that stays, before the row disappears.
+  if (state.summary === null && summary.contains(document.activeElement)) {
+    chooseFiles.focus();
+  }
   summary.hidden = state.summary === null;
   if (state.summary !== null) {
     summaryText.textContent = formatTotal(state.summary.optimised, state.summary.savedBytes);
   }
-  setDisabled(openFolder, !state.hasOutput);
+  setDisabled(openFolder, !canOpenFolder(state));
 
   // The one live region: written only when there is a new message.
   if (state.messageSeq !== renderedMessageSeq) {
@@ -103,6 +116,14 @@ async function call(command) {
   try {
     await invoke(command);
   } catch (reason) {
+    const kind = classifyRejection(reason);
+    // "busy" is announced by the run-busy event that comes with it.
+    if (kind === 'busy') {
+      return;
+    }
+    if (kind === 'unknown') {
+      console.error(command, reason);
+    }
     dispatch({ type: 'command-rejected', payload: reason });
   }
 }
@@ -110,27 +131,34 @@ async function call(command) {
 // A button that cannot be used right now stays focusable (aria-disabled), so
 // its click does nothing.
 chooseFiles.addEventListener('click', () => {
-  if (!state.running) {
+  if (canChoose(state)) {
     call('choose_files');
   }
 });
 
 chooseFolder.addEventListener('click', () => {
-  if (!state.running) {
+  if (canChoose(state)) {
     call('choose_folder');
   }
 });
 
 openFolder.addEventListener('click', () => {
-  if (state.hasOutput) {
+  if (canOpenFolder(state)) {
     call('open_output_folder');
   }
 });
 
-for (const type of ['run-started', 'file-done', 'run-finished', 'run-busy', 'run-cancelled', 'drag-state']) {
-  listen(type, (event) => dispatch({ type, payload: event.payload })).catch((reason) => {
-    dispatch({ type: 'command-rejected', payload: reason });
-  });
-}
+const EVENTS = ['run-started', 'file-done', 'run-finished', 'run-busy', 'run-cancelled', 'drag-state'];
+
+// If listening fails, say so once, not once per event.
+Promise.allSettled(
+  EVENTS.map((type) => listen(type, (event) => dispatch({ type, payload: event.payload }))),
+).then((results) => {
+  const failures = settledFailures(results);
+  if (failures.length > 0) {
+    console.error('listen failed', failures);
+    dispatch({ type: 'command-rejected', payload: 'listen-failed' });
+  }
+});
 
 render();

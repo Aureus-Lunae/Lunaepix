@@ -132,6 +132,36 @@ export function reduce(state, action) {
 }
 
 /**
+ * The two gates. The click handlers and the aria-disabled attributes both
+ * ask these, so what a button looks like and what a click does cannot differ.
+ */
+export function canChoose(state) {
+  return state.running === false;
+}
+
+export function canOpenFolder(state) {
+  return state.running === false && state.hasOutput === true;
+}
+
+/**
+ * What the page does with a rejected command: "busy" is already announced by
+ * the `run-busy` event the backend sends with it, so the page says nothing
+ * more; "known" rejections get their message; anything else is "unknown" and
+ * is logged to the console as well.
+ */
+export function classifyRejection(reason) {
+  if (reason === 'busy') {
+    return 'busy';
+  }
+  return typeof reason === 'string' && Object.hasOwn(REJECTIONS, reason) ? 'known' : 'unknown';
+}
+
+/** The reasons of the rejected results of `Promise.allSettled`, in order. */
+export function settledFailures(results) {
+  return results.filter((result) => result.status === 'rejected').map((result) => result.reason);
+}
+
+/**
  * What the table shows for one stored row. A done row has the formatted
  * numbers; a skipped or failed row has `text`, the status word and the
  * reason, in place of the numbers.

@@ -1,7 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { MESSAGES, initialState, reduce, rowView } from '../state.js';
+import {
+  MESSAGES,
+  canChoose,
+  canOpenFolder,
+  classifyRejection,
+  initialState,
+  reduce,
+  rowView,
+  settledFailures,
+} from '../../ui/state.js';
 
 function apply(state, ...actions) {
   return actions.reduce((current, action) => reduce(current, action), state);
@@ -309,4 +318,71 @@ test('rowView of a failed row has the word "failed" and the reason', () => {
 test('rowView gives a nameless file a readable name', () => {
   assert.equal(rowView({ kind: 'skipped', name: '', reason: 'x' }).name, '(no name)');
   assert.equal(rowView({ kind: 'done', name: 'a.png', before: 1, after: 1, millis: 1 }).name, 'a.png');
+});
+
+// canChoose and canOpenFolder: the two gates the click handlers and the
+// aria-disabled attributes both use
+
+test('canChoose is true when idle', () => {
+  assert.equal(canChoose(initialState()), true);
+  assert.equal(canChoose(apply(initialState(), started(1), finished(1, 5, true))), true);
+});
+
+test('canChoose is false while a run is active', () => {
+  assert.equal(canChoose(apply(initialState(), started(2))), false);
+  assert.equal(canChoose(apply(initialState(), started(2), done(0))), false);
+});
+
+test('canOpenFolder is true after a run that wrote output', () => {
+  assert.equal(canOpenFolder(apply(initialState(), started(1), finished(1, 5, true))), true);
+});
+
+test('canOpenFolder is false before any run and after a run with no output', () => {
+  assert.equal(canOpenFolder(initialState()), false);
+  assert.equal(canOpenFolder(apply(initialState(), started(1), finished(0, 0, false))), false);
+});
+
+test('canOpenFolder is false when has_output is missing from the last run-finished', () => {
+  const state = reduce(initialState(), { type: 'run-finished', payload: { optimised: 1, saved_bytes: 1 } });
+  assert.equal(canOpenFolder(state), false);
+});
+
+test('canOpenFolder is false while a new run is active, even after an earlier run with output', () => {
+  const earlier = apply(initialState(), started(1), finished(1, 5, true));
+  assert.equal(canOpenFolder(reduce(earlier, started(3))), false);
+  // Also when a state claims both (the gate does not rely on the reducer).
+  assert.equal(canOpenFolder({ ...earlier, running: true }), false);
+});
+
+// classifyRejection: what the page does with a rejected command
+
+test('classifyRejection says "busy" for a busy rejection, which run-busy already announces', () => {
+  assert.equal(classifyRejection('busy'), 'busy');
+});
+
+test('classifyRejection says "known" for the other two rejections of the interface', () => {
+  assert.equal(classifyRejection('no-output'), 'known');
+  assert.equal(classifyRejection('open-failed'), 'known');
+});
+
+test('classifyRejection says "unknown" for anything else, so it can be logged', () => {
+  for (const other of ['', 'Busy', 'listen-failed', 'constructor', new Error('x'), null, undefined, 42, ['busy']]) {
+    assert.equal(classifyRejection(other), 'unknown', String(other));
+  }
+});
+
+// settledFailures: the reasons of the rejected results of Promise.allSettled
+
+test('settledFailures lists the reasons of rejected results, in order', () => {
+  const results = [
+    { status: 'fulfilled', value: () => {} },
+    { status: 'rejected', reason: 'first' },
+    { status: 'rejected', reason: 'second' },
+  ];
+  assert.deepEqual(settledFailures(results), ['first', 'second']);
+});
+
+test('settledFailures is empty when every result is fulfilled', () => {
+  assert.deepEqual(settledFailures([{ status: 'fulfilled', value: 1 }, { status: 'fulfilled', value: 2 }]), []);
+  assert.deepEqual(settledFailures([]), []);
 });

@@ -9,7 +9,7 @@ import {
   formatSummary,
   formatTime,
   formatTotal,
-} from '../format.js';
+} from '../../ui/format.js';
 
 const KIB = 1024;
 const MIB = 1024 * 1024;
