@@ -3,11 +3,48 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
   <title>Lunaepix</title>
   <link rel="stylesheet" href="app.css">
 </head>
 <body>
-  <h1>Lunaepix</h1>
-  <script src="app.js"></script>
+  <header class="lunaepixHeader">
+    <h1 class="lunaepixHeader__title">Lunaepix</h1>
+  </header>
+
+  <main class="lunaepixMain">
+    <section class="lunaepixDrop" id="drop" aria-labelledby="dropTitle">
+      <h2 class="lunaepixDrop__title" id="dropTitle">Drop images or a folder here</h2>
+      <p class="lunaepixDrop__hint">PNG · JPG · SVG</p>
+      <div class="lunaepixDrop__actions">
+        <button class="lunaepixDrop__button" id="chooseFiles" type="button">Choose files</button>
+        <button class="lunaepixDrop__button" id="chooseFolder" type="button">Choose folder</button>
+      </div>
+    </section>
+
+    <p class="lunaepixProgress" id="progress" hidden></p>
+    <p class="lunaepixStatus" id="status" role="status"></p>
+
+    <table class="lunaepixResults" id="results" hidden>
+      <caption class="lunaepixResults__caption">Optimised files</caption>
+      <thead>
+        <tr>
+          <th class="lunaepixResults__headCell" scope="col">File</th>
+          <th class="lunaepixResults__headCell -number" scope="col">Before</th>
+          <th class="lunaepixResults__headCell -number" scope="col">After</th>
+          <th class="lunaepixResults__headCell -number" scope="col">Saved</th>
+          <th class="lunaepixResults__headCell -number" scope="col">Time</th>
+        </tr>
+      </thead>
+      <tbody id="resultsBody"></tbody>
+    </table>
+
+    <div class="lunaepixSummary" id="summary" hidden>
+      <p class="lunaepixSummary__text" id="summaryText"></p>
+      <button class="lunaepixSummary__button" id="openFolder" type="button" aria-disabled="true">Open folder</button>
+    </div>
+  </main>
+
+  <script type="module" src="app.js"></script>
 </body>
 </html>
