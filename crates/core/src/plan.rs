@@ -15,7 +15,7 @@ pub const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_RUN_FILES: usize = 2000;
 
 /// Name of the output folder used when a whole folder is planned.
-const OUTPUT_DIR: &str = "optimized";
+pub(crate) const OUTPUT_DIR: &str = "optimized";
 
 /// Prefix of the output name used when a single file is planned.
 const OUTPUT_PREFIX: &str = "optimized-";
@@ -31,7 +31,10 @@ pub fn plan_files(inputs: &[PathBuf]) -> Vec<Job> {
                 let dest = input.with_file_name(prefixed_name(input));
                 plan.add_file(input, dest, meta.len());
             }
-            _ => plan.jobs.push(Job::Skip { src: input.clone(), reason: Skip::NotAFile }),
+            _ => plan.jobs.push(Job::Skip {
+                src: input.clone(),
+                reason: Skip::NotAFile,
+            }),
         }
     }
     plan.jobs
@@ -61,7 +64,10 @@ impl Plan {
     /// Subfolders (including `optimized/`) and symlinks are ignored.
     fn add_folder(&mut self, dir: &Path) {
         let Ok(entries) = fs::read_dir(dir) else {
-            self.jobs.push(Job::Skip { src: dir.to_path_buf(), reason: Skip::NotAFile });
+            self.jobs.push(Job::Skip {
+                src: dir.to_path_buf(),
+                reason: Skip::NotAFile,
+            });
             return;
         };
         let mut files: Vec<(OsString, u64)> = entries
@@ -118,27 +124,50 @@ fn prefixed_name(path: &Path) -> OsString {
     name
 }
 
-/// Case-insensitive check for `png`, `jpg`, `jpeg` and `svg`.
+/// The file formats Lunaepix handles, told apart by extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Format {
+    Png,
+    Jpg,
+    Svg,
+}
+
+/// Case-insensitive match of the extension on `png`, `jpg`/`jpeg` and `svg`.
+/// The planner and `optimize_file` both decide the format here.
+pub(crate) fn format_of(path: &Path) -> Option<Format> {
+    let ext = path.extension()?;
+    let is = |name: &str| ext.eq_ignore_ascii_case(OsStr::new(name));
+    if is("png") {
+        Some(Format::Png)
+    } else if is("jpg") || is("jpeg") {
+        Some(Format::Jpg)
+    } else if is("svg") {
+        Some(Format::Svg)
+    } else {
+        None
+    }
+}
+
 fn has_supported_extension(path: &Path) -> bool {
-    path.extension().is_some_and(|ext| {
-        ["png", "jpg", "jpeg", "svg"]
-            .iter()
-            .any(|supported| ext.eq_ignore_ascii_case(OsStr::new(supported)))
-    })
+    format_of(path).is_some()
 }
 
 /// Canonical form of a path that may not exist yet. If the path exists, it is
 /// canonicalised whole, which resolves a symlink at the destination. Otherwise
 /// the nearest existing parent is canonicalised and the remaining names are
 /// joined back on.
-fn resolve(path: &Path) -> PathBuf {
+pub(crate) fn resolve(path: &Path) -> PathBuf {
     if let Ok(canonical) = fs::canonicalize(path) {
         return canonical;
     }
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return path.to_path_buf();
     };
-    let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
     resolve(parent).join(name)
 }
 
@@ -171,7 +200,9 @@ mod tests {
     }
 
     fn count_optimize(jobs: &[Job]) -> usize {
-        jobs.iter().filter(|j| matches!(j, Job::Optimize { .. })).count()
+        jobs.iter()
+            .filter(|j| matches!(j, Job::Optimize { .. }))
+            .count()
     }
 
     fn count_skip(jobs: &[Job], wanted: Skip) -> usize {
@@ -181,8 +212,10 @@ mod tests {
     }
 
     fn listing(dir: &Path) -> Vec<OsString> {
-        let mut names: Vec<_> =
-            fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         names.sort();
         names
     }
@@ -193,8 +226,11 @@ mod tests {
     fn plans_an_uppercase_extension_to_optimized_prefix_in_the_same_folder() {
         let tmp = TempDir::new().unwrap();
         let src = touch(tmp.path(), "a.PNG");
-        let jobs = plan_files(&[src.clone()]);
-        assert_eq!(jobs, vec![optimize(src, tmp.path().join("optimized-a.PNG"))]);
+        let jobs = plan_files(std::slice::from_ref(&src));
+        assert_eq!(
+            jobs,
+            vec![optimize(src, tmp.path().join("optimized-a.PNG"))]
+        );
     }
 
     #[test]
@@ -214,7 +250,10 @@ mod tests {
         let jobs = plan_files(&[gif.clone(), webp.clone()]);
         assert_eq!(
             jobs,
-            vec![skip(gif, Skip::UnsupportedType), skip(webp, Skip::UnsupportedType)]
+            vec![
+                skip(gif, Skip::UnsupportedType),
+                skip(webp, Skip::UnsupportedType)
+            ]
         );
     }
 
@@ -233,10 +272,13 @@ mod tests {
     fn plans_a_name_with_spaces_and_non_ascii_characters() {
         let tmp = TempDir::new().unwrap();
         let src = touch(tmp.path(), "Mobilis Logo – zwart é.png");
-        let jobs = plan_files(&[src.clone()]);
+        let jobs = plan_files(std::slice::from_ref(&src));
         assert_eq!(
             jobs,
-            vec![optimize(src, tmp.path().join("optimized-Mobilis Logo – zwart é.png"))]
+            vec![optimize(
+                src,
+                tmp.path().join("optimized-Mobilis Logo – zwart é.png")
+            )]
         );
     }
 
@@ -358,7 +400,10 @@ mod tests {
         let sub = tmp.path().join("sub");
         fs::create_dir(&sub).unwrap();
         touch(&sub, "deep.png");
-        assert_eq!(plan_files(&[tmp.path().to_path_buf()]), plan_folder(tmp.path()));
+        assert_eq!(
+            plan_files(&[tmp.path().to_path_buf()]),
+            plan_folder(tmp.path())
+        );
     }
 
     #[test]
@@ -404,7 +449,10 @@ mod tests {
     fn skips_a_missing_path_as_not_a_file() {
         let tmp = TempDir::new().unwrap();
         let missing = tmp.path().join("gone.png");
-        assert_eq!(plan_files(&[missing.clone()]), vec![skip(missing, Skip::NotAFile)]);
+        assert_eq!(
+            plan_files(std::slice::from_ref(&missing)),
+            vec![skip(missing, Skip::NotAFile)]
+        );
     }
 
     #[cfg(unix)]
@@ -414,7 +462,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("s.png");
         let _listener = UnixListener::bind(&path).unwrap();
-        assert_eq!(plan_files(&[path.clone()]), vec![skip(path, Skip::NotAFile)]);
+        assert_eq!(
+            plan_files(std::slice::from_ref(&path)),
+            vec![skip(path, Skip::NotAFile)]
+        );
     }
 
     // --- size limit -------------------------------------------------------
@@ -425,7 +476,7 @@ mod tests {
         assert_eq!(MAX_FILE_BYTES, 104_857_600);
         let src = sized(tmp.path(), "edge.png", 104_857_600);
         assert_eq!(
-            plan_files(&[src.clone()]),
+            plan_files(std::slice::from_ref(&src)),
             vec![optimize(src, tmp.path().join("optimized-edge.png"))]
         );
     }
@@ -434,7 +485,10 @@ mod tests {
     fn skips_a_file_one_byte_over_the_size_limit_as_too_large() {
         let tmp = TempDir::new().unwrap();
         let src = sized(tmp.path(), "big.png", 104_857_601);
-        assert_eq!(plan_files(&[src.clone()]), vec![skip(src, Skip::TooLarge)]);
+        assert_eq!(
+            plan_files(std::slice::from_ref(&src)),
+            vec![skip(src, Skip::TooLarge)]
+        );
     }
 
     #[test]
@@ -475,7 +529,10 @@ mod tests {
         many(tmp.path(), "img", 2001);
         let jobs = plan_folder(tmp.path());
         assert_eq!(count_optimize(&jobs), 2000);
-        assert_eq!(jobs[2000], skip(tmp.path().join("img2000.png"), Skip::OverRunLimit));
+        assert_eq!(
+            jobs[2000],
+            skip(tmp.path().join("img2000.png"), Skip::OverRunLimit)
+        );
     }
 
     #[test]
@@ -520,7 +577,9 @@ mod tests {
         jobs.extend(plan_files(&[tmp.path().join("a.png")]));
         assert_eq!(count_optimize(&jobs), 3);
         for job in &jobs {
-            let Job::Optimize { src, dest } = job else { panic!("unexpected {job:?}") };
+            let Job::Optimize { src, dest } = job else {
+                panic!("unexpected {job:?}")
+            };
             assert_ne!(src, dest);
         }
     }
@@ -532,7 +591,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let src = touch(tmp.path(), "a.png");
         symlink(&src, tmp.path().join("optimized-a.png")).unwrap();
-        assert_eq!(plan_files(&[src.clone()]), vec![skip(src, Skip::IsOwnDestination)]);
+        assert_eq!(
+            plan_files(std::slice::from_ref(&src)),
+            vec![skip(src, Skip::IsOwnDestination)]
+        );
     }
 
     #[cfg(unix)]
@@ -542,7 +604,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let src = touch(tmp.path(), "a.png");
         symlink(tmp.path(), tmp.path().join("optimized")).unwrap();
-        assert_eq!(plan_folder(tmp.path()), vec![skip(src, Skip::IsOwnDestination)]);
+        assert_eq!(
+            plan_folder(tmp.path()),
+            vec![skip(src, Skip::IsOwnDestination)]
+        );
     }
 
     #[cfg(unix)]
@@ -553,8 +618,11 @@ mod tests {
         let src = touch(tmp.path(), "a.png");
         let other = touch(tmp.path(), "other.png");
         symlink(&other, tmp.path().join("optimized-a.png")).unwrap();
-        let jobs = plan_files(&[src.clone()]);
-        assert_eq!(jobs, vec![optimize(src, tmp.path().join("optimized-a.png"))]);
+        let jobs = plan_files(std::slice::from_ref(&src));
+        assert_eq!(
+            jobs,
+            vec![optimize(src, tmp.path().join("optimized-a.png"))]
+        );
     }
 
     // --- duplicates -------------------------------------------------------
@@ -565,7 +633,10 @@ mod tests {
         let src = touch(tmp.path(), "a.png");
         let respelled = tmp.path().join(".").join("a.png");
         let jobs = plan_files(&[src.clone(), src.clone(), respelled]);
-        assert_eq!(jobs, vec![optimize(src, tmp.path().join("optimized-a.png"))]);
+        assert_eq!(
+            jobs,
+            vec![optimize(src, tmp.path().join("optimized-a.png"))]
+        );
     }
 
     #[test]
