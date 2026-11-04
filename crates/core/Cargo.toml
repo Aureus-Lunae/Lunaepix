@@ -12,9 +12,16 @@ thiserror = { workspace = true }
 # Same settings as the Step 2 evaluation: today's `oxipng -o 4 --strip safe`.
 oxipng = { version = "=10.2.1", default-features = false, features = ["parallel"] }
 tempfile = "3.27.0"
+# Same settings as the Step 2 evaluation: a jpegtran-style coefficient
+# transcode. The default features need nasm for SIMD, which only speeds up the
+# DCT that a coefficient transcode never runs. `unwinding` lets libjpeg errors
+# unwind as Rust panics (`extern "C-unwind"`); `jpegtran` builds transupp.c,
+# which copies the markers.
+mozjpeg-sys = { version = "=2.2.3", default-features = false, features = ["parallel", "unwinding", "jpegtran"] }
 
 [dev-dependencies]
 # Test fixtures: `png` encodes (low compression, redundant chunk), `image`
-# decodes for the pixel comparison.
+# decodes for the pixel comparison and encodes the baseline JPEG fixtures
+# (standard Huffman tables, so there is something to optimise).
 png = "0.17.16"
-image = { version = "=0.25.10", default-features = false, features = ["png"] }
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }

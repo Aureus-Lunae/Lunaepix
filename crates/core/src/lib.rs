@@ -5,6 +5,10 @@
 //!
 //! The `plan_*` functions never write to the filesystem; destination folders
 //! are created only when a job runs.
+//!
+//! `unsafe` code is denied everywhere but in `jpg`, the libjpeg FFI.
+
+#![deny(unsafe_code)]
 
 use std::fmt;
 use std::fs;
@@ -13,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 mod atomic;
+#[allow(unsafe_code)]
+mod jpg;
 mod plan;
 mod png;
 
@@ -76,8 +82,8 @@ pub enum OptimizeError {
     /// The file is not a PNG, JPG or SVG.
     #[error("{path}: unsupported file type", path = path.display())]
     UnsupportedType { path: PathBuf },
-    /// A supported format whose optimiser is not built yet (JPG: Step 5, SVG:
-    /// Step 6). Nothing is written.
+    /// A supported format whose optimiser is not built yet (SVG: Step 6).
+    /// Nothing is written.
     #[error("{path}: {format} files cannot be optimised yet", path = path.display())]
     NotYetSupported { path: PathBuf, format: &'static str },
     /// The file has a supported extension but its content could not be
@@ -103,22 +109,6 @@ pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> 
     let format = plan::format_of(src).ok_or_else(|| OptimizeError::UnsupportedType {
         path: src.to_path_buf(),
     })?;
-    let optimize: fn(&[u8]) -> Result<Vec<u8>, String> = match format {
-        plan::Format::Png => png::optimize,
-        plan::Format::Jpg => {
-            return Err(OptimizeError::NotYetSupported {
-                path: src.to_path_buf(),
-                format: "JPG",
-            });
-        }
-        plan::Format::Svg => {
-            return Err(OptimizeError::NotYetSupported {
-                path: src.to_path_buf(),
-                format: "SVG",
-            });
-        }
-    };
-
     let io_error = |path: &Path| {
         let path = path.to_path_buf();
         move |cause| OptimizeError::Io { path, cause }
@@ -136,7 +126,17 @@ pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> 
     let permissions = file.metadata().map_err(io_error(src))?.permissions();
     let mut original = Vec::new();
     file.read_to_end(&mut original).map_err(io_error(src))?;
-    let optimized = optimize(&original).map_err(|message| OptimizeError::Invalid {
+    let optimized = match format {
+        plan::Format::Png => png::optimize(&original),
+        plan::Format::Jpg => jpg::optimize(&original),
+        plan::Format::Svg => {
+            return Err(OptimizeError::NotYetSupported {
+                path: src.to_path_buf(),
+                format: "SVG",
+            });
+        }
+    }
+    .map_err(|message| OptimizeError::Invalid {
         path: src.to_path_buf(),
         message,
     })?;
