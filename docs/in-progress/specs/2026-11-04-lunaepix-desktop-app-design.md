@@ -17,6 +17,7 @@ Decided in conversation (2026-11-04):
 - Not yet discussed, deliberately left out of scope: auto-update, any lossy mode.
 - Input is **drag and drop and also a folder picker** (user, 2026-11-04): a "Choose folder" button opens a native folder dialog, in addition to dropping files or a folder.
 - **SVG engine: option 2, a Rust SVG optimiser crate** (user, 2026-11-04). No Node sidecar, no WASM. If no crate comes within a few percent of svgo, the implementer stops and reports the numbers; it does not switch to option 1 or 3 on its own.
+- **Implementation plan approved (2026-11-04):** `docs/in-progress/plans/2026-11-04-lunaepix-desktop-app.md`. Execute it in a fresh session, subagent-driven; Step 2 (compressor evaluation) is a hard gate before any other code.
 - The Layout sketch below is approved; it is the binding layout (no mock-up file).
 
 ## Problem
