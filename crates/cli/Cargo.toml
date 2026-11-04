@@ -1,0 +1,15 @@
+[package]
+name = "lunaepix-cli"
+description = "Command-line front end for Lunaepix"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "lunaepix"
+path = "src/main.rs"
+
+[dependencies]
+lunaepix-core = { workspace = true }
