@@ -18,6 +18,8 @@ Everything decided in conversation is in the spec's Handoff. Do not re-open it. 
 
 **Execution (2026-11-04):** Step 2 ran before Step 1, because both handoffs say the gate comes before any other code. The gate rulings (SVG edge-noise tolerance, JPG always smallest-lossless, MPL-2.0 allowed) are in the spec's Handoff.
 
+**Step 7 changed (user, 2026-11-04):** the batch runner optimises each file in a child process of the app's own binary (hidden worker mode), so a crash, abort, out-of-memory or timeout in a library fails only that file. The CLI (Step 8) and the Tauri binary (Step 9) both answer the worker mode. See the spec's Handoff, "One process per file".
+
 Not in scope: macOS, auto-update, code signing, lossy modes, recursive folders, WebP.
 
 ## Execution
