@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+# The worker mode on its own, for the integration tests (see the file). The
+# CLI and the app answer the worker mode from their own binaries.
+[[bin]]
+name = "lunaepix-worker"
+path = "src/bin/lunaepix-worker.rs"
+
 [dependencies]
 thiserror = { workspace = true }
 # Same settings as the Step 2 evaluation: today's `oxipng -o 4 --strip safe`.
