@@ -98,15 +98,22 @@ pub enum OptimizeError {
 /// the whole call: read, optimise and write.
 pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> {
     let started = Instant::now();
-    let format = plan::format_of(src)
-        .ok_or_else(|| OptimizeError::UnsupportedType { path: src.to_path_buf() })?;
+    let format = plan::format_of(src).ok_or_else(|| OptimizeError::UnsupportedType {
+        path: src.to_path_buf(),
+    })?;
     let optimize: fn(&[u8]) -> Result<Vec<u8>, String> = match format {
         plan::Format::Png => png::optimize,
         plan::Format::Jpg => {
-            return Err(OptimizeError::NotYetSupported { path: src.to_path_buf(), format: "JPG" });
+            return Err(OptimizeError::NotYetSupported {
+                path: src.to_path_buf(),
+                format: "JPG",
+            });
         }
         plan::Format::Svg => {
-            return Err(OptimizeError::NotYetSupported { path: src.to_path_buf(), format: "SVG" });
+            return Err(OptimizeError::NotYetSupported {
+                path: src.to_path_buf(),
+                format: "SVG",
+            });
         }
     };
 
@@ -127,8 +134,10 @@ pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> 
     let permissions = file.metadata().map_err(io_error(src))?.permissions();
     let mut original = Vec::new();
     file.read_to_end(&mut original).map_err(io_error(src))?;
-    let optimized = optimize(&original)
-        .map_err(|message| OptimizeError::Invalid { path: src.to_path_buf(), message })?;
+    let optimized = optimize(&original).map_err(|message| OptimizeError::Invalid {
+        path: src.to_path_buf(),
+        message,
+    })?;
     atomic::write_atomically(dest, &optimized, permissions).map_err(io_error(dest))?;
 
     Ok(Outcome {
@@ -144,14 +153,20 @@ mod tests {
 
     #[test]
     fn skip_reasons_are_human_readable() {
-        assert_eq!(Skip::UnsupportedType.to_string(), "Not a PNG, JPG or SVG file");
+        assert_eq!(
+            Skip::UnsupportedType.to_string(),
+            "Not a PNG, JPG or SVG file"
+        );
         assert_eq!(Skip::NotAFile.to_string(), "Not a readable file");
         assert_ne!(Skip::TooLarge.to_string(), Skip::OverRunLimit.to_string());
     }
 
     #[test]
     fn the_run_limit_skip_names_the_file_count_limit() {
-        assert_eq!(Skip::OverRunLimit.to_string(), "Too many files in one run (max 2000)");
+        assert_eq!(
+            Skip::OverRunLimit.to_string(),
+            "Too many files in one run (max 2000)"
+        );
         // The old text spoke of a size limit; the limit is a file count.
         assert!(!Skip::OverRunLimit.to_string().contains("size"));
     }

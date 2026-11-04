@@ -69,8 +69,10 @@ mod tests {
     }
 
     fn listing(dir: &Path) -> Vec<OsString> {
-        let mut names: Vec<_> =
-            fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         names.sort();
         names
     }

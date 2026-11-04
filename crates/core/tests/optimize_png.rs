@@ -68,7 +68,10 @@ fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
 }
 
 fn listing(dir: &Path) -> Vec<OsString> {
-    let mut names: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    let mut names: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
     names.sort();
     names
 }
@@ -96,7 +99,12 @@ fn optimizes_a_png_to_a_smaller_file_with_identical_pixels() {
     let outcome = optimize_file(&src, &dest).unwrap();
 
     let optimized = fs::read(&dest).unwrap();
-    assert!(optimized.len() < original.len(), "{} !< {}", optimized.len(), original.len());
+    assert!(
+        optimized.len() < original.len(),
+        "{} !< {}",
+        optimized.len(),
+        original.len()
+    );
     assert_same_pixels(&original, &optimized);
     assert_eq!(outcome.before, original.len() as u64);
     assert_eq!(outcome.after, optimized.len() as u64);
@@ -111,7 +119,10 @@ fn the_pixel_comparison_detects_a_different_image() {
     changed_img.get_pixel_mut(0, 0).0 = [1, 2, 3, 255];
     let mut changed = Vec::new();
     changed_img
-        .write_to(&mut std::io::Cursor::new(&mut changed), image::ImageFormat::Png)
+        .write_to(
+            &mut std::io::Cursor::new(&mut changed),
+            image::ImageFormat::Png,
+        )
         .unwrap();
     let result = std::panic::catch_unwind(|| assert_same_pixels(&original, &changed));
     assert!(result.is_err());
@@ -234,7 +245,10 @@ fn rejects_an_empty_png_file() {
     let tmp = TempDir::new().unwrap();
     let src = write(tmp.path(), "empty.png", b"");
     let dest = tmp.path().join("optimized-empty.png");
-    assert!(matches!(optimize_file(&src, &dest), Err(OptimizeError::Invalid { .. })));
+    assert!(matches!(
+        optimize_file(&src, &dest),
+        Err(OptimizeError::Invalid { .. })
+    ));
     assert!(!dest.exists());
 }
 
@@ -255,7 +269,10 @@ fn rejects_a_gif_as_unsupported_and_writes_nothing() {
     let src = write(tmp.path(), "a.gif", b"GIF89a");
     let dest = tmp.path().join("optimized-a.gif");
     let err = optimize_file(&src, &dest).unwrap_err();
-    assert!(matches!(err, OptimizeError::UnsupportedType { .. }), "{err:?}");
+    assert!(
+        matches!(err, OptimizeError::UnsupportedType { .. }),
+        "{err:?}"
+    );
     assert!(!dest.exists());
 }
 
@@ -266,7 +283,10 @@ fn rejects_jpg_and_svg_with_a_clear_error_until_they_are_built() {
         let src = write(tmp.path(), name, b"data");
         let dest = tmp.path().join(format!("optimized-{name}"));
         let err = optimize_file(&src, &dest).unwrap_err();
-        assert!(matches!(err, OptimizeError::NotYetSupported { .. }), "{name}: {err:?}");
+        assert!(
+            matches!(err, OptimizeError::NotYetSupported { .. }),
+            "{name}: {err:?}"
+        );
         assert!(err.to_string().contains("cannot be optimised yet"), "{err}");
         assert!(!dest.exists());
     }
@@ -278,21 +298,33 @@ fn rejects_jpg_and_svg_with_a_clear_error_until_they_are_built() {
 fn replaces_an_existing_optimized_file() {
     let tmp = TempDir::new().unwrap();
     let src = write(tmp.path(), "a.png", &wasteful_png());
-    let dest = write(tmp.path(), "optimized-a.png", b"stale output from an earlier run");
+    let dest = write(
+        tmp.path(),
+        "optimized-a.png",
+        b"stale output from an earlier run",
+    );
 
     optimize_file(&src, &dest).unwrap();
 
     let written = fs::read(&dest).unwrap();
     assert_ne!(written, b"stale output from an earlier run");
     assert_same_pixels(&fs::read(&src).unwrap(), &written);
-    assert_eq!(listing(tmp.path()).len(), 2, "only the source and the output remain");
+    assert_eq!(
+        listing(tmp.path()).len(),
+        2,
+        "only the source and the output remain"
+    );
 }
 
 #[test]
 fn keeps_an_existing_optimized_file_when_the_new_run_fails() {
     let tmp = TempDir::new().unwrap();
     let src = write(tmp.path(), "a.png", &truncated_png());
-    let dest = write(tmp.path(), "optimized-a.png", b"output of an earlier good run");
+    let dest = write(
+        tmp.path(),
+        "optimized-a.png",
+        b"output of an earlier good run",
+    );
 
     assert!(optimize_file(&src, &dest).is_err());
 
@@ -308,7 +340,10 @@ fn creates_the_missing_destination_folder_when_it_writes() {
     optimize_file(&src, &dest).unwrap();
 
     assert!(dest.is_file());
-    assert_eq!(listing(&tmp.path().join("optimized")), [OsString::from("a.png")]);
+    assert_eq!(
+        listing(&tmp.path().join("optimized")),
+        [OsString::from("a.png")]
+    );
 }
 
 #[test]
@@ -342,15 +377,25 @@ fn replaces_a_symlink_at_the_destination_instead_of_writing_through_it() {
     use std::os::unix::fs::symlink;
     let tmp = TempDir::new().unwrap();
     let src = write(tmp.path(), "a.png", &wasteful_png());
-    let other = write(tmp.path(), "other.png", b"another file that must not change");
+    let other = write(
+        tmp.path(),
+        "other.png",
+        b"another file that must not change",
+    );
     let dest = tmp.path().join("optimized-a.png");
     symlink(&other, &dest).unwrap();
 
     optimize_file(&src, &dest).unwrap();
 
-    assert_eq!(fs::read(&other).unwrap(), b"another file that must not change");
+    assert_eq!(
+        fs::read(&other).unwrap(),
+        b"another file that must not change"
+    );
     let meta = fs::symlink_metadata(&dest).unwrap();
-    assert!(meta.file_type().is_file(), "destination must now be a regular file");
+    assert!(
+        meta.file_type().is_file(),
+        "destination must now be a regular file"
+    );
     assert_same_pixels(&fs::read(&src).unwrap(), &fs::read(&dest).unwrap());
 }
 
@@ -419,7 +464,12 @@ fn refuses_a_destination_that_is_a_symlink_to_the_source() {
     assert!(optimize_file(&src, &dest).is_err());
 
     assert_eq!(fs::read(&src).unwrap(), original);
-    assert!(fs::symlink_metadata(&dest).unwrap().file_type().is_symlink());
+    assert!(
+        fs::symlink_metadata(&dest)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[test]
@@ -443,7 +493,10 @@ fn refuses_a_destination_folder_that_is_a_symlink_and_writes_nothing_behind_it()
 
     let result = optimize_file(&src, &tmp.path().join("optimized").join("a.png"));
 
-    assert!(matches!(result, Err(OptimizeError::Io { .. })), "{result:?}");
+    assert!(
+        matches!(result, Err(OptimizeError::Io { .. })),
+        "{result:?}"
+    );
     assert!(listing(&elsewhere).is_empty());
 }
 
@@ -465,8 +518,14 @@ fn chunk_types(png: &[u8]) -> Vec<[u8; 4]> {
 fn strips_text_chunks_but_keeps_display_chunks() {
     let tmp = TempDir::new().unwrap();
     let original = wasteful_png();
-    assert!(chunk_types(&original).contains(b"tEXt"), "fixture must carry a tEXt chunk");
-    assert!(chunk_types(&original).contains(b"pHYs"), "fixture must carry a pHYs chunk");
+    assert!(
+        chunk_types(&original).contains(b"tEXt"),
+        "fixture must carry a tEXt chunk"
+    );
+    assert!(
+        chunk_types(&original).contains(b"pHYs"),
+        "fixture must carry a pHYs chunk"
+    );
     let src = write(tmp.path(), "a.png", &original);
     let dest = tmp.path().join("optimized-a.png");
 
