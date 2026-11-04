@@ -26,7 +26,10 @@ oxvg_optimiser = "=0.0.9"
 oxvg_ast = { version = "=0.0.9", features = ["roxmltree"] }
 # The parser oxvg_ast reads (its `roxmltree` feature asks for 0.21). We parse
 # with it ourselves, check the document, and hand that same document to oxvg.
-roxmltree = "0.21.2"
+# Pinned with `=`: the entity-expansion bound (svg::check_entities) relies on
+# its limit of 255 nested references inside one reference, which the
+# `roxmltree_*` tests in svg.rs check. Re-run them before any upgrade.
+roxmltree = "=0.21.2"
 
 [dev-dependencies]
 # Test fixtures: `png` encodes (low compression, redundant chunk), `image`

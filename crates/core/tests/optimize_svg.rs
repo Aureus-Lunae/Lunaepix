@@ -420,7 +420,10 @@ fn writes_an_already_optimised_svg_as_an_equal_size_copy() {
 
 #[test]
 fn keeps_the_original_bytes_when_the_optimised_svg_is_not_smaller() {
-    // Already minimal: oxvg can only reformat it, never shrink it.
+    // Already minimal: oxvg can only reformat it, never shrink it. A unit test
+    // in svg.rs (`the_not_shrinkable_fixture_…`) checks that oxvg returns
+    // other bytes, not shorter, so this passes only through the fallback.
+    // Keep the two fixtures identical.
     let tmp = TempDir::new().unwrap();
     let minimal = br#"<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0h9v9z"/></svg>"#;
     let src = write(tmp.path(), "a.svg", minimal);

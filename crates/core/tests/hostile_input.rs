@@ -575,14 +575,18 @@ fn the_connection_check_sees_a_connection() {
 }
 
 #[test]
-fn never_connects_to_a_url_in_a_doctype_image_use_or_script_and_keeps_the_script() {
+fn never_connects_to_a_url_in_a_doctype_image_use_script_or_css_and_keeps_the_script() {
     let (listener, base) = listener();
     let svg = format!(
         "<!DOCTYPE svg SYSTEM \"{base}/svg11.dtd\">\
          <svg {SVG_NS} xmlns:xlink=\"http://www.w3.org/1999/xlink\" viewBox=\"0 0 10 10\">\
+         <style>@import url(\"{base}/a.css\");\
+         .c {{ background: url({base}/b.png); }}</style>\
          <script>fetch(\"{base}/script\")</script>\
          <image href=\"{base}/x.png\" width=\"5\" height=\"5\"/>\
-         <use xlink:href=\"{base}/ext.svg#a\"/></svg>"
+         <use xlink:href=\"{base}/ext.svg#a\"/>\
+         <rect class=\"c\" style=\"fill:url({base}/p#x)\" width=\"5\" height=\"5\"/>\
+         <rect fill=\"url({base}/q#y)\" x=\"5\" width=\"5\" height=\"5\"/></svg>"
     );
 
     let text = optimised_text(&svg);
@@ -590,6 +594,8 @@ fn never_connects_to_a_url_in_a_doctype_image_use_or_script_and_keeps_the_script
     assert_nobody_connected(&listener);
     // Kept, as svgo's preset-default keeps it; the optimiser never runs it.
     assert!(text.contains("<script"), "{text}");
+    // The CSS was parsed, not dropped unread: the import survives as text.
+    assert!(text.contains("a.css"), "{text}");
 }
 
 // Nesting and size.

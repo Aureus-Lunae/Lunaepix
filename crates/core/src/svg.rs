@@ -87,16 +87,23 @@ fn parsing_options<'input>() -> ParsingOptions<'input> {
 ///   no value here.
 /// - Each reference in the body pulls in one value, or up to
 ///   [`VALUES_PER_REFERENCE`] values when the prolog holds any `&` at all:
-///   a declaration may then reference another entity. A character
-///   reference counts here too (`&#38;a;` in a value reads as `&a;` to some
-///   parsers), and so does an `&` in a comment; both only raise the bound.
-/// - Every reference in the body starts with `&`. Character references
-///   (`&#`) there expand to one character and are not counted. Any other
-///   `&` is counted, even where it is no reference (in a comment or CDATA,
-///   say), which again only raises the bound.
+///   a declaration may then reference another entity. The test is any `&`
+///   rather than a parsed reference, so it also fires for a character
+///   reference or a predefined entity in a value, and for an `&` in a
+///   comment. None of those nest (roxmltree expands `&#38;a;` in a value to
+///   the text `&a;`, never to a reference), so counting them only makes the
+///   bound stricter.
+/// - Every reference in the body starts with `&`. Character references and
+///   the five predefined entities there ([`NEVER_EXPANDS`]) are one
+///   character each and are not counted. Any other `&` is counted, even
+///   where it is no reference (in a comment or CDATA, say), which again
+///   only makes the bound stricter.
 ///
 /// roxmltree refuses a "billion laughs" itself, but not many references to
-/// one large value, which grows quadratically.
+/// one large value, which grows quadratically. This bound depends on
+/// roxmltree's limit of 255 nested references inside one reference, which is
+/// why roxmltree is pinned with `=` and the `roxmltree_*` tests below check
+/// that limit.
 fn check_entities(text: &str) -> Result<(), String> {
     if !text.contains("<!ENTITY") {
         return Ok(());
@@ -119,13 +126,24 @@ fn check_entities(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Every `&` that does not start a character reference.
+/// What may follow an `&` without it being a reference that can expand: a
+/// character reference, or one of the five predefined entities. roxmltree
+/// turns those five into characters before it looks at the DTD
+/// (`Stream::consume_reference`), so a declaration cannot redefine them.
+const NEVER_EXPANDS: [&[u8]; 6] = [b"#", b"amp;", b"lt;", b"gt;", b"quot;", b"apos;"];
+
+/// Every `&` that does not start a reference in [`NEVER_EXPANDS`].
 fn references(text: &str) -> u64 {
     let bytes = text.as_bytes();
     let count = bytes
         .iter()
         .enumerate()
-        .filter(|&(at, &byte)| byte == b'&' && bytes.get(at + 1) != Some(&b'#'))
+        .filter(|&(at, &byte)| {
+            byte == b'&'
+                && !NEVER_EXPANDS
+                    .iter()
+                    .any(|tail| bytes[at + 1..].starts_with(tail))
+        })
         .count();
     count as u64
 }
@@ -370,9 +388,11 @@ mod tests {
     }
 
     #[test]
-    fn counts_a_character_reference_inside_a_declaration_as_nesting() {
-        // `&#38;` is `&`: the value of b may read as a reference to a. The
-        // same length of prolog with a plain character instead stays flat.
+    fn counts_any_ampersand_in_the_prolog_as_nesting_even_one_that_cannot_nest() {
+        // roxmltree expands `&#38;a;` in b's value to the text `&a;`, never to
+        // a reference, so b does not nest. The check counts it anyway, which
+        // only makes the bound stricter. The same length of prolog with a
+        // plain character instead stays flat.
         let flat = format!(
             "<!ENTITY a \"{}\"><!ENTITY b \"x#38;a;\">",
             "x".repeat(1000)
@@ -388,10 +408,99 @@ mod tests {
     }
 
     #[test]
+    fn does_not_count_the_five_predefined_entities() {
+        // roxmltree reads these as characters before it looks at the DTD, so
+        // a declaration cannot redefine them and they never expand.
+        let decls = format!(
+            "<!ENTITY amp \"{0}\"><!ENTITY lt \"{0}\"><!ENTITY a \"{0}\">",
+            "x".repeat(1000)
+        );
+        let (_, prolog) = with_dtd(&decls, "");
+        let many = budget() / prolog + 1;
+        for predefined in ["&amp;", "&lt;", "&gt;", "&quot;", "&apos;"] {
+            let (text, _) = with_dtd(&decls, &predefined.repeat(many));
+            assert_eq!(check_entities(&text), Ok(()), "{predefined}");
+        }
+    }
+
+    #[test]
+    fn still_counts_a_declared_entity_whose_name_starts_like_a_predefined_one() {
+        let decls = format!("<!ENTITY ampx \"{}\">", "x".repeat(1000));
+        let (_, prolog) = with_dtd(&decls, "");
+        let many = budget() / prolog + 1;
+        let (text, _) = with_dtd(&decls, &"&ampx;".repeat(many));
+        assert!(check_entities(&text).is_err());
+    }
+
+    #[test]
     fn reports_xml_errors_found_while_estimating() {
         let (text, _) = with_dtd("<!ENTITY a \"x\">", "<unclosed>");
         let err = check_entities(&text).unwrap_err();
         assert!(err.contains("not well-formed XML"), "{err}");
+    }
+
+    // --- roxmltree's behaviour that check_entities relies on ------------------------------
+    //
+    // These run roxmltree itself, with our options. If an upgrade changes
+    // its limit or how it reads values, they fail, and the bound in
+    // check_entities (VALUES_PER_REFERENCE) must be re-derived.
+
+    /// One top-level reference to r, whose value holds `inner` references
+    /// to a, in text (`<desc>`) or in an attribute.
+    fn one_reference_resolving(inner: usize, in_attribute: bool) -> String {
+        let decls = format!("<!ENTITY a \"x\"><!ENTITY r \"{}\">", "&a;".repeat(inner));
+        if in_attribute {
+            format!("<!DOCTYPE svg [{decls}]><svg {SVG_NS} id=\"&r;\"/>")
+        } else {
+            format!("<!DOCTYPE svg [{decls}]><svg {SVG_NS}><desc>&r;</desc></svg>")
+        }
+    }
+
+    fn roxmltree_parse(text: &str) -> Result<(), roxmltree::Error> {
+        Document::parse_with_options(text, parsing_options()).map(drop)
+    }
+
+    #[test]
+    fn roxmltree_lets_one_reference_resolve_255_nested_references_as_check_entities_assumes() {
+        assert_eq!(VALUES_PER_REFERENCE, 1 + 255);
+        for in_attribute in [false, true] {
+            let text = one_reference_resolving(255, in_attribute);
+            assert!(roxmltree_parse(&text).is_ok(), "attribute: {in_attribute}");
+        }
+    }
+
+    #[test]
+    fn roxmltree_refuses_one_reference_that_resolves_256_as_check_entities_assumes() {
+        for in_attribute in [false, true] {
+            let text = one_reference_resolving(256, in_attribute);
+            assert!(
+                matches!(
+                    roxmltree_parse(&text),
+                    Err(roxmltree::Error::EntityReferenceLoop(_))
+                ),
+                "attribute: {in_attribute}"
+            );
+        }
+    }
+
+    #[test]
+    fn roxmltree_reads_a_character_reference_in_a_value_as_text_never_as_a_reference() {
+        // `&#38;a;` in b's value becomes the text "&a;". Were it read as a
+        // reference, the undeclared a would be an error.
+        let text =
+            format!("<!DOCTYPE svg [<!ENTITY b \"&#38;a;\">]><svg {SVG_NS}><desc>&b;</desc></svg>");
+        let doc = Document::parse_with_options(&text, parsing_options()).unwrap();
+        let desc = doc
+            .descendants()
+            .find(|n| n.tag_name().name() == "desc")
+            .unwrap();
+        assert_eq!(desc.text(), Some("&a;"));
+        // A real reference to the undeclared a is that error.
+        let real = text.replace("&#38;a;", "&a;");
+        assert!(matches!(
+            roxmltree_parse(&real),
+            Err(roxmltree::Error::UnknownEntityReference(..))
+        ));
     }
 
     // --- the parser never resolves external entities -----------------------------------------
@@ -402,6 +511,31 @@ mod tests {
         assert!(options.allow_dtd);
         assert!(options.entity_resolver.is_none());
         assert_eq!(options.nodes_limit, MAX_SVG_NODES);
+    }
+
+    // --- the not-smaller fallback --------------------------------------------------------
+
+    /// The fixture of `keeps_the_original_bytes_when_the_optimised_svg_is_not_smaller`
+    /// in tests/optimize_svg.rs; keep the two identical.
+    const NOT_SHRINKABLE: &str =
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0h9v9z"/></svg>"#;
+
+    #[test]
+    fn the_not_shrinkable_fixture_makes_oxvg_return_other_bytes_that_are_not_shorter() {
+        // Guard for the integration test: if oxvg returned the input bytes
+        // themselves, that test would pass without the fallback ever running.
+        let output = run_oxvg(&parse(NOT_SHRINKABLE).unwrap()).unwrap();
+        assert_ne!(output, NOT_SHRINKABLE.as_bytes(), "oxvg changed nothing");
+        assert!(
+            output.len() >= NOT_SHRINKABLE.len(),
+            "oxvg shrank it to {}",
+            String::from_utf8_lossy(&output)
+        );
+        // And the fallback then hands back the input, not oxvg's bytes.
+        assert_eq!(
+            optimize(NOT_SHRINKABLE.as_bytes()).unwrap(),
+            NOT_SHRINKABLE.as_bytes()
+        );
     }
 
     // --- the output check ----------------------------------------------------------------
