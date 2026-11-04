@@ -9,6 +9,12 @@ authors.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+# Same settings as the Step 2 evaluation: today's `oxipng -o 4 --strip safe`.
+oxipng = { version = "=10.2.1", default-features = false, features = ["parallel"] }
+tempfile = "3.27.0"
 
 [dev-dependencies]
-tempfile = "3.27.0"
+# Test fixtures: `png` encodes (low compression, redundant chunk), `image`
+# decodes for the pixel comparison.
+png = "0.17.16"
+image = { version = "=0.25.10", default-features = false, features = ["png"] }

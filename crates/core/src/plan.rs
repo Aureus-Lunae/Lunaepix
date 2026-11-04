@@ -118,13 +118,32 @@ fn prefixed_name(path: &Path) -> OsString {
     name
 }
 
-/// Case-insensitive check for `png`, `jpg`, `jpeg` and `svg`.
+/// The file formats Lunaepix handles, told apart by extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Format {
+    Png,
+    Jpg,
+    Svg,
+}
+
+/// Case-insensitive match of the extension on `png`, `jpg`/`jpeg` and `svg`.
+/// The planner and `optimize_file` both decide the format here.
+pub(crate) fn format_of(path: &Path) -> Option<Format> {
+    let ext = path.extension()?;
+    let is = |name: &str| ext.eq_ignore_ascii_case(OsStr::new(name));
+    if is("png") {
+        Some(Format::Png)
+    } else if is("jpg") || is("jpeg") {
+        Some(Format::Jpg)
+    } else if is("svg") {
+        Some(Format::Svg)
+    } else {
+        None
+    }
+}
+
 fn has_supported_extension(path: &Path) -> bool {
-    path.extension().is_some_and(|ext| {
-        ["png", "jpg", "jpeg", "svg"]
-            .iter()
-            .any(|supported| ext.eq_ignore_ascii_case(OsStr::new(supported)))
-    })
+    format_of(path).is_some()
 }
 
 /// Canonical form of a path that may not exist yet. If the path exists, it is

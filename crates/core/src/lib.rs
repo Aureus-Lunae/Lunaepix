@@ -7,10 +7,14 @@
 //! are created only when a job runs.
 
 use std::fmt;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+mod atomic;
 mod plan;
+mod png;
 
 pub use plan::{MAX_FILE_BYTES, MAX_RUN_FILES, plan_files, plan_folder};
 
@@ -44,7 +48,9 @@ impl fmt::Display for Skip {
         f.write_str(match self {
             Skip::UnsupportedType => "Not a PNG, JPG or SVG file",
             Skip::TooLarge => "File is too large",
-            Skip::OverRunLimit => "Run size limit reached",
+            Skip::OverRunLimit => {
+                return write!(f, "Too many files in one run (max {MAX_RUN_FILES})");
+            }
             Skip::IsOwnDestination => "Already in the output folder",
             Skip::NotAFile => "Not a readable file",
         })
@@ -63,16 +69,17 @@ pub enum Job {
 /// A file that failed while being optimised.
 #[derive(Debug, thiserror::Error)]
 pub enum OptimizeError {
-    /// Reading or writing `path` failed.
-    #[error("{path}: {source}", path = path.display())]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
+    /// Reading or writing `path` failed. The cause is part of the message and
+    /// deliberately not a `source()`, so an error chain does not print it twice.
+    #[error("{path}: {cause}", path = path.display())]
+    Io { path: PathBuf, cause: io::Error },
     /// The file is not a PNG, JPG or SVG.
     #[error("{path}: unsupported file type", path = path.display())]
     UnsupportedType { path: PathBuf },
+    /// A supported format whose optimiser is not built yet (JPG: Step 5, SVG:
+    /// Step 6). Nothing is written.
+    #[error("{path}: {format} files cannot be optimised yet", path = path.display())]
+    NotYetSupported { path: PathBuf, format: &'static str },
     /// The file has a supported extension but its content could not be
     /// parsed, or the optimised result did not pass the lossless check.
     #[error("{path}: {message}", path = path.display())]
@@ -80,9 +87,39 @@ pub enum OptimizeError {
 }
 
 /// Optimise `src` losslessly and write the result to `dest`.
+///
+/// The format is chosen by the extension, case-insensitively, exactly as the
+/// planner does. `src` is only ever read. `dest` is written atomically (the
+/// `write_atomically` helper) and its folder is created if missing, only
+/// when there is a result to write. If anything fails, `dest` is not touched
+/// and no temporary file is left behind. `Outcome::millis` is the wall time of
+/// the whole call: read, optimise and write.
 pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> {
-    let _ = (src, dest);
-    todo!("implemented in Step 4")
+    let started = Instant::now();
+    let format = plan::format_of(src)
+        .ok_or_else(|| OptimizeError::UnsupportedType { path: src.to_path_buf() })?;
+    let optimize: fn(&[u8]) -> Result<Vec<u8>, String> = match format {
+        plan::Format::Png => png::optimize,
+        plan::Format::Jpg => {
+            return Err(OptimizeError::NotYetSupported { path: src.to_path_buf(), format: "JPG" });
+        }
+        plan::Format::Svg => {
+            return Err(OptimizeError::NotYetSupported { path: src.to_path_buf(), format: "SVG" });
+        }
+    };
+
+    let original = fs::read(src)
+        .map_err(|cause| OptimizeError::Io { path: src.to_path_buf(), cause })?;
+    let optimized = optimize(&original)
+        .map_err(|message| OptimizeError::Invalid { path: src.to_path_buf(), message })?;
+    atomic::write_atomically(dest, &optimized)
+        .map_err(|cause| OptimizeError::Io { path: dest.to_path_buf(), cause })?;
+
+    Ok(Outcome {
+        before: original.len() as u64,
+        after: optimized.len() as u64,
+        millis: started.elapsed().as_millis() as u64,
+    })
 }
 
 #[cfg(test)]
@@ -94,5 +131,12 @@ mod tests {
         assert_eq!(Skip::UnsupportedType.to_string(), "Not a PNG, JPG or SVG file");
         assert_eq!(Skip::NotAFile.to_string(), "Not a readable file");
         assert_ne!(Skip::TooLarge.to_string(), Skip::OverRunLimit.to_string());
+    }
+
+    #[test]
+    fn the_run_limit_skip_names_the_file_count_limit() {
+        assert_eq!(Skip::OverRunLimit.to_string(), "Too many files in one run (max 2000)");
+        // The old text spoke of a size limit; the limit is a file count.
+        assert!(!Skip::OverRunLimit.to_string().contains("size"));
     }
 }
