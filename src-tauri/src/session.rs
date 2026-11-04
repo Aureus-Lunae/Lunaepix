@@ -191,8 +191,9 @@ pub fn run_session(
 /// `file-done` per finished file, then exactly one `run-finished`.
 ///
 /// Before `run-finished` goes out, the output folder is stored in
-/// `last_output` and the ticket is given back, so the window may open the
-/// folder or start the next run as soon as it hears it. If `run` or `emit`
+/// `last_output`, so the window may open it as soon as it hears the event.
+/// The ticket is given back only after `run-finished` has gone out, so the
+/// next run's `run-started` always comes after it. If `run` or `emit`
 /// panics during the run, `run-finished` still goes out once, with what was
 /// counted so far, and then the panic carries on.
 pub fn run_session_with(
@@ -213,8 +214,10 @@ pub fn run_session_with(
     }));
     *last_output.lock().unwrap_or_else(PoisonError::into_inner) =
         tally.output_folder().map(Path::to_path_buf);
-    drop(ticket);
     emit(Event::RunFinished(tally.finished()));
+    // Given back only now (or by unwinding, if that emit panics), so a next
+    // run's `run-started` can never overtake this `run-finished`.
+    drop(ticket);
     if let Err(payload) = outcome {
         panic::resume_unwind(payload);
     }
@@ -627,10 +630,10 @@ mod tests {
         let worker = Worker::new("/nonexistent/lunaepix-worker-for-tests");
         let last_output = Mutex::new(Some(PathBuf::from("/from/an/earlier/run")));
         let mut events = Vec::new();
-        let mut free_at_finish = None;
+        let mut held_at_finish = None;
         run_session(ticket, &jobs, &worker, &last_output, &mut |event| {
             if let Event::RunFinished(_) = event {
-                free_at_finish = Some(guard.try_start().is_some());
+                held_at_finish = Some(guard.try_start().is_none());
             }
             events.push(event);
         });
@@ -658,10 +661,37 @@ mod tests {
                 has_output: false,
             })
         );
-        // The ticket was given back before `run-finished` went out.
-        assert_eq!(free_at_finish, Some(true));
+        // The ticket is still held while `run-finished` goes out, so no next
+        // run can start before it, and it is given back right after.
+        assert_eq!(held_at_finish, Some(true));
+        assert!(guard.try_start().is_some());
         // This run wrote nothing, so the earlier run's folder is forgotten.
         assert_eq!(*last_output.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn a_start_attempted_while_run_finished_is_sent_is_refused_as_busy() {
+        let guard = RunGuard::new();
+        let jobs = vec![optimize("/srv/photos/optimized/a.png")];
+        let last_output = Mutex::new(None);
+        let mut claimed_at_finish = None;
+        let mut busy_events = Vec::new();
+        run_session_with(
+            guard.try_start().unwrap(),
+            &jobs,
+            &last_output,
+            &mut |event| {
+                if let Event::RunFinished(_) = event {
+                    let claimed = claim_run(&guard, &mut |busy| busy_events.push(busy));
+                    claimed_at_finish = Some(claimed.err());
+                }
+            },
+            |_, progress| progress(0, Path::new("/srv/photos/a.png"), &written()),
+        );
+        assert_eq!(claimed_at_finish, Some(Some(CommandError::Busy)));
+        assert_eq!(busy_events, [Event::RunBusy]);
+        // Once `run-finished` is out, the next run is accepted.
+        assert!(claim_run(&guard, &mut |_| {}).is_ok());
     }
 
     #[test]
@@ -722,18 +752,26 @@ mod tests {
         ];
         let last_output = Mutex::new(None);
         let mut events = Vec::new();
+        let mut held_at_finish = None;
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
             run_session_with(
                 guard.try_start().unwrap(),
                 &jobs,
                 &last_output,
-                &mut |event| events.push(event),
+                &mut |event| {
+                    if let Event::RunFinished(_) = event {
+                        held_at_finish = Some(guard.try_start().is_none());
+                    }
+                    events.push(event);
+                },
                 |_, progress| {
                     progress(0, Path::new("/srv/photos/a.png"), &written());
                     panic!("the runner failed half-way");
                 },
             );
         }));
+        // On this path too, the ticket is held until `run-finished` is out.
+        assert_eq!(held_at_finish, Some(true));
         // The panic is not swallowed.
         assert!(outcome.is_err());
         assert_eq!(count_finished(&events), 1);

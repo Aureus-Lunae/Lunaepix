@@ -70,8 +70,10 @@ clamp it.
 The run is over. `optimised` counts the `done` files, and `saved_bytes` is
 their total saving (a file that grew counts 0). `has_output` says whether
 `open_output_folder` has a folder to open. Before this event goes out, the
-backend frees the run and stores the output folder, so the next drop, pick
-or "Open folder" works as soon as it arrives.
+backend stores the output folder, so "Open folder" works as soon as the
+event arrives. The run is freed right after the event goes out. In the
+moment between the two, a drop or pick gets `"busy"` / `run-busy`; a retry
+works.
 
 ```json
 { "optimised": 2, "saved_bytes": 341210, "has_output": true }
@@ -104,15 +106,13 @@ its run starts.
 
 ## Rules for the window
 
-- **Handle events in the order they arrive, and keep no assumptions across
-  runs.** The guard is freed just before `run-finished` goes out. A drop at
-  that moment can therefore start run N+1, and its `run-started` may arrive
-  before run N's `run-finished`. Do not assume that run N's `run-finished`
-  comes before run N+1's `run-started`. A `run-started` always begins a new
-  run: clear the table and reset the counters, whatever state the page is
-  in. The payloads carry no run number, so in that rare overlap the page
-  cannot tell whose `run-finished` arrives late. It shows that summary for
-  the new run until the new run's own `run-finished` replaces it.
+- **Runs never overlap, so events are strictly ordered.** Handle them in the
+  order they arrive. The backend frees a run only after its `run-finished`
+  has gone out. Run N's events are therefore always `run-started`, then its
+  `file-done`s, then `run-finished`, and all of them come before any event
+  of run N+1. A `run-finished` always belongs to the last `run-started`, so
+  no run number is needed. A `run-started` begins a new run: clear the table
+  and reset the counters.
 - **Listen only to the events above.** Do not listen to Tauri's own
   `tauri://drag-enter`, `tauri://drag-over` or `tauri://drag-drop`: Tauri
   puts the dropped paths in them, and they reach the page only when a
