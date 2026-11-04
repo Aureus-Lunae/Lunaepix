@@ -23,7 +23,7 @@ permissions:
 
 # A newer run for the same ref replaces the one still going.
 concurrency:
-  group: windows-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -92,7 +92,9 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # No build cache here: the test job's cache is a debug-profile cache,
+      # which a release build cannot use, and a cache of its own would only
+      # add upload time.
 
       # The repository has no package.json, so the Tauri command line comes
       # from crates.io at a fixed version, built against the lock file of the
