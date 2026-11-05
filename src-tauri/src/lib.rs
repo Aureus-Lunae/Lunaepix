@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use lunaepix_core::{Job, Worker, plan_files, plan_folder};
+use lunaepix_core::{Job, StopHandle, Worker, plan_files, plan_folder};
 use tauri::{AppHandle, DragDropEvent, Emitter, Manager, Window, WindowEvent, Wry};
 use tauri_plugin_dialog::{DialogExt, FileDialogBuilder, FilePath};
 
@@ -33,6 +33,8 @@ const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "svg", "PNG", "JPG", "
 struct AppState {
     guard: RunGuard,
     worker: Worker,
+    /// Stops the active run when the window closes.
+    stop: StopHandle,
     /// Output folder of the last completed run, if it wrote anything.
     last_output: Mutex<Option<PathBuf>>,
     /// Last `drag-state` sent, so a stream of drag-over events sends one.
@@ -62,6 +64,7 @@ fn run_jobs(app: &AppHandle, ticket: RunTicket, jobs: &[Job]) {
         ticket,
         jobs,
         &state.worker,
+        &state.stop,
         &state.last_output,
         &mut |event| emit(app, event),
     );
@@ -136,9 +139,26 @@ fn open_output_folder(app: AppHandle) -> Result<(), CommandError> {
     })
 }
 
+/// Call `stop` when `event` is the window closing. The app ends with its one
+/// window, so the run ends too: `stop` kills the running worker and starts no
+/// other, before the process exits. Asking to close and the window going
+/// away both count (stopping twice is harmless), so that a close that skips
+/// the request is covered as well.
+fn stop_on_close(event: &WindowEvent, stop: impl FnOnce()) {
+    if matches!(
+        event,
+        WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
+    ) {
+        stop();
+    }
+}
+
 /// Drag and drop, handled here so that no path reaches the window: the
 /// window hears `drag-state` only, and a drop starts a run.
 fn on_window_event(window: &Window, event: &WindowEvent) {
+    stop_on_close(event, || {
+        window.app_handle().state::<AppState>().stop.stop()
+    });
     let WindowEvent::DragDrop(drag) = event else {
         return;
     };
@@ -186,6 +206,7 @@ pub fn run() -> ExitCode {
     let state = AppState {
         guard: RunGuard::new(),
         worker,
+        stop: StopHandle::new(),
         last_output: Mutex::new(None),
         drag_over: AtomicBool::new(false),
     };
@@ -209,5 +230,34 @@ pub fn run() -> ExitCode {
             eprintln!("lunaepix: the window could not start: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use tauri::PhysicalSize;
+
+    use super::*;
+
+    #[test]
+    fn a_closing_window_stops_the_run_once() {
+        let stops = Cell::new(0);
+        stop_on_close(&WindowEvent::Destroyed, || stops.set(stops.get() + 1));
+        assert_eq!(stops.get(), 1);
+    }
+
+    #[test]
+    fn other_window_events_leave_the_run_alone() {
+        let stops = Cell::new(0);
+        for event in [
+            WindowEvent::Focused(true),
+            WindowEvent::Focused(false),
+            WindowEvent::Resized(PhysicalSize::new(800, 600)),
+        ] {
+            stop_on_close(&event, || stops.set(stops.get() + 1));
+        }
+        assert_eq!(stops.get(), 0);
     }
 }

@@ -8,10 +8,12 @@
 //! in its own worker process ([`worker`]), so a library that crashes the
 //! process fails only that file.
 //!
-//! `unsafe` code is denied everywhere but in `jpg`, the libjpeg FFI.
+//! `unsafe` code is denied everywhere but in `jpg`, the libjpeg FFI, and in
+//! `platform`, the worker's two start-up system calls.
 
 #![deny(unsafe_code)]
 
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
@@ -22,6 +24,8 @@ mod atomic;
 #[allow(unsafe_code)]
 mod jpg;
 mod plan;
+#[allow(unsafe_code)]
+mod platform;
 mod png;
 mod run;
 mod svg;
@@ -31,7 +35,7 @@ pub use plan::{
     MAX_FILE_BYTES, MAX_PIXELS, MAX_RUN_FILES, MAX_SVG_DEPTH, MAX_SVG_ENTITY_BYTES, MAX_SVG_NODES,
     MAX_WORKER_MESSAGE_BYTES, MAX_WORKER_OUTPUT_BYTES, WORKER_TIMEOUT, plan_files, plan_folder,
 };
-pub use run::{Crash, FileResult, RunError, Worker, run};
+pub use run::{Crash, FileResult, RunError, StopHandle, Worker, run, run_until_stopped};
 pub use worker::WORKER_FLAG;
 
 /// Result of optimising one file. Sizes are in bytes.
@@ -51,8 +55,8 @@ pub enum Skip {
     TooLarge,
     /// The run already holds the maximum number of files to optimise.
     OverRunLimit,
-    /// The file is itself in the destination folder, so optimising it would
-    /// overwrite its own output.
+    /// The file's output would be the file itself: it is already in the
+    /// output folder, or its output name is a symlink back to it.
     IsOwnDestination,
     /// The input does not exist or is not a regular file (for example a
     /// socket), or it is a folder that could not be read.
@@ -67,7 +71,7 @@ impl fmt::Display for Skip {
             Skip::OverRunLimit => {
                 return write!(f, "Too many files in one run (max {MAX_RUN_FILES})");
             }
-            Skip::IsOwnDestination => "Already in the output folder",
+            Skip::IsOwnDestination => "Its output would overwrite the file itself",
             Skip::NotAFile => "Not a readable file",
         })
     }
@@ -121,7 +125,11 @@ impl OptimizeError {
 /// permissions. A `dest` that is the same file as `src` (after resolving
 /// symlinks and `.`/`..`) is refused, and so is a `dest` whose folder is not
 /// the source's folder or its `optimized/` subfolder (checked before anything
-/// is created). `Outcome::millis` is the wall time of
+/// is created). A source of more than [`MAX_FILE_BYTES`] when it is read (it
+/// grew after planning) is refused with the planner's size reason, having
+/// read one byte past the limit at most. On Windows the output does not get
+/// the source's read-only attribute, so a later run can replace it.
+/// `Outcome::millis` is the wall time of
 /// the whole call: read, optimise and write.
 pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> {
     let started = Instant::now();
@@ -141,10 +149,15 @@ pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> 
     }
     // Opened read-only; the same handle gives the size, the permissions and
     // the bytes, so they all describe one file.
-    let mut file = fs::File::open(src).map_err(io_error(src))?;
+    let file = fs::File::open(src).map_err(io_error(src))?;
     let permissions = file.metadata().map_err(io_error(src))?.permissions();
-    let mut original = Vec::new();
-    file.read_to_end(&mut original).map_err(io_error(src))?;
+    // The planner skipped a larger file, but it may have grown since.
+    let original = read_at_most(file, MAX_FILE_BYTES)
+        .map_err(io_error(src))?
+        .ok_or_else(|| OptimizeError::Invalid {
+            path: src.to_path_buf(),
+            message: Skip::TooLarge.to_string(),
+        })?;
     let optimized = match format {
         plan::Format::Png => png::optimize(&original),
         plan::Format::Jpg => jpg::optimize(&original),
@@ -168,7 +181,9 @@ pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> 
 /// it) or to its `optimized/` subfolder, which are the two places the planner
 /// chooses. Both folders are compared after resolving symlinks, so the user's
 /// own folder may itself be reached through a link, but an `optimized` that is
-/// a link to anywhere else is refused. Nothing is created or written here: a
+/// a link to anywhere else is refused. On Windows and macOS an existing
+/// `Optimized` (any letter case) is the output folder. Nothing is created or
+/// written here: a
 /// folder that does not exist yet is resolved through its nearest existing
 /// parent.
 ///
@@ -177,7 +192,7 @@ pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> 
 fn ensure_destination_folder(src: &Path, dest: &Path) -> Result<(), OptimizeError> {
     let source_folder = plan::resolve(atomic::folder_of(src));
     let dest_folder = plan::resolve(atomic::folder_of(dest));
-    if dest_folder == source_folder || dest_folder == source_folder.join(plan::OUTPUT_DIR) {
+    if is_allowed_destination_folder(&dest_folder, &source_folder, NAMES_IGNORE_CASE) {
         return Ok(());
     }
     Err(OptimizeError::Invalid {
@@ -187,6 +202,41 @@ fn ensure_destination_folder(src: &Path, dest: &Path) -> Result<(), OptimizeErro
             plan::OUTPUT_DIR
         ),
     })
+}
+
+/// Whether the file systems of this target usually treat `Optimized` and
+/// `optimized` as one name: Windows (NTFS) and macOS (APFS) by default.
+const NAMES_IGNORE_CASE: bool = cfg!(any(windows, target_os = "macos"));
+
+/// Whether output may go to `dest_folder`: `source_folder` itself, or its
+/// `optimized` subfolder. Both are resolved paths. The parent is compared
+/// exactly; with `ignore_case`, the last name is compared without regard to
+/// ASCII letter case, because resolving an existing `Optimized` folder on a
+/// case-insensitive file system gives that spelling back.
+fn is_allowed_destination_folder(
+    dest_folder: &Path,
+    source_folder: &Path,
+    ignore_case: bool,
+) -> bool {
+    if dest_folder == source_folder {
+        return true;
+    }
+    let (Some(parent), Some(name)) = (dest_folder.parent(), dest_folder.file_name()) else {
+        return false;
+    };
+    let output = OsStr::new(plan::OUTPUT_DIR);
+    parent == source_folder
+        && (name == output || (ignore_case && name.eq_ignore_ascii_case(output)))
+}
+
+/// All of `reader`, or `None` if it holds more than `limit` bytes. At most
+/// one byte past the limit is read.
+fn read_at_most(reader: impl Read, limit: u64) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= limit).then_some(bytes))
 }
 
 #[cfg(test)]
@@ -240,6 +290,104 @@ mod tests {
             // The reason alone does not carry the path.
             assert!(!error.reason().contains("dir/"), "{}", error.reason());
         }
+    }
+
+    #[test]
+    fn the_own_destination_skip_says_the_output_would_overwrite_the_file() {
+        assert_eq!(
+            Skip::IsOwnDestination.to_string(),
+            "Its output would overwrite the file itself"
+        );
+        // The old text named an output folder, which a symlink back to the
+        // source is not in.
+        assert!(!Skip::IsOwnDestination.to_string().contains("output folder"));
+    }
+
+    // --- the read cap -------------------------------------------------------
+
+    #[test]
+    fn reads_a_source_of_exactly_the_limit_whole() {
+        let bytes = [7u8; 10];
+        assert_eq!(read_at_most(&bytes[..], 10).unwrap(), Some(bytes.to_vec()));
+        assert_eq!(read_at_most(&[][..], 10).unwrap(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn refuses_a_source_one_byte_over_the_limit() {
+        assert_eq!(read_at_most(&[7u8; 11][..], 10).unwrap(), None);
+        assert_eq!(read_at_most(&[7u8; 1000][..], 10).unwrap(), None);
+    }
+
+    #[test]
+    fn passes_on_a_read_error_of_the_source() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("disk gone"))
+            }
+        }
+        let error = read_at_most(Broken, 10).unwrap_err();
+        assert_eq!(error.to_string(), "disk gone");
+    }
+
+    // --- where output may go -------------------------------------------------
+
+    #[test]
+    fn accepts_the_source_folder_and_its_optimized_folder_exactly() {
+        let source = Path::new("/photos/trip");
+        for ignore_case in [false, true] {
+            assert!(is_allowed_destination_folder(source, source, ignore_case));
+            assert!(is_allowed_destination_folder(
+                &source.join("optimized"),
+                source,
+                ignore_case
+            ));
+        }
+    }
+
+    #[test]
+    fn accepts_an_optimized_folder_in_another_letter_case_only_when_names_ignore_case() {
+        let source = Path::new("/photos/trip");
+        for name in ["Optimized", "OPTIMIZED", "optimizeD"] {
+            let folder = source.join(name);
+            assert!(
+                is_allowed_destination_folder(&folder, source, true),
+                "{name}"
+            );
+            assert!(
+                !is_allowed_destination_folder(&folder, source, false),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_another_parent_or_another_name_whatever_the_case_rule() {
+        let source = Path::new("/photos/trip");
+        let refused = [
+            PathBuf::from("/photos/other/optimized"),
+            PathBuf::from("/photos/optimized"),
+            // The parent is compared exactly, also where names ignore case.
+            PathBuf::from("/photos/Trip/optimized"),
+            PathBuf::from("/photos/trip/optimizedx"),
+            PathBuf::from("/photos/trip/optimised"),
+            PathBuf::from("/photos/trip/optimized/deeper"),
+            PathBuf::from("/photos"),
+        ];
+        for folder in &refused {
+            for ignore_case in [false, true] {
+                assert!(
+                    !is_allowed_destination_folder(folder, source, ignore_case),
+                    "{} ({ignore_case})",
+                    folder.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn names_ignore_case_exactly_on_windows_and_macos() {
+        assert_eq!(NAMES_IGNORE_CASE, cfg!(any(windows, target_os = "macos")));
     }
 
     #[test]

@@ -37,6 +37,14 @@ oxvg_ast = { version = "=0.0.9", features = ["roxmltree"] }
 # `roxmltree_*` tests in svg.rs check. Re-run them before any upgrade.
 roxmltree = "=0.21.2"
 
+# The worker's start-up calls (see src/platform.rs). Both versions are the ones
+# already in Cargo.lock, so no new package.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.191"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Diagnostics_Debug"] }
+
 [dev-dependencies]
 # Test fixtures: `png` encodes (low compression, redundant chunk), `image`
 # decodes for the pixel comparison and encodes the baseline JPEG fixtures

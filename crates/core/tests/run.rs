@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use lunaepix_core::{Crash, MAX_WORKER_OUTPUT_BYTES};
 use lunaepix_core::{
-    FileResult, Job, OptimizeError, Outcome, RunError, Skip, WORKER_FLAG, WORKER_TIMEOUT, Worker,
-    plan_files, plan_folder, run,
+    FileResult, Job, OptimizeError, Outcome, RunError, Skip, StopHandle, WORKER_FLAG,
+    WORKER_TIMEOUT, Worker, plan_files, plan_folder, run, run_until_stopped,
 };
 use tempfile::TempDir;
 
@@ -265,6 +265,126 @@ fn a_cancelled_dialog_does_nothing() {
 
     assert!(results.is_empty());
     assert_eq!(calls, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_worker_that_panicked_and_exited_101_counts_as_crashed() {
+    // 101 is what the worker exits with when the optimiser panics: no
+    // record, the panic message on stderr.
+    let tmp = TempDir::new().unwrap();
+    let jobs = one_png_job(tmp.path());
+    let body = "echo \"thread 'optimize' panicked at src/svg.rs\" >&2; exit 101";
+
+    let results = run(&jobs, &script(body, WORKER_TIMEOUT), |_, _, _| {});
+
+    assert_eq!(crash(&results[0]), Crash::ExitCode(101));
+    let reason = failure(&results[0]).reason();
+    assert_eq!(reason, "the optimiser crashed on this file (exit code 101)");
+    // The panic text stays out of the reason the window shows.
+    assert!(!reason.contains("panicked"), "{reason}");
+    assert!(!tmp.path().join("optimized-a.png").exists());
+}
+
+// --- stopping a run (the window closes) ----------------------------------------
+
+/// Wait up to five seconds for `path` to hold `lines` lines.
+#[cfg(target_os = "linux")]
+fn wait_for_lines(path: &Path, lines: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fs::read_to_string(path).map_or(0, |text| text.lines().count()) < lines
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn stopping_a_run_kills_and_reaps_its_worker_and_starts_no_further_file() {
+    let tmp = TempDir::new().unwrap();
+    let srcs = [
+        write(tmp.path(), "a.png", &png_bytes()),
+        write(tmp.path(), "b.png", &png_bytes()),
+    ];
+    let jobs = plan_files(&srcs);
+    let pids = tmp.path().join("pids");
+    // Every worker started appends its PID; `exec` keeps the PID.
+    let body = format!("echo $$ >> '{}'; exec sleep 60", pids.display());
+    let worker = script(&body, WORKER_TIMEOUT);
+    let stop = StopHandle::new();
+
+    let started = Instant::now();
+    let results = std::thread::scope(|scope| {
+        let running = scope.spawn(|| run_until_stopped(&jobs, &worker, &stop, |_, _, _| {}));
+        wait_for_lines(&pids, 1);
+        // What the window's close handler does.
+        stop.stop();
+        running.join().unwrap()
+    });
+
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(20), "{elapsed:?}");
+    assert!(stop.is_stopped());
+    let started_pids = fs::read_to_string(&pids).unwrap();
+    assert_eq!(started_pids.lines().count(), 1, "b.png must not start");
+    let pid = started_pids.trim();
+    assert!(
+        !Path::new("/proc").join(pid).exists(),
+        "worker {pid} still exists"
+    );
+    assert_eq!(results.len(), 1, "{results:?}");
+    match failure(&results[0]) {
+        RunError::Stopped { path } => assert_eq!(path, &srcs[0]),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(failure(&results[0]).reason(), "the run was stopped");
+    assert!(!tmp.path().join("optimized-a.png").exists());
+}
+
+#[test]
+fn a_run_whose_stop_handle_is_never_used_runs_every_file() {
+    let tmp = TempDir::new().unwrap();
+    let srcs = [
+        write(tmp.path(), "a.png", &png_bytes()),
+        write(tmp.path(), "b.svg", &svg_bytes()),
+    ];
+    let jobs = plan_files(&srcs);
+    let stop = StopHandle::new();
+
+    let results = run_until_stopped(&jobs, &worker(), &stop, |_, _, _| {});
+
+    assert_eq!(results.len(), 2);
+    optimized(&results[0]);
+    optimized(&results[1]);
+    assert!(!stop.is_stopped());
+}
+
+#[test]
+fn a_run_stopped_before_it_starts_runs_nothing_and_reports_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let jobs = one_png_job(tmp.path());
+    let stop = StopHandle::new();
+    stop.stop();
+    let mut reported = 0;
+
+    let results = run_until_stopped(&jobs, &worker(), &stop, |_, _, _| reported += 1);
+
+    assert!(results.is_empty(), "{results:?}");
+    assert_eq!(reported, 0);
+    assert!(!tmp.path().join("optimized-a.png").exists());
+}
+
+#[test]
+fn a_clone_of_a_stop_handle_stops_the_same_run() {
+    let stop = StopHandle::new();
+    let clone = stop.clone();
+    assert!(!stop.is_stopped());
+    clone.stop();
+    assert!(stop.is_stopped());
+    // Stopping twice is harmless.
+    stop.stop();
+    assert!(clone.is_stopped());
 }
 
 /// A worker that cannot be started: any attempt to spawn it fails.

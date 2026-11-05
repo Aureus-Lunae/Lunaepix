@@ -10,9 +10,8 @@ use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -94,6 +93,10 @@ pub enum RunError {
     /// The worker program could not be started.
     #[error("{path}: the optimiser could not be started: {cause}", path = path.display())]
     Spawn { path: PathBuf, cause: io::Error },
+    /// The run was stopped (the window closed) while this file was being
+    /// optimised; its worker was killed. No output was written.
+    #[error("{path}: the run was stopped", path = path.display())]
+    Stopped { path: PathBuf },
 }
 
 impl RunError {
@@ -113,6 +116,7 @@ impl RunError {
             RunError::Spawn { cause, .. } => {
                 format!("the optimiser could not be started: {cause}")
             }
+            RunError::Stopped { .. } => "the run was stopped".to_owned(),
         }
     }
 }
@@ -181,15 +185,31 @@ fn signal_name(signal: i32) -> Option<&'static str> {
 pub fn run(
     jobs: &[Job],
     worker: &Worker,
+    on_progress: impl FnMut(usize, &Path, &FileResult),
+) -> Vec<FileResult> {
+    run_until_stopped(jobs, worker, &StopHandle::new(), on_progress)
+}
+
+/// [`run`], until `stop` is used. From then on no worker is started, and no
+/// further job is reported: the run returns at once with the results so
+/// far, the last being [`RunError::Stopped`] for the file whose worker was
+/// killed (if one was running).
+pub fn run_until_stopped(
+    jobs: &[Job],
+    worker: &Worker,
+    stop: &StopHandle,
     mut on_progress: impl FnMut(usize, &Path, &FileResult),
 ) -> Vec<FileResult> {
     let mut results = Vec::with_capacity(jobs.len());
     for (index, job) in jobs.iter().enumerate() {
+        if stop.is_stopped() {
+            break;
+        }
         let (src, result) = match job {
             Job::Skip { src, reason } => (src, FileResult::Skipped(*reason)),
             Job::Optimize { src, dest } => (
                 src,
-                match run_worker(worker, src, dest) {
+                match run_worker(worker, src, dest, stop) {
                     Ok(outcome) => FileResult::Optimized(outcome),
                     Err(error) => FileResult::Failed(error),
                 },
@@ -201,42 +221,105 @@ pub fn run(
     results
 }
 
+/// Stops a run from another thread: the window's close handler uses it.
+/// Clones share one state.
+#[derive(Debug, Clone, Default)]
+pub struct StopHandle(Arc<StopState>);
+
+#[derive(Debug, Default)]
+struct StopState {
+    stopped: AtomicBool,
+    /// The worker running now, if any. Its runner and [`StopHandle::stop`]
+    /// take turns on it; the lock is held only for a call on the handle.
+    active: Mutex<Option<Child>>,
+}
+
+impl StopHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stop the run: no worker starts after this, and the one running now is
+    /// killed through its own handle and reaped before this returns. Harmless
+    /// to call twice, or when nothing runs.
+    pub fn stop(&self) {
+        self.0.stopped.store(true, Ordering::SeqCst);
+        if let Some(child) = self.active().as_mut() {
+            kill_and_reap(child);
+        }
+    }
+
+    /// Whether [`stop`](Self::stop) has been called.
+    pub fn is_stopped(&self) -> bool {
+        self.0.stopped.load(Ordering::SeqCst)
+    }
+
+    fn active(&self) -> MutexGuard<'_, Option<Child>> {
+        self.0.active.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Run `call` on the active worker; `None` if there is none.
+    fn with_active<T>(&self, call: impl FnOnce(&mut Child) -> T) -> Option<T> {
+        self.active().as_mut().map(call)
+    }
+}
+
 /// Optimise one file in a worker process.
 ///
 /// The worker gets no shell and no stdin; the paths are separate arguments.
 /// Its stdout and stderr are read on two threads, each up to
 /// [`MAX_WORKER_OUTPUT_BYTES`]; if either goes past that, or the timeout
-/// passes, the worker is killed through its own handle and reaped.
-fn run_worker(worker: &Worker, src: &Path, dest: &Path) -> Result<Outcome, RunError> {
+/// passes, the worker is killed through its own handle and reaped. While it
+/// runs, the worker sits in `stop`, so that a stop from another thread can
+/// kill it.
+fn run_worker(
+    worker: &Worker,
+    src: &Path,
+    dest: &Path,
+    stop: &StopHandle,
+) -> Result<Outcome, RunError> {
     let spawn_error = |cause| RunError::Spawn {
         path: src.to_path_buf(),
         cause,
     };
-    let mut child = Command::new(&worker.program)
-        .args(&worker.args)
-        .arg(src)
-        .arg(dest)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(spawn_error)?;
-
-    let overflow = Arc::new(AtomicBool::new(false));
-    let readers = match (child.stdout.take(), child.stderr.take()) {
-        (Some(stdout), Some(stderr)) => read_capped(stdout, &overflow)
-            .and_then(|out| Ok((out, read_capped(stderr, &overflow)?))),
-        _ => Err(io::Error::other("the worker's output pipes are missing")),
+    let stopped = || RunError::Stopped {
+        path: src.to_path_buf(),
     };
-    let (stdout, stderr) = match readers {
-        Ok(readers) => readers,
-        Err(cause) => {
-            stop(&mut child);
-            return Err(spawn_error(cause));
+    let (pipes, overflow) = {
+        // The flag is checked, and the worker started and stored, under the
+        // lock that `stop` takes after setting the flag: either `stop` sees
+        // the worker, or the worker is never started.
+        let mut active = stop.active();
+        if stop.is_stopped() {
+            return Err(stopped());
         }
+        let mut child = Command::new(&worker.program)
+            .args(&worker.args)
+            .arg(src)
+            .arg(dest)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(spawn_error)?;
+        let overflow = Arc::new(AtomicBool::new(false));
+        let pipes = match (child.stdout.take(), child.stderr.take()) {
+            (Some(stdout), Some(stderr)) => read_capped(stdout, &overflow)
+                .and_then(|out| Ok((out, read_capped(stderr, &overflow)?))),
+            _ => Err(io::Error::other("the worker's output pipes are missing")),
+        };
+        if pipes.is_err() {
+            kill_and_reap(&mut child);
+        } else {
+            *active = Some(child);
+        }
+        (pipes, overflow)
     };
+    let (stdout, stderr) = pipes.map_err(spawn_error)?;
 
-    let ended = wait(&mut child, worker.timeout, &overflow);
+    let ended = wait(stop, worker.timeout, &overflow);
+    // Reaped by now; the next file starts with an empty slot.
+    stop.active().take();
     // A reader sets the overflow flag before it sends, so once both have
     // been received the flag is final.
     let stdout = stdout.recv_timeout(PIPE_GRACE).ok();
@@ -247,11 +330,15 @@ fn run_worker(worker: &Worker, src: &Path, dest: &Path) -> Result<Outcome, RunEr
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
     };
 
-    if let Ended::TimedOut = ended {
-        return Err(RunError::TimedOut {
-            path: src.to_path_buf(),
-            limit: worker.timeout,
-        });
+    match ended {
+        Ended::Stopped => return Err(stopped()),
+        Ended::TimedOut => {
+            return Err(RunError::TimedOut {
+                path: src.to_path_buf(),
+                limit: worker.timeout,
+            });
+        }
+        Ended::Exited(_) | Ended::Unknown => {}
     }
     // Checked before the exit status: a worker whose pipe was closed on it
     // may have died of that (`SIGPIPE`).
@@ -279,32 +366,38 @@ enum Ended {
     Exited(ExitStatus),
     /// Killed and reaped after the timeout.
     TimedOut,
+    /// Killed and reaped by [`StopHandle::stop`].
+    Stopped,
     /// Waiting failed, or the output overflowed (told apart by its flag);
     /// the worker was killed and reaped.
     Unknown,
 }
 
-/// Wait for `child` to exit, polling, and stop it if it runs past `timeout`
-/// or its output overflows.
-fn wait(child: &mut Child, timeout: Duration, overflow: &AtomicBool) -> Ended {
+/// Wait for the worker in `stop` to exit, polling, and kill it if it runs
+/// past `timeout` or its output overflows. A stop from another thread has
+/// killed and reaped it already, and wins over whatever status it left.
+fn wait(stop: &StopHandle, timeout: Duration, overflow: &AtomicBool) -> Ended {
     let started = Instant::now();
     let mut pause = Duration::from_millis(1);
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ended::Exited(status),
-            Ok(None) => {}
-            Err(_) => {
-                stop(child);
+        if stop.is_stopped() {
+            return Ended::Stopped;
+        }
+        match stop.with_active(|child| child.try_wait()) {
+            Some(Ok(Some(status))) => return Ended::Exited(status),
+            Some(Ok(None)) => {}
+            Some(Err(_)) | None => {
+                stop.with_active(kill_and_reap);
                 return Ended::Unknown;
             }
         }
         if overflow.load(Ordering::SeqCst) {
-            stop(child);
+            stop.with_active(kill_and_reap);
             return Ended::Unknown;
         }
         let elapsed = started.elapsed();
         if elapsed >= timeout {
-            stop(child);
+            stop.with_active(kill_and_reap);
             return Ended::TimedOut;
         }
         thread::sleep(pause.min(timeout - elapsed));
@@ -314,7 +407,7 @@ fn wait(child: &mut Child, timeout: Duration, overflow: &AtomicBool) -> Ended {
 
 /// Kill this one child, through its handle, and reap it. Either step may
 /// fail only because it has already exited, which is what is wanted.
-fn stop(child: &mut Child) {
+fn kill_and_reap(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -396,6 +489,9 @@ mod tests {
                 path: PathBuf::from("dir/d.jpg"),
                 cause: io::Error::other("no such program"),
             },
+            RunError::Stopped {
+                path: PathBuf::from("dir/e.svg"),
+            },
         ]
     }
 
@@ -409,6 +505,7 @@ mod tests {
                 "the optimiser crashed on this file (killed by signal 6, SIGABRT, for example a stack overflow)",
                 "the optimiser timed out after 600s and was stopped",
                 "the optimiser could not be started: no such program",
+                "the run was stopped",
             ]
         );
     }

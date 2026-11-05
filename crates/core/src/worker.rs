@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
 
-use crate::{MAX_WORKER_MESSAGE_BYTES, OptimizeError, Outcome, optimize_file};
+use crate::{MAX_WORKER_MESSAGE_BYTES, OptimizeError, Outcome, optimize_file, platform};
 
 /// The hidden first argument that starts a binary in worker mode.
 pub const WORKER_FLAG: &str = "--lunaepix-worker";
@@ -75,21 +75,45 @@ pub fn serve_if_requested() -> Option<ExitCode> {
 /// Optimise one file and write the result record to stdout. `args` are the
 /// arguments after the flag, which must be exactly `<src> <dest>`.
 ///
-/// On Linux the worker first raises its own OOM score, so that when memory
-/// runs out the kernel kills the worker rather than the window. The file is
-/// optimised on a thread with a fixed 8 MiB stack.
+/// First the worker sets itself up for its parent: on Linux it asks to be
+/// killed when the thread that started it ends (so closing the window stops
+/// it), then raises its own OOM score, so that when memory runs out the
+/// kernel kills the worker rather than the window; on Windows it turns off
+/// the crash dialogs. The file is optimised on a thread with a fixed 8 MiB
+/// stack.
 pub fn serve(args: impl IntoIterator<Item = OsString>) -> ExitCode {
+    // Before the OOM score: the tests read a score of 1000 as "ready".
+    platform::die_with_parent();
+    raise_oom_score();
+    platform::suppress_crash_dialogs();
+    serve_with(
+        args,
+        |src: &Path, dest: &Path| optimize_file(src, dest),
+        &mut io::stdout().lock(),
+    )
+}
+
+/// [`serve`] without the start-up calls, with the optimiser and the output
+/// given: the tests hand in an optimiser that panics, and a buffer for the
+/// record, and keep their own process as it is.
+pub(crate) fn serve_with<F>(
+    args: impl IntoIterator<Item = OsString>,
+    optimise: F,
+    out: &mut dyn Write,
+) -> ExitCode
+where
+    F: FnOnce(&Path, &Path) -> Result<Outcome, OptimizeError> + Send + 'static,
+{
     let mut args = args.into_iter();
     let (Some(src), Some(dest), None) = (args.next(), args.next(), args.next()) else {
         eprintln!("usage: <program> {WORKER_FLAG} <source> <destination>");
         return ExitCode::from(EXIT_USAGE);
     };
     let (src, dest) = (PathBuf::from(src), PathBuf::from(dest));
-    raise_oom_score();
 
     let job = {
         let (src, dest) = (src.clone(), dest.clone());
-        move || optimize_file(&src, &dest)
+        move || optimise(&src, &dest)
     };
     let spawned = thread::Builder::new()
         .name("optimize".to_owned())
@@ -106,11 +130,7 @@ pub fn serve(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     };
 
     let record = format_record(&result, &src, &dest);
-    let mut stdout = io::stdout().lock();
-    if let Err(error) = stdout
-        .write_all(record.as_bytes())
-        .and_then(|()| stdout.flush())
-    {
+    if let Err(error) = out.write_all(record.as_bytes()).and_then(|()| out.flush()) {
         eprintln!("could not write the result: {error}");
         return ExitCode::from(EXIT_NO_RECORD);
     }
@@ -424,6 +444,84 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    fn worker_args() -> Vec<OsString> {
+        let (src, dest) = paths();
+        vec![src.into_os_string(), dest.into_os_string()]
+    }
+
+    #[test]
+    fn exits_101_without_a_record_when_the_optimiser_panics() {
+        let mut out = Vec::new();
+        let code = serve_with(
+            worker_args(),
+            |_: &Path, _: &Path| -> Result<Outcome, OptimizeError> {
+                panic!("the optimiser hit a bug")
+            },
+            &mut out,
+        );
+        assert_eq!(code, ExitCode::from(101));
+        assert!(out.is_empty(), "{:?}", String::from_utf8_lossy(&out));
+    }
+
+    #[test]
+    fn exits_0_with_exactly_the_record_when_the_optimiser_returns() {
+        // The counterpart: the same call without a panic writes its record.
+        let outcome = Outcome {
+            before: 10,
+            after: 4,
+            millis: 2,
+        };
+        let mut out = Vec::new();
+        let code = serve_with(
+            worker_args(),
+            move |_: &Path, _: &Path| Ok(outcome),
+            &mut out,
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(out, b"lunaepix-worker 1 ok 10 4 2\n");
+    }
+
+    #[test]
+    fn exits_1_with_the_error_record_when_the_optimiser_refuses_the_file() {
+        let mut out = Vec::new();
+        let code = serve_with(
+            worker_args(),
+            |src: &Path, _: &Path| {
+                Err(OptimizeError::UnsupportedType {
+                    path: src.to_path_buf(),
+                })
+            },
+            &mut out,
+        );
+        assert_eq!(code, ExitCode::from(1));
+        assert_eq!(out, b"lunaepix-worker 1 unsupported src\n");
+    }
+
+    #[test]
+    fn exits_3_when_the_record_cannot_be_written() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let code = serve_with(
+            worker_args(),
+            |_: &Path, _: &Path| {
+                Ok(Outcome {
+                    before: 1,
+                    after: 1,
+                    millis: 0,
+                })
+            },
+            &mut Closed,
+        );
+        assert_eq!(code, ExitCode::from(3));
     }
 
     #[test]

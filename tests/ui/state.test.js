@@ -10,6 +10,7 @@ import {
   reduce,
   rowView,
   settledFailures,
+  summaryLine,
 } from '../../ui/state.js';
 
 function apply(state, ...actions) {
@@ -107,6 +108,37 @@ test('file-done keeps rows in the order they arrive', () => {
   );
 });
 
+test('file-done appends to the run\'s own row list instead of copying it', () => {
+  const first = apply(initialState(), started(3), done(0));
+  const list = first.rows;
+  const second = reduce(first, skipped(1));
+  assert.equal(second.rows, list, 'the same array, one row longer');
+  assert.equal(second.rows.length, 2);
+  assert.notEqual(second, first, 'still a new state object');
+});
+
+test('run-started gives the new run a new row list and leaves the last run\'s rows alone', () => {
+  const previous = apply(initialState(), started(2), done(0), done(1));
+  const list = previous.rows;
+  const next = apply(previous, started(1), done(0, 'new.png'));
+  assert.notEqual(next.rows, list);
+  assert.equal(list.length, 2);
+  assert.deepEqual(next.rows.map((row) => row.name), ['new.png']);
+});
+
+test('a run of more than 2000 files keeps every row, in order', () => {
+  const total = 2500;
+  let state = reduce(initialState(), started(total));
+  const list = state.rows;
+  for (let index = 0; index < total; index += 1) {
+    state = reduce(state, done(index, `img${index}.png`));
+  }
+  assert.equal(state.rows, list);
+  assert.equal(state.rows.length, total);
+  assert.equal(state.rows[0].name, 'img0.png');
+  assert.equal(state.rows[total - 1].name, `img${total - 1}.png`);
+});
+
 test('file-done ignores a status it does not know', () => {
   const before = apply(initialState(), started(1));
   const state = reduce(before, {
@@ -175,10 +207,25 @@ test('run-finished for a single file uses the singular in the announcement', () 
   assert.equal(state.message, 'Optimised 1 file, saved 100 B');
 });
 
-test('run-finished for an empty run announces zero files', () => {
+const NO_FILES = 'No PNG, JPG or SVG files directly in this folder (subfolders are not included)';
+
+test('a run that planned no files says so, and that subfolders are not included, in the announcement and the summary', () => {
   const state = apply(initialState(), started(0), finished(0, 0, false));
-  assert.equal(state.message, 'Optimised 0 files, saved 0 B');
+  assert.equal(MESSAGES.noFiles, NO_FILES);
+  assert.equal(state.message, NO_FILES);
+  assert.equal(summaryLine(state), NO_FILES);
   assert.deepEqual(state.rows, []);
+});
+
+test('a run with one file, even a skipped one, gives the usual totals instead', () => {
+  const state = apply(initialState(), started(1), skipped(0), finished(0, 0, false));
+  assert.equal(state.message, 'Optimised 0 files, saved 0 B');
+  assert.equal(summaryLine(state), 'Total: 0 files, saved 0 B');
+});
+
+test('the summary line of a run with optimised files is its total', () => {
+  const state = apply(initialState(), started(2), done(0), done(1), finished(2, 341210, true));
+  assert.equal(summaryLine(state), 'Total: 2 files, saved 333.2 KiB');
 });
 
 test('run-finished treats unusable numbers as zero', () => {
@@ -273,12 +320,28 @@ test('an event it does not know changes nothing', () => {
   assert.equal(reduce(state, { type: 'tauri-something', payload: {} }), state);
 });
 
-test('reduce never changes the state it was given', () => {
-  const before = apply(initialState(), started(1));
+test('reduce never changes the state it was given, other than file-done appending its row', () => {
+  const before = apply(initialState(), started(2), done(0));
   const snapshot = JSON.stringify(before);
-  reduce(before, done(0));
-  reduce(before, finished(1, 5, true));
-  assert.equal(JSON.stringify(before), snapshot);
+  for (const action of [
+    finished(1, 5, true),
+    started(3),
+    { type: 'run-busy', payload: null },
+    { type: 'command-rejected', payload: 'no-output' },
+    { type: 'drag-state', payload: { over: true } },
+  ]) {
+    reduce(before, action);
+    assert.equal(JSON.stringify(before), snapshot, action.type);
+  }
+  // file-done appends to the run's row list (no copy per event), and
+  // changes nothing else of the state it was given.
+  const withoutRows = (state) => JSON.stringify({ ...state, rows: null });
+  const rowsBefore = JSON.stringify(before.rows);
+  const restSnapshot = withoutRows(before);
+  reduce(before, done(1, 'b.png'));
+  assert.equal(withoutRows(before), restSnapshot);
+  assert.equal(before.rows.length, 2);
+  assert.equal(JSON.stringify(before.rows.slice(0, 1)), rowsBefore);
 });
 
 // rowView

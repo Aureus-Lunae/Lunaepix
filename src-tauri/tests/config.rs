@@ -741,7 +741,133 @@ fn the_index_page_has_no_title_style_handler_or_inline_script() {
     let html = index_html();
     assert_eq!(html_attribute_problems(&html), Vec::<String>::new());
     // The module script is loaded from a file.
-    assert!(html.contains("<script type=\"module\" src=\"app.js\">"));
+    assert!(loads_the_module_script(&html));
+}
+
+/// Whether `html` has a `<script>` start tag that loads `app.js` as a
+/// module, read as tokens: a comment or text that spells it does not count.
+fn loads_the_module_script(html: &str) -> bool {
+    start_tags(html).iter().any(|tag| {
+        tag.name == "script"
+            && tag.attr("src") == Some("app.js")
+            && tag.attr("type") == Some("module")
+    })
+}
+
+#[test]
+fn the_module_script_tag_is_read_as_a_token_in_a_fixture() {
+    assert!(loads_the_module_script(
+        "<body><script type=\"module\" src=\"app.js\"></script></body>"
+    ));
+    assert!(loads_the_module_script(
+        "<SCRIPT SRC='app.js' TYPE='module'></SCRIPT>"
+    ));
+    // Only inside a comment, or as text: no script is loaded.
+    assert!(!loads_the_module_script(
+        "<body><!-- <script type=\"module\" src=\"app.js\"></script> --></body>"
+    ));
+    assert!(!loads_the_module_script(
+        "<p>&lt;script type=\"module\" src=\"app.js\"&gt;</p>"
+    ));
+    // Another file, or not a module.
+    assert!(!loads_the_module_script(
+        "<script type=\"module\" src=\"other.js\"></script>"
+    ));
+    assert!(!loads_the_module_script("<script src=\"app.js\"></script>"));
+    assert!(!loads_the_module_script(
+        "<script data-src=\"app.js\" type=\"module\"></script>"
+    ));
+}
+
+// --- the static C runtime on Windows ---------------------------------------------
+
+const WINDOWS_MSVC: &str = "x86_64-pc-windows-msvc";
+
+/// Problems with the Cargo configuration that links the C runtime
+/// statically into the Windows build, so that a clean Windows machine
+/// without the Visual C++ redistributable can start the app. Read as TOML:
+/// `target.x86_64-pc-windows-msvc.rustflags` must hold `-C` followed by
+/// `target-feature=+crt-static`, or the joined `-Ctarget-feature=+crt-static`.
+fn crt_static_problems(config_toml: &str) -> Vec<String> {
+    let table = match config_toml.parse::<toml::Table>() {
+        Ok(table) => table,
+        Err(error) => return vec![format!("not TOML: {error}")],
+    };
+    let Some(target) = table
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .and_then(|targets| targets.get(WINDOWS_MSVC))
+        .and_then(toml::Value::as_table)
+    else {
+        return vec![format!("no [target.{WINDOWS_MSVC}] table")];
+    };
+    let Some(flags) = target.get("rustflags").and_then(toml::Value::as_array) else {
+        return vec!["no rustflags array".to_owned()];
+    };
+    let flags: Vec<&str> = flags.iter().filter_map(toml::Value::as_str).collect();
+    let static_crt = flags.contains(&"-Ctarget-feature=+crt-static")
+        || flags
+            .windows(2)
+            .any(|pair| pair == ["-C", "target-feature=+crt-static"]);
+    if static_crt {
+        Vec::new()
+    } else {
+        vec![format!(
+            "rustflags {flags:?} do not link the CRT statically"
+        )]
+    }
+}
+
+fn cargo_config() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.cargo/config.toml");
+    fs::read_to_string(path).unwrap()
+}
+
+#[test]
+fn the_windows_build_links_the_c_runtime_statically() {
+    assert_eq!(crt_static_problems(&cargo_config()), Vec::<String>::new());
+}
+
+#[test]
+fn a_cargo_config_with_the_static_runtime_in_either_spelling_passes_a_fixture() {
+    for flags in [
+        r#"["-C", "target-feature=+crt-static"]"#,
+        r#"["-Ctarget-feature=+crt-static"]"#,
+        r#"["-C", "link-arg=/X", "-C", "target-feature=+crt-static"]"#,
+    ] {
+        let config = format!("[target.{WINDOWS_MSVC}]\nrustflags = {flags}\n");
+        assert_eq!(
+            crt_static_problems(&config),
+            Vec::<String>::new(),
+            "{config}"
+        );
+    }
+}
+
+#[test]
+fn a_cargo_config_without_the_static_runtime_is_caught_in_a_fixture() {
+    let configs = [
+        // Only in a comment.
+        format!(
+            "[target.{WINDOWS_MSVC}]\n# rustflags = [\"-C\", \"target-feature=+crt-static\"]\n"
+        ),
+        format!("[target.{WINDOWS_MSVC}]\nrustflags = [] # -C target-feature=+crt-static\n"),
+        // For another target.
+        "[target.x86_64-pc-windows-gnu]\nrustflags = [\"-C\", \"target-feature=+crt-static\"]\n"
+            .to_owned(),
+        // The flag without its `-C`, the pair the wrong way round, or another feature.
+        format!("[target.{WINDOWS_MSVC}]\nrustflags = [\"target-feature=+crt-static\"]\n"),
+        format!("[target.{WINDOWS_MSVC}]\nrustflags = [\"target-feature=+crt-static\", \"-C\"]\n"),
+        format!("[target.{WINDOWS_MSVC}]\nrustflags = [\"-C\", \"target-feature=-crt-static\"]\n"),
+        // A string where an array belongs, and no rustflags at all.
+        format!("[target.{WINDOWS_MSVC}]\nrustflags = \"-C target-feature=+crt-static\"\n"),
+        format!("[target.{WINDOWS_MSVC}]\nlinker = \"link.exe\"\n"),
+        // Not TOML.
+        format!("[target.{WINDOWS_MSVC}\nrustflags = [\"-C\", \"target-feature=+crt-static\"]\n"),
+    ];
+    for config in &configs {
+        assert_eq!(crt_static_problems(config).len(), 1, "{config}");
+    }
 }
 
 #[test]

@@ -27,7 +27,8 @@ pub(crate) fn folder_of(path: &Path) -> &Path {
 /// - A symlink at `dest` itself is replaced, never followed: the rename swaps
 ///   the directory entry, so the link's target is not written to.
 /// - The file gets exactly `permissions` (the caller passes the source's, so
-///   the output is never more readable than the original).
+///   the output is never more readable than the original), except that on
+///   Windows it is never read-only ([`output_permissions`]).
 /// - The data is synced to disk before the rename, so a crash cannot leave
 ///   `dest` pointing at an empty or partial file.
 /// - On any failure the temporary file is removed and `dest` is not changed.
@@ -44,10 +45,34 @@ pub(crate) fn write_atomically(
     let mut temp = NamedTempFile::new_in(parent)?;
     temp.write_all(bytes)?;
     temp.flush()?;
-    temp.as_file().set_permissions(permissions)?;
+    temp.as_file()
+        .set_permissions(output_permissions(permissions))?;
     temp.as_file().sync_all()?;
     temp.persist(dest).map_err(|failed| failed.error)?;
     Ok(())
+}
+
+/// The permissions the output gets for a source with `permissions`.
+///
+/// On Windows the only permission is the read-only attribute, and renaming
+/// onto a read-only file fails there ("Access is denied"). A read-only source
+/// would give a read-only output that the next run could not replace, so the
+/// output is never read-only. Who may read it is not changed by that.
+#[cfg(windows)]
+// On Windows `set_readonly(false)` clears one attribute; the lint is about
+// unix, where it would add write bits for everyone.
+#[allow(clippy::permissions_set_readonly_false)]
+fn output_permissions(mut permissions: fs::Permissions) -> fs::Permissions {
+    permissions.set_readonly(false);
+    permissions
+}
+
+/// The permissions the output gets for a source with `permissions`: exactly
+/// those. On unix a read-only output does not block the next run, because a
+/// rename needs write access to the folder, not to the file.
+#[cfg(not(windows))]
+fn output_permissions(permissions: fs::Permissions) -> fs::Permissions {
+    permissions
 }
 
 #[cfg(test)]

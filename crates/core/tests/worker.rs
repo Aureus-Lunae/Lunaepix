@@ -196,3 +196,106 @@ fn a_child_that_is_not_the_worker_keeps_the_inherited_oom_score() {
     let own = fs::read_to_string("/proc/self/oom_score_adj").unwrap();
     assert_eq!(score, own.trim());
 }
+
+/// Whether process `pid` still runs: it exists and is not a zombie.
+#[cfg(target_os = "linux")]
+fn is_running(pid: &str) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // The state is the first field after the parenthesised name.
+        Ok(stat) => stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| !rest.starts_with('Z')),
+        Err(_) => false,
+    }
+}
+
+/// Start `program args...` in the background of a shell that then waits on
+/// its stdin, wait for `ready(pid)`, end the shell, and report whether the
+/// program still runs `grace` later. The program is stopped either way.
+#[cfg(target_os = "linux")]
+fn outlives_its_parent(
+    program: &str,
+    args: &[&std::ffi::OsStr],
+    ready: impl Fn(&str) -> bool,
+    grace: Duration,
+) -> bool {
+    use std::io::{BufRead, BufReader};
+
+    // `read` ends when the test closes the shell's stdin.
+    let mut shell = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#""$0" "$@" </dev/null >/dev/null 2>&1 & echo $!; read _"#)
+        .arg(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(shell.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let pid = line.trim().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready(&pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    drop(shell.stdin.take());
+    shell.wait().unwrap();
+    let deadline = Instant::now() + grace;
+    while is_running(&pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let survived = is_running(&pid);
+    if survived {
+        // Started by this test (through the shell): stop exactly that PID.
+        let _ = Command::new("kill").arg("-9").arg(&pid).status();
+    }
+    survived
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dies_when_the_process_that_started_it_exits() {
+    // Stands in for the window closing or crashing mid-file: the worker,
+    // blocked on its source, must not carry on alone.
+    let tmp = TempDir::new().unwrap();
+    let src = fifo(tmp.path());
+    let dest = tmp.path().join("optimized-slow.png");
+    // The worker asks for the signal before it sets its OOM score, so a
+    // score of 1000 says it is ready.
+    let ready = |pid: &str| {
+        fs::read_to_string(format!("/proc/{pid}/oom_score_adj"))
+            .is_ok_and(|score| score.trim() == "1000")
+    };
+
+    let survived = outlives_its_parent(
+        WORKER,
+        &[WORKER_FLAG.as_ref(), src.as_os_str(), dest.as_os_str()],
+        ready,
+        Duration::from_secs(5),
+    );
+
+    assert!(!survived, "the worker kept running after its parent exited");
+    assert!(!dest.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_child_that_is_not_the_worker_outlives_the_process_that_started_it() {
+    // The proof that the test above can see a survivor: `cat`, blocked on the
+    // same kind of FIFO, keeps running after the same shell exits.
+    let tmp = TempDir::new().unwrap();
+    let src = fifo(tmp.path());
+
+    let survived = outlives_its_parent(
+        "cat",
+        &[src.as_os_str()],
+        is_running,
+        Duration::from_millis(500),
+    );
+
+    assert!(survived, "cat should outlive the shell");
+}
