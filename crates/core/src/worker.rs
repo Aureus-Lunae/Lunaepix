@@ -372,8 +372,15 @@ mod tests {
 
     #[test]
     fn parses_an_io_error_back_with_its_os_error_and_its_text() {
+        // The OS's own "access denied" code: EACCES on unix,
+        // ERROR_ACCESS_DENIED on Windows (where 13 is ERROR_INVALID_DATA).
+        #[cfg(unix)]
+        const ACCESS_DENIED: i32 = 13;
+        #[cfg(windows)]
+        const ACCESS_DENIED: i32 = 5;
+
         let (src, _) = paths();
-        let cause = io::Error::from_raw_os_error(13);
+        let cause = io::Error::from_raw_os_error(ACCESS_DENIED);
         let text = cause.to_string();
         let (_, parsed) = round_trip(Err(OptimizeError::Io {
             path: src.clone(),
@@ -382,7 +389,7 @@ mod tests {
         match parsed.unwrap_err() {
             OptimizeError::Io { path, cause } => {
                 assert_eq!(path, src);
-                assert_eq!(cause.raw_os_error(), Some(13));
+                assert_eq!(cause.raw_os_error(), Some(ACCESS_DENIED));
                 assert_eq!(cause.kind(), io::ErrorKind::PermissionDenied);
                 assert_eq!(cause.to_string(), text);
             }
