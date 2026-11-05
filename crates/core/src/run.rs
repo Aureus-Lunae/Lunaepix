@@ -520,6 +520,11 @@ mod tests {
             }
         }
 
+        /// A worker whose program does not exist, so it can never start.
+        fn missing_worker() -> Worker {
+            Worker::new("/nonexistent/lunaepix-worker")
+        }
+
         /// A handle with `script` running in its slot.
         fn running(script: &str) -> StopHandle {
             let stop = StopHandle::new();
@@ -540,20 +545,31 @@ mod tests {
         }
 
         #[test]
-        fn a_stopped_handle_starts_no_worker_and_reports_the_file_as_stopped() {
+        fn a_stopped_handle_does_not_even_try_to_start_the_worker() {
             let tmp = TempDir::new().unwrap();
-            let pid = tmp.path().join("pid");
             let stop = StopHandle::new();
             stop.stop();
             let (src, dest) = (tmp.path().join("a.png"), tmp.path().join("b.png"));
 
-            let result = run_worker(&pid_worker(&pid), &src, &dest, &stop);
+            // A program that cannot start: only the check under the lock can
+            // turn this into `Stopped`. Without it the spawn is tried and
+            // fails, which is `Spawn`, every time.
+            let result = run_worker(&missing_worker(), &src, &dest, &stop);
 
             assert!(
                 matches!(result, Err(RunError::Stopped { .. })),
                 "{result:?}"
             );
-            assert!(!pid.exists(), "a worker started after the stop");
+        }
+
+        #[test]
+        fn a_fresh_handle_does_try_to_start_a_missing_worker() {
+            let tmp = TempDir::new().unwrap();
+            let (src, dest) = (tmp.path().join("a.png"), tmp.path().join("b.png"));
+
+            let result = run_worker(&missing_worker(), &src, &dest, &StopHandle::new());
+
+            assert!(matches!(result, Err(RunError::Spawn { .. })), "{result:?}");
         }
 
         #[test]
