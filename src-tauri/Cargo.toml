@@ -30,3 +30,4 @@ serde_json = "1.0.154"
 # Test fixtures for the worker-mode smoke test, as in the CLI's tests.
 png = "0.17.16"
 tempfile = "3.27.0"
+yaml-rust2 = "0.13.0"
