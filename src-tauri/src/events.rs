@@ -94,8 +94,10 @@ impl Event {
     }
 }
 
-/// The name of the one row that stands for the files the run limit left out.
-pub const OVER_LIMIT_NAME: &str = "More files";
+/// The name of the one row that stands for the files the run limit left out:
+/// a placeholder in the style of `(no name)`, so that it is never taken for a
+/// file name.
+pub const OVER_LIMIT_NAME: &str = "(over the limit)";
 
 /// The `file-done` payload of row `index`, the one row that stands for the
 /// `count` files the run limit left out, instead of a row for each.

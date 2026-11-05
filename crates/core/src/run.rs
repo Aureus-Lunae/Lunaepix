@@ -265,9 +265,6 @@ impl StopHandle {
     }
 }
 
-/// Optimise one file in a worker process.
-///
-/// The worker gets no shell and no stdin; the paths are separate arguments.
 /// Windows' `CREATE_NO_WINDOW` process creation flag.
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -284,6 +281,9 @@ fn without_console_window(command: &mut Command) -> &mut Command {
     command
 }
 
+/// Optimise one file in a worker process.
+///
+/// The worker gets no shell and no stdin; the paths are separate arguments.
 /// Its stdout and stderr are read on two threads, each up to
 /// [`MAX_WORKER_OUTPUT_BYTES`]; if either goes past that, or the timeout
 /// passes, the worker is killed through its own handle and reaped. While it
@@ -381,6 +381,7 @@ fn run_worker(
 }
 
 /// How the wait for a worker ended.
+#[derive(Debug)]
 enum Ended {
     Exited(ExitStatus),
     /// Killed and reaped after the timeout.
@@ -396,13 +397,31 @@ enum Ended {
 /// past `timeout` or its output overflows. A stop from another thread has
 /// killed and reaped it already, and wins over whatever status it left.
 fn wait(stop: &StopHandle, timeout: Duration, overflow: &AtomicBool) -> Ended {
+    wait_with(stop, timeout, overflow, Child::try_wait)
+}
+
+/// [`wait`], with the poll of the worker given: the tests use it to put a
+/// stop between the flag check and the poll, which a real run reaches only
+/// by a race.
+fn wait_with(
+    stop: &StopHandle,
+    timeout: Duration,
+    overflow: &AtomicBool,
+    mut poll: impl FnMut(&mut Child) -> io::Result<Option<ExitStatus>>,
+) -> Ended {
     let started = Instant::now();
     let mut pause = Duration::from_millis(1);
     loop {
         if stop.is_stopped() {
+            // `stop()` has killed and reaped it already; this makes sure
+            // that a stopped wait never leaves a worker behind.
+            stop.with_active(kill_and_reap);
             return Ended::Stopped;
         }
-        match stop.with_active(|child| child.try_wait()) {
+        match stop.with_active(&mut poll) {
+            // A stop that came after the check above killed the worker
+            // itself: the status it left is that kill, not a crash.
+            Some(Ok(Some(_))) if stop.is_stopped() => return Ended::Stopped,
             Some(Ok(Some(status))) => return Ended::Exited(status),
             Some(Ok(None)) => {}
             Some(Err(_)) | None => {
@@ -471,6 +490,162 @@ fn signal_of(_status: ExitStatus) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The worker's start and its wait, driven directly: the stop paths that
+    /// a whole run can reach only through a timing race.
+    #[cfg(unix)]
+    mod stop_paths {
+        use std::fs;
+        use std::os::unix::process::ExitStatusExt;
+
+        use tempfile::TempDir;
+
+        use super::*;
+
+        const LONG: Duration = Duration::from_secs(30);
+
+        fn sh(script: &str) -> Command {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", script]);
+            command
+        }
+
+        /// A worker that writes its PID to `pid_file`, and nothing else.
+        fn pid_worker(pid_file: &Path) -> Worker {
+            let script = format!("echo $$ > '{}'", pid_file.display());
+            Worker {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into(), "worker".into()],
+                timeout: LONG,
+            }
+        }
+
+        /// A handle with `script` running in its slot.
+        fn running(script: &str) -> StopHandle {
+            let stop = StopHandle::new();
+            *stop.active() = Some(sh(script).spawn().unwrap());
+            stop
+        }
+
+        /// Sets the flag only, as the first step of `stop()` does, without
+        /// the kill that follows it.
+        fn flag_only(stop: &StopHandle) {
+            stop.0.stopped.store(true, Ordering::SeqCst);
+        }
+
+        /// The status of the child in the slot, once it has been reaped.
+        fn reaped_status(stop: &StopHandle) -> Option<ExitStatus> {
+            stop.with_active(|child| child.try_wait().unwrap())
+                .flatten()
+        }
+
+        #[test]
+        fn a_stopped_handle_starts_no_worker_and_reports_the_file_as_stopped() {
+            let tmp = TempDir::new().unwrap();
+            let pid = tmp.path().join("pid");
+            let stop = StopHandle::new();
+            stop.stop();
+            let (src, dest) = (tmp.path().join("a.png"), tmp.path().join("b.png"));
+
+            let result = run_worker(&pid_worker(&pid), &src, &dest, &stop);
+
+            assert!(
+                matches!(result, Err(RunError::Stopped { .. })),
+                "{result:?}"
+            );
+            assert!(!pid.exists(), "a worker started after the stop");
+        }
+
+        #[test]
+        fn a_fresh_handle_does_start_the_worker() {
+            let tmp = TempDir::new().unwrap();
+            let pid = tmp.path().join("pid");
+            let (src, dest) = (tmp.path().join("a.png"), tmp.path().join("b.png"));
+
+            let result = run_worker(&pid_worker(&pid), &src, &dest, &StopHandle::new());
+
+            assert!(
+                !matches!(result, Err(RunError::Stopped { .. })),
+                "{result:?}"
+            );
+            let written = fs::read_to_string(&pid).expect("the worker ran");
+            assert!(written.trim().parse::<u32>().is_ok(), "{written:?}");
+        }
+
+        #[test]
+        fn a_stopped_wait_kills_and_reaps_a_worker_that_is_still_running() {
+            let stop = running("exec sleep 30");
+            flag_only(&stop);
+
+            let ended = wait(&stop, LONG, &AtomicBool::new(false));
+
+            assert!(matches!(ended, Ended::Stopped), "{ended:?}");
+            let status = reaped_status(&stop).expect("killed and reaped");
+            assert_eq!(status.signal(), Some(9));
+        }
+
+        #[test]
+        fn a_wait_that_is_not_stopped_lets_the_worker_exit_on_its_own() {
+            let stop = running("exit 0");
+
+            let ended = wait(&stop, LONG, &AtomicBool::new(false));
+
+            let Ended::Exited(status) = ended else {
+                panic!("expected an exit, got {ended:?}");
+            };
+            assert_eq!((status.code(), status.signal()), (Some(0), None));
+        }
+
+        #[test]
+        fn an_exit_seen_after_a_stop_counts_as_stopped() {
+            let stop = running("exec sleep 30");
+
+            // What `stop()` does in the race: it lands after the loop's
+            // flag check and kills the worker before `try_wait` looks.
+            let ended = wait_with(&stop, LONG, &AtomicBool::new(false), |child| {
+                kill_and_reap(child);
+                flag_only(&stop);
+                child.try_wait()
+            });
+
+            assert!(matches!(ended, Ended::Stopped), "{ended:?}");
+        }
+
+        #[test]
+        fn an_exit_seen_without_a_stop_counts_as_an_exit() {
+            let stop = running("exec sleep 30");
+
+            // The same kill without a stop, as the kernel's OOM killer would.
+            let ended = wait_with(&stop, LONG, &AtomicBool::new(false), |child| {
+                kill_and_reap(child);
+                child.try_wait()
+            });
+
+            let Ended::Exited(status) = ended else {
+                panic!("expected an exit, got {ended:?}");
+            };
+            assert_eq!(status.signal(), Some(9));
+        }
+
+        #[test]
+        fn a_poll_error_kills_the_worker_and_ends_unknown() {
+            let stop = running("exec sleep 30");
+
+            let ended = wait_with(&stop, LONG, &AtomicBool::new(false), |_| {
+                Err(io::Error::other("the poll failed"))
+            });
+
+            assert!(matches!(ended, Ended::Unknown), "{ended:?}");
+            let status = reaped_status(&stop).expect("killed and reaped");
+            assert_eq!(status.signal(), Some(9));
+        }
+
+        #[test]
+        fn a_wait_with_no_worker_in_the_slot_ends_unknown() {
+            let ended = wait(&StopHandle::new(), LONG, &AtomicBool::new(false));
+            assert!(matches!(ended, Ended::Unknown), "{ended:?}");
+        }
+    }
 
     /// Only Windows CI runs this. std has no getter for the creation flags,
     /// so the test pins the constant to the Windows SDK's value and shows

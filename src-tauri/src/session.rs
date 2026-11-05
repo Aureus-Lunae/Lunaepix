@@ -941,7 +941,13 @@ mod tests {
         let last = rows.last().unwrap();
         assert_eq!(last.index, MAX_RUN_FILES);
         assert_eq!(last.status, Status::Skipped);
-        assert_eq!(last.name, "More files");
+        assert_eq!(last.name, "(over the limit)");
+        let named = rows.iter().filter(|row| row.name == "(over the limit)");
+        assert_eq!(
+            named.count(),
+            1,
+            "only the limit row carries the placeholder"
+        );
         assert_eq!(
             last.reason.as_deref(),
             Some("3 more files not optimised: over the 2000-file limit")

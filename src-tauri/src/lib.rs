@@ -353,10 +353,10 @@ mod tests {
     }
 
     #[test]
-    fn the_sidecar_name_has_the_platform_suffix() {
-        assert_eq!(
-            sidecar_name(),
-            format!("lunaepix-worker{}", std::env::consts::EXE_SUFFIX)
-        );
+    fn the_sidecar_name_is_lunaepix_worker_with_exe_on_windows_only() {
+        #[cfg(windows)]
+        assert_eq!(sidecar_name(), "lunaepix-worker.exe");
+        #[cfg(not(windows))]
+        assert_eq!(sidecar_name(), "lunaepix-worker");
     }
 }

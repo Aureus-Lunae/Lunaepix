@@ -60,7 +60,7 @@ with no file name.
 
 A run optimises at most 2000 files. The files left out for that reason do
 not get a row each: after every other row comes one `skipped` row named
-`More files`, whose reason counts them ("3 more files not optimised: over
+`(over the limit)`, whose reason counts them ("3 more files not optimised: over
 the 2000-file limit", or "1 more file ..."), and `total` counts it as one.
 Files skipped for any other reason keep a row of their own.
 
