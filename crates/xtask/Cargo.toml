@@ -1,0 +1,13 @@
+[package]
+name = "lunaepix-xtask"
+description = "Build helper: puts the worker binary where the Tauri bundler expects its sidecar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+# A build tool, never shipped or published.
+publish = false
+
+# std only: no dependencies, so it builds in a second before the bundle.
+[dependencies]

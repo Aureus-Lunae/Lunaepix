@@ -6,14 +6,15 @@
 
 use std::path::Path;
 
-use lunaepix_core::FileResult;
+use lunaepix_core::{FileResult, MAX_RUN_FILES};
 use serde::Serialize;
 
 /// A run has been planned and starts now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunStarted {
-    /// Number of `file-done` events that follow, one per planned file
-    /// (skipped files included).
+    /// Number of `file-done` events that follow: one per planned file
+    /// (skipped files included), except that the files the run limit left
+    /// out share one row ([`over_limit_row`]).
     pub total: usize,
 }
 
@@ -90,6 +91,28 @@ impl Event {
             Event::RunCancelled => "run-cancelled",
             Event::DragState(_) => "drag-state",
         }
+    }
+}
+
+/// The name of the one row that stands for the files the run limit left out:
+/// a placeholder in the style of `(no name)`, so that it is never taken for a
+/// file name.
+pub const OVER_LIMIT_NAME: &str = "(over the limit)";
+
+/// The `file-done` payload of row `index`, the one row that stands for the
+/// `count` files the run limit left out, instead of a row for each.
+pub fn over_limit_row(index: usize, count: usize) -> FileDone {
+    let files = if count == 1 { "file" } else { "files" };
+    FileDone {
+        index,
+        name: OVER_LIMIT_NAME.to_owned(),
+        status: Status::Skipped,
+        before: None,
+        after: None,
+        millis: None,
+        reason: Some(format!(
+            "{count} more {files} not optimised: over the {MAX_RUN_FILES}-file limit"
+        )),
     }
 }
 

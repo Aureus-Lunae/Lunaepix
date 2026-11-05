@@ -2494,6 +2494,7 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "image",
+ "libc",
  "mozjpeg-sys",
  "oxipng",
  "oxvg_ast",
@@ -2503,7 +2504,12 @@ dependencies = [
  "roxmltree",
  "tempfile",
  "thiserror 2.0.21",
+ "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "lunaepix-xtask"
+version = "0.1.0"
 
 [[package]]
 name = "markup5ever"

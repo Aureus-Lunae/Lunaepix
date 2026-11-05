@@ -23,8 +23,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lunaepix_core::{
-    FileResult, MAX_SVG_DEPTH, MAX_SVG_NODES, OptimizeError, Outcome, RunError, Worker,
-    optimize_file, plan_files, run,
+    FileResult, MAX_FILE_BYTES, MAX_SVG_DEPTH, MAX_SVG_NODES, OptimizeError, Outcome, RunError,
+    Skip, Worker, optimize_file, plan_files, run,
 };
 use tempfile::TempDir;
 
@@ -66,6 +66,53 @@ fn assert_refused(name: &str, bytes: &[u8]) -> String {
     assert!(!dest.exists(), "an output file was written");
     assert_eq!(listing(tmp.path()), before, "something was left behind");
     err.to_string()
+}
+
+// --- Any format: a file that grew after it was planned ---------------------------
+
+/// A file of `len` bytes, all zero, without writing them (a sparse file on
+/// the systems that have them).
+fn sized_file(dir: &Path, name: &str, len: u64) -> PathBuf {
+    let path = dir.join(name);
+    fs::File::create(&path).unwrap().set_len(len).unwrap();
+    path
+}
+
+#[test]
+fn refuses_a_source_that_grew_past_the_size_limit_after_planning() {
+    // The planner skips a file over the limit, but a file can grow between
+    // planning and the worker reading it. The worker reads one byte past the
+    // limit at most, and refuses with the planner's own reason.
+    let tmp = TempDir::new().unwrap();
+    let src = sized_file(tmp.path(), "grown.png", MAX_FILE_BYTES + 1);
+    let dest = tmp.path().join("optimized-grown.png");
+
+    let started = Instant::now();
+    let err = optimize_file(&src, &dest).unwrap_err();
+
+    assert!(started.elapsed() < QUICK, "took {:?}", started.elapsed());
+    assert_eq!(err.reason(), Skip::TooLarge.to_string());
+    assert!(
+        matches!(&err, OptimizeError::Invalid { path, .. } if path == &src),
+        "{err:?}"
+    );
+    assert!(!dest.exists());
+    assert_eq!(listing(tmp.path()), [OsString::from("grown.png")]);
+}
+
+#[test]
+fn reads_a_source_of_exactly_the_size_limit_and_hands_it_to_the_optimiser() {
+    // The counterpart: at the limit the bytes are read and decoded, so the
+    // refusal is the decoder's (zeros are not a PNG), not the size reason.
+    let tmp = TempDir::new().unwrap();
+    let src = sized_file(tmp.path(), "full.png", MAX_FILE_BYTES);
+    let dest = tmp.path().join("optimized-full.png");
+
+    let err = optimize_file(&src, &dest).unwrap_err();
+
+    assert_ne!(err.reason(), Skip::TooLarge.to_string());
+    assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
+    assert!(!dest.exists());
 }
 
 // --- PNG ---------------------------------------------------------------------------

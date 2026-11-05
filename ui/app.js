@@ -2,7 +2,7 @@
 // src-tauri/INTERFACE.md); `state.js` turns each event into the next state and
 // `render` shows it. File names and reasons are written with textContent only.
 
-import { formatProgress, formatTotal } from './format.js';
+import { formatProgress } from './format.js';
 import {
   canChoose,
   canOpenFolder,
@@ -11,6 +11,7 @@ import {
   reduce,
   rowView,
   settledFailures,
+  summaryLine,
 } from './state.js';
 
 const { invoke } = window.__TAURI__.core;
@@ -96,7 +97,7 @@ function render() {
   }
   summary.hidden = state.summary === null;
   if (state.summary !== null) {
-    summaryText.textContent = formatTotal(state.summary.optimised, state.summary.savedBytes);
+    summaryText.textContent = summaryLine(state);
   }
   setDisabled(openFolder, !canOpenFolder(state));
 

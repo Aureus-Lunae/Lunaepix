@@ -642,3 +642,126 @@ fn shows_the_io_cause_once_in_the_message_and_not_again_as_a_source() {
     assert!(message.contains("gone.png"), "{message}");
     assert!(err.source().is_none());
 }
+
+// --- a read-only source ----------------------------------------------------------------
+
+/// Mark `path` read-only the portable way (on unix: every write bit cleared).
+fn set_read_only(path: &Path, read_only: bool) {
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_readonly(read_only);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+#[test]
+fn replaces_the_output_of_a_read_only_source_on_a_second_run() {
+    // The spec: "Destination exists: replaced with fresh output". On Windows
+    // a read-only output used to block the rename of the second run.
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &wasteful_png());
+    set_read_only(&src, true);
+    let dest = tmp.path().join("optimized-a.png");
+
+    let first = optimize_file(&src, &dest);
+    let second = optimize_file(&src, &dest);
+
+    // Writable again, so the temporary folder can be removed on every system.
+    set_read_only(&src, false);
+    if dest.exists() {
+        set_read_only(&dest, false);
+    }
+    first.unwrap();
+    second.unwrap();
+    assert_same_pixels(&fs::read(&src).unwrap(), &fs::read(&dest).unwrap());
+    assert_eq!(
+        listing(tmp.path()).len(),
+        2,
+        "only the source and the output"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn does_not_copy_the_read_only_attribute_to_the_output_on_windows() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &wasteful_png());
+    set_read_only(&src, true);
+    let dest = tmp.path().join("optimized-a.png");
+
+    let result = optimize_file(&src, &dest);
+
+    let source_read_only = fs::metadata(&src).unwrap().permissions().readonly();
+    let output_read_only = fs::metadata(&dest).map(|m| m.permissions().readonly());
+    set_read_only(&src, false);
+    if dest.exists() {
+        set_read_only(&dest, false);
+    }
+    result.unwrap();
+    assert!(source_read_only, "the source keeps its own attribute");
+    assert!(
+        !output_read_only.unwrap(),
+        "the output must stay replaceable"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn gives_the_output_the_read_only_mode_of_a_read_only_source_on_unix() {
+    // The counterpart: on unix a read-only output does not block a rerun (the
+    // rename needs the folder's write bit, not the file's), so the output
+    // keeps the source's mode exactly and gains no write bit.
+    assert_eq!(optimize_with_source_mode(0o444), 0o444);
+}
+
+// --- an `Optimized` folder in another letter case --------------------------------------
+
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn writes_into_an_existing_optimized_folder_spelled_in_another_letter_case() {
+    // On a case-insensitive file system `optimized` and `Optimized` are one
+    // folder, and resolving it gives the spelling on disk.
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &wasteful_png());
+    fs::create_dir(tmp.path().join("Optimized")).unwrap();
+    let dest = tmp.path().join("optimized").join("a.png");
+
+    optimize_file(&src, &dest).unwrap();
+
+    assert_eq!(
+        listing(tmp.path()),
+        [OsString::from("Optimized"), OsString::from("a.png")]
+    );
+    assert_eq!(
+        listing(&tmp.path().join("Optimized")),
+        [OsString::from("a.png")]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn refuses_a_folder_named_optimized_in_another_letter_case_on_linux() {
+    // On Linux `Optimized` is a folder of its own, not the output folder, so
+    // output may not go there.
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &wasteful_png());
+    let other = tmp.path().join("Optimized");
+    fs::create_dir(&other).unwrap();
+
+    let err = optimize_file(&src, &other.join("a.png")).unwrap_err();
+
+    assert!(err.to_string().contains("'optimized' folder"), "{err}");
+    assert!(listing(&other).is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn writes_into_the_optimized_folder_beside_a_differently_spelled_one_on_linux() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &wasteful_png());
+    fs::create_dir(tmp.path().join("Optimized")).unwrap();
+    let dest = tmp.path().join("optimized").join("a.png");
+
+    optimize_file(&src, &dest).unwrap();
+
+    assert!(dest.is_file());
+    assert!(listing(&tmp.path().join("Optimized")).is_empty());
+}

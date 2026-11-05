@@ -741,7 +741,133 @@ fn the_index_page_has_no_title_style_handler_or_inline_script() {
     let html = index_html();
     assert_eq!(html_attribute_problems(&html), Vec::<String>::new());
     // The module script is loaded from a file.
-    assert!(html.contains("<script type=\"module\" src=\"app.js\">"));
+    assert!(loads_the_module_script(&html));
+}
+
+/// Whether `html` has a `<script>` start tag that loads `app.js` as a
+/// module, read as tokens: a comment or text that spells it does not count.
+fn loads_the_module_script(html: &str) -> bool {
+    start_tags(html).iter().any(|tag| {
+        tag.name == "script"
+            && tag.attr("src") == Some("app.js")
+            && tag.attr("type") == Some("module")
+    })
+}
+
+#[test]
+fn the_module_script_tag_is_read_as_a_token_in_a_fixture() {
+    assert!(loads_the_module_script(
+        "<body><script type=\"module\" src=\"app.js\"></script></body>"
+    ));
+    assert!(loads_the_module_script(
+        "<SCRIPT SRC='app.js' TYPE='module'></SCRIPT>"
+    ));
+    // Only inside a comment, or as text: no script is loaded.
+    assert!(!loads_the_module_script(
+        "<body><!-- <script type=\"module\" src=\"app.js\"></script> --></body>"
+    ));
+    assert!(!loads_the_module_script(
+        "<p>&lt;script type=\"module\" src=\"app.js\"&gt;</p>"
+    ));
+    // Another file, or not a module.
+    assert!(!loads_the_module_script(
+        "<script type=\"module\" src=\"other.js\"></script>"
+    ));
+    assert!(!loads_the_module_script("<script src=\"app.js\"></script>"));
+    assert!(!loads_the_module_script(
+        "<script data-src=\"app.js\" type=\"module\"></script>"
+    ));
+}
+
+// --- the static C runtime on Windows ---------------------------------------------
+
+const WINDOWS_MSVC: &str = "x86_64-pc-windows-msvc";
+
+/// Problems with the Cargo configuration that links the C runtime
+/// statically into the Windows build, so that a clean Windows machine
+/// without the Visual C++ redistributable can start the app. Read as TOML:
+/// `target.x86_64-pc-windows-msvc.rustflags` must hold `-C` followed by
+/// `target-feature=+crt-static`, or the joined `-Ctarget-feature=+crt-static`.
+fn crt_static_problems(config_toml: &str) -> Vec<String> {
+    let table = match config_toml.parse::<toml::Table>() {
+        Ok(table) => table,
+        Err(error) => return vec![format!("not TOML: {error}")],
+    };
+    let Some(target) = table
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .and_then(|targets| targets.get(WINDOWS_MSVC))
+        .and_then(toml::Value::as_table)
+    else {
+        return vec![format!("no [target.{WINDOWS_MSVC}] table")];
+    };
+    let Some(flags) = target.get("rustflags").and_then(toml::Value::as_array) else {
+        return vec!["no rustflags array".to_owned()];
+    };
+    let flags: Vec<&str> = flags.iter().filter_map(toml::Value::as_str).collect();
+    let static_crt = flags.contains(&"-Ctarget-feature=+crt-static")
+        || flags
+            .windows(2)
+            .any(|pair| pair == ["-C", "target-feature=+crt-static"]);
+    if static_crt {
+        Vec::new()
+    } else {
+        vec![format!(
+            "rustflags {flags:?} do not link the CRT statically"
+        )]
+    }
+}
+
+fn cargo_config() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.cargo/config.toml");
+    fs::read_to_string(path).unwrap()
+}
+
+#[test]
+fn the_windows_build_links_the_c_runtime_statically() {
+    assert_eq!(crt_static_problems(&cargo_config()), Vec::<String>::new());
+}
+
+#[test]
+fn a_cargo_config_with_the_static_runtime_in_either_spelling_passes_a_fixture() {
+    for flags in [
+        r#"["-C", "target-feature=+crt-static"]"#,
+        r#"["-Ctarget-feature=+crt-static"]"#,
+        r#"["-C", "link-arg=/X", "-C", "target-feature=+crt-static"]"#,
+    ] {
+        let config = format!("[target.{WINDOWS_MSVC}]\nrustflags = {flags}\n");
+        assert_eq!(
+            crt_static_problems(&config),
+            Vec::<String>::new(),
+            "{config}"
+        );
+    }
+}
+
+#[test]
+fn a_cargo_config_without_the_static_runtime_is_caught_in_a_fixture() {
+    let configs = [
+        // Only in a comment.
+        format!(
+            "[target.{WINDOWS_MSVC}]\n# rustflags = [\"-C\", \"target-feature=+crt-static\"]\n"
+        ),
+        format!("[target.{WINDOWS_MSVC}]\nrustflags = [] # -C target-feature=+crt-static\n"),
+        // For another target.
+        "[target.x86_64-pc-windows-gnu]\nrustflags = [\"-C\", \"target-feature=+crt-static\"]\n"
+            .to_owned(),
+        // The flag without its `-C`, the pair the wrong way round, or another feature.
+        format!("[target.{WINDOWS_MSVC}]\nrustflags = [\"target-feature=+crt-static\"]\n"),
+        format!("[target.{WINDOWS_MSVC}]\nrustflags = [\"target-feature=+crt-static\", \"-C\"]\n"),
+        format!("[target.{WINDOWS_MSVC}]\nrustflags = [\"-C\", \"target-feature=-crt-static\"]\n"),
+        // A string where an array belongs, and no rustflags at all.
+        format!("[target.{WINDOWS_MSVC}]\nrustflags = \"-C target-feature=+crt-static\"\n"),
+        format!("[target.{WINDOWS_MSVC}]\nlinker = \"link.exe\"\n"),
+        // Not TOML.
+        format!("[target.{WINDOWS_MSVC}\nrustflags = [\"-C\", \"target-feature=+crt-static\"]\n"),
+    ];
+    for config in &configs {
+        assert_eq!(crt_static_problems(config).len(), 1, "{config}");
+    }
 }
 
 #[test]
@@ -1409,4 +1535,151 @@ fn a_text_without_the_ijg_wording_or_the_libdeflate_notice_is_caught_in_a_fixtur
     assert!(has_libdeflate_notice(
         "<pre>Copyright 2016 Eric Biggers\nCopyright 2024 Google LLC</pre>"
     ));
+}
+
+// --- the worker sidecar, in the bundle build only ---------------------------------
+
+/// The worker the bundle ships beside the app, relative to `src-tauri/`.
+/// tauri-build copies it into the target folder on every build that sees
+/// it, and stops when the file is missing: so it lives in a config file
+/// that only the bundle build reads, and `cargo test` and `clippy` never do.
+const SIDECAR: &str = "binaries/lunaepix-worker";
+
+/// The command that builds the worker and stages it under `binaries/`
+/// before Tauri bundles (`crates/xtask`).
+const SIDECAR_BUILD: &str = "cargo run --locked -p lunaepix-xtask -- sidecar";
+
+fn read_text(name: &str) -> String {
+    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(name)).unwrap()
+}
+
+/// What is wrong with the bundle-only config: `bundle.externalBin` must be
+/// exactly `[SIDECAR]`, and `build.beforeBuildCommand` exactly the string
+/// [`SIDECAR_BUILD`].
+fn bundle_config_problems(text: &str) -> Vec<String> {
+    let config: Value = match serde_json::from_str(text) {
+        Ok(config) => config,
+        Err(error) => return vec![format!("not JSON: {error}")],
+    };
+    let mut problems = Vec::new();
+    match config.pointer("/bundle/externalBin") {
+        Some(Value::Array(list)) if list.len() == 1 && list[0] == SIDECAR => {}
+        Some(other) => problems.push(format!(
+            "bundle.externalBin: {other} is not [\"{SIDECAR}\"]"
+        )),
+        None => problems.push("bundle.externalBin: missing".to_owned()),
+    }
+    match config.pointer("/build/beforeBuildCommand") {
+        Some(Value::String(command)) if command == SIDECAR_BUILD => {}
+        Some(other) => problems.push(format!(
+            "build.beforeBuildCommand: {other} is not {SIDECAR_BUILD:?}"
+        )),
+        None => problems.push("build.beforeBuildCommand: missing".to_owned()),
+    }
+    problems
+}
+
+/// What is wrong with a config every build reads: it may not name a sidecar,
+/// or `cargo test` stops as soon as `src-tauri/binaries/` is empty.
+fn main_config_problems(config: &Value) -> Vec<String> {
+    match config.pointer("/bundle/externalBin") {
+        None => Vec::new(),
+        Some(found) => vec![format!(
+            "bundle.externalBin in a config every build reads: {found}"
+        )],
+    }
+}
+
+/// The platform configs Tauri merges into every build on that platform
+/// (`tauri.<platform>.conf.json`, `.json5`, `Tauri.<platform>.toml`).
+fn platform_configs(dir: &Path) -> Vec<String> {
+    let platforms = ["linux", "windows", "macos", "android", "ios"];
+    let names = platforms.iter().flat_map(|platform| {
+        [
+            format!("tauri.{platform}.conf.json"),
+            format!("tauri.{platform}.conf.json5"),
+            format!("Tauri.{platform}.toml"),
+        ]
+    });
+    names.filter(|name| dir.join(name).exists()).collect()
+}
+
+#[test]
+fn the_bundle_config_adds_the_worker_sidecar_and_builds_it_first() {
+    let text = read_text("tauri.bundle.conf.json");
+    assert_eq!(bundle_config_problems(&text), Vec::<String>::new());
+    // Nothing else: the rest comes from tauri.conf.json.
+    let config: Value = serde_json::from_str(&text).unwrap();
+    let mut keys: Vec<&str> = config
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["$schema", "build", "bundle"]);
+}
+
+#[test]
+fn a_bundle_config_without_the_sidecar_or_its_build_is_caught_in_a_fixture() {
+    let build = format!("\"build\": {{ \"beforeBuildCommand\": \"{SIDECAR_BUILD}\" }}");
+    let bundle = format!("\"bundle\": {{ \"externalBin\": [\"{SIDECAR}\"] }}");
+    let good = format!("{{ {build}, {bundle} }}");
+    assert_eq!(bundle_config_problems(&good), Vec::<String>::new());
+    let other_bin = "\"bundle\": { \"externalBin\": [\"binaries/lunaepix-app\"] }";
+    let extra_bin = format!("\"bundle\": {{ \"externalBin\": [\"{SIDECAR}\", \"binaries/x\"] }}");
+    let string_bin = format!("\"bundle\": {{ \"externalBin\": \"{SIDECAR}\" }}");
+    let other_build = "\"build\": { \"beforeBuildCommand\": \"cargo build --release\" }";
+    let object_build =
+        format!("\"build\": {{ \"beforeBuildCommand\": {{ \"script\": \"{SIDECAR_BUILD}\" }} }}");
+    for (fixture, needle) in [
+        (format!("{{ {build} }}"), "externalBin: missing"),
+        (format!("{{ {build}, {other_bin} }}"), "externalBin"),
+        (format!("{{ {build}, {extra_bin} }}"), "externalBin"),
+        (format!("{{ {build}, {string_bin} }}"), "externalBin"),
+        (format!("{{ {bundle} }}"), "beforeBuildCommand: missing"),
+        (
+            format!("{{ {other_build}, {bundle} }}"),
+            "beforeBuildCommand",
+        ),
+        (
+            format!("{{ {object_build}, {bundle} }}"),
+            "beforeBuildCommand",
+        ),
+        (format!("{{ {build}, {bundle}"), "not JSON"),
+    ] {
+        let problems = bundle_config_problems(&fixture);
+        assert!(names(&problems, needle), "{fixture}: {problems:?}");
+    }
+}
+
+#[test]
+fn the_main_config_has_no_external_bin_and_there_are_no_platform_configs() {
+    let config = read_json("tauri.conf.json");
+    assert_eq!(main_config_problems(&config), Vec::<String>::new());
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert_eq!(platform_configs(dir), Vec::<String>::new());
+}
+
+#[test]
+fn a_main_config_with_an_external_bin_is_caught_in_a_fixture() {
+    for external_bin in [
+        serde_json::json!([SIDECAR]),
+        serde_json::json!([]),
+        serde_json::json!(SIDECAR),
+    ] {
+        let fixture =
+            serde_json::json!({ "bundle": { "active": true, "externalBin": external_bin } });
+        let problems = main_config_problems(&fixture);
+        assert!(names(&problems, "externalBin"), "{fixture}: {problems:?}");
+    }
+    // A platform config beside the main one is found.
+    let dir = std::env::temp_dir().join(format!("lunaepix-config-test-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    assert_eq!(platform_configs(&dir), Vec::<String>::new());
+    fs::write(dir.join("tauri.linux.conf.json"), "{}").unwrap();
+    fs::write(dir.join("Tauri.windows.toml"), "").unwrap();
+    let found = platform_configs(&dir);
+    fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(found, ["tauri.linux.conf.json", "Tauri.windows.toml"]);
 }

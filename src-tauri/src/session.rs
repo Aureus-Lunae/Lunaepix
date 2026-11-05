@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use lunaepix_core::{FileResult, Job, Worker};
+use lunaepix_core::{FileResult, Job, Skip, StopHandle, Worker};
 use serde::Serialize;
 
-use crate::events::{Event, RunFinished, RunStarted, file_done};
+use crate::events::{Event, RunFinished, RunStarted, file_done, over_limit_row};
 
 /// Why a command did nothing. Serialised as a bare string: `"busy"`,
 /// `"no-output"` or `"open-failed"`.
@@ -173,22 +173,44 @@ impl Tally {
     }
 }
 
-/// Run `jobs` on this thread with the real runner and `worker`; see
-/// [`run_session_with`].
+/// Run `jobs` on this thread with the real runner and `worker`, until `stop`
+/// is used (the window closes); see [`run_session_with`].
 pub fn run_session(
     ticket: RunTicket,
     jobs: &[Job],
     worker: &Worker,
+    stop: &StopHandle,
     last_output: &Mutex<Option<PathBuf>>,
     emit: &mut impl FnMut(Event),
 ) {
     run_session_with(ticket, jobs, last_output, emit, |jobs, progress| {
-        lunaepix_core::run(jobs, worker, progress);
+        lunaepix_core::run_until_stopped(jobs, worker, stop, progress);
     });
+}
+
+/// `jobs` without the files the run limit left out, and how many those were.
+fn without_over_limit(jobs: &[Job]) -> (Vec<Job>, usize) {
+    let is_over = |job: &&Job| {
+        matches!(
+            job,
+            Job::Skip {
+                reason: Skip::OverRunLimit,
+                ..
+            }
+        )
+    };
+    let left_out = jobs.iter().filter(is_over).count();
+    let kept = jobs.iter().filter(|job| !is_over(job)).cloned().collect();
+    (kept, left_out)
 }
 
 /// Run `jobs` through `run` and tell the window: `run-started`, one
 /// `file-done` per finished file, then exactly one `run-finished`.
+///
+/// The files the run limit left out (a folder of 30,000 photos leaves out
+/// 28,000) are not handed to `run`: after the other files, one `file-done`
+/// row stands for all of them ([`over_limit_row`]), and `run-started`
+/// counts it as one.
 ///
 /// Before `run-finished` goes out, the output folder is stored in
 /// `last_output`, so the window may open it as soon as it hears the event.
@@ -203,14 +225,19 @@ pub fn run_session_with(
     emit: &mut impl FnMut(Event),
     run: impl FnOnce(&[Job], &mut dyn FnMut(usize, &Path, &FileResult)),
 ) {
-    emit(Event::RunStarted(RunStarted { total: jobs.len() }));
+    let (jobs, left_out) = without_over_limit(jobs);
+    let total = jobs.len() + usize::from(left_out > 0);
+    emit(Event::RunStarted(RunStarted { total }));
     let mut tally = Tally::default();
     // Caught so that the window always hears the end of a run it saw start.
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-        run(jobs, &mut |index, src, result| {
+        run(&jobs, &mut |index, src, result| {
             tally.record(jobs.get(index), result);
             emit(Event::FileDone(file_done(index, src, result)));
         });
+        if left_out > 0 {
+            emit(Event::FileDone(over_limit_row(jobs.len(), left_out)));
+        }
     }));
     *last_output.lock().unwrap_or_else(PoisonError::into_inner) =
         tally.output_folder().map(Path::to_path_buf);
@@ -229,11 +256,13 @@ mod tests {
     use std::fs;
     use std::io;
 
-    use lunaepix_core::{OptimizeError, Outcome, RunError, Skip, plan_files, plan_folder};
+    use lunaepix_core::{
+        MAX_RUN_FILES, OptimizeError, Outcome, RunError, Skip, StopHandle, plan_files, plan_folder,
+    };
     use tempfile::TempDir;
 
     use super::*;
-    use crate::events::Status;
+    use crate::events::{FileDone, Status};
 
     fn optimized(before: u64, after: u64) -> FileResult {
         FileResult::Optimized(Outcome {
@@ -631,12 +660,19 @@ mod tests {
         let last_output = Mutex::new(Some(PathBuf::from("/from/an/earlier/run")));
         let mut events = Vec::new();
         let mut held_at_finish = None;
-        run_session(ticket, &jobs, &worker, &last_output, &mut |event| {
-            if let Event::RunFinished(_) = event {
-                held_at_finish = Some(guard.try_start().is_none());
-            }
-            events.push(event);
-        });
+        run_session(
+            ticket,
+            &jobs,
+            &worker,
+            &StopHandle::new(),
+            &last_output,
+            &mut |event| {
+                if let Event::RunFinished(_) = event {
+                    held_at_finish = Some(guard.try_start().is_none());
+                }
+                events.push(event);
+            },
+        );
 
         let names: Vec<&str> = events.iter().map(Event::name).collect();
         assert_eq!(
@@ -702,11 +738,18 @@ mod tests {
         let worker = Worker::new("/nonexistent/lunaepix-worker-for-tests");
         let last_output = Mutex::new(None);
         let mut busy_during_file = None;
-        run_session(ticket, &jobs, &worker, &last_output, &mut |event| {
-            if let Event::FileDone(_) = event {
-                busy_during_file = Some(guard.try_start().is_none());
-            }
-        });
+        run_session(
+            ticket,
+            &jobs,
+            &worker,
+            &StopHandle::new(),
+            &last_output,
+            &mut |event| {
+                if let Event::FileDone(_) = event {
+                    busy_during_file = Some(guard.try_start().is_none());
+                }
+            },
+        );
         assert_eq!(busy_during_file, Some(true));
     }
 
@@ -803,6 +846,7 @@ mod tests {
                 guard.try_start().unwrap(),
                 &jobs,
                 &worker,
+                &StopHandle::new(),
                 &last_output,
                 &mut |event| {
                     let is_file = matches!(event, Event::FileDone(_));
@@ -816,6 +860,224 @@ mod tests {
         assert!(outcome.is_err());
         assert_eq!(count_finished(&events), 1);
         assert_eq!(events.last().map(Event::name), Some("run-finished"));
+        assert!(guard.try_start().is_some());
+    }
+
+    // --- the run limit ------------------------------------------------------
+
+    /// A folder holding `pngs` PNG files named `img0000.png` and on, plus
+    /// `extra` files; the planner does not read their bytes.
+    fn folder_with_pngs(pngs: usize, extra: &[&str]) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        for index in 0..pngs {
+            fs::write(dir.path().join(format!("img{index:04}.png")), b"png").unwrap();
+        }
+        for name in extra {
+            fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        dir
+    }
+
+    /// The events of a session over `jobs`, and the jobs its runner was
+    /// given. The runner is a double that reports every job as written.
+    fn session_over(jobs: &[Job]) -> (Vec<Event>, Vec<Job>) {
+        let guard = RunGuard::new();
+        let last_output = Mutex::new(None);
+        let mut events = Vec::new();
+        let mut given = Vec::new();
+        run_session_with(
+            guard.try_start().unwrap(),
+            jobs,
+            &last_output,
+            &mut |event| events.push(event),
+            |jobs, progress| {
+                given = jobs.to_vec();
+                for (index, job) in jobs.iter().enumerate() {
+                    let (src, result) = match job {
+                        Job::Optimize { src, .. } => (src, written()),
+                        Job::Skip { src, reason } => (src, FileResult::Skipped(*reason)),
+                    };
+                    progress(index, src, &result);
+                }
+            },
+        );
+        (events, given)
+    }
+
+    fn rows(events: &[Event]) -> Vec<&FileDone> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::FileDone(done) => Some(done),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn limit_rows<'a>(rows: &[&'a FileDone]) -> Vec<&'a FileDone> {
+        rows.iter()
+            .copied()
+            .filter(|row| {
+                row.reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("over the 2000-file limit"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn files_left_out_by_the_run_limit_collapse_into_one_row_at_the_end() {
+        let dir = folder_with_pngs(MAX_RUN_FILES + 3, &[]);
+        let (events, given) = session_over(&plan_folder(dir.path()));
+
+        assert_eq!(
+            events[0],
+            Event::RunStarted(RunStarted {
+                total: MAX_RUN_FILES + 1
+            })
+        );
+        let rows = rows(&events);
+        assert_eq!(rows.len(), MAX_RUN_FILES + 1);
+        let last = rows.last().unwrap();
+        assert_eq!(last.index, MAX_RUN_FILES);
+        assert_eq!(last.status, Status::Skipped);
+        assert_eq!(last.name, "(over the limit)");
+        let named = rows.iter().filter(|row| row.name == "(over the limit)");
+        assert_eq!(
+            named.count(),
+            1,
+            "only the limit row carries the placeholder"
+        );
+        assert_eq!(
+            last.reason.as_deref(),
+            Some("3 more files not optimised: over the 2000-file limit")
+        );
+        assert_eq!(limit_rows(&rows).len(), 1);
+        // The runner never sees the files left out.
+        assert_eq!(given.len(), MAX_RUN_FILES);
+        assert!(given.iter().all(|job| matches!(job, Job::Optimize { .. })));
+        assert_eq!(count_finished(&events), 1);
+    }
+
+    #[test]
+    fn one_file_left_out_by_the_run_limit_is_counted_in_the_singular() {
+        let dir = folder_with_pngs(MAX_RUN_FILES + 1, &[]);
+        let (events, _) = session_over(&plan_folder(dir.path()));
+
+        let rows = rows(&events);
+        assert_eq!(
+            rows.last().unwrap().reason.as_deref(),
+            Some("1 more file not optimised: over the 2000-file limit")
+        );
+    }
+
+    #[test]
+    fn a_run_of_exactly_the_file_limit_has_no_row_for_files_left_out() {
+        let dir = folder_with_pngs(MAX_RUN_FILES, &[]);
+        let (events, given) = session_over(&plan_folder(dir.path()));
+
+        assert_eq!(
+            events[0],
+            Event::RunStarted(RunStarted {
+                total: MAX_RUN_FILES
+            })
+        );
+        let rows = rows(&events);
+        assert_eq!(rows.len(), MAX_RUN_FILES);
+        assert!(limit_rows(&rows).is_empty());
+        assert!(rows.iter().all(|row| row.status == Status::Done));
+        assert_eq!(given.len(), MAX_RUN_FILES);
+    }
+
+    #[test]
+    fn files_skipped_for_another_reason_keep_a_row_each_beside_the_limit_row() {
+        let dir = folder_with_pngs(MAX_RUN_FILES + 2, &["a.gif", "notes.txt"]);
+        let (events, _) = session_over(&plan_folder(dir.path()));
+
+        let rows = rows(&events);
+        // 2000 optimised, two unsupported files, one row for the two left out.
+        assert_eq!(rows.len(), MAX_RUN_FILES + 3);
+        let unsupported: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.reason.as_deref() == Some("Not a PNG, JPG or SVG file"))
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(unsupported, ["a.gif", "notes.txt"]);
+        let limit = limit_rows(&rows);
+        assert_eq!(limit.len(), 1);
+        assert_eq!(
+            limit[0].reason.as_deref(),
+            Some("2 more files not optimised: over the 2000-file limit")
+        );
+        // Every row has its own index, in order, and the total matches.
+        let indexes: Vec<usize> = rows.iter().map(|row| row.index).collect();
+        assert_eq!(indexes, (0..rows.len()).collect::<Vec<_>>());
+        assert_eq!(
+            events[0],
+            Event::RunStarted(RunStarted { total: rows.len() })
+        );
+    }
+
+    // --- the window closes during a run -------------------------------------
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stopping_a_session_as_the_window_closes_kills_its_worker_and_finishes_once() {
+        use std::time::{Duration, Instant};
+
+        let dir = TempDir::new().unwrap();
+        for name in ["a.png", "b.png"] {
+            fs::write(dir.path().join(name), b"png").unwrap();
+        }
+        let jobs = plan_folder(dir.path());
+        let pids = dir.path().join("pids");
+        // A worker that hangs; every one started appends its PID first.
+        let worker = Worker {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".into(),
+                format!("echo $$ >> '{}'; exec sleep 60", pids.display()).into(),
+                "fake-worker".into(),
+            ],
+            timeout: Duration::from_secs(600),
+        };
+        let guard = RunGuard::new();
+        let stop = StopHandle::new();
+        let last_output = Mutex::new(None);
+        let events = Mutex::new(Vec::new());
+
+        std::thread::scope(|scope| {
+            let running = scope.spawn(|| {
+                run_session(
+                    guard.try_start().unwrap(),
+                    &jobs,
+                    &worker,
+                    &stop,
+                    &last_output,
+                    &mut |event| events.lock().unwrap().push(event),
+                );
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !pids.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // What the close handler does.
+            stop.stop();
+            running.join().unwrap();
+        });
+
+        let started = fs::read_to_string(&pids).unwrap();
+        assert_eq!(started.lines().count(), 1, "b.png must not start");
+        let pid = started.trim();
+        assert!(
+            !Path::new("/proc").join(pid).exists(),
+            "worker {pid} runs on"
+        );
+        let events = events.into_inner().unwrap();
+        assert_eq!(count_finished(&events), 1);
+        let rows = rows(&events);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reason.as_deref(), Some("the run was stopped"));
         assert!(guard.try_start().is_some());
     }
 }

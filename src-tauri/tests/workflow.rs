@@ -449,6 +449,59 @@ fn setting_problems(text: &str) -> Vec<String> {
     })
 }
 
+// ---- the bundle build ----
+
+/// The config file that adds the worker sidecar; only the bundle build reads it.
+const BUNDLE_CONFIG: &str = "src-tauri/tauri.bundle.conf.json";
+
+/// Whether the words of one command line pass `--config BUNDLE_CONFIG` (or
+/// `--config=BUNDLE_CONFIG`).
+fn passes_bundle_config(words: &[&str]) -> bool {
+    let joined = format!("--config={BUNDLE_CONFIG}");
+    words.contains(&joined.as_str())
+        || words
+            .windows(2)
+            .any(|pair| pair == ["--config", BUNDLE_CONFIG])
+}
+
+/// The build job runs `cargo tauri build`, and every such line in it, outside
+/// shell comments, passes the bundle config. Without it the installer ships
+/// without the worker sidecar, and the app falls back to its own, slower
+/// worker mode.
+fn bundle_build_problems(text: &str) -> Vec<String> {
+    on_tree(text, |doc| {
+        let Some((_, build)) = jobs(doc).into_iter().find(|(name, _)| name == "build") else {
+            return vec!["no build job".to_owned()];
+        };
+        let scripts = steps_of(build)
+            .into_iter()
+            .filter_map(|step| scalar(&step["run"]))
+            .map(|script| without_comments(&script))
+            .collect::<Vec<_>>();
+        let lines = scripts.iter().flat_map(|script| script.lines());
+        let words = lines.map(|line| {
+            line.split_whitespace()
+                .map(|word| word.trim_matches(|c| c == '\'' || c == '"'))
+                .collect::<Vec<_>>()
+        });
+        let builds = words
+            .filter(|words| words.windows(3).any(|w| w == ["cargo", "tauri", "build"]))
+            .collect::<Vec<_>>();
+        if builds.is_empty() {
+            return vec!["the build job has no cargo tauri build".to_owned()];
+        }
+        let plain = builds.iter().filter(|words| !passes_bundle_config(words));
+        plain
+            .map(|words| {
+                format!(
+                    "a bundle build without --config {BUNDLE_CONFIG}: {}",
+                    words.join(" ")
+                )
+            })
+            .collect()
+    })
+}
+
 const REQUIRED_COMMANDS: &[&str] = &[
     "cargo fmt --all --check",
     "cargo clippy --workspace --all-targets -- -D warnings",
@@ -460,6 +513,10 @@ const REQUIRED_COMMANDS: &[&str] = &[
 // ---- fixtures ----
 
 const PIN: &str = "11bd71901bbe5b1630ceea73d27597364c9af683";
+
+/// The build job's bundle step in `good()`.
+const BUILD_STEP: &str =
+    "      - run: cargo tauri build --config src-tauri/tauri.bundle.conf.json\n";
 
 const UPLOAD_STEP: &str = "      - uses: actions/upload-artifact@PIN # v7
         with:
@@ -502,7 +559,7 @@ jobs:
     needs: test
     runs-on: windows-latest
     steps:
-      - run: cargo tauri build
+      - run: cargo tauri build --config src-tauri/tauri.bundle.conf.json
 ";
     format!("{base}{UPLOAD_STEP}").replace("PIN", PIN)
 }
@@ -539,6 +596,7 @@ fn every_check(text: &str) -> Vec<(&'static str, Vec<String>)> {
         ),
         ("structure_problems", structure_problems(text)),
         ("setting_problems", setting_problems(text)),
+        ("bundle_build_problems", bundle_build_problems(text)),
     ]
 }
 
@@ -1041,7 +1099,7 @@ fn a_missing_concurrency_or_a_group_without_the_workflow_name_is_caught_in_a_fix
 #[test]
 #[rustfmt::skip]
 fn a_build_job_that_restores_a_cache_is_caught_in_a_fixture() {
-    let build = "      - run: cargo tauri build\n";
+    let build = BUILD_STEP;
     for cache in ["Swatinem/rust-cache@PIN # v2", "actions/cache@PIN # v4", "actions/cache/restore@v4", "actions/cache/save@PIN # v4"] {
         let text = with(build, &format!("{build}      - uses: {cache}\n"));
         assert_problem(&structure_problems(&text), "the build job restores a cache", cache);
@@ -1145,4 +1203,47 @@ fn an_upload_that_ignores_missing_files_is_caught_in_a_fixture() {
     // The action's default is to warn, so an upload that sets nothing is wrong.
     assert_eq!(setting_problems(&with("          if-no-files-found: error\n", "")).len(), 1);
     assert_eq!(setting_problems(&with(UPLOAD_STEP, "")).len(), 1);
+}
+
+// ---- the bundle build ----
+
+#[test]
+#[rustfmt::skip]
+fn a_bundle_build_with_the_config_file_passes_a_fixture() {
+    assert_clean(bundle_build_problems(&good()));
+    for step in [
+        "      - run: cargo tauri build --config=src-tauri/tauri.bundle.conf.json\n",
+        "      - run: cargo tauri build --verbose --config 'src-tauri/tauri.bundle.conf.json'\n",
+        "      - run: |\n          cargo --version\n          cargo tauri build --config \"src-tauri/tauri.bundle.conf.json\"\n",
+    ] {
+        assert_clean(bundle_build_problems(&with(BUILD_STEP, step)));
+    }
+}
+
+#[test]
+#[rustfmt::skip]
+fn a_bundle_build_without_the_config_file_is_caught_in_a_fixture() {
+    let plain = "      - run: cargo tauri build\n";
+    let without = "a bundle build without --config";
+    let test_step = "      - run: cargo test --workspace\n";
+    let texts = [
+        // The plain build.
+        with(BUILD_STEP, plain),
+        // The flag only in a shell comment.
+        with(BUILD_STEP, "      - run: |\n          cargo tauri build\n          # --config src-tauri/tauri.bundle.conf.json\n"),
+        with(BUILD_STEP, "      - run: |\n          cargo tauri build # --config src-tauri/tauri.bundle.conf.json\n"),
+        // Another file, or the flag without its file.
+        with(BUILD_STEP, "      - run: cargo tauri build --config src-tauri/tauri.conf.json\n"),
+        with(BUILD_STEP, "      - run: cargo tauri build --config\n"),
+        // The flag only in the test job.
+        with(BUILD_STEP, plain).replacen(test_step, &format!("{test_step}{BUILD_STEP}"), 1),
+        // A second, plain build after the right one.
+        add_step("      - run: cargo tauri build"),
+    ];
+    assert_all_caught(bundle_build_problems, without, &texts);
+    // No bundle build in the build job at all, and no build job.
+    let none = with(BUILD_STEP, "      - run: cargo build --release\n");
+    assert_problem(&bundle_build_problems(&none), "the build job has no cargo tauri build", &none);
+    let no_build = good().replacen("  build:\n", "  installer:\n", 1);
+    assert_problem(&bundle_build_problems(&no_build), "no build job", &no_build);
 }

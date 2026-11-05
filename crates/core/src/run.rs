@@ -10,9 +10,8 @@ use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,8 +30,9 @@ const PIPE_GRACE: Duration = Duration::from_secs(2);
 /// The program the runner starts for each file, as
 /// `<program> <args...> <src> <dest>`.
 ///
-/// The CLI and the app use [`Worker::current_exe`]: their own binary, in
-/// worker mode. Tests put another program in its place.
+/// The CLI uses [`Worker::current_exe`]: its own binary, in worker mode. A
+/// release app uses the `lunaepix-worker` sidecar beside it, and falls back
+/// to its own binary. Tests put another program in its place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worker {
     pub program: PathBuf,
@@ -94,6 +94,10 @@ pub enum RunError {
     /// The worker program could not be started.
     #[error("{path}: the optimiser could not be started: {cause}", path = path.display())]
     Spawn { path: PathBuf, cause: io::Error },
+    /// The run was stopped (the window closed) while this file was being
+    /// optimised; its worker was killed. No output was written.
+    #[error("{path}: the run was stopped", path = path.display())]
+    Stopped { path: PathBuf },
 }
 
 impl RunError {
@@ -113,6 +117,7 @@ impl RunError {
             RunError::Spawn { cause, .. } => {
                 format!("the optimiser could not be started: {cause}")
             }
+            RunError::Stopped { .. } => "the run was stopped".to_owned(),
         }
     }
 }
@@ -181,15 +186,31 @@ fn signal_name(signal: i32) -> Option<&'static str> {
 pub fn run(
     jobs: &[Job],
     worker: &Worker,
+    on_progress: impl FnMut(usize, &Path, &FileResult),
+) -> Vec<FileResult> {
+    run_until_stopped(jobs, worker, &StopHandle::new(), on_progress)
+}
+
+/// [`run`], until `stop` is used. From then on no worker is started, and no
+/// further job is reported: the run returns at once with the results so
+/// far, the last being [`RunError::Stopped`] for the file whose worker was
+/// killed (if one was running).
+pub fn run_until_stopped(
+    jobs: &[Job],
+    worker: &Worker,
+    stop: &StopHandle,
     mut on_progress: impl FnMut(usize, &Path, &FileResult),
 ) -> Vec<FileResult> {
     let mut results = Vec::with_capacity(jobs.len());
     for (index, job) in jobs.iter().enumerate() {
+        if stop.is_stopped() {
+            break;
+        }
         let (src, result) = match job {
             Job::Skip { src, reason } => (src, FileResult::Skipped(*reason)),
             Job::Optimize { src, dest } => (
                 src,
-                match run_worker(worker, src, dest) {
+                match run_worker(worker, src, dest, stop) {
                     Ok(outcome) => FileResult::Optimized(outcome),
                     Err(error) => FileResult::Failed(error),
                 },
@@ -201,42 +222,123 @@ pub fn run(
     results
 }
 
+/// Stops a run from another thread: the window's close handler uses it.
+/// Clones share one state.
+#[derive(Debug, Clone, Default)]
+pub struct StopHandle(Arc<StopState>);
+
+#[derive(Debug, Default)]
+struct StopState {
+    stopped: AtomicBool,
+    /// The worker running now, if any. Its runner and [`StopHandle::stop`]
+    /// take turns on it; the lock is held only for a call on the handle.
+    active: Mutex<Option<Child>>,
+}
+
+impl StopHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stop the run: no worker starts after this, and the one running now is
+    /// killed through its own handle and reaped before this returns. Harmless
+    /// to call twice, or when nothing runs.
+    pub fn stop(&self) {
+        self.0.stopped.store(true, Ordering::SeqCst);
+        if let Some(child) = self.active().as_mut() {
+            kill_and_reap(child);
+        }
+    }
+
+    /// Whether [`stop`](Self::stop) has been called.
+    pub fn is_stopped(&self) -> bool {
+        self.0.stopped.load(Ordering::SeqCst)
+    }
+
+    fn active(&self) -> MutexGuard<'_, Option<Child>> {
+        self.0.active.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Run `call` on the active worker; `None` if there is none.
+    fn with_active<T>(&self, call: impl FnOnce(&mut Child) -> T) -> Option<T> {
+        self.active().as_mut().map(call)
+    }
+}
+
+/// Windows' `CREATE_NO_WINDOW` process creation flag.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// On Windows, the worker is a console program: without this flag, every
+/// file would flash a console window when the app (a window program)
+/// starts its worker. Elsewhere the command is left as it is.
+fn without_console_window(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 /// Optimise one file in a worker process.
 ///
 /// The worker gets no shell and no stdin; the paths are separate arguments.
 /// Its stdout and stderr are read on two threads, each up to
 /// [`MAX_WORKER_OUTPUT_BYTES`]; if either goes past that, or the timeout
-/// passes, the worker is killed through its own handle and reaped.
-fn run_worker(worker: &Worker, src: &Path, dest: &Path) -> Result<Outcome, RunError> {
+/// passes, the worker is killed through its own handle and reaped. While it
+/// runs, the worker sits in `stop`, so that a stop from another thread can
+/// kill it.
+fn run_worker(
+    worker: &Worker,
+    src: &Path,
+    dest: &Path,
+    stop: &StopHandle,
+) -> Result<Outcome, RunError> {
     let spawn_error = |cause| RunError::Spawn {
         path: src.to_path_buf(),
         cause,
     };
-    let mut child = Command::new(&worker.program)
-        .args(&worker.args)
-        .arg(src)
-        .arg(dest)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(spawn_error)?;
-
-    let overflow = Arc::new(AtomicBool::new(false));
-    let readers = match (child.stdout.take(), child.stderr.take()) {
-        (Some(stdout), Some(stderr)) => read_capped(stdout, &overflow)
-            .and_then(|out| Ok((out, read_capped(stderr, &overflow)?))),
-        _ => Err(io::Error::other("the worker's output pipes are missing")),
+    let stopped = || RunError::Stopped {
+        path: src.to_path_buf(),
     };
-    let (stdout, stderr) = match readers {
-        Ok(readers) => readers,
-        Err(cause) => {
-            stop(&mut child);
-            return Err(spawn_error(cause));
+    let (pipes, overflow) = {
+        // The flag is checked, and the worker started and stored, under the
+        // lock that `stop` takes after setting the flag: either `stop` sees
+        // the worker, or the worker is never started.
+        let mut active = stop.active();
+        if stop.is_stopped() {
+            return Err(stopped());
         }
+        let mut command = Command::new(&worker.program);
+        command
+            .args(&worker.args)
+            .arg(src)
+            .arg(dest)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = without_console_window(&mut command)
+            .spawn()
+            .map_err(spawn_error)?;
+        let overflow = Arc::new(AtomicBool::new(false));
+        let pipes = match (child.stdout.take(), child.stderr.take()) {
+            (Some(stdout), Some(stderr)) => read_capped(stdout, &overflow)
+                .and_then(|out| Ok((out, read_capped(stderr, &overflow)?))),
+            _ => Err(io::Error::other("the worker's output pipes are missing")),
+        };
+        if pipes.is_err() {
+            kill_and_reap(&mut child);
+        } else {
+            *active = Some(child);
+        }
+        (pipes, overflow)
     };
+    let (stdout, stderr) = pipes.map_err(spawn_error)?;
 
-    let ended = wait(&mut child, worker.timeout, &overflow);
+    let ended = wait(stop, worker.timeout, &overflow);
+    // Reaped by now; the next file starts with an empty slot.
+    stop.active().take();
     // A reader sets the overflow flag before it sends, so once both have
     // been received the flag is final.
     let stdout = stdout.recv_timeout(PIPE_GRACE).ok();
@@ -247,11 +349,15 @@ fn run_worker(worker: &Worker, src: &Path, dest: &Path) -> Result<Outcome, RunEr
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
     };
 
-    if let Ended::TimedOut = ended {
-        return Err(RunError::TimedOut {
-            path: src.to_path_buf(),
-            limit: worker.timeout,
-        });
+    match ended {
+        Ended::Stopped => return Err(stopped()),
+        Ended::TimedOut => {
+            return Err(RunError::TimedOut {
+                path: src.to_path_buf(),
+                limit: worker.timeout,
+            });
+        }
+        Ended::Exited(_) | Ended::Unknown => {}
     }
     // Checked before the exit status: a worker whose pipe was closed on it
     // may have died of that (`SIGPIPE`).
@@ -275,36 +381,61 @@ fn run_worker(worker: &Worker, src: &Path, dest: &Path) -> Result<Outcome, RunEr
 }
 
 /// How the wait for a worker ended.
+#[derive(Debug)]
 enum Ended {
     Exited(ExitStatus),
     /// Killed and reaped after the timeout.
     TimedOut,
+    /// Killed and reaped by [`StopHandle::stop`].
+    Stopped,
     /// Waiting failed, or the output overflowed (told apart by its flag);
     /// the worker was killed and reaped.
     Unknown,
 }
 
-/// Wait for `child` to exit, polling, and stop it if it runs past `timeout`
-/// or its output overflows.
-fn wait(child: &mut Child, timeout: Duration, overflow: &AtomicBool) -> Ended {
+/// Wait for the worker in `stop` to exit, polling, and kill it if it runs
+/// past `timeout` or its output overflows. A stop from another thread has
+/// killed and reaped it already, and wins over whatever status it left.
+fn wait(stop: &StopHandle, timeout: Duration, overflow: &AtomicBool) -> Ended {
+    wait_with(stop, timeout, overflow, Child::try_wait)
+}
+
+/// [`wait`], with the poll of the worker given: the tests use it to put a
+/// stop between the flag check and the poll, which a real run reaches only
+/// by a race.
+fn wait_with(
+    stop: &StopHandle,
+    timeout: Duration,
+    overflow: &AtomicBool,
+    mut poll: impl FnMut(&mut Child) -> io::Result<Option<ExitStatus>>,
+) -> Ended {
     let started = Instant::now();
     let mut pause = Duration::from_millis(1);
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ended::Exited(status),
-            Ok(None) => {}
-            Err(_) => {
-                stop(child);
+        if stop.is_stopped() {
+            // `stop()` has killed and reaped it already; this makes sure
+            // that a stopped wait never leaves a worker behind.
+            stop.with_active(kill_and_reap);
+            return Ended::Stopped;
+        }
+        match stop.with_active(&mut poll) {
+            // A stop that came after the check above killed the worker
+            // itself: the status it left is that kill, not a crash.
+            Some(Ok(Some(_))) if stop.is_stopped() => return Ended::Stopped,
+            Some(Ok(Some(status))) => return Ended::Exited(status),
+            Some(Ok(None)) => {}
+            Some(Err(_)) | None => {
+                stop.with_active(kill_and_reap);
                 return Ended::Unknown;
             }
         }
         if overflow.load(Ordering::SeqCst) {
-            stop(child);
+            stop.with_active(kill_and_reap);
             return Ended::Unknown;
         }
         let elapsed = started.elapsed();
         if elapsed >= timeout {
-            stop(child);
+            stop.with_active(kill_and_reap);
             return Ended::TimedOut;
         }
         thread::sleep(pause.min(timeout - elapsed));
@@ -314,7 +445,7 @@ fn wait(child: &mut Child, timeout: Duration, overflow: &AtomicBool) -> Ended {
 
 /// Kill this one child, through its handle, and reap it. Either step may
 /// fail only because it has already exited, which is what is wanted.
-fn stop(child: &mut Child) {
+fn kill_and_reap(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -360,6 +491,198 @@ fn signal_of(_status: ExitStatus) -> Option<i32> {
 mod tests {
     use super::*;
 
+    /// The worker's start and its wait, driven directly: the stop paths that
+    /// a whole run can reach only through a timing race.
+    #[cfg(unix)]
+    mod stop_paths {
+        use std::fs;
+        use std::os::unix::process::ExitStatusExt;
+
+        use tempfile::TempDir;
+
+        use super::*;
+
+        const LONG: Duration = Duration::from_secs(30);
+
+        fn sh(script: &str) -> Command {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", script]);
+            command
+        }
+
+        /// A worker that writes its PID to `pid_file`, and nothing else.
+        fn pid_worker(pid_file: &Path) -> Worker {
+            let script = format!("echo $$ > '{}'", pid_file.display());
+            Worker {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into(), "worker".into()],
+                timeout: LONG,
+            }
+        }
+
+        /// A worker whose program does not exist, so it can never start.
+        fn missing_worker() -> Worker {
+            Worker::new("/nonexistent/lunaepix-worker")
+        }
+
+        /// A handle with `script` running in its slot.
+        fn running(script: &str) -> StopHandle {
+            let stop = StopHandle::new();
+            *stop.active() = Some(sh(script).spawn().unwrap());
+            stop
+        }
+
+        /// Sets the flag only, as the first step of `stop()` does, without
+        /// the kill that follows it.
+        fn flag_only(stop: &StopHandle) {
+            stop.0.stopped.store(true, Ordering::SeqCst);
+        }
+
+        /// The status of the child in the slot, once it has been reaped.
+        fn reaped_status(stop: &StopHandle) -> Option<ExitStatus> {
+            stop.with_active(|child| child.try_wait().unwrap())
+                .flatten()
+        }
+
+        #[test]
+        fn a_stopped_handle_does_not_even_try_to_start_the_worker() {
+            let tmp = TempDir::new().unwrap();
+            let stop = StopHandle::new();
+            stop.stop();
+            let (src, dest) = (tmp.path().join("a.png"), tmp.path().join("b.png"));
+
+            // A program that cannot start: only the check under the lock can
+            // turn this into `Stopped`. Without it the spawn is tried and
+            // fails, which is `Spawn`, every time.
+            let result = run_worker(&missing_worker(), &src, &dest, &stop);
+
+            assert!(
+                matches!(result, Err(RunError::Stopped { .. })),
+                "{result:?}"
+            );
+        }
+
+        #[test]
+        fn a_fresh_handle_does_try_to_start_a_missing_worker() {
+            let tmp = TempDir::new().unwrap();
+            let (src, dest) = (tmp.path().join("a.png"), tmp.path().join("b.png"));
+
+            let result = run_worker(&missing_worker(), &src, &dest, &StopHandle::new());
+
+            assert!(matches!(result, Err(RunError::Spawn { .. })), "{result:?}");
+        }
+
+        #[test]
+        fn a_fresh_handle_does_start_the_worker() {
+            let tmp = TempDir::new().unwrap();
+            let pid = tmp.path().join("pid");
+            let (src, dest) = (tmp.path().join("a.png"), tmp.path().join("b.png"));
+
+            let result = run_worker(&pid_worker(&pid), &src, &dest, &StopHandle::new());
+
+            assert!(
+                !matches!(result, Err(RunError::Stopped { .. })),
+                "{result:?}"
+            );
+            let written = fs::read_to_string(&pid).expect("the worker ran");
+            assert!(written.trim().parse::<u32>().is_ok(), "{written:?}");
+        }
+
+        #[test]
+        fn a_stopped_wait_kills_and_reaps_a_worker_that_is_still_running() {
+            let stop = running("exec sleep 30");
+            flag_only(&stop);
+
+            let ended = wait(&stop, LONG, &AtomicBool::new(false));
+
+            assert!(matches!(ended, Ended::Stopped), "{ended:?}");
+            let status = reaped_status(&stop).expect("killed and reaped");
+            assert_eq!(status.signal(), Some(9));
+        }
+
+        #[test]
+        fn a_wait_that_is_not_stopped_lets_the_worker_exit_on_its_own() {
+            let stop = running("exit 0");
+
+            let ended = wait(&stop, LONG, &AtomicBool::new(false));
+
+            let Ended::Exited(status) = ended else {
+                panic!("expected an exit, got {ended:?}");
+            };
+            assert_eq!((status.code(), status.signal()), (Some(0), None));
+        }
+
+        #[test]
+        fn an_exit_seen_after_a_stop_counts_as_stopped() {
+            let stop = running("exec sleep 30");
+
+            // What `stop()` does in the race: it lands after the loop's
+            // flag check and kills the worker before `try_wait` looks.
+            let ended = wait_with(&stop, LONG, &AtomicBool::new(false), |child| {
+                kill_and_reap(child);
+                flag_only(&stop);
+                child.try_wait()
+            });
+
+            assert!(matches!(ended, Ended::Stopped), "{ended:?}");
+        }
+
+        #[test]
+        fn an_exit_seen_without_a_stop_counts_as_an_exit() {
+            let stop = running("exec sleep 30");
+
+            // The same kill without a stop, as the kernel's OOM killer would.
+            let ended = wait_with(&stop, LONG, &AtomicBool::new(false), |child| {
+                kill_and_reap(child);
+                child.try_wait()
+            });
+
+            let Ended::Exited(status) = ended else {
+                panic!("expected an exit, got {ended:?}");
+            };
+            assert_eq!(status.signal(), Some(9));
+        }
+
+        #[test]
+        fn a_poll_error_kills_the_worker_and_ends_unknown() {
+            let stop = running("exec sleep 30");
+
+            let ended = wait_with(&stop, LONG, &AtomicBool::new(false), |_| {
+                Err(io::Error::other("the poll failed"))
+            });
+
+            assert!(matches!(ended, Ended::Unknown), "{ended:?}");
+            let status = reaped_status(&stop).expect("killed and reaped");
+            assert_eq!(status.signal(), Some(9));
+        }
+
+        #[test]
+        fn a_wait_with_no_worker_in_the_slot_ends_unknown() {
+            let ended = wait(&StopHandle::new(), LONG, &AtomicBool::new(false));
+            assert!(matches!(ended, Ended::Unknown), "{ended:?}");
+        }
+    }
+
+    /// Only Windows CI runs this. std has no getter for the creation flags,
+    /// so the test pins the constant to the Windows SDK's value and shows
+    /// that a command with the flag still starts and hands back its output;
+    /// whether a window flashes only the manual Windows test can show.
+    #[cfg(windows)]
+    #[test]
+    fn the_worker_is_started_without_a_console_window() {
+        assert_eq!(
+            CREATE_NO_WINDOW,
+            windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
+        );
+        let mut command = Command::new("cmd");
+        command
+            .args(["/C", "echo", "started"])
+            .stdout(Stdio::piped());
+        let output = without_console_window(&mut command).output().unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("started"));
+    }
+
     #[test]
     fn names_the_signals_a_crash_usually_ends_in() {
         assert_eq!(
@@ -396,6 +719,9 @@ mod tests {
                 path: PathBuf::from("dir/d.jpg"),
                 cause: io::Error::other("no such program"),
             },
+            RunError::Stopped {
+                path: PathBuf::from("dir/e.svg"),
+            },
         ]
     }
 
@@ -409,6 +735,7 @@ mod tests {
                 "the optimiser crashed on this file (killed by signal 6, SIGABRT, for example a stack overflow)",
                 "the optimiser timed out after 600s and was stopped",
                 "the optimiser could not be started: no such program",
+                "the run was stopped",
             ]
         );
     }

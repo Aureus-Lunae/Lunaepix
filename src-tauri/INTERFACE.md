@@ -39,7 +39,9 @@ with `innerHTML`. A file name may contain any character.
 ### `run-started`
 
 A run starts. `total` is the number of `file-done` events that follow,
-skipped files included. It can be 0, for an empty folder.
+skipped files included. It can be 0, for an empty folder; the window then
+says "No PNG, JPG or SVG files directly in this folder (subfolders are not
+included)".
 
 ```json
 { "total": 3 }
@@ -55,6 +57,15 @@ One per file, in order, `index` from 0 to `total - 1`. `status` is `"done"`,
 
 `name` is the file name alone, never a path. It is empty only for a path
 with no file name.
+
+A run optimises at most 2000 files. The files left out for that reason do
+not get a row each: after every other row comes one `skipped` row named
+`(over the limit)`, whose reason counts them ("3 more files not optimised: over
+the 2000-file limit", or "1 more file ..."), and `total` counts it as one.
+Files skipped for any other reason keep a row of their own.
+
+A file whose worker was stopped because the window closed is `failed` with
+the reason "the run was stopped"; no later file runs.
 
 ```json
 { "index": 0, "name": "logo-black.svg", "status": "done", "before": 21828, "after": 9631, "millis": 22 }

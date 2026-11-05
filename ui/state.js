@@ -1,17 +1,20 @@
 // The window's state as pure functions: `reduce` turns one backend event (or
 // one rejected command) into the next state, and `rowView` turns a stored
 // row into the text for the table. No DOM here, so the node tests can load it.
+// `reduce` never changes the state it is given, with one exception:
+// `file-done` appends its row to the run's row list instead of copying it.
 //
 // Events are handled in the order they arrive; the backend guarantees runs
 // never overlap (see src-tauri/INTERFACE.md).
 
-import { formatPercent, formatSize, formatSummary, formatTime } from './format.js';
+import { formatPercent, formatSize, formatSummary, formatTime, formatTotal } from './format.js';
 
 /** Messages for the live region. A rejection the page does not know gets `unknown`. */
 export const MESSAGES = Object.freeze({
   busy: "Already optimising; try again when it's done.",
   noOutput: 'Nothing has been written yet.',
   openFailed: 'The folder could not be opened.',
+  noFiles: 'No PNG, JPG or SVG files directly in this folder (subfolders are not included)',
   unknown: 'Something went wrong.',
 });
 
@@ -92,7 +95,15 @@ export function reduce(state, action) {
 
     case 'file-done': {
       const row = rowFrom(payload);
-      return row === null ? state : { ...state, rows: [...state.rows, row] };
+      if (row === null) {
+        return state;
+      }
+      // Appended in place: a run can have thousands of rows, and copying the
+      // list for each one would cost time that grows with the square of the
+      // count. The list belongs to this run (`run-started` makes a new one),
+      // and `render` reads only how far it has grown.
+      state.rows.push(row);
+      return { ...state };
     }
 
     case 'run-finished': {
@@ -101,8 +112,11 @@ export function reduce(state, action) {
         optimised: count(finished.optimised),
         savedBytes: count(finished.saved_bytes),
       };
+      const message = isEmptyRun(state)
+        ? MESSAGES.noFiles
+        : formatSummary(summary.optimised, summary.savedBytes);
       return {
-        ...withMessage(state, formatSummary(summary.optimised, summary.savedBytes)),
+        ...withMessage(state, message),
         running: false,
         summary,
         hasOutput: finished.has_output === true,
@@ -154,6 +168,23 @@ export function classifyRejection(reason) {
     return 'busy';
   }
   return typeof reason === 'string' && Object.hasOwn(REJECTIONS, reason) ? 'known' : 'unknown';
+}
+
+/** Whether the last run planned no file at all, so there is nothing to total. */
+function isEmptyRun(state) {
+  return state.total === 0 && state.rows.length === 0;
+}
+
+/**
+ * The text of the summary row under the table: the total, or for a run that
+ * planned no file at all, why the table is empty.
+ */
+export function summaryLine(state) {
+  if (isEmptyRun(state)) {
+    return MESSAGES.noFiles;
+  }
+  const summary = state.summary ?? { optimised: 0, savedBytes: 0 };
+  return formatTotal(summary.optimised, summary.savedBytes);
 }
 
 /** The reasons of the rejected results of `Promise.allSettled`, in order. */
