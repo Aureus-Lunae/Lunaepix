@@ -153,8 +153,8 @@ const EVENTS = ['run-started', 'file-done', 'run-finished', 'run-busy', 'run-can
 // If listening fails, say so once, not once per event.
 Promise.allSettled(
   EVENTS.map((type) => listen(type, (event) => dispatch({ type, payload: event.payload }))),
-).then((results) => {
-  const failures = settledFailures(results);
+).then((settled) => {
+  const failures = settledFailures(settled);
   if (failures.length > 0) {
     console.error('listen failed', failures);
     dispatch({ type: 'command-rejected', payload: 'listen-failed' });
