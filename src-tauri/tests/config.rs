@@ -2,9 +2,15 @@
 //! them silently: the capability grants the three app commands and event
 //! listening only, and the content security policy stays strict.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
+use html5ever::tokenizer::states::RawKind;
+use html5ever::tokenizer::{
+    BufferQueue, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts,
+};
 use serde_json::Value;
 
 /// Every permission the window may have.
@@ -149,6 +155,80 @@ fn the_window_is_lunaepix_with_the_global_api_and_native_drag_and_drop() {
     assert!(window["minWidth"].as_u64().unwrap() >= 360);
 }
 
+/// The bundle formats we ship: deb and rpm for Linux, NSIS and MSI for
+/// Windows. Never `all` and never an AppImage, which would carry about 190
+/// LGPL/GPL system libraries without notices or a source offer.
+const BUNDLE_TARGETS: &[&str] = &["deb", "rpm", "nsis", "msi"];
+
+/// What is wrong with `bundle.targets`: it must be a non-empty list, and
+/// every entry one of [`BUNDLE_TARGETS`]. A missing list means Tauri's default
+/// (`all`), and the string `"all"` is not a list; both are refused.
+fn bundle_target_problems(config: &Value) -> Vec<String> {
+    let Some(targets) = config
+        .get("bundle")
+        .and_then(|bundle| bundle.get("targets"))
+    else {
+        return vec!["bundle.targets: no list (Tauri then builds all)".to_owned()];
+    };
+    let Some(list) = targets.as_array() else {
+        return vec![format!("bundle.targets: {targets} is not a list")];
+    };
+    let mut problems = Vec::new();
+    if list.is_empty() {
+        problems.push("bundle.targets: the list is empty".to_owned());
+    }
+    for target in list {
+        match target.as_str() {
+            Some(name) if BUNDLE_TARGETS.contains(&name) => {}
+            Some(name) => problems.push(format!(
+                "bundle.targets: {name} is not one of {BUNDLE_TARGETS:?}"
+            )),
+            None => problems.push(format!("bundle.targets: {target} is not a string")),
+        }
+    }
+    problems
+}
+
+#[test]
+fn the_bundle_targets_are_the_explicit_list_deb_rpm_nsis_msi() {
+    let config = read_json("tauri.conf.json");
+    assert_eq!(bundle_target_problems(&config), Vec::<String>::new());
+    assert_eq!(
+        config["bundle"]["targets"],
+        serde_json::json!(BUNDLE_TARGETS)
+    );
+}
+
+#[test]
+fn a_bundle_target_list_outside_the_four_is_caught_in_a_fixture() {
+    let with = |targets: Value| serde_json::json!({ "bundle": { "targets": targets } });
+    for (fixture, needle) in [
+        (with(serde_json::json!("all")), "not a list"),
+        (with(serde_json::json!("deb")), "not a list"),
+        (with(serde_json::json!(["all"])), "all"),
+        (with(serde_json::json!(["deb", "appimage"])), "appimage"),
+        (with(serde_json::json!(["AppImage"])), "AppImage"),
+        (with(serde_json::json!(["rpm", "dmg"])), "dmg"),
+        (with(serde_json::json!(["msi", 3])), "not a string"),
+        (with(serde_json::json!([])), "empty"),
+        (
+            serde_json::json!({ "bundle": { "active": true } }),
+            "no list",
+        ),
+        (serde_json::json!({}), "no list"),
+    ] {
+        let problems = bundle_target_problems(&fixture);
+        assert!(names(&problems, needle), "{fixture}: {problems:?}");
+    }
+    // Any non-empty choice among the four is fine.
+    for ok in [
+        serde_json::json!(["deb"]),
+        serde_json::json!(BUNDLE_TARGETS),
+    ] {
+        assert_eq!(bundle_target_problems(&with(ok)), Vec::<String>::new());
+    }
+}
+
 // ---------------------------------------------------------------------
 // Static rules for the window (`ui/`). The content security policy blocks
 // most of these at run time; the checks keep them out of the source, and
@@ -232,83 +312,205 @@ fn requested_ids(js: &str) -> Vec<String> {
         .collect()
 }
 
-/// The ids a script asks for that `html` does not have.
+/// The ids a script asks for that `html` does not have as an `id` attribute.
 fn missing_ids(js: &str, html: &str) -> Vec<String> {
+    let present: HashSet<String> = start_tags(html)
+        .into_iter()
+        .filter_map(|tag| tag.attr("id").map(str::to_owned))
+        .collect();
     requested_ids(js)
         .into_iter()
-        .filter(|id| !html.contains(&format!("id=\"{id}\"")))
+        .filter(|id| !present.contains(id))
         .collect()
 }
 
-/// Text that must appear nowhere in the window's files, in any case.
-/// `tauri://` events carry dropped paths; the others write file data into
-/// the page as markup, or set a `title`, a `style` or a whole class list
-/// (which the CSP, the accessibility rules or the class rules forbid), or run
-/// code from a string.
-const FORBIDDEN_TEXT: &[&str] = &[
+/// A lint, not a guarantee: it looks for known spellings in the text of the
+/// window's files, after whitespace is normalised (see [`lint_normalised`]),
+/// in any case. Another spelling of the same thing can still pass. The
+/// reliable guards are the capability and the content security policy; this
+/// keeps the common ways out of the source. `tauri://` events carry dropped
+/// paths (`onDragDropEvent` subscribes to one without the text); the others
+/// write file data into the page as markup, or set a `title`, a `style` or a
+/// whole class list (which the CSP, the accessibility rules or the class rules
+/// forbid), or run code from a string. Patterns are written in the normalised
+/// form: lower case, no space next to punctuation.
+const JS_LINT_PATTERNS: &[&str] = &[
     "tauri://",
+    "ondragdropevent",
     "innerhtml",
     "outerhtml",
     "insertadjacenthtml",
     "autofocus",
-    ".title =",
     ".title=",
+    "['title']",
+    "[\"title\"]",
+    "[`title`]",
     "setattribute('title'",
     "setattribute(\"title\"",
+    "setattribute(`title`",
     "setattribute('style'",
     "setattribute(\"style\"",
-    "classname =",
+    "setattribute(`style`",
     "classname=",
     "document.write",
     "eval(",
     "new function",
 ];
 
-fn forbidden_text(text: &str) -> Vec<&'static str> {
-    let lower = text.to_ascii_lowercase();
-    FORBIDDEN_TEXT
+/// The characters that a space next to is dropped by [`lint_normalised`].
+const LINT_PUNCTUATION: &[char] = &['(', ')', '[', ']', '=', '.', '\'', '"', '`'];
+
+/// Lower case, every run of whitespace as one space, and no space next to
+/// punctuation, so `el.setAttribute (\n 'title'` reads as
+/// `el.setattribute('title'`.
+fn lint_normalised(text: &str) -> String {
+    let mut text = text
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for punctuation in LINT_PUNCTUATION {
+        text = text
+            .replace(&format!(" {punctuation}"), &punctuation.to_string())
+            .replace(&format!("{punctuation} "), &punctuation.to_string());
+    }
+    text
+}
+
+fn js_lint_hits(text: &str) -> Vec<&'static str> {
+    let normalised = lint_normalised(text);
+    JS_LINT_PATTERNS
         .iter()
         .copied()
-        .filter(|forbidden| lower.contains(forbidden))
+        .filter(|pattern| normalised.contains(pattern))
         .collect()
 }
 
-/// The tags of an HTML text, from `<` to `>`, with spaces around `=`
-/// removed so `title = "x"` reads as `title="x"`.
-fn tags(html: &str) -> Vec<String> {
-    html.split('<')
-        .skip(1)
-        .filter_map(|part| part.split_once('>').map(|(tag, _)| tag))
-        .map(|tag| {
-            let mut tag = tag.replace(['\n', '\t', '\r'], " ");
-            while tag.contains(" =") || tag.contains("= ") {
-                tag = tag.replace(" =", "=").replace("= ", "=");
+// ---------------------------------------------------------------------
+// HTML is read as tokens (html5ever's tokenizer), never scanned as text: a
+// `>` inside an attribute value, a tag spelled in a comment, a script or a
+// title, or `data-id` next to `id` all read as what they are.
+// ---------------------------------------------------------------------
+
+/// What the tokenizer found, reduced to what the checks need: start tags with
+/// their attributes (names in lower case, values decoded), end tags, and text.
+/// Comments and doctypes are dropped.
+enum Piece {
+    Start(StartTag),
+    End(String),
+    Text(String),
+}
+
+struct StartTag {
+    name: String,
+    attrs: Vec<(String, String)>,
+}
+
+impl StartTag {
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(attr, _)| attr == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Collects the pieces. A bare tokenizer does not know that the text inside
+/// `<script>`, `<style>` and `<title>` is not markup (the tree builder tells it),
+/// so this sink does the same for the elements that matter.
+struct Collector(RefCell<Vec<Piece>>);
+
+impl TokenSink for Collector {
+    type Handle = ();
+
+    fn process_token(&self, token: Token, _line_number: u64) -> TokenSinkResult<()> {
+        let Token::TagToken(tag) = token else {
+            if let Token::CharacterTokens(text) = token {
+                self.0.borrow_mut().push(Piece::Text(text.to_string()));
             }
-            tag
+            return TokenSinkResult::Continue;
+        };
+        let name = tag.name.to_string();
+        if tag.kind == TagKind::EndTag {
+            self.0.borrow_mut().push(Piece::End(name));
+            return TokenSinkResult::Continue;
+        }
+        let result = match name.as_str() {
+            "script" => TokenSinkResult::RawData(RawKind::ScriptData),
+            "style" | "xmp" | "iframe" | "noembed" | "noframes" => {
+                TokenSinkResult::RawData(RawKind::Rawtext)
+            }
+            "title" | "textarea" => TokenSinkResult::RawData(RawKind::Rcdata),
+            "plaintext" => TokenSinkResult::Plaintext,
+            _ => TokenSinkResult::Continue,
+        };
+        let attrs = tag
+            .attrs
+            .iter()
+            .map(|attr| (attr.name.local.to_string(), attr.value.to_string()))
+            .collect();
+        self.0
+            .borrow_mut()
+            .push(Piece::Start(StartTag { name, attrs }));
+        result
+    }
+}
+
+fn pieces(html: &str) -> Vec<Piece> {
+    let queue = BufferQueue::default();
+    queue.push_back(html.into());
+    let tokenizer = Tokenizer::new(
+        Collector(RefCell::new(Vec::new())),
+        TokenizerOpts::default(),
+    );
+    let _ = tokenizer.feed(&queue);
+    tokenizer.end();
+    tokenizer.sink.0.take()
+}
+
+fn start_tags(html: &str) -> Vec<StartTag> {
+    pieces(html)
+        .into_iter()
+        .filter_map(|piece| match piece {
+            Piece::Start(tag) => Some(tag),
+            _ => None,
         })
         .collect()
 }
 
+/// The text nodes of `html` that are not inside one of the `skipped`
+/// elements. Comments are never text.
+fn text_outside(html: &str, skipped: &[&str]) -> String {
+    let mut depth = 0usize;
+    let mut text = String::new();
+    for piece in pieces(html) {
+        match piece {
+            Piece::Start(tag) if skipped.contains(&tag.name.as_str()) => depth += 1,
+            Piece::End(name) if skipped.contains(&name.as_str()) => {
+                depth = depth.saturating_sub(1);
+            }
+            Piece::Text(chunk) if depth == 0 => text.push_str(&chunk),
+            _ => {}
+        }
+    }
+    text
+}
+
 /// Problems with attributes in the HTML: a `title` or `style` attribute,
-/// an `on...` event handler, or an inline `<script>` (one without `src`).
+/// an `on...` event handler, or an inline `<script>` (one without a `src`
+/// attribute).
 fn html_attribute_problems(html: &str) -> Vec<String> {
     let mut problems = Vec::new();
-    for tag in tags(html) {
-        let mut words = tag.split_whitespace();
-        let element = words.next().unwrap_or("").to_ascii_lowercase();
-        if element == "script" && !tag.to_ascii_lowercase().contains(" src=") {
+    for tag in start_tags(html) {
+        if tag.name == "script" && tag.attr("src").is_none() {
             problems.push("inline <script> without src".to_owned());
         }
-        for word in words {
-            let Some((name, _)) = word.split_once('=') else {
-                continue;
-            };
-            let name = name.to_ascii_lowercase();
+        for (name, _) in &tag.attrs {
             let is_handler = name.len() > 2
                 && name.starts_with("on")
                 && name.chars().all(|c| c.is_ascii_lowercase());
             if name == "title" || name == "style" || is_handler {
-                problems.push(format!("{name}= attribute in <{element}>"));
+                problems.push(format!("{name}= attribute in <{}>", tag.name));
             }
         }
     }
@@ -317,32 +519,43 @@ fn html_attribute_problems(html: &str) -> Vec<String> {
 
 /// What `index.html` needs for the accessibility rules, as problems.
 fn structure_problems(html: &str) -> Vec<String> {
+    let tags = start_tags(html);
+    let count = |name: &str| tags.iter().filter(|tag| tag.name == name).count();
     let mut problems = Vec::new();
-    let count = |needle: &str| html.matches(needle).count();
     let mut expect = |ok: bool, what: &str| {
         if !ok {
             problems.push(what.to_owned());
         }
     };
-    expect(html.contains("<html lang=\"en\""), "html lang=\"en\"");
-    expect(count("<h1") == 1, "exactly one <h1>");
-    expect(count("<header") == 1, "one <header>");
-    expect(count("<main") == 1, "one <main>");
-    expect(count("<caption") == 1, "one <caption>");
-    expect(count("<title>") == 1, "one <title>");
-    expect(count("scope=\"col\"") == 5, "five scope=\"col\" headers");
+    expect(
+        tags.iter()
+            .any(|tag| tag.name == "html" && tag.attr("lang") == Some("en")),
+        "html lang=\"en\"",
+    );
+    expect(count("h1") == 1, "exactly one <h1>");
+    expect(count("header") == 1, "one <header>");
+    expect(count("main") == 1, "one <main>");
+    expect(count("caption") == 1, "one <caption>");
+    expect(count("title") == 1, "one <title>");
+    expect(
+        tags.iter()
+            .filter(|tag| tag.name == "th" && tag.attr("scope") == Some("col"))
+            .count()
+            == 5,
+        "five scope=\"col\" headers",
+    );
     problems
 }
 
 #[test]
-fn the_window_files_hold_no_forbidden_text() {
+fn the_window_files_pass_the_js_lint() {
     for (name, text) in ui_files() {
-        assert_eq!(forbidden_text(&text), Vec::<&str>::new(), "in ui/{name}");
+        assert_eq!(js_lint_hits(&text), Vec::<&str>::new(), "in ui/{name}");
     }
 }
 
 #[test]
-fn forbidden_text_is_caught_in_a_fixture() {
+fn js_lint_catches_every_listed_pattern_in_a_fixture() {
     for bad in [
         "listen('tauri://drag-drop', f)",
         "row.innerHTML = name",
@@ -361,13 +574,32 @@ fn forbidden_text_is_caught_in_a_fixture() {
         "document.write(html)",
         "eval(code)",
         "new Function('return 1')",
+        // The event that carries dropped paths, subscribed without its name.
+        "getCurrentWebview().onDragDropEvent(cb)",
+        "getCurrentWebview().ONDRAGDROPEVENT(cb)",
+        // Spacing and line breaks do not hide a pattern.
+        "el.setAttribute( 'title', text)",
+        "el.setAttribute ('title' , text)",
+        "el.setAttribute(\n  'title',\n  text)",
+        "el.setAttribute( \"title\", text)",
+        "el.setAttribute(`title`, text)",
+        "el.setAttribute( 'style', css)",
+        "el['title'] = text",
+        "el[ \"title\" ] = text",
+        "el[`title`] = text",
+        "el.title   = text",
+        "el.title\n  = text",
+        "el . title = text",
+        "el.className\n= 'a b'",
+        "new\n  Function('return 1')",
+        "eval (code)",
     ] {
-        assert_eq!(forbidden_text(bad).len(), 1, "{bad}");
+        assert_eq!(js_lint_hits(bad).len(), 1, "{bad}");
     }
-    assert!(forbidden_text("row.textContent = name; tbody.replaceChildren(row)").is_empty());
+    assert!(js_lint_hits("row.textContent = name; tbody.replaceChildren(row)").is_empty());
     // Safe ways of doing the same things are not flagged.
     assert!(
-        forbidden_text(
+        js_lint_hits(
             "tr.classList.add('-failed'); tr.setAttribute('aria-disabled', 'true'); \
              el.style.color = 'red'; const retrieved = items;"
         )
@@ -473,6 +705,33 @@ fn a_missing_element_id_is_caught_in_a_fixture() {
         )
         .is_empty()
     );
+    // Only an `id` attribute counts: not `data-id`, not text, not a comment.
+    assert_eq!(
+        missing_ids("document.getElementById('x')", "<p data-id=\"x\"></p>"),
+        vec!["x"]
+    );
+    assert_eq!(
+        missing_ids(
+            "document.getElementById('x')",
+            "<!-- <p id=\"x\"> --><p>id=\"x\"</p>"
+        ),
+        vec!["x"]
+    );
+    assert_eq!(
+        missing_ids(
+            "document.getElementById('x')",
+            "<p title=\" id=\"x\"\" data-x='id=\"x\"'>"
+        ),
+        vec!["x"]
+    );
+    // Any spelling of a real id attribute counts.
+    assert!(
+        missing_ids(
+            "document.getElementById('x'); document.getElementById('y')",
+            "<p class=\"a\" ID='x'></p><p id = \"y\"></p>"
+        )
+        .is_empty()
+    );
     // A call with a variable is not an id the check can read.
     assert!(missing_ids("document.getElementById(name)", html).is_empty());
 }
@@ -504,6 +763,25 @@ fn html_attribute_problems_are_caught_in_a_fixture() {
         html_attribute_problems("<script type=\"module\">run()</script>").len(),
         1
     );
+    // A `>` inside a quoted value does not end the tag.
+    assert_eq!(
+        html_attribute_problems("<button data-x=\"a>b\" title=\"tip\">").len(),
+        1
+    );
+    assert_eq!(
+        html_attribute_problems("<button data-x='a>b' onclick='go()'>").len(),
+        1
+    );
+    // The text ` src=` inside another attribute's value is not a `src`.
+    assert_eq!(
+        html_attribute_problems("<script data-n=\" src=\">alert(1)</script>").len(),
+        1
+    );
+    assert_eq!(
+        html_attribute_problems("<script data-src=\"app.js\"></script>").len(),
+        1
+    );
+    assert_eq!(html_attribute_problems("<SCRIPT>run()</SCRIPT>").len(), 1);
     // Clean markup, including the <title> element and a script from a file.
     assert!(
         html_attribute_problems(
@@ -512,6 +790,27 @@ fn html_attribute_problems_are_caught_in_a_fixture() {
          <link rel=\"stylesheet\" href=\"a.css\">"
         )
         .is_empty()
+    );
+}
+
+#[test]
+fn an_attribute_spelled_in_a_comment_or_in_text_is_not_an_attribute() {
+    assert!(
+        html_attribute_problems(
+            "<!-- <p title=\"x\" onclick=\"y\"> --><p>a title=\"x\" in text</p>\
+             <!-- <script>x</script> -->"
+        )
+        .is_empty()
+    );
+    assert!(
+        html_attribute_problems(
+            "<p data-title=\"x\" data-style=\"y\" data-onclick=\"z\" class=\"title\">"
+        )
+        .is_empty()
+    );
+    // A script's own text is not markup: the `<p title>` inside it is a string.
+    assert!(
+        html_attribute_problems("<script src=\"a.js\">s = '<p title=\"x\">';</script>").is_empty()
     );
 }
 
@@ -532,6 +831,71 @@ fn a_page_without_that_structure_is_flagged() {
         .replace("<h1>b</h1>", "")
         .replace("lang=\"en\"", "");
     assert_eq!(structure_problems(&no_lang), vec!["html lang=\"en\""]);
+}
+
+/// A page with exactly the structure the rules need, with `title`, `heading`
+/// and `extra` to vary.
+fn page(title: &str, heading: &str, extra: &str) -> String {
+    format!(
+        "<html lang=\"en\"><title>{title}</title>{heading}{extra}<header></header>\
+         <main></main><caption>c</caption>\
+         <th scope=\"col\"><th scope=\"col\"><th scope=\"col\">\
+         <th scope=\"col\"><th scope=\"col\">"
+    )
+}
+
+#[test]
+fn headings_in_comments_scripts_and_titles_are_not_counted() {
+    let h1 = "<h1>a</h1>";
+    assert_eq!(structure_problems(&page("x", h1, "")), Vec::<String>::new());
+    // A second `<h1` that is only comment, script, style or title text.
+    for extra in [
+        "<!-- <h1>b</h1> -->",
+        "<script src=\"a.js\">document.write('<h1>b</h1>')</script>",
+        "<style>/* <h1> */</style>",
+    ] {
+        assert_eq!(
+            structure_problems(&page("x", h1, extra)),
+            Vec::<String>::new(),
+            "{extra}"
+        );
+    }
+    assert_eq!(
+        structure_problems(&page("a <h1> b", h1, "")),
+        Vec::<String>::new()
+    );
+    // A real second h1 still counts.
+    assert_eq!(
+        structure_problems(&page("x", h1, "<h1>b</h1>")),
+        vec!["exactly one <h1>"]
+    );
+    // And the only h1 inside a comment is no h1.
+    assert_eq!(
+        structure_problems(&page("x", "<!-- <h1>a</h1> -->", "")),
+        vec!["exactly one <h1>"]
+    );
+}
+
+#[test]
+fn only_a_real_html_lang_and_real_column_headers_satisfy_the_structure() {
+    let good = page("x", "<h1>a</h1>", "");
+    // `lang` on another element, or in a comment, is not on <html>.
+    let other = good.replace("<html lang=\"en\">", "<html><p lang=\"en\">");
+    assert_eq!(structure_problems(&other), vec!["html lang=\"en\""]);
+    let commented = good.replace("<html lang=\"en\">", "<!-- <html lang=\"en\"> --><html>");
+    assert_eq!(structure_problems(&commented), vec!["html lang=\"en\""]);
+    // A scope="col" that is only comment text is not a header.
+    let four = good.replacen("<th scope=\"col\">", "", 1) + "<!-- <th scope=\"col\"> -->";
+    assert_eq!(
+        structure_problems(&four),
+        vec!["five scope=\"col\" headers"]
+    );
+    // Another value of scope is not "col".
+    let rows = good.replacen("scope=\"col\"", "scope=\"row\"", 1);
+    assert_eq!(
+        structure_problems(&rows),
+        vec!["five scope=\"col\" headers"]
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -590,9 +954,14 @@ fn repo_file(name: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
+/// The exceptions a permitted licence may carry (`X WITH Y`).
+const PERMITTED_EXCEPTIONS: &[&str] = &["LLVM-exception"];
+
 /// The terms of an SPDX expression that are not permitted. The expression is
-/// split on `AND`, `OR` and parentheses; a term `X WITH Y` is permitted when
-/// the whole term or `X` is (an exception only narrows a licence).
+/// split on `AND`, `OR` and parentheses. A term is permitted when it is in
+/// [`PERMITTED_LICENCES`], or is `X WITH Y` with a permitted `X` and a `Y` in
+/// [`PERMITTED_EXCEPTIONS`] (an exception only narrows a licence). A term with
+/// two `WITH`s, or an exception we do not know, is refused.
 fn unpermitted_terms(expression: &str) -> Vec<String> {
     let spaced = expression.replace(['(', ')'], " ");
     let mut terms = Vec::new();
@@ -609,8 +978,15 @@ fn unpermitted_terms(expression: &str) -> Vec<String> {
     terms
         .into_iter()
         .filter(|term| {
-            let base = term.split(" WITH ").next().unwrap_or(term);
-            !PERMITTED_LICENCES.contains(&term.as_str()) && !PERMITTED_LICENCES.contains(&base)
+            if PERMITTED_LICENCES.contains(&term.as_str()) {
+                return false;
+            }
+            match term.split(" WITH ").collect::<Vec<_>>().as_slice() {
+                [base, exception] => {
+                    !(PERMITTED_LICENCES.contains(base) && PERMITTED_EXCEPTIONS.contains(exception))
+                }
+                _ => true,
+            }
         })
         .collect()
 }
@@ -689,8 +1065,16 @@ fn crate_problems(name: &str, krate: &toml::Table, problems: &mut Vec<String>) {
         Some(expression) => expression_problems(&format!("{place}.license"), expression, problems),
         None => problems.push(format!("{place}: no license")),
     }
-    let files = clarify.get("files").and_then(toml::Value::as_array);
-    for file in files.into_iter().flatten() {
+    let none = Vec::new();
+    let files = match clarify.get("files").map(toml::Value::as_array) {
+        None => &none,
+        Some(Some(files)) => files,
+        Some(None) => {
+            problems.push(format!("{place}.files: not an array"));
+            &none
+        }
+    };
+    for file in files {
         let Some(file) = file.as_table() else {
             problems.push(format!("{place}.files: an entry is not a table"));
             continue;
@@ -739,31 +1123,26 @@ fn has_ijg_sentence(text: &str) -> bool {
     one_line(text).contains(IJG_SENTENCE)
 }
 
-/// The html without its `<pre>` blocks, which hold the licence texts.
-fn without_licence_texts(html: &str) -> String {
-    let mut parts = html.split("<pre");
-    let mut out = parts.next().unwrap_or("").to_owned();
-    for part in parts {
-        if let Some((_, after)) = part.split_once("</pre>") {
-            out.push_str(after);
-        }
-    }
-    out
+/// The text of the licence page as a reader sees it: text nodes only, so a
+/// comment, a `<script>` or a `<style>` does not count.
+fn page_text(html: &str) -> String {
+    one_line(&text_outside(html, &["script", "style"]))
 }
 
-/// The IJG statement stands in the page's own words, outside the licence texts.
+/// The IJG statement stands in the page's own words, outside the licence
+/// texts (`<pre>` blocks).
 fn has_ijg_statement_in_intro(html: &str) -> bool {
-    has_ijg_sentence(&without_licence_texts(html))
+    has_ijg_sentence(&text_outside(html, &["script", "style", "pre"]))
 }
 
 /// The IJG licence text: its own wording, as it appears in libjpeg's README.
 fn has_ijg_licence_text(html: &str) -> bool {
-    one_line(html).contains("based in part on the work of the Independent JPEG Group")
+    page_text(html).contains("based in part on the work of the Independent JPEG Group")
 }
 
 /// libdeflate's MIT notice, as in `libdeflate/COPYING` inside libdeflate-sys.
 fn has_libdeflate_notice(html: &str) -> bool {
-    let text = one_line(html);
+    let text = page_text(html);
     text.contains("Copyright 2016 Eric Biggers") && text.contains("Copyright 2024 Google LLC")
 }
 
@@ -849,6 +1228,12 @@ fn a_clarify_entry_with_a_copyleft_licence_is_caught_and_a_permitted_one_is_not(
         "(GPL-2.0-only)",
         "GPL-3.0-only WITH Classpath-exception-2.0",
         "mit and gpl-3.0-only",
+        // At most one WITH per term, and only a known exception.
+        "Apache-2.0 WITH LLVM-exception WITH Classpath-exception-2.0",
+        "Apache-2.0 WITH LLVM-exception WITH LLVM-exception",
+        "MIT WITH Classpath-exception-2.0",
+        "Apache-2.0 WITH",
+        "MIT AND Apache-2.0 WITH LLVM-exception WITH GCC-exception-3.1",
     ] {
         let fixture = format!("[x.clarify]\nlicense = \"{expression}\"\n");
         assert!(!about_problems(&fixture).is_empty(), "{expression}");
@@ -857,6 +1242,8 @@ fn a_clarify_entry_with_a_copyleft_licence_is_caught_and_a_permitted_one_is_not(
         "(MIT OR Apache-2.0) AND Unicode-3.0",
         "Apache-2.0 WITH LLVM-exception",
         "IJG AND Zlib AND BSD-3-Clause",
+        "MIT AND Apache-2.0 WITH LLVM-exception",
+        "MIT WITH LLVM-exception",
     ] {
         let fixture = format!("[x.clarify]\nlicense = \"{expression}\"\n");
         assert_eq!(
@@ -865,6 +1252,22 @@ fn a_clarify_entry_with_a_copyleft_licence_is_caught_and_a_permitted_one_is_not(
             "{expression}"
         );
     }
+}
+
+#[test]
+fn clarify_files_that_is_not_an_array_is_a_problem_and_an_array_is_not() {
+    for files in ["\"LICENSE\"", "{ path = \"a\", checksum = \"b\" }", "3"] {
+        let fixture = format!("[x.clarify]\nlicense = \"MIT\"\nfiles = {files}\n");
+        let problems = about_problems(&fixture);
+        assert!(
+            names(&problems, "x.clarify.files: not an array"),
+            "{files}: {problems:?}"
+        );
+    }
+    let empty = "[x.clarify]\nlicense = \"MIT\"\nfiles = []\n";
+    assert_eq!(about_problems(empty), Vec::<String>::new());
+    let none = "[x.clarify]\nlicense = \"MIT\"\n";
+    assert_eq!(about_problems(none), Vec::<String>::new());
 }
 
 #[test]
@@ -964,6 +1367,40 @@ fn a_text_without_the_ijg_wording_or_the_libdeflate_notice_is_caught_in_a_fixtur
     assert!(!has_ijg_statement_in_intro(&even_capitalised));
     let in_intro = format!("<main><p>{IJG_SENTENCE}</p></main><pre>licence</pre>");
     assert!(has_ijg_statement_in_intro(&in_intro));
+    // Text in a comment, a script or a style is not on the page.
+    let in_comment = format!("<p>Intro</p><!-- {IJG_SENTENCE} --><pre>licence</pre>");
+    assert!(!has_ijg_statement_in_intro(&in_comment));
+    let in_script = format!("<p>Intro</p><script>var s = '{IJG_SENTENCE}';</script>");
+    assert!(!has_ijg_statement_in_intro(&in_script));
+    let in_style = format!("<p>Intro</p><style>/* {IJG_SENTENCE} */</style>");
+    assert!(!has_ijg_statement_in_intro(&in_style));
+    // A `<pre` in a comment does not hide the real intro.
+    let pre_in_comment = format!("<!-- <pre> --><p>{IJG_SENTENCE}</p>");
+    assert!(has_ijg_statement_in_intro(&pre_in_comment));
+    // Text nodes are read as text: across inline tags, with entities decoded.
+    assert!(has_ijg_statement_in_intro(
+        "<p>This software is based in part on the work of the <b>Independent JPEG Group</b>.</p>"
+    ));
+    assert!(has_ijg_statement_in_intro(
+        "<p>This software is based in part on the work of the Independent&nbsp;JPEG Group.</p>"
+    ));
+    // The licence's own wording, likewise, must be on the page.
+    let wording = "based in part on the work of the Independent JPEG Group";
+    assert!(!has_ijg_licence_text(&format!("<!-- {wording} -->")));
+    assert!(!has_ijg_licence_text(&format!(
+        "<script>'{wording}'</script>"
+    )));
+    assert!(has_ijg_licence_text(&format!("<pre>{wording}</pre>")));
+    // libdeflate: the notice in a comment, a script or a style is not a notice.
+    let notice = "Copyright 2016 Eric Biggers Copyright 2024 Google LLC";
+    assert!(!has_libdeflate_notice(&format!("<!-- {notice} -->")));
+    assert!(!has_libdeflate_notice(&format!(
+        "<script>'{notice}'</script>"
+    )));
+    assert!(!has_libdeflate_notice(&format!(
+        "<style>/* {notice} */</style>"
+    )));
+    assert!(has_libdeflate_notice(&format!("<pre>{notice}</pre>")));
     // libdeflate: one of the two holders is not the notice; neither is none.
     assert!(!has_libdeflate_notice(
         "<pre>Copyright 2016 Eric Biggers</pre>"
