@@ -34,3 +34,21 @@ ignore-build-dependencies = true
 # The platforms the app is built for (Linux and Windows; no macOS, no
 # mobile), so crates that only other platforms use are not listed.
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+
+# libdeflate-sys declares only Apache-2.0, but it vendors libdeflate's C code,
+# which is MIT ("Copyright 2016 Eric Biggers", "2024 Google LLC", in
+# libdeflate/COPYING inside the crate). Its notice must ship, so the crate is
+# clarified from the two real files. The checksums are SHA-256; a new version
+# of the crate with changed files fails the run, which is the point.
+[libdeflate-sys.clarify]
+license = "Apache-2.0 AND MIT"
+
+[[libdeflate-sys.clarify.files]]
+path = "LICENSE"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+license = "Apache-2.0"
+
+[[libdeflate-sys.clarify.files]]
+path = "libdeflate/COPYING"
+checksum = "4ad69099cb4374836fd27583d9991e2838cd86b6e4666ab26b2d32582c91e73a"
+license = "MIT"
