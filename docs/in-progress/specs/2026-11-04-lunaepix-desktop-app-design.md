@@ -53,7 +53,7 @@ The shell function only works where bash, GNU `stat -c`, GNU `date +%s%N`, `awk`
   - SVG: no maintained Rust equivalent of `svgo` is known. Open question below.
   - JPG: a lossless JPEG optimiser crate (Huffman table optimisation and progressive encode, no re-quantisation), matching `jpegoptim`'s default behaviour.
 - The core is one Rust library with a single function that takes a source path and a destination path and returns `{before, after, ms}` or an error. The window and the command line are thin callers, so there is one code path.
-- The shell functions `optimg` and `optimgdir` become wrappers that call the app's CLI binary, so the terminal and the window give identical results.
+- ~~The shell functions `optimg` and `optimgdir` become wrappers that call the app's CLI binary, so the terminal and the window give identical results.~~ (dropped, see Handoff)
 
 ### SVG engine (decided: Rust crate)
 
@@ -65,8 +65,8 @@ Chosen by the user: a Rust SVG optimiser crate, linked into the app. No maintain
 
 ### Platforms
 
-- Linux: built and tested locally (AppImage/RPM).
-- Windows: built by a GitHub Actions workflow on `windows-latest` using `tauri-action`, producing an unsigned installer (MSI/NSIS) as a downloadable artifact. Run on tag push or manually.
+- Linux: built and tested locally (deb/RPM).
+- Windows: built by a GitHub Actions workflow on `windows-latest` using `cargo install tauri-cli` (not `tauri-action`), producing an unsigned installer (MSI/NSIS) as a downloadable artifact. Run on tag push or manually.
 - No macOS release.
 - The Rust core uses `std::path` only and no GNU tools. Paths dropped or chosen in the window are handled as `PathBuf`, so Windows drive letters, backslashes and spaces work. Test cases include a name with spaces and non-ASCII characters.
 
