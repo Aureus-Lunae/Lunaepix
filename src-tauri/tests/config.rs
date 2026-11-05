@@ -1536,3 +1536,150 @@ fn a_text_without_the_ijg_wording_or_the_libdeflate_notice_is_caught_in_a_fixtur
         "<pre>Copyright 2016 Eric Biggers\nCopyright 2024 Google LLC</pre>"
     ));
 }
+
+// --- the worker sidecar, in the bundle build only ---------------------------------
+
+/// The worker the bundle ships beside the app, relative to `src-tauri/`.
+/// tauri-build copies it into the target folder on every build that sees
+/// it, and stops when the file is missing: so it lives in a config file
+/// that only the bundle build reads, and `cargo test` and `clippy` never do.
+const SIDECAR: &str = "binaries/lunaepix-worker";
+
+/// The command that builds the worker and stages it under `binaries/`
+/// before Tauri bundles (`crates/xtask`).
+const SIDECAR_BUILD: &str = "cargo run --locked -p lunaepix-xtask -- sidecar";
+
+fn read_text(name: &str) -> String {
+    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(name)).unwrap()
+}
+
+/// What is wrong with the bundle-only config: `bundle.externalBin` must be
+/// exactly `[SIDECAR]`, and `build.beforeBuildCommand` exactly the string
+/// [`SIDECAR_BUILD`].
+fn bundle_config_problems(text: &str) -> Vec<String> {
+    let config: Value = match serde_json::from_str(text) {
+        Ok(config) => config,
+        Err(error) => return vec![format!("not JSON: {error}")],
+    };
+    let mut problems = Vec::new();
+    match config.pointer("/bundle/externalBin") {
+        Some(Value::Array(list)) if list.len() == 1 && list[0] == SIDECAR => {}
+        Some(other) => problems.push(format!(
+            "bundle.externalBin: {other} is not [\"{SIDECAR}\"]"
+        )),
+        None => problems.push("bundle.externalBin: missing".to_owned()),
+    }
+    match config.pointer("/build/beforeBuildCommand") {
+        Some(Value::String(command)) if command == SIDECAR_BUILD => {}
+        Some(other) => problems.push(format!(
+            "build.beforeBuildCommand: {other} is not {SIDECAR_BUILD:?}"
+        )),
+        None => problems.push("build.beforeBuildCommand: missing".to_owned()),
+    }
+    problems
+}
+
+/// What is wrong with a config every build reads: it may not name a sidecar,
+/// or `cargo test` stops as soon as `src-tauri/binaries/` is empty.
+fn main_config_problems(config: &Value) -> Vec<String> {
+    match config.pointer("/bundle/externalBin") {
+        None => Vec::new(),
+        Some(found) => vec![format!(
+            "bundle.externalBin in a config every build reads: {found}"
+        )],
+    }
+}
+
+/// The platform configs Tauri merges into every build on that platform
+/// (`tauri.<platform>.conf.json`, `.json5`, `Tauri.<platform>.toml`).
+fn platform_configs(dir: &Path) -> Vec<String> {
+    let platforms = ["linux", "windows", "macos", "android", "ios"];
+    let names = platforms.iter().flat_map(|platform| {
+        [
+            format!("tauri.{platform}.conf.json"),
+            format!("tauri.{platform}.conf.json5"),
+            format!("Tauri.{platform}.toml"),
+        ]
+    });
+    names.filter(|name| dir.join(name).exists()).collect()
+}
+
+#[test]
+fn the_bundle_config_adds_the_worker_sidecar_and_builds_it_first() {
+    let text = read_text("tauri.bundle.conf.json");
+    assert_eq!(bundle_config_problems(&text), Vec::<String>::new());
+    // Nothing else: the rest comes from tauri.conf.json.
+    let config: Value = serde_json::from_str(&text).unwrap();
+    let mut keys: Vec<&str> = config
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["$schema", "build", "bundle"]);
+}
+
+#[test]
+fn a_bundle_config_without_the_sidecar_or_its_build_is_caught_in_a_fixture() {
+    let build = format!("\"build\": {{ \"beforeBuildCommand\": \"{SIDECAR_BUILD}\" }}");
+    let bundle = format!("\"bundle\": {{ \"externalBin\": [\"{SIDECAR}\"] }}");
+    let good = format!("{{ {build}, {bundle} }}");
+    assert_eq!(bundle_config_problems(&good), Vec::<String>::new());
+    let other_bin = "\"bundle\": { \"externalBin\": [\"binaries/lunaepix-app\"] }";
+    let extra_bin = format!("\"bundle\": {{ \"externalBin\": [\"{SIDECAR}\", \"binaries/x\"] }}");
+    let string_bin = format!("\"bundle\": {{ \"externalBin\": \"{SIDECAR}\" }}");
+    let other_build = "\"build\": { \"beforeBuildCommand\": \"cargo build --release\" }";
+    let object_build =
+        format!("\"build\": {{ \"beforeBuildCommand\": {{ \"script\": \"{SIDECAR_BUILD}\" }} }}");
+    for (fixture, needle) in [
+        (format!("{{ {build} }}"), "externalBin: missing"),
+        (format!("{{ {build}, {other_bin} }}"), "externalBin"),
+        (format!("{{ {build}, {extra_bin} }}"), "externalBin"),
+        (format!("{{ {build}, {string_bin} }}"), "externalBin"),
+        (format!("{{ {bundle} }}"), "beforeBuildCommand: missing"),
+        (
+            format!("{{ {other_build}, {bundle} }}"),
+            "beforeBuildCommand",
+        ),
+        (
+            format!("{{ {object_build}, {bundle} }}"),
+            "beforeBuildCommand",
+        ),
+        (format!("{{ {build}, {bundle}"), "not JSON"),
+    ] {
+        let problems = bundle_config_problems(&fixture);
+        assert!(names(&problems, needle), "{fixture}: {problems:?}");
+    }
+}
+
+#[test]
+fn the_main_config_has_no_external_bin_and_there_are_no_platform_configs() {
+    let config = read_json("tauri.conf.json");
+    assert_eq!(main_config_problems(&config), Vec::<String>::new());
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert_eq!(platform_configs(dir), Vec::<String>::new());
+}
+
+#[test]
+fn a_main_config_with_an_external_bin_is_caught_in_a_fixture() {
+    for external_bin in [
+        serde_json::json!([SIDECAR]),
+        serde_json::json!([]),
+        serde_json::json!(SIDECAR),
+    ] {
+        let fixture =
+            serde_json::json!({ "bundle": { "active": true, "externalBin": external_bin } });
+        let problems = main_config_problems(&fixture);
+        assert!(names(&problems, "externalBin"), "{fixture}: {problems:?}");
+    }
+    // A platform config beside the main one is found.
+    let dir = std::env::temp_dir().join(format!("lunaepix-config-test-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    assert_eq!(platform_configs(&dir), Vec::<String>::new());
+    fs::write(dir.join("tauri.linux.conf.json"), "{}").unwrap();
+    fs::write(dir.join("Tauri.windows.toml"), "").unwrap();
+    let found = platform_configs(&dir);
+    fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(found, ["tauri.linux.conf.json", "Tauri.windows.toml"]);
+}

@@ -36,11 +36,15 @@ others). Install what the Fedora section of
 (<https://rustup.rs>). Then:
 
 ```
-cargo install tauri-cli --locked --version 2.12.4   # once
-cargo tauri build                                    # bundles end up in target/release/bundle/
-cargo test --workspace                               # the Rust tests
-node --test "tests/ui/*.test.js"                     # the window script tests
+cargo install tauri-cli --locked --version 2.12.4             # once
+cargo tauri build --config src-tauri/tauri.bundle.conf.json   # bundles end up in target/release/bundle/
+cargo test --workspace                                        # the Rust tests
+node --test "tests/ui/*.test.js"                              # the window script tests
 ```
+
+The `--config` file adds the small worker program that optimises each file,
+and builds it first; without it the app still works, but starts each file
+about ten times slower.
 
 `cargo tauri dev` runs the window app from the source without bundling.
 

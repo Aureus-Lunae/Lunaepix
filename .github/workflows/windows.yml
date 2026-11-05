@@ -102,9 +102,10 @@ jobs:
       - name: Install the Tauri command line
         run: cargo install tauri-cli --locked --version 2.12.4
 
-      # Builds in release mode and bundles the NSIS and MSI installers.
+      # Builds in release mode and bundles the NSIS and MSI installers. The
+      # config file adds the worker sidecar and builds it first (crates/xtask).
       - name: Build the installer
-        run: cargo tauri build
+        run: cargo tauri build --config src-tauri/tauri.bundle.conf.json
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

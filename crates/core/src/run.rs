@@ -30,8 +30,9 @@ const PIPE_GRACE: Duration = Duration::from_secs(2);
 /// The program the runner starts for each file, as
 /// `<program> <args...> <src> <dest>`.
 ///
-/// The CLI and the app use [`Worker::current_exe`]: their own binary, in
-/// worker mode. Tests put another program in its place.
+/// The CLI uses [`Worker::current_exe`]: its own binary, in worker mode. A
+/// release app uses the `lunaepix-worker` sidecar beside it, and falls back
+/// to its own binary. Tests put another program in its place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worker {
     pub program: PathBuf,
@@ -267,6 +268,22 @@ impl StopHandle {
 /// Optimise one file in a worker process.
 ///
 /// The worker gets no shell and no stdin; the paths are separate arguments.
+/// Windows' `CREATE_NO_WINDOW` process creation flag.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// On Windows, the worker is a console program: without this flag, every
+/// file would flash a console window when the app (a window program)
+/// starts its worker. Elsewhere the command is left as it is.
+fn without_console_window(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 /// Its stdout and stderr are read on two threads, each up to
 /// [`MAX_WORKER_OUTPUT_BYTES`]; if either goes past that, or the timeout
 /// passes, the worker is killed through its own handle and reaped. While it
@@ -293,13 +310,15 @@ fn run_worker(
         if stop.is_stopped() {
             return Err(stopped());
         }
-        let mut child = Command::new(&worker.program)
+        let mut command = Command::new(&worker.program);
+        command
             .args(&worker.args)
             .arg(src)
             .arg(dest)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = without_console_window(&mut command)
             .spawn()
             .map_err(spawn_error)?;
         let overflow = Arc::new(AtomicBool::new(false));
@@ -452,6 +471,26 @@ fn signal_of(_status: ExitStatus) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only Windows CI runs this. std has no getter for the creation flags,
+    /// so the test pins the constant to the Windows SDK's value and shows
+    /// that a command with the flag still starts and hands back its output;
+    /// whether a window flashes only the manual Windows test can show.
+    #[cfg(windows)]
+    #[test]
+    fn the_worker_is_started_without_a_console_window() {
+        assert_eq!(
+            CREATE_NO_WINDOW,
+            windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
+        );
+        let mut command = Command::new("cmd");
+        command
+            .args(["/C", "echo", "started"])
+            .stdout(Stdio::piped());
+        let output = without_console_window(&mut command).output().unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("started"));
+    }
 
     #[test]
     fn names_the_signals_a_crash_usually_ends_in() {

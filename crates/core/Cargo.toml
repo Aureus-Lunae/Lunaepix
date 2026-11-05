@@ -7,8 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# The worker mode on its own, for the integration tests (see the file). The
-# CLI and the app answer the worker mode from their own binaries.
+# The worker mode on its own. The bundle installs it beside the app as the
+# worker sidecar (built and staged by crates/xtask, see
+# src-tauri/tauri.bundle.conf.json), and the integration tests start it.
+# The CLI, and the app when the sidecar is missing, answer the worker mode
+# from their own binaries.
 [[bin]]
 name = "lunaepix-worker"
 path = "src/bin/lunaepix-worker.rs"
@@ -44,6 +47,11 @@ libc = "0.2.191"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_Diagnostics_Debug"] }
+
+# The SDK's CREATE_NO_WINDOW, which a test compares with run.rs's own constant.
+# Tests only, so the shipped worker gains no feature.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
 # Test fixtures: `png` encodes (low compression, redundant chunk), `image`

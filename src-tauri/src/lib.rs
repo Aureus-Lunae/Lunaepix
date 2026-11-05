@@ -9,7 +9,7 @@
 pub mod events;
 pub mod session;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -194,15 +194,55 @@ fn on_window_event(window: &Window, event: &WindowEvent) {
     }
 }
 
+/// The worker binary the bundle installs beside the app (Tauri's
+/// `externalBin`, see `tauri.bundle.conf.json`).
+fn sidecar_name() -> String {
+    format!("lunaepix-worker{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// The program that optimises each file, and a warning to print, if any.
+///
+/// A release build uses the worker beside it: that binary links five
+/// libraries instead of the window's 160, so it starts in about 6 ms
+/// instead of 58. When it is missing (an app built without the bundle
+/// config), the app's own worker mode does the work, with one warning.
+/// A debug build always uses its own worker mode, so `cargo run` needs no
+/// sidecar. `is_file` is the file-system check, injected for the tests.
+fn choose_worker(
+    app_exe: &Path,
+    release: bool,
+    is_file: impl Fn(&Path) -> bool,
+) -> (Worker, Option<String>) {
+    let itself = || Worker::new(app_exe);
+    if !release {
+        return (itself(), None);
+    }
+    let sidecar = app_exe.with_file_name(sidecar_name());
+    if is_file(&sidecar) {
+        (Worker::new(sidecar), None)
+    } else {
+        let warning = format!(
+            "lunaepix: no worker at {}, so the app optimises in its own, slower worker mode",
+            sidecar.display()
+        );
+        (itself(), Some(warning))
+    }
+}
+
 /// Start the window. `main` calls this after the worker-mode check.
 pub fn run() -> ExitCode {
-    let worker = match Worker::current_exe() {
-        Ok(worker) => worker,
+    let app_exe = match std::env::current_exe() {
+        Ok(path) => path,
         Err(error) => {
             eprintln!("lunaepix: cannot find its own program file: {error}");
             return ExitCode::FAILURE;
         }
     };
+    let release = !cfg!(debug_assertions);
+    let (worker, warning) = choose_worker(&app_exe, release, Path::is_file);
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
     let state = AppState {
         guard: RunGuard::new(),
         worker,
@@ -235,7 +275,7 @@ pub fn run() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     use tauri::PhysicalSize;
 
@@ -259,5 +299,64 @@ mod tests {
             stop_on_close(&event, || stops.set(stops.get() + 1));
         }
         assert_eq!(stops.get(), 0);
+    }
+
+    // --- which worker ---------------------------------------------------------
+
+    fn app_exe() -> PathBuf {
+        Path::new("/opt/lunaepix/bin").join(format!("lunaepix-app{}", std::env::consts::EXE_SUFFIX))
+    }
+
+    fn sidecar() -> PathBuf {
+        Path::new("/opt/lunaepix/bin")
+            .join(format!("lunaepix-worker{}", std::env::consts::EXE_SUFFIX))
+    }
+
+    #[test]
+    fn a_release_app_uses_the_sidecar_beside_it() {
+        let asked = RefCell::new(Vec::new());
+        let (worker, warning) = choose_worker(&app_exe(), true, |path| {
+            asked.borrow_mut().push(path.to_path_buf());
+            path == sidecar()
+        });
+        assert_eq!(worker, Worker::new(sidecar()));
+        assert_eq!(warning, None);
+        assert_eq!(*asked.borrow(), [sidecar()]);
+    }
+
+    #[test]
+    fn a_release_app_without_the_sidecar_falls_back_to_itself_and_warns_once() {
+        let (worker, warning) = choose_worker(&app_exe(), true, |_| false);
+        assert_eq!(worker, Worker::new(app_exe()));
+        let warning = warning.expect("one warning");
+        assert!(
+            warning.contains(&sidecar().display().to_string()),
+            "{warning}"
+        );
+        assert_eq!(warning.lines().count(), 1, "{warning}");
+    }
+
+    #[test]
+    fn a_debug_app_always_uses_itself_even_with_a_sidecar_beside_it() {
+        let asked = Cell::new(0);
+        let (worker, warning) = choose_worker(&app_exe(), false, |_| {
+            asked.set(asked.get() + 1);
+            true
+        });
+        assert_eq!(worker, Worker::new(app_exe()));
+        assert_eq!(warning, None);
+        assert_eq!(
+            asked.get(),
+            0,
+            "a debug build does not look for the sidecar"
+        );
+    }
+
+    #[test]
+    fn the_sidecar_name_has_the_platform_suffix() {
+        assert_eq!(
+            sidecar_name(),
+            format!("lunaepix-worker{}", std::env::consts::EXE_SUFFIX)
+        );
     }
 }
