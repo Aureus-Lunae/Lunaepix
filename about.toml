@@ -1,0 +1,36 @@
+# Settings for cargo-about, which writes THIRD-PARTY-LICENSES.html (the
+# licences of the code that ships inside Lunaepix). Regenerate it with:
+#
+#   cargo about generate -c about.toml about.hbs -o THIRD-PARTY-LICENSES.html
+#
+# `accepted` is a policy, not a convenience: only permissive licences, plus
+# MPL-2.0 (oxvg pulls in MPL-2.0 crates; a user decision). A GPL, LGPL or AGPL
+# crate, or any licence not listed here, makes the run fail. Do not add to
+# this list to make a run pass: report it to the project owner instead
+# (src-tauri/tests/config.rs checks the list).
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "BSL-1.0",
+    "CC0-1.0",
+    "0BSD",
+    "IJG",
+    "MPL-2.0",
+]
+
+# Only what is compiled into the app. Test-only crates are not shipped, and
+# build scripts (and the crates only they use) run at build time: none of
+# their code ends up in the binary.
+ignore-dev-dependencies = true
+ignore-build-dependencies = true
+
+# The platforms the app is built for (Linux and Windows; no macOS, no
+# mobile), so crates that only other platforms use are not listed.
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
