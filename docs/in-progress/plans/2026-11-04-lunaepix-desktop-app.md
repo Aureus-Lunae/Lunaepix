@@ -22,6 +22,8 @@ Everything decided in conversation is in the spec's Handoff. Do not re-open it. 
 
 **Step 11 dropped (user, 2026-11-04):** "This is an app, not a terminal option." No shell wrappers; `~/.bashrc.d/` is left untouched. Execution continues with Step 12. See the spec's Handoff.
 
+**Steps 12–14 and the final review (2026-11-05):** Steps 12 and 13 each went through a user-decided fix round after the text-scan defect class repeated, and both now parse what they check. Step 14 built deb, rpm and AppImage; the final review then found the AppImage ships LGPL/GPL system libraries, and the user dropped it. Before the merge to main, a final fix wave covers every Important finding and the extra fixes the user chose; see the spec's Handoff, "Final review fixes".
+
 Not in scope: macOS, auto-update, code signing, lossy modes, recursive folders, WebP.
 
 ## Execution
