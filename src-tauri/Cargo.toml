@@ -13,11 +13,11 @@ name = "lunaepix_app_lib"
 crate-type = ["rlib"]
 
 [build-dependencies]
-tauri-build = "2"
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
 lunaepix-core = { workspace = true }
-tauri = "2"
+tauri = { version = "2", features = [] }
 # Both plugins are called from Rust only; the window gets none of their
 # permissions (see capabilities/default.json). The 3.0 alphas need Tauri 3.
 tauri-plugin-dialog = "2.8.4"
