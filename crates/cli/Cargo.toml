@@ -1,0 +1,20 @@
+[package]
+name = "lunaepix-cli"
+description = "Command-line front end for Lunaepix"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "lunaepix"
+path = "src/main.rs"
+
+[dependencies]
+lunaepix-core = { workspace = true }
+
+[dev-dependencies]
+# Test fixtures: `png` makes the PNGs, `tempfile` the folders they live in.
+png = "0.17.16"
+tempfile = "3.27.0"

@@ -19,6 +19,18 @@ Decided in conversation (2026-11-04):
 - **SVG engine: option 2, a Rust SVG optimiser crate** (user, 2026-11-04). No Node sidecar, no WASM. If no crate comes within a few percent of svgo, the implementer stops and reports the numbers; it does not switch to option 1 or 3 on its own.
 - **Implementation plan approved (2026-11-04):** `docs/in-progress/plans/2026-11-04-lunaepix-desktop-app.md`. Execute it in a fresh session, subagent-driven; Step 2 (compressor evaluation) is a hard gate before any other code.
 - The Layout sketch below is approved; it is the binding layout (no mock-up file).
+- **Step 2 evaluation (2026-11-04):** PNG `oxipng` crate 10.2.1 is byte-identical to the CLI; JPG `mozjpeg-sys` 2.2.3 (jpegtran-style coefficient transcode) is byte-identical to jpegoptim on 13/13 files; SVG `oxvg_optimiser`/`oxvg_ast` 0.0.9 is +0.57 % vs svgo in total. Pin oxvg with `=` and commit `Cargo.lock`.
+- **SVG "renders identically" means edge noise is accepted** (user, 2026-11-04): neither svgo nor oxvg is pixel-identical, because both round coordinates. Tests accept differences on anti-aliased edges only: no differing pixel inside a flat area, and at most about 0.5 % of pixels different.
+- **JPG mode: always smallest-lossless** (user, 2026-11-04, chosen over "match jpegoptim" and over a switch): build both the jpegoptim-equivalent result (same coding mode as the input, optimised Huffman tables) and mozjpeg's tuned progressive result (coefficient transcode, no re-quantisation), keep the smaller of the two, and keep the original bytes if neither is smaller. Output may therefore become progressive. Checked against the Jugoo CMS upload (`m_images.php` plus CI3 `Upload`): progressive JPGs pass every check, and the WebP the CMS makes is the same size either way. The CMS refuses images over 2600 px or 5 MB (defaults), which Lunaepix neither causes nor fixes.
+- **Licences: MPL-2.0 is allowed** (user, 2026-11-04): oxvg pulls in MPL-2.0 crates. If the app is ever distributed it will be open source. GPL, LGPL and AGPL remain a stop. Step 13 generates a third-party licences file (it is needed anyway for the IJG credit of mozjpeg).
+- **Decompression bombs** (2026-11-04): images over `MAX_PIXELS` = 100 megapixels are refused from the header, before decoding (controller ruling after a security review). The same class of defect recurred in the PNG check, and the user chose to fix the cause, not only the instance: use each library's own limit first (oxipng `max_decompressed_size`, libjpeg's own header parse plus `max_memory_to_use`), keep our checks as an extra layer, and collect crafted inputs for every format in one shared test file, `crates/core/tests/hostile_input.rs`. Step 6 extends it with SVG entity expansion and deep nesting.
+- **One process per file** (user, 2026-11-04, after the same defect class appeared a third time: a 200 KB SVG with deeply nested CSS brackets crashed the process with a stack overflow inside oxvg's CSS parser). The batch runner (Step 7) optimises each file in a child process of the app's own binary, in a hidden worker mode. A crash, abort, out-of-memory or timeout marks only that file as failed ("the optimiser crashed on this file"); the window and the other files carry on. The existing format checks stay, for their clear messages. Chosen over "bound CSS nesting only" and "bound CSS nesting plus a 64 MiB stack thread".
+- **SVG parsing** (Step 6): roxmltree with `allow_dtd: true` (Illustrator files carry a DOCTYPE), and no entity resolver, so external entities are never read. Limits: element depth 128, 1,000,000 nodes, entity expansion capped at 16 MiB by an over-estimating check whose soundness relies on roxmltree 0.21.2. roxmltree is therefore pinned exactly, with tests that fail if its entity limits change. Scripts are kept, as svgo does.
+- **Step 11 dropped (user, 2026-11-04):** "This is an app, not a terminal option." The shell functions `optimg`/`optimgdir` in `~/.bashrc.d/` are not rewritten and the user's shell config is not touched. The `lunaepix` CLI from Step 8 stays in the repo. Found while preparing the step: `~/.bashrc` sources every file in `~/.bashrc.d/`, including `90-miscCommands.sh.bak`, so the old imagemin `optimg` overrides the current one; that is the user's to handle.
+- **Gate passed (2026-11-04):** the user ruled on all Step 2 numbers; implementation continues with Step 1.
+- **Parse structured files, never scan them as text** (user, 2026-11-05). The defect class "a check that reads a structured format as text, so another spelling passes" recurred in Step 12 (workflow YAML), Step 13 (`about.toml`) and the final review (the window's HTML). Each fix uses a real parser: yaml-rust2 for the workflow, the `toml` crate for `about.toml`, and html5ever's tokenizer for `ui/index.html` and the licences HTML (all test-only dependencies). The JS checks stay text and are described as a lint, not a guarantee.
+- **No AppImage** (user, 2026-11-05). An AppImage bundles about 190 LGPL/GPL system libraries (WebKitGTK, GTK, gnutls, nettle, gmp) without notices or a source offer, which the licence policy above forbids. Linux ships as deb and rpm, which use the system's libraries; Windows as NSIS and MSI. The bundle targets are listed explicitly, never `all`.
+- **Final review fixes** (user, 2026-11-05), all in this branch before the merge to main. Windows: no crash dialog from a crashing worker, a static CRT, a rerun that works on a read-only source, and an existing `Optimized` folder in another letter case. Over-limit files collapse into one summary row. A run that finds no image says "No PNG, JPG or SVG files directly in this folder (subfolders are not included)". Closing the window stops the running worker. The worker becomes a small separate binary shipped as a Tauri sidecar, instead of a second copy of the full app.
 
 ## Problem
 
@@ -41,7 +53,7 @@ The shell function only works where bash, GNU `stat -c`, GNU `date +%s%N`, `awk`
   - SVG: no maintained Rust equivalent of `svgo` is known. Open question below.
   - JPG: a lossless JPEG optimiser crate (Huffman table optimisation and progressive encode, no re-quantisation), matching `jpegoptim`'s default behaviour.
 - The core is one Rust library with a single function that takes a source path and a destination path and returns `{before, after, ms}` or an error. The window and the command line are thin callers, so there is one code path.
-- The shell functions `optimg` and `optimgdir` become wrappers that call the app's CLI binary, so the terminal and the window give identical results.
+- ~~The shell functions `optimg` and `optimgdir` become wrappers that call the app's CLI binary, so the terminal and the window give identical results.~~ (dropped, see Handoff)
 
 ### SVG engine (decided: Rust crate)
 
@@ -53,8 +65,8 @@ Chosen by the user: a Rust SVG optimiser crate, linked into the app. No maintain
 
 ### Platforms
 
-- Linux: built and tested locally (AppImage/RPM).
-- Windows: built by a GitHub Actions workflow on `windows-latest` using `tauri-action`, producing an unsigned installer (MSI/NSIS) as a downloadable artifact. Run on tag push or manually.
+- Linux: built and tested locally (deb/RPM).
+- Windows: built by a GitHub Actions workflow on `windows-latest` using `cargo install tauri-cli` (not `tauri-action`), producing an unsigned installer (MSI/NSIS) as a downloadable artifact. Run on tag push or manually.
 - No macOS release.
 - The Rust core uses `std::path` only and no GNU tools. Paths dropped or chosen in the window are handled as `PathBuf`, so Windows drive letters, backslashes and spaces work. Test cases include a name with spaces and non-ASCII characters.
 

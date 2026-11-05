@@ -16,6 +16,14 @@ Everything decided in conversation is in the spec's Handoff. Do not re-open it. 
 - The compressor evaluation (Step 2) runs **before** any other code and is a hard gate.
 - The plan names no crate versions. The implementer picks current versions and records them.
 
+**Execution (2026-11-04):** Step 2 ran before Step 1, because both handoffs say the gate comes before any other code. The gate rulings (SVG edge-noise tolerance, JPG always smallest-lossless, MPL-2.0 allowed) are in the spec's Handoff.
+
+**Step 7 changed (user, 2026-11-04):** the batch runner optimises each file in a child process of the app's own binary (hidden worker mode), so a crash, abort, out-of-memory or timeout in a library fails only that file. The CLI (Step 8) and the Tauri binary (Step 9) both answer the worker mode. See the spec's Handoff, "One process per file".
+
+**Step 11 dropped (user, 2026-11-04):** "This is an app, not a terminal option." No shell wrappers; `~/.bashrc.d/` is left untouched. Execution continues with Step 12. See the spec's Handoff.
+
+**Steps 12–14 and the final review (2026-11-05):** Steps 12 and 13 each went through a user-decided fix round after the text-scan defect class repeated, and both now parse what they check. Step 14 built deb, rpm and AppImage; the final review then found the AppImage ships LGPL/GPL system libraries, and the user dropped it. Before the merge to main, a final fix wave covers every Important finding and the extra fixes the user chose; see the spec's Handoff, "Final review fixes".
+
 Not in scope: macOS, auto-update, code signing, lossy modes, recursive folders, WebP.
 
 ## Execution

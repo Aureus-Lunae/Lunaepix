@@ -1,0 +1,40 @@
+[package]
+name = "lunaepix-app"
+description = "Lunaepix desktop app (Tauri 2)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "lunaepix_app_lib"
+# Desktop only: no mobile build, so no staticlib or cdylib.
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+lunaepix-core = { workspace = true }
+tauri = { version = "2", features = [] }
+# Both plugins are called from Rust only; the window gets none of their
+# permissions (see capabilities/default.json). The 3.0 alphas need Tauri 3.
+tauri-plugin-dialog = "2.8.4"
+tauri-plugin-opener = "2.7.2"
+serde = { version = "1.0.229", features = ["derive"] }
+
+[dev-dependencies]
+# The event payloads are checked as the JSON the window receives.
+serde_json = "1.0.154"
+# Test fixtures for the worker-mode smoke test, as in the CLI's tests.
+png = "0.17.16"
+tempfile = "3.27.0"
+yaml-rust2 = "0.13.0"
+# Reads about.toml (the licence policy) as TOML in the config checks. The
+# version already in Cargo.lock (tauri's build tools use it), so no new package.
+toml = "1.2.0"
+# Reads ui/index.html and THIRD-PARTY-LICENSES.html as HTML tokens in the
+# config checks, never as text. The version already in Cargo.lock (tauri-utils
+# uses it), so no new package.
+html5ever = "0.39.0"
