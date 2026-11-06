@@ -1,4 +1,4 @@
-//! Lunaepix core: lossless PNG, JPG and SVG optimisation.
+//! Lunaepix core: lossless PNG, JPG, SVG and WebP optimisation.
 //!
 //! All logic and all tests live here. The CLI and the Tauri app are thin
 //! front ends over this crate.
@@ -29,6 +29,7 @@ mod platform;
 mod png;
 mod run;
 mod svg;
+mod webp;
 pub mod worker;
 
 pub use plan::{
@@ -49,7 +50,7 @@ pub struct Outcome {
 /// Why a file is left alone. The `Display` text is shown to the user in the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Skip {
-    /// Not a PNG, JPG or SVG file.
+    /// Not a PNG, JPG, SVG or WebP file.
     UnsupportedType,
     /// Larger than the per-file size limit.
     TooLarge,
@@ -93,7 +94,7 @@ pub enum OptimizeError {
     /// deliberately not a `source()`, so an error chain does not print it twice.
     #[error("{path}: {cause}", path = path.display())]
     Io { path: PathBuf, cause: io::Error },
-    /// The file is not a PNG, JPG or SVG.
+    /// The file is not a PNG, JPG, SVG or WebP.
     #[error("{path}: unsupported file type", path = path.display())]
     UnsupportedType { path: PathBuf },
     /// The file has a supported extension but its content could not be
@@ -162,6 +163,7 @@ pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> 
         plan::Format::Png => png::optimize(&original),
         plan::Format::Jpg => jpg::optimize(&original),
         plan::Format::Svg => svg::optimize(&original),
+        plan::Format::Webp => webp::optimize(&original),
     }
     .map_err(|message| OptimizeError::Invalid {
         path: src.to_path_buf(),

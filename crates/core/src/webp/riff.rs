@@ -1,0 +1,711 @@
+//! The RIFF container of a WebP file, walked in safe Rust.
+//!
+//! The walk reads chunk headers and the few header bytes of the image chunks
+//! (`VP8X`, `VP8L`, `VP8 `) and nothing else. It never decodes an image, so a
+//! file that declares a huge image is refused from its headers alone.
+
+use crate::plan::check_pixels;
+
+/// Most chunks one file may hold. A real file has a handful, an animation one
+/// `ANMF` per frame; the limit only stops a file of nothing but empty chunks
+/// (13 million of them fit in [`crate::MAX_FILE_BYTES`]) from growing the
+/// chunk list to hundreds of megabytes.
+const MAX_CHUNKS: usize = 1_000_000;
+
+/// The error for content that is not WebP data at all.
+const NOT_WEBP: &str = "not a WebP file (the content is not WebP data)";
+
+/// The size of the `RIFF` header: `"RIFF"`, the size field and `"WEBP"`.
+const RIFF_HEADER: usize = 12;
+
+/// The `VP8X` payload: flags, 3 reserved bytes, then the two canvas sizes.
+const VP8X_LEN: usize = 10;
+
+/// What a file holds, as far as the optimiser needs to tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// A still `VP8 ` image, with or without an `ALPH` chunk.
+    Lossy,
+    /// A still `VP8L` image.
+    Lossless,
+    /// An `ANIM` chunk and at least one `ANMF` frame.
+    Animated,
+}
+
+/// One chunk: its FourCC and its payload, without the padding byte an odd
+/// size is followed by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Read by the strip step; until then, only by the tests.
+pub(crate) struct Chunk<'a> {
+    pub fourcc: [u8; 4],
+    pub data: &'a [u8],
+}
+
+/// A parsed WebP file: its chunks in file order, and what kind of file it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Read by the strip step; until then, only by the tests.
+pub(crate) struct WebpFile<'a> {
+    pub chunks: Vec<Chunk<'a>>,
+    pub kind: Kind,
+}
+
+/// The error for a file whose RIFF container is broken.
+fn unreadable(why: &str) -> String {
+    format!("could not read the WebP data: {why}")
+}
+
+/// Check that `bytes` is WebP data, walk its chunks and check the size of
+/// the image it declares, in that order.
+///
+/// The walk stops at the RIFF size: bytes after it are ignored, and a chunk
+/// that runs past it is refused. Every offset is computed with checked
+/// arithmetic, so a declared size of 4 GB is an error, not a panic or an
+/// allocation. A `VP8X` must be the first chunk and may occur once, as in the
+/// container specification; a file with no image chunk is refused.
+///
+/// The size check covers the `VP8X` canvas and, as well, the header of every
+/// `VP8L` and `VP8 ` chunk, against [`crate::MAX_PIXELS`]. It comes before
+/// the check for an image chunk, so a canvas over the limit is "too large"
+/// even when the file holds no image.
+///
+/// The errors are messages for the user: "not a WebP file (…)" when the
+/// content is not WebP data, `check_pixels`'s text when the image is too
+/// large, and "could not read the WebP data: …" otherwise.
+pub(crate) fn parse(bytes: &[u8]) -> Result<WebpFile<'_>, String> {
+    let body = riff_body(bytes)?;
+    let chunks = walk(body)?;
+    for chunk in &chunks {
+        if let Some((width, height)) = declared_size(chunk)? {
+            check_pixels(width, height)?;
+        }
+    }
+    let kind = kind_of(&chunks)?;
+    Ok(WebpFile { chunks, kind })
+}
+
+/// The chunks of the file: the bytes between the `RIFF` header and the end
+/// the RIFF size gives. Refuses what is not `RIFF`…`WEBP`, and a size that is
+/// too small for the form type or runs past the end of the file.
+fn riff_body(bytes: &[u8]) -> Result<&[u8], String> {
+    let Some(header) = bytes.first_chunk::<RIFF_HEADER>() else {
+        return Err(NOT_WEBP.to_owned());
+    };
+    if &header[..4] != b"RIFF" || &header[8..] != b"WEBP" {
+        return Err(NOT_WEBP.to_owned());
+    }
+    let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+    // The size counts everything after the first 8 bytes.
+    match size.checked_add(8) {
+        Some(end) if (RIFF_HEADER..=bytes.len()).contains(&end) => Ok(&bytes[RIFF_HEADER..end]),
+        _ => Err(unreadable(
+            "the RIFF size is too small, or runs past the end of the file",
+        )),
+    }
+}
+
+/// Every chunk of `body`, in order: a header of FourCC and little-endian
+/// size, the payload, and one zero byte when the size is odd. A final odd
+/// chunk may lack its padding byte; some writers leave it out.
+fn walk(body: &[u8]) -> Result<Vec<Chunk<'_>>, String> {
+    let mut chunks = Vec::new();
+    let mut at = 0;
+    while at < body.len() {
+        let header = at.checked_add(8).and_then(|end| body.get(at..end));
+        let Some(&[f0, f1, f2, f3, s0, s1, s2, s3]) = header else {
+            return Err(unreadable("a chunk header is cut short"));
+        };
+        let fourcc = [f0, f1, f2, f3];
+        let size = u32::from_le_bytes([s0, s1, s2, s3]) as usize;
+        let start = at + 8;
+        let Some(end) = start.checked_add(size).filter(|&end| end <= body.len()) else {
+            return Err(unreadable(&format!(
+                "the {} chunk runs past the end of the file",
+                name_of(&fourcc)
+            )));
+        };
+        if chunks.len() == MAX_CHUNKS {
+            return Err(unreadable(&format!("it has more than {MAX_CHUNKS} chunks")));
+        }
+        if &fourcc == b"VP8X" {
+            if chunks.first().is_some_and(|c: &Chunk| &c.fourcc == b"VP8X") {
+                return Err(unreadable("it has more than one VP8X chunk"));
+            }
+            if !chunks.is_empty() {
+                return Err(unreadable("the VP8X chunk is not the first chunk"));
+            }
+        }
+        chunks.push(Chunk {
+            fourcc,
+            data: &body[start..end],
+        });
+        // The pad byte is skipped; at most it is the one missing at the end.
+        at = end.saturating_add(size & 1).min(body.len());
+    }
+    Ok(chunks)
+}
+
+/// The FourCC as text for a message; it can be any four bytes.
+fn name_of(fourcc: &[u8; 4]) -> String {
+    String::from_utf8_lossy(fourcc).trim_end().to_owned()
+}
+
+/// The image size a chunk declares in its header, for `VP8X` (the canvas),
+/// `VP8L` and `VP8 `; `None` for every other chunk.
+fn declared_size(chunk: &Chunk<'_>) -> Result<Option<(u32, u32)>, String> {
+    match &chunk.fourcc {
+        // Flags, 3 reserved bytes, then width-1 and height-1, 24 bits each.
+        b"VP8X" => {
+            let &[_, _, _, _, w0, w1, w2, h0, h1, h2, ..] = chunk.data else {
+                return Err(unreadable(&format!(
+                    "the VP8X chunk is shorter than its {VP8X_LEN}-byte header"
+                )));
+            };
+            let width = u32::from_le_bytes([w0, w1, w2, 0]) + 1;
+            let height = u32::from_le_bytes([h0, h1, h2, 0]) + 1;
+            Ok(Some((width, height)))
+        }
+        // The signature 0x2F, then width-1 and height-1 in 14 bits each.
+        b"VP8L" => {
+            let &[signature, b0, b1, b2, b3, ..] = chunk.data else {
+                return Err(unreadable(
+                    "the VP8L chunk is shorter than its 5-byte header",
+                ));
+            };
+            if signature != 0x2F {
+                return Err(unreadable("the VP8L chunk does not start with 0x2F"));
+            }
+            let bits = u32::from_le_bytes([b0, b1, b2, b3]);
+            Ok(Some(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)))
+        }
+        // The 3-byte frame tag, the start code, then width and height in 14
+        // bits each (the top two bits are a scale).
+        b"VP8 " => {
+            let &[_, _, _, 0x9D, 0x01, 0x2A, w0, w1, h0, h1, ..] = chunk.data else {
+                return Err(unreadable(
+                    "the VP8 chunk is too short, or lacks its start code",
+                ));
+            };
+            let width = u32::from(u16::from_le_bytes([w0, w1]) & 0x3FFF);
+            let height = u32::from(u16::from_le_bytes([h0, h1]) & 0x3FFF);
+            Ok(Some((width, height)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// What the chunks make: an animation (`ANIM` and a frame), else the still
+/// image of the first `VP8L` or `VP8 ` chunk. No image chunk is an error.
+fn kind_of(chunks: &[Chunk<'_>]) -> Result<Kind, String> {
+    let has = |fourcc: &[u8; 4]| chunks.iter().any(|c| &c.fourcc == fourcc);
+    if has(b"ANIM") && has(b"ANMF") {
+        return Ok(Kind::Animated);
+    }
+    match chunks
+        .iter()
+        .find(|c| matches!(&c.fourcc, b"VP8L" | b"VP8 "))
+    {
+        Some(c) if &c.fourcc == b"VP8L" => Ok(Kind::Lossless),
+        Some(_) => Ok(Kind::Lossy),
+        None => Err(unreadable("it has no image chunk")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Generous: a refusal takes microseconds; a walk that trusts a declared
+    /// size takes far longer or panics.
+    const QUICK: Duration = Duration::from_secs(5);
+
+    const NOT_WEBP: &str = "not a WebP file (the content is not WebP data)";
+    const UNREADABLE: &str = "could not read the WebP data:";
+
+    // --- fixtures -----------------------------------------------------------
+
+    /// One chunk: FourCC, size, payload, and the zero pad byte of an odd size.
+    fn chunk(fourcc: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut out = raw_chunk(fourcc, data.len() as u32, data);
+        if data.len() % 2 == 1 {
+            out.push(0);
+        }
+        out
+    }
+
+    /// A chunk header declaring `size`, followed by `data` as it is, with no
+    /// padding: for chunks whose declared size is wrong on purpose.
+    fn raw_chunk(fourcc: &[u8; 4], size: u32, data: &[u8]) -> Vec<u8> {
+        let mut out = fourcc.to_vec();
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// A RIFF header whose size is right for `body`, then `body`.
+    fn riff_of(body: &[u8]) -> Vec<u8> {
+        riff_declaring(4 + body.len() as u32, body)
+    }
+
+    /// A RIFF header with the given size field, `WEBP`, then `body`.
+    fn riff_declaring(size: u32, body: &[u8]) -> Vec<u8> {
+        let mut out = b"RIFF".to_vec();
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(b"WEBP");
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn riff(chunks: &[Vec<u8>]) -> Vec<u8> {
+        riff_of(&chunks.concat())
+    }
+
+    /// A `VP8X` chunk for a `w`x`h` canvas (stored as width-1 and height-1,
+    /// 24 bits each).
+    fn vp8x(flags: u8, w: u32, h: u32) -> Vec<u8> {
+        let mut data = vec![flags, 0, 0, 0];
+        data.extend_from_slice(&(w - 1).to_le_bytes()[..3]);
+        data.extend_from_slice(&(h - 1).to_le_bytes()[..3]);
+        chunk(b"VP8X", &data)
+    }
+
+    /// A `VP8L` payload that declares `w`x`h`, with a few bytes of "bitstream"
+    /// behind the header (the walk never decodes it).
+    fn vp8l_payload(w: u32, h: u32) -> Vec<u8> {
+        let bits = (w - 1) | ((h - 1) << 14);
+        let mut data = vec![0x2F];
+        data.extend_from_slice(&bits.to_le_bytes());
+        data.extend_from_slice(&[0; 5]);
+        data
+    }
+
+    fn vp8l(w: u32, h: u32) -> Vec<u8> {
+        chunk(b"VP8L", &vp8l_payload(w, h))
+    }
+
+    /// A `VP8 ` payload that declares `w`x`h`: the key frame tag, the start
+    /// code, the two sizes, and a few bytes of "bitstream".
+    fn vp8_payload(w: u16, h: u16) -> Vec<u8> {
+        let mut data = vec![0x30, 0x01, 0x00, 0x9D, 0x01, 0x2A];
+        data.extend_from_slice(&w.to_le_bytes());
+        data.extend_from_slice(&h.to_le_bytes());
+        data.extend_from_slice(&[0; 4]);
+        data
+    }
+
+    fn vp8(w: u16, h: u16) -> Vec<u8> {
+        chunk(b"VP8 ", &vp8_payload(w, h))
+    }
+
+    /// An `ANMF` frame: the 16-byte frame header and a few bytes of frame data.
+    fn anmf() -> Vec<u8> {
+        chunk(b"ANMF", &[0; 24])
+    }
+
+    /// `ANIM`: background colour and loop count.
+    fn anim() -> Vec<u8> {
+        chunk(b"ANIM", &[0; 6])
+    }
+
+    /// A real lossless WebP from `image`'s encoder.
+    fn real_lossless() -> Vec<u8> {
+        let pixels: Vec<u8> = (0..16 * 16 * 4).map(|i| (i * 7 % 251) as u8).collect();
+        let mut out = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut out)
+            .encode(&pixels, 16, 16, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        out
+    }
+
+    /// `parse`, which must come back quickly whatever the input declares.
+    fn parse_quickly(bytes: &[u8]) -> Result<WebpFile<'_>, String> {
+        let started = Instant::now();
+        let result = parse(bytes);
+        assert!(started.elapsed() < QUICK, "took {:?}", started.elapsed());
+        result
+    }
+
+    /// The error of a file the walk must refuse as unreadable.
+    fn unreadable(bytes: &[u8]) -> String {
+        let err = parse_quickly(bytes).unwrap_err();
+        assert!(err.starts_with(UNREADABLE), "{err}");
+        err
+    }
+
+    fn fourccs(file: &WebpFile<'_>) -> Vec<String> {
+        file.chunks
+            .iter()
+            .map(|c| String::from_utf8_lossy(&c.fourcc).into_owned())
+            .collect()
+    }
+
+    // --- the content check ----------------------------------------------------
+
+    #[test]
+    fn the_fixture_helpers_write_a_riff_size_that_covers_the_file() {
+        // Proof that the hand-made files say what the tests rely on.
+        let file = riff(&[vp8x(0, 1, 1), vp8l(1, 1)]);
+        assert_eq!(
+            u32::from_le_bytes(file[4..8].try_into().unwrap()) as usize,
+            file.len() - 8
+        );
+        assert_eq!(&file[8..12], b"WEBP");
+    }
+
+    #[test]
+    fn refuses_what_is_not_webp_data() {
+        let png = [
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R',
+        ];
+        let mut wave = b"RIFF".to_vec();
+        wave.extend_from_slice(&36u32.to_le_bytes());
+        wave.extend_from_slice(b"WAVEfmt ");
+        let mut not_riff = riff(&[vp8l(1, 1)]);
+        not_riff[0] = b'X';
+        let mut not_webp_form = riff(&[vp8l(1, 1)]);
+        not_webp_form[11] = b'X';
+        let cases: [&[u8]; 7] = [
+            &png,
+            &wave,
+            &[],
+            b"RIFF",
+            // The header cut one byte short of its twelve.
+            b"RIFF\x04\x00\x00\x00WEB",
+            &not_riff,
+            &not_webp_form,
+        ];
+        for case in cases {
+            assert_eq!(parse_quickly(case).unwrap_err(), NOT_WEBP, "{case:?}");
+        }
+    }
+
+    // --- what kind of file it is ------------------------------------------------
+
+    #[test]
+    fn parses_a_simple_lossless_file_as_lossless() {
+        let bytes = real_lossless();
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(file.kind, Kind::Lossless);
+        assert_eq!(fourccs(&file), ["VP8L"]);
+        assert_eq!(file.chunks[0].data[0], 0x2F);
+    }
+
+    #[test]
+    fn parses_a_lossy_file_as_lossy() {
+        let bytes = riff(&[vp8(640, 480)]);
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(file.kind, Kind::Lossy);
+        assert_ne!(file.kind, Kind::Lossless);
+        assert_eq!(fourccs(&file), ["VP8 "]);
+    }
+
+    #[test]
+    fn parses_a_lossy_file_with_alpha_as_lossy() {
+        let bytes = riff(&[vp8x(0x10, 64, 64), chunk(b"ALPH", &[0; 12]), vp8(64, 64)]);
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(file.kind, Kind::Lossy);
+        assert_eq!(fourccs(&file), ["VP8X", "ALPH", "VP8 "]);
+    }
+
+    #[test]
+    fn parses_an_extended_lossless_file_as_lossless() {
+        let bytes = riff(&[vp8x(0, 32, 32), vp8l(32, 32)]);
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(file.kind, Kind::Lossless);
+        assert_eq!(fourccs(&file), ["VP8X", "VP8L"]);
+    }
+
+    #[test]
+    fn parses_an_animated_file_as_animated() {
+        let bytes = riff(&[vp8x(0x02, 100, 100), anim(), anmf(), anmf()]);
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(file.kind, Kind::Animated);
+        assert_eq!(fourccs(&file), ["VP8X", "ANIM", "ANMF", "ANMF"]);
+    }
+
+    #[test]
+    fn does_not_call_the_same_file_without_anim_and_anmf_animated() {
+        // The animation flag alone does not make a still image animated.
+        let flagged_still = riff(&[vp8x(0x02, 100, 100), vp8l(100, 100)]);
+        assert_eq!(parse_quickly(&flagged_still).unwrap().kind, Kind::Lossless);
+
+        // An ANIM chunk without frames does not either.
+        let no_frames = riff(&[vp8x(0x02, 100, 100), anim(), vp8l(100, 100)]);
+        assert_eq!(parse_quickly(&no_frames).unwrap().kind, Kind::Lossless);
+
+        // Frames without ANIM are no animation and no still image.
+        let no_anim = riff(&[vp8x(0x02, 100, 100), anmf(), anmf()]);
+        assert!(unreadable(&no_anim).contains("no image chunk"));
+    }
+
+    // --- VP8X --------------------------------------------------------------------
+
+    #[test]
+    fn parses_a_vp8x_that_comes_first_exactly_once() {
+        let bytes = riff(&[vp8x(0x20, 8, 8), chunk(b"ICCP", &[1, 2, 3, 4]), vp8l(8, 8)]);
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(fourccs(&file), ["VP8X", "ICCP", "VP8L"]);
+        assert_eq!(file.chunks[0].data.len(), 10);
+    }
+
+    #[test]
+    fn refuses_a_vp8x_that_is_not_first() {
+        let err = unreadable(&riff(&[vp8l(8, 8), vp8x(0, 8, 8)]));
+        assert!(err.contains("VP8X") && err.contains("first"), "{err}");
+        let err = unreadable(&riff(&[chunk(b"ICCP", &[0; 4]), vp8x(0, 8, 8), vp8l(8, 8)]));
+        assert!(err.contains("VP8X") && err.contains("first"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_second_vp8x() {
+        let err = unreadable(&riff(&[vp8x(0, 8, 8), vp8x(0, 8, 8), vp8l(8, 8)]));
+        assert!(err.contains("more than one VP8X"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_vp8x_shorter_than_its_header() {
+        let short = chunk(b"VP8X", &[0; 9]);
+        let err = unreadable(&riff(&[short, vp8l(8, 8)]));
+        assert!(err.contains("VP8X"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_file_without_an_image_chunk() {
+        let exif_only = riff(&[vp8x(0x08, 8, 8), chunk(b"EXIF", &[0; 6])]);
+        assert!(unreadable(&exif_only).contains("no image chunk"));
+        // Not even a VP8X.
+        assert!(unreadable(&riff(&[])).contains("no image chunk"));
+    }
+
+    // --- the chunk walk -------------------------------------------------------------
+
+    #[test]
+    fn refuses_a_chunk_past_the_end() {
+        // A declared size of four gigabytes, in a RIFF that is otherwise right.
+        let huge = raw_chunk(b"VP8L", u32::MAX, &vp8l_payload(8, 8));
+        unreadable(&riff_of(&huge));
+        let huge_after_vp8x = [vp8x(0, 8, 8), raw_chunk(b"EXIF", u32::MAX, &[0; 6])].concat();
+        unreadable(&riff_of(&huge_after_vp8x));
+        // Just one byte past the end.
+        let payload = vp8l_payload(8, 8);
+        let one_over = raw_chunk(b"VP8L", payload.len() as u32 + 1, &payload);
+        unreadable(&riff_of(&one_over));
+    }
+
+    #[test]
+    fn refuses_a_riff_size_larger_than_the_file() {
+        let good = riff(&[vp8x(0, 8, 8), vp8l(8, 8)]);
+        let body = &good[12..];
+        for extra in [1u32, 1000, u32::MAX - 4 - body.len() as u32] {
+            let bytes = riff_declaring(4 + body.len() as u32 + extra, body);
+            unreadable(&bytes);
+        }
+        // The size field alone is at its largest.
+        unreadable(&riff_declaring(u32::MAX, body));
+        // And the exact size is accepted.
+        assert!(parse_quickly(&good).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_riff_size_too_small_for_the_form_type() {
+        for size in 0..4u32 {
+            unreadable(&riff_declaring(size, &vp8l(8, 8)));
+        }
+    }
+
+    #[test]
+    fn refuses_a_chunk_that_runs_past_the_riff_size_inside_the_file() {
+        let mut bytes = riff(&[vp8x(0, 8, 8), vp8l(8, 8)]);
+        let size = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        // The RIFF ends 4 bytes early; the file does not.
+        bytes[4..8].copy_from_slice(&(size - 4).to_le_bytes());
+        unreadable(&bytes);
+
+        // The same for a chunk of odd size whose last payload byte is cut off.
+        let odd = riff(&[vp8x(0, 8, 8), chunk(b"VP8L", &vp8l_payload(8, 8)[..9])]);
+        let mut cut = odd.clone();
+        let size = u32::from_le_bytes(cut[4..8].try_into().unwrap());
+        cut[4..8].copy_from_slice(&(size - 2).to_le_bytes());
+        unreadable(&cut);
+        assert!(parse_quickly(&odd).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_chunk_header_cut_short() {
+        for left in 1..8 {
+            let mut body = [vp8x(0, 8, 8), vp8l(8, 8)].concat();
+            body.extend_from_slice(&b"JUNKJUNK"[..left]);
+            unreadable(&riff_of(&body));
+        }
+    }
+
+    #[test]
+    fn ignores_bytes_after_the_riff_size() {
+        let clean = riff(&[vp8x(0, 8, 8), vp8l(8, 8)]);
+        let mut with_tail = clean.clone();
+        // A whole chunk after the RIFF, and then bytes that are no chunk.
+        with_tail.extend(chunk(b"EXIF", &[0; 6]));
+        with_tail.extend_from_slice(b"junk");
+        let file = parse_quickly(&with_tail).unwrap();
+        assert_eq!(fourccs(&file), ["VP8X", "VP8L"]);
+        assert_eq!(file.kind, Kind::Lossless);
+    }
+
+    #[test]
+    fn skips_the_padding_byte_of_an_odd_sized_chunk() {
+        let bytes = riff(&[vp8x(0x20, 8, 8), chunk(b"ICCP", &[1, 2, 3]), vp8l(8, 8)]);
+        let file = parse_quickly(&bytes).unwrap();
+        // The chunk after the odd one is found, and the pad is not its data.
+        assert_eq!(fourccs(&file), ["VP8X", "ICCP", "VP8L"]);
+        assert_eq!(file.chunks[1].data, [1, 2, 3]);
+    }
+
+    #[test]
+    fn accepts_a_final_odd_sized_chunk_without_its_padding_byte() {
+        // Some writers leave the last pad out of the RIFF size.
+        let payload = vp8l_payload(8, 8);
+        assert_eq!(payload.len() % 2, 0);
+        let odd = &payload[..9];
+        let body = [vp8x(0, 8, 8), raw_chunk(b"VP8L", 9, odd)].concat();
+        let bytes = riff_of(&body);
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(file.chunks[1].data, odd);
+    }
+
+    #[test]
+    fn accepts_exactly_the_chunk_limit() {
+        let mut body = vp8l(8, 8);
+        for _ in 1..MAX_CHUNKS {
+            body.extend(chunk(b"JUNK", &[]));
+        }
+        let bytes = riff_of(&body);
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(file.chunks.len(), MAX_CHUNKS);
+    }
+
+    #[test]
+    fn refuses_more_chunks_than_the_limit() {
+        let mut body = vp8l(8, 8);
+        for _ in 0..MAX_CHUNKS {
+            body.extend(chunk(b"JUNK", &[]));
+        }
+        let err = unreadable(&riff_of(&body));
+        assert!(err.contains("chunks"), "{err}");
+    }
+
+    // --- the image headers ---------------------------------------------------------
+
+    #[test]
+    fn refuses_a_vp8l_shorter_than_its_header() {
+        for len in 0..5 {
+            let short = chunk(b"VP8L", &vp8l_payload(8, 8)[..len]);
+            let err = unreadable(&riff(&[short]));
+            assert!(err.contains("VP8L"), "{err}");
+        }
+    }
+
+    #[test]
+    fn refuses_a_vp8l_without_its_signature_byte() {
+        let mut payload = vp8l_payload(8, 8);
+        payload[0] = 0x2E;
+        let err = unreadable(&riff(&[chunk(b"VP8L", &payload)]));
+        assert!(err.contains("VP8L"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_vp8_shorter_than_its_header() {
+        for len in 0..10 {
+            let short = chunk(b"VP8 ", &vp8_payload(8, 8)[..len]);
+            let err = unreadable(&riff(&[short]));
+            assert!(err.contains("VP8"), "{err}");
+        }
+    }
+
+    #[test]
+    fn refuses_a_vp8_without_its_start_code() {
+        let mut payload = vp8_payload(8, 8);
+        payload[3] = 0x9C;
+        let err = unreadable(&riff(&[chunk(b"VP8 ", &payload)]));
+        assert!(err.contains("start code"), "{err}");
+    }
+
+    // --- the pixel limit --------------------------------------------------------------
+
+    #[test]
+    fn refuses_a_canvas_over_the_pixel_limit() {
+        // A VP8X alone, so only the size can be what refuses it.
+        let bomb = riff(&[vp8x(0, 20_000, 20_000)]);
+        assert!(bomb.len() < 64);
+        assert_eq!(
+            parse_quickly(&bomb).unwrap_err(),
+            "image too large: 20000×20000 exceeds 100 megapixels"
+        );
+        // The largest canvas the 24-bit fields hold.
+        let largest = riff(&[vp8x(0, 1 << 24, 1 << 24)]);
+        assert_eq!(
+            parse_quickly(&largest).unwrap_err(),
+            "image too large: 16777216×16777216 exceeds 100 megapixels"
+        );
+        // One row over the limit, next to an image header within it.
+        let over = riff(&[vp8x(0, 10_000, 10_001), vp8l(1, 1)]);
+        assert!(
+            parse_quickly(&over)
+                .unwrap_err()
+                .starts_with("image too large")
+        );
+    }
+
+    #[test]
+    fn refuses_a_canvas_at_the_limit_with_no_image_chunk_as_unreadable_not_too_large() {
+        let err = unreadable(&riff(&[vp8x(0, 10_000, 10_000)]));
+        assert!(!err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn parses_a_vp8x_canvas_at_the_pixel_limit() {
+        let bytes = riff(&[vp8x(0, 10_000, 10_000), vp8l(1, 1)]);
+        assert_eq!(parse_quickly(&bytes).unwrap().kind, Kind::Lossless);
+    }
+
+    #[test]
+    fn parses_a_vp8l_and_a_vp8_header_within_the_limit() {
+        assert!(parse_quickly(&riff(&[vp8l(10_000, 10_000)])).is_ok());
+        assert!(parse_quickly(&riff(&[vp8(10_000, 10_000)])).is_ok());
+        assert!(parse_quickly(&riff(&[vp8l(16_384, 1)])).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_vp8l_header_over_the_limit_under_a_small_canvas() {
+        // The canvas passes; the image header declares the 14-bit largest.
+        let bytes = riff(&[vp8x(0, 100, 100), vp8l(16_384, 16_384)]);
+        assert_eq!(
+            parse_quickly(&bytes).unwrap_err(),
+            "image too large: 16384×16384 exceeds 100 megapixels"
+        );
+        let alone = riff(&[vp8l(10_001, 10_000)]);
+        assert!(
+            parse_quickly(&alone)
+                .unwrap_err()
+                .starts_with("image too large")
+        );
+    }
+
+    #[test]
+    fn refuses_a_vp8_header_over_the_limit() {
+        let bytes = riff(&[vp8(16_383, 16_383)]);
+        assert_eq!(
+            parse_quickly(&bytes).unwrap_err(),
+            "image too large: 16383×16383 exceeds 100 megapixels"
+        );
+    }
+
+    #[test]
+    fn refuses_a_canvas_over_the_limit_over_a_small_vp8l_header() {
+        // Both sizes are checked: a small image header does not excuse the canvas.
+        let bytes = riff(&[vp8x(0, 20_000, 20_000), vp8l(1, 1)]);
+        assert_eq!(
+            parse_quickly(&bytes).unwrap_err(),
+            "image too large: 20000×20000 exceeds 100 megapixels"
+        );
+    }
+}

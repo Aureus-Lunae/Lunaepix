@@ -56,9 +56,10 @@ windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
 [dev-dependencies]
 # Test fixtures: `png` encodes (low compression, redundant chunk), `image`
 # decodes for the pixel comparison and encodes the baseline JPEG fixtures
-# (standard Huffman tables, so there is something to optimise).
+# (standard Huffman tables, so there is something to optimise). Its `webp`
+# feature gives the lossless WebP fixtures, from a pure-Rust encoder.
 png = "0.17.16"
-image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 # Valid chunk CRCs for hand-made hostile PNGs (already in the tree via `png`).
 crc32fast = "1.5.4"
 # Renders the SVG input and output for the edge-noise comparison. No system
