@@ -23,6 +23,7 @@ Copied verbatim from the spec's Handoff, plus what was decided while planning. G
 - **Logo in the window header** (user, 2026-11-06, chosen over "only ship the app icon"): show the moon logo next to the "Lunaepix" heading inside the window, made from the same SVG. The approved sketch in the spec's Layout section is binding: logo about 32 px tall, decorative (`alt=""`), the heading text stays as it is. The moon app icon (commit `dd0849e`, already on this branch) ships in the same release.
 - The desktop-app spec's decisions stand: lossless only, one worker process per file, `MAX_PIXELS` checked from the header before decoding, hostile inputs in `crates/core/tests/hostile_input.rs`, licences limited to the `about.toml` list, structured files checked with a parser.
 - The Jugoo CMS makes lossy WebP (GD quality 100, no metadata); Lunaepix copies those unchanged. That is expected, not a defect.
+- **Gate ruling (user, 2026-11-06): "Drop the re-encode".** Task 1 measured level 9 at +0.66% over libwebp's default lossless on total bytes (larger on 4 of 8 samples), +10.4% over the fastest preset, and, scaled to 100 MP, 4.3–7.5 min and about 5 GB, over both flags. So Tasks 5 and 6 are removed whole: every WebP, lossless included, gets only the stripped candidate. `libwebp-sys` stays a test-only dependency (lossy fixtures). There is no `webp::codec`, no `unsafe` in product WebP code, no "re-encoded WebP did not decode" error, no licence change, and `lib.rs`'s unsafe doc line stays as it is. Review Focus 4 lapses with Task 5. Task 8's hand check "a lossless WebP gets smaller" becomes "a lossless WebP with EXIF gets smaller; one without metadata is copied unchanged". Measurements: `.superpowers/sdd/2026-11-06-lunaepix-webp/task-1-report.md` (scratch, not committed).
 - **Task 1 is a hard gate.** No product code is written before the user has ruled on its numbers. If the user drops the re-encode there, Tasks 5 and 6 are removed whole, and `libwebp-sys` stays a test-only dependency.
 
 Decided while planning (2026-11-06; approved with the plan):
@@ -82,10 +83,10 @@ Inputs the spec implies but no test row names, most likely to bite first. Each o
 **Files:**
 - Create (throwaway, outside git): `.superpowers/sdd/2026-11-06-lunaepix-webp/gate/` (a scratch cargo project that depends on `libwebp-sys =0.14.4` and `image =0.25.10`). `.superpowers/` is already git-ignored.
 
-- [ ] **Step 1:** Make lossless WebP test files from every image in `samples/png` and `samples/jpg`, at libwebp's default lossless settings (`WebPConfigInit` plus `lossless = 1`) and at its fastest (`WebPConfigLosslessPreset(…, 0)`). Make lossy WebP files at quality 75 and 100, each once with and once without an EXIF block of about 10 KB and an XMP block of about 2 KB, added by hand as chunks.
-- [ ] **Step 2:** For each lossless file, time the whole re-encode candidate (decode, level-9 encode with `exact = 1`, decode again, compare RGBA) and record the size before and after. Use a release build and `/usr/bin/time -v` for the peak resident memory. For each lossy file, record the size after stripping metadata.
-- [ ] **Step 3:** Time and measure the largest sample, or a sample scaled to about 25 megapixels, and scale time and memory linearly to 100 megapixels. Flag a scaled time over **3 minutes** or a scaled memory over **4 GB**.
-- [ ] **Step 4:** Report a table to the user and **stop**. The table has one row per file: kind, size before, size after, saving %, time and peak memory. The report states the two flags and asks the user to rule: build the re-encode as specified; build it with a different level or limit (the user names it); or drop the re-encode, which removes Tasks 5 and 6. Record the ruling in the spec's and the plan's Handoff before Task 2 starts.
+- [x] **Step 1:** Make lossless WebP test files from every image in `samples/png` and `samples/jpg`, at libwebp's default lossless settings (`WebPConfigInit` plus `lossless = 1`) and at its fastest (`WebPConfigLosslessPreset(…, 0)`). Make lossy WebP files at quality 75 and 100, each once with and once without an EXIF block of about 10 KB and an XMP block of about 2 KB, added by hand as chunks.
+- [x] **Step 2:** For each lossless file, time the whole re-encode candidate (decode, level-9 encode with `exact = 1`, decode again, compare RGBA) and record the size before and after. Use a release build and `/usr/bin/time -v` for the peak resident memory. For each lossy file, record the size after stripping metadata.
+- [x] **Step 3:** Time and measure the largest sample, or a sample scaled to about 25 megapixels, and scale time and memory linearly to 100 megapixels. Flag a scaled time over **3 minutes** or a scaled memory over **4 GB**.
+- [x] **Step 4:** Report a table to the user and **stop**. The table has one row per file: kind, size before, size after, saving %, time and peak memory. The report states the two flags and asks the user to rule: build the re-encode as specified; build it with a different level or limit (the user names it); or drop the re-encode, which removes Tasks 5 and 6. Record the ruling in the spec's and the plan's Handoff before Task 2 starts.
 
 ### Task 2: Recognise WebP and walk the container
 
@@ -174,7 +175,7 @@ VP8  payload: 3-byte frame tag, start code 9D 01 2A, width u16 & 0x3FFF, height 
 - [ ] **Step 4: Run** both suites. Expected: all pass.
 - [ ] **Step 5: Commit** with the message "Name WebP in the window, the CLI and the skip reason".
 
-### Task 5: Re-encode still lossless WebP with libwebp (removed if the gate drops it)
+### Task 5: Re-encode still lossless WebP with libwebp (REMOVED by the gate ruling, 2026-11-06)
 
 **Files:**
 - Modify: `crates/core/Cargo.toml` (`libwebp-sys = { version = "=0.14.4" }` as a normal dependency, with a comment in the style of the other codec pins; the default features `std` and `parallel` stay, and no SIMD-flag features are added)
@@ -202,7 +203,7 @@ VP8  payload: 3-byte frame tag, start code 9D 01 2A, width u16 & 0x3FFF, height 
 - [ ] **Step 4: Run** `cargo test --workspace` and clippy (as in Task 3). Then time a release run of `lunaepix` on the gate's largest lossless sample and confirm it is within the time measured in Task 1.
 - [ ] **Step 5: Commit** with the message "Re-encode still lossless WebP at libwebp's strongest lossless setting".
 
-### Task 6: Licence notice for libwebp (removed if the gate drops the re-encode)
+### Task 6: Licence notice for libwebp (REMOVED by the gate ruling, 2026-11-06)
 
 **Files:**
 - Modify: `about.toml` (`[libwebp-sys.clarify]`)
