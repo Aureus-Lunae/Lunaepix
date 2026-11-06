@@ -184,9 +184,11 @@ pub(crate) enum Format {
     Png,
     Jpg,
     Svg,
+    Webp,
 }
 
-/// Case-insensitive match of the extension on `png`, `jpg`/`jpeg` and `svg`.
+/// Case-insensitive match of the extension on `png`, `jpg`/`jpeg`, `svg` and
+/// `webp`.
 /// The planner and `optimize_file` both decide the format here.
 pub(crate) fn format_of(path: &Path) -> Option<Format> {
     let ext = path.extension()?;
@@ -197,6 +199,8 @@ pub(crate) fn format_of(path: &Path) -> Option<Format> {
         Some(Format::Jpg)
     } else if is("svg") {
         Some(Format::Svg)
+    } else if is("webp") {
+        Some(Format::Webp)
     } else {
         None
     }
@@ -330,16 +334,31 @@ mod tests {
     }
 
     #[test]
-    fn skips_gif_and_webp_as_unsupported_and_plans_nothing() {
+    fn skips_gif_and_lookalike_extensions_as_unsupported() {
         let tmp = TempDir::new().unwrap();
-        let gif = touch(tmp.path(), "a.gif");
-        let webp = touch(tmp.path(), "a.webp");
-        let jobs = plan_files(&[gif.clone(), webp.clone()]);
+        let names = ["a.gif", "a.webpx", "a.web"];
+        let inputs: Vec<PathBuf> = names.iter().map(|n| touch(tmp.path(), n)).collect();
+        let jobs = plan_files(&inputs);
+        assert_eq!(
+            jobs,
+            inputs
+                .into_iter()
+                .map(|src| skip(src, Skip::UnsupportedType))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn plans_webp_in_either_letter_case() {
+        let tmp = TempDir::new().unwrap();
+        let lower = touch(tmp.path(), "a.webp");
+        let upper = touch(tmp.path(), "a.WEBP");
+        let jobs = plan_files(&[lower.clone(), upper.clone()]);
         assert_eq!(
             jobs,
             vec![
-                skip(gif, Skip::UnsupportedType),
-                skip(webp, Skip::UnsupportedType)
+                optimize(lower, tmp.path().join("optimized-a.webp")),
+                optimize(upper, tmp.path().join("optimized-a.WEBP")),
             ]
         );
     }
