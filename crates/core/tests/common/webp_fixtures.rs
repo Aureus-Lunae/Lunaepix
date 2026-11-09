@@ -230,6 +230,78 @@ pub fn animated(frames: &[Vec<u8>], w: u32, h: u32) -> Vec<u8> {
     from_chunks(&chunks)
 }
 
+// --- EXIF ---------------------------------------------------------------------------
+
+/// The EXIF Orientation tag, and the TIFF type SHORT its value must have.
+pub const ORIENTATION: u16 = 0x0112;
+pub const SHORT: u16 = 3;
+/// The prefix some writers put before the TIFF stream, as in a JPEG.
+pub const EXIF_PREFIX: &[u8] = b"Exif\0\0";
+
+/// One IFD entry: tag, type, count and value. The value is always written as
+/// a 16-bit number in the first two bytes of the 4-byte value field, in the
+/// stream's byte order, whatever the type says: so a reader that skips the
+/// type check reads the same number, and only the type tells them apart.
+pub type IfdEntry = (u16, u16, u32, u16);
+
+/// A TIFF stream: the header (`II*\0` or `MM\0*`), IFD0 at offset 8 holding
+/// `entries`, and a zero next-IFD offset.
+pub fn tiff(big_endian: bool, entries: &[IfdEntry]) -> Vec<u8> {
+    let u16b = |v: u16| {
+        if big_endian {
+            v.to_be_bytes()
+        } else {
+            v.to_le_bytes()
+        }
+    };
+    let u32b = |v: u32| {
+        if big_endian {
+            v.to_be_bytes()
+        } else {
+            v.to_le_bytes()
+        }
+    };
+    let mut out = if big_endian {
+        b"MM".to_vec()
+    } else {
+        b"II".to_vec()
+    };
+    out.extend(u16b(42));
+    out.extend(u32b(8));
+    out.extend(u16b(entries.len() as u16));
+    for &(tag, kind, count, value) in entries {
+        out.extend(u16b(tag));
+        out.extend(u16b(kind));
+        out.extend(u32b(count));
+        out.extend(u16b(value));
+        out.extend([0, 0]);
+    }
+    out.extend(u32b(0));
+    out
+}
+
+/// An EXIF payload as a camera writes it: optionally the `Exif\0\0` prefix,
+/// then a TIFF stream whose IFD0 holds an image width, the Orientation and a
+/// height, then 2 KB of other data (a maker note, say), so stripping
+/// the chunk is a clear gain.
+pub fn exif_with_orientation(orientation: u16, big_endian: bool, prefix: bool) -> Vec<u8> {
+    let mut out = if prefix {
+        EXIF_PREFIX.to_vec()
+    } else {
+        Vec::new()
+    };
+    out.extend(tiff(
+        big_endian,
+        &[
+            (0x0100, SHORT, 1, 640),
+            (ORIENTATION, SHORT, 1, orientation),
+            (0x0101, SHORT, 1, 480),
+        ],
+    ));
+    out.extend([0x4D; 2_048]);
+    out
+}
+
 // --- decoding ----------------------------------------------------------------------
 
 /// A still image decoded with the `image` crate: its size and RGBA bytes.

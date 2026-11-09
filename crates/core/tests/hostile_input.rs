@@ -28,6 +28,9 @@ use lunaepix_core::{
 };
 use tempfile::TempDir;
 
+mod common;
+use common::webp_fixtures as fx;
+
 /// Generous: a refusal takes milliseconds; allocating and touching gigabytes
 /// takes far longer.
 const QUICK: Duration = Duration::from_secs(5);
@@ -886,6 +889,53 @@ fn refuses_a_webp_canvas_at_the_pixel_limit_with_no_image_as_unreadable() {
         "{message}"
     );
     assert!(!message.contains("too large"), "{message}");
+}
+
+/// A WebP holding `exif` as its EXIF chunk, optimised: the output.
+fn optimised_with_exif(exif: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let original = fx::with_chunks(&normal_webp(), &[(*b"EXIF", exif)]);
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "exif.webp", &original);
+    let dest = tmp.path().join("optimized-exif.webp");
+
+    let started = Instant::now();
+    let result = optimize_file(&src, &dest);
+    assert!(started.elapsed() < QUICK, "took {:?}", started.elapsed());
+
+    result.expect("a malformed EXIF chunk must not refuse the file");
+    (original, fs::read(&dest).unwrap())
+}
+
+#[test]
+fn optimises_a_webp_with_a_malformed_exif_chunk_and_drops_the_chunk() {
+    let le = |v: u32| v.to_le_bytes();
+    let mut header_cut = fx::EXIF_PREFIX.to_vec();
+    header_cut.extend_from_slice(b"II*");
+    let mut offset_past_end = fx::tiff(false, &[(fx::ORIENTATION, fx::SHORT, 1, 6)]);
+    offset_past_end[4..8].copy_from_slice(&le(u32::MAX));
+    let mut offset_into_header = fx::tiff(true, &[(fx::ORIENTATION, fx::SHORT, 1, 6)]);
+    offset_into_header[4..8].copy_from_slice(&2u32.to_be_bytes());
+    let mut count_too_large = fx::tiff(false, &[]);
+    count_too_large[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+    let wrong_type = fx::tiff(true, &[(fx::ORIENTATION, 4, 1, 6)]);
+    let cases: [(&str, Vec<u8>); 6] = [
+        ("empty", Vec::new()),
+        ("header cut short", header_cut),
+        ("IFD0 offset past the end", offset_past_end),
+        ("IFD0 offset into the header", offset_into_header),
+        ("entry count larger than the payload", count_too_large),
+        ("Orientation of type LONG", wrong_type),
+    ];
+    for (what, exif) in cases {
+        let (original, out) = optimised_with_exif(&exif);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "VP8L"], "{what}");
+        assert_eq!(fx::decode_rgba(&out), fx::decode_rgba(&original), "{what}");
+    }
+
+    // The control: the same file with a well-formed rotation keeps its EXIF.
+    let rotated = fx::exif_with_orientation(6, true, false);
+    let (_, out) = optimised_with_exif(&rotated);
+    assert_eq!(fx::chunk_payload(&out, b"EXIF"), Some(rotated));
 }
 
 // --- Crashes, isolated by the worker process ---------------------------------------

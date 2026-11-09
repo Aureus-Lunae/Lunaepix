@@ -200,6 +200,48 @@ fn copies_a_lossy_file_without_metadata_as_it_is() {
     assert_eq!(optimized(&lossy), lossy);
 }
 
+// --- EXIF that carries a rotation ---------------------------------------------------
+
+#[test]
+fn keeps_the_exif_of_a_rotated_photo_byte_for_byte_and_never_grows() {
+    let base = fx::lossless(&fx::photo_rgba(SIZE, SIZE, false), SIZE, SIZE);
+    for (orientation, big_endian, prefix) in [(6, false, true), (8, true, false)] {
+        let exif = fx::exif_with_orientation(orientation, big_endian, prefix);
+
+        // With XMP beside it: the XMP goes, the EXIF stays as it was.
+        let original = fx::with_chunks(&base, &[(*b"EXIF", &exif), (*b"XMP ", &[2u8; 1_000])]);
+        let out = optimized(&original);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "VP8L", "EXIF"]);
+        assert_eq!(fx::chunk_payload(&out, b"EXIF").as_ref(), Some(&exif));
+        let flags = out[fx::VP8X_FLAGS_AT];
+        assert_eq!(flags & (fx::FLAG_EXIF | fx::FLAG_XMP), fx::FLAG_EXIF);
+        assert!(out.len() < original.len() - 900, "{} bytes", out.len());
+        assert_eq!(fx::decode_rgba(&out), fx::decode_rgba(&original));
+
+        // With nothing else to lose: copied as it is, never larger.
+        let only_exif = fx::with_chunks(&base, &[(*b"EXIF", &exif)]);
+        assert_eq!(optimized(&only_exif), only_exif);
+    }
+}
+
+#[test]
+fn drops_the_exif_of_an_unrotated_photo_and_gets_smaller() {
+    let base = fx::lossless(&fx::photo_rgba(SIZE, SIZE, false), SIZE, SIZE);
+    for (big_endian, prefix) in [(false, true), (true, false)] {
+        let exif = fx::exif_with_orientation(1, big_endian, prefix);
+        let original = fx::with_chunks(&base, &[(*b"EXIF", &exif), (*b"XMP ", &[2u8; 1_000])]);
+        let out = optimized(&original);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "VP8L"]);
+        assert_eq!(out[fx::VP8X_FLAGS_AT] & (fx::FLAG_EXIF | fx::FLAG_XMP), 0);
+        assert!(
+            out.len() < original.len() - exif.len(),
+            "{} bytes",
+            out.len()
+        );
+        assert_eq!(fx::decode_rgba(&out), fx::decode_rgba(&original));
+    }
+}
+
 // --- a folder run ---------------------------------------------------------------
 
 fn worker() -> Worker {

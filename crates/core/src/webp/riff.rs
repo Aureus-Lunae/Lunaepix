@@ -4,6 +4,7 @@
 //! (`VP8X`, `VP8L`, `VP8 `) and nothing else. It never decodes an image, so a
 //! file that declares a huge image is refused from its headers alone.
 
+use super::exif;
 use crate::plan::check_pixels;
 
 /// Most chunks one file may hold. A real file has a handful, an animation one
@@ -42,15 +43,18 @@ pub(crate) struct Chunk<'a> {
 
 /// A parsed WebP file: its chunks in file order, and what kind of file it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // `kind` is read by the tests only; nothing in a run needs it.
 pub(crate) struct WebpFile<'a> {
     pub chunks: Vec<Chunk<'a>>,
+    /// Read by the tests only; nothing in a run needs it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub kind: Kind,
 }
 
-/// The chunks a stripped file keeps: the image, its alpha, the animation and
-/// the colour profile, and the `VP8X` that describes them. Every other chunk
-/// is dropped: `EXIF`, `XMP ` and whatever else a writer put in.
+/// The chunks a stripped file always keeps: the image, its alpha, the
+/// animation and the colour profile, and the `VP8X` that describes them.
+/// The first `EXIF` chunk is kept too when it turns the picture (see
+/// [`exif::is_rotated`]). Every other chunk is dropped: `XMP `, the other
+/// `EXIF` chunks and whatever else a writer put in.
 const KEPT: [&[u8; 4]; 7] = [
     b"VP8X", b"ICCP", b"ANIM", b"ANMF", b"ALPH", b"VP8 ", b"VP8L",
 ];
@@ -66,16 +70,27 @@ impl WebpFile<'_> {
     /// when the source left the last one out. The image chunks are copied byte
     /// for byte; nothing is decoded.
     ///
-    /// The `VP8X` flags for ICC, EXIF and XMP are set from the chunks that are
-    /// left, whatever the source's flags said; every other bit, the reserved
-    /// bytes and the canvas are as they were. A file with no `VP8X` stays
-    /// without one. The RIFF size is written to match, so bytes the source had
-    /// after its own RIFF size are not in the result.
+    /// The `VP8X` flags for EXIF and XMP are set from the chunks that are
+    /// left, whatever the source's flags said. The ICC flag is the source's
+    /// own, set or clear, when an `ICCP` chunk is left, so colour management
+    /// is exactly as before; with no `ICCP` chunk it is cleared. Every other
+    /// bit, the reserved bytes and the canvas are as they were. A file with
+    /// no `VP8X` stays without one. The RIFF size is written to match, so
+    /// bytes the source had after its own RIFF size are not in the result.
     pub(crate) fn stripped(&self) -> Vec<u8> {
+        // A reader uses the first EXIF chunk; it stays when it turns the
+        // picture, and every other EXIF chunk goes.
+        let rotated_exif = self
+            .chunks
+            .iter()
+            .position(|chunk| &chunk.fourcc == b"EXIF")
+            .filter(|&at| exif::is_rotated(self.chunks[at].data));
         let kept: Vec<&Chunk<'_>> = self
             .chunks
             .iter()
-            .filter(|chunk| KEPT.contains(&&chunk.fourcc))
+            .enumerate()
+            .filter(|&(at, chunk)| KEPT.contains(&&chunk.fourcc) || Some(at) == rotated_exif)
+            .map(|(_, chunk)| chunk)
             .collect();
         let has_icc = kept.iter().any(|chunk| &chunk.fourcc == b"ICCP");
 
@@ -89,9 +104,13 @@ impl WebpFile<'_> {
             if &chunk.fourcc == b"VP8X" {
                 // `parse` refuses a VP8X shorter than its 10 bytes.
                 let flags = &mut body[payload_at];
+                let source_icc = *flags & FLAG_ICC;
                 *flags &= !(FLAG_ICC | FLAG_EXIF | FLAG_XMP);
                 if has_icc {
-                    *flags |= FLAG_ICC;
+                    *flags |= source_icc;
+                }
+                if rotated_exif.is_some() {
+                    *flags |= FLAG_EXIF;
                 }
             }
             if chunk.data.len() % 2 == 1 {
@@ -1086,6 +1105,7 @@ mod tests {
     fn rewrites_flags_that_disagree_with_the_chunks() {
         let image = || fx::chunks_of(&lossless_file(false)).remove(0);
         let vp8x = |flags: u8| (*b"VP8X", fx::vp8x_payload(flags, SIZE, SIZE));
+        let rotated = || (*b"EXIF", fx::exif_with_orientation(6, false, true));
         // (the chunks, the flags the output must have)
         let cases: Vec<(Vec<fx::RawChunk>, u8)> = vec![
             // An EXIF chunk with its flag clear: dropped, flag stays clear.
@@ -1094,10 +1114,16 @@ mod tests {
             (vec![vp8x(fx::FLAG_XMP), image()], 0),
             // The EXIF flag set with no EXIF chunk: cleared.
             (vec![vp8x(fx::FLAG_EXIF), image()], 0),
-            // The ICC flag set with no ICCP chunk: cleared.
+            // The ICC flag set with no ICCP chunk: cleared, like the others.
             (vec![vp8x(fx::FLAG_ICC), image()], 0),
-            // An ICCP chunk with its flag clear: the flag is set.
-            (vec![vp8x(0), (*b"ICCP", vec![1; 8]), image()], fx::FLAG_ICC),
+            // A rotated EXIF chunk with its flag clear: kept, the flag set.
+            (vec![vp8x(0), image(), rotated()], fx::FLAG_EXIF),
+            // A rotated EXIF chunk with its flag set, and an XMP flag with no
+            // chunk: EXIF stays set, XMP is cleared.
+            (
+                vec![vp8x(fx::FLAG_EXIF | fx::FLAG_XMP), image(), rotated()],
+                fx::FLAG_EXIF,
+            ),
             // Several at once, with alpha and animation flags that stay.
             (
                 vec![
@@ -1113,15 +1139,160 @@ mod tests {
             let out = stripped_of(&input);
             assert_eq!(flags(&out), expected, "{:?}", fx::chunk_names(&input));
             assert_well_formed(&out);
-            // Flags and chunks agree.
+            // The EXIF and XMP flags agree with the chunks kept, and no ICC
+            // flag is left without an ICCP chunk.
             let names = fx::chunk_names(&out);
-            assert_eq!(
-                flags(&out) & fx::FLAG_ICC != 0,
-                names.iter().any(|n| n == "ICCP")
-            );
-            assert!(!names.iter().any(|n| n == "EXIF" || n == "XMP "));
-            assert_eq!(flags(&out) & (fx::FLAG_EXIF | fx::FLAG_XMP), 0);
+            let has = |name: &str| names.iter().any(|n| n == name);
+            assert_eq!(flags(&out) & fx::FLAG_EXIF != 0, has("EXIF"));
+            assert!(!has("XMP "));
+            assert_eq!(flags(&out) & fx::FLAG_XMP, 0);
+            if !has("ICCP") {
+                assert_eq!(flags(&out) & fx::FLAG_ICC, 0);
+            }
         }
+    }
+
+    #[test]
+    fn keeps_the_sources_icc_flag_when_the_file_has_an_iccp_chunk() {
+        // The ruling "Keep the source's flag": with an ICCP chunk, the ICC
+        // bit is copied, set or clear, whatever else is stripped.
+        let image = || fx::chunks_of(&lossless_file(false)).remove(0);
+        let iccp = || (*b"ICCP", ICC_EVEN.to_vec());
+        for extra in [
+            None,
+            Some((*b"EXIF", vec![1; 8])),
+            Some((*b"XMP ", vec![2; 8])),
+        ] {
+            for source_flags in [0, fx::FLAG_ICC, fx::FLAG_ICC | fx::FLAG_XMP, fx::FLAG_XMP] {
+                let mut chunks = vec![
+                    (*b"VP8X", fx::vp8x_payload(source_flags, SIZE, SIZE)),
+                    iccp(),
+                    image(),
+                ];
+                chunks.extend(extra.clone());
+                let input = fx::from_chunks(&chunks);
+
+                let out = stripped_of(&input);
+
+                assert_eq!(fx::chunk_names(&out), ["VP8X", "ICCP", "VP8L"]);
+                assert_eq!(
+                    flags(&out),
+                    source_flags & fx::FLAG_ICC,
+                    "source flags {source_flags:#04x}, extra {:?}",
+                    extra.as_ref().map(|c| c.0)
+                );
+                assert_well_formed(&out);
+            }
+        }
+    }
+
+    // --- stripped: EXIF that carries a rotation ------------------------------------
+
+    #[test]
+    fn keeps_a_rotated_exif_chunk_byte_identical_and_sets_its_flag() {
+        for (orientation, big_endian, prefix) in [
+            (6, false, true),
+            (8, true, false),
+            (3, false, false),
+            (6, true, true),
+        ] {
+            let exif = fx::exif_with_orientation(orientation, big_endian, prefix);
+            let input = fx::with_chunks(
+                &lossless_file(true),
+                &[(*b"EXIF", &exif), (*b"XMP ", b"<x:xmpmeta/>")],
+            );
+
+            let out = stripped_of(&input);
+
+            assert_well_formed(&out);
+            assert_eq!(fx::chunk_names(&out), ["VP8X", "VP8L", "EXIF"]);
+            assert_eq!(fx::chunk_payload(&out, b"EXIF"), Some(exif));
+            assert_eq!(
+                flags(&out),
+                (flags(&input) & fx::FLAG_ALPHA) | fx::FLAG_EXIF,
+                "orientation {orientation}"
+            );
+            assert!(out.len() < input.len(), "the XMP is gone");
+            assert_eq!(fx::decode_rgba(&out), fx::decode_rgba(&input));
+        }
+    }
+
+    #[test]
+    fn drops_an_exif_chunk_that_carries_no_rotation() {
+        let unrotated: [Vec<u8>; 4] = [
+            fx::exif_with_orientation(1, false, true),
+            fx::exif_with_orientation(1, true, false),
+            // No Orientation tag at all.
+            fx::tiff(false, &[(0x0100, fx::SHORT, 1, 6)]),
+            // Unreadable: the TIFF header cut short.
+            b"Exif\0\0II*".to_vec(),
+        ];
+        for exif in unrotated {
+            let input = fx::with_chunks(&lossless_file(false), &[(*b"EXIF", &exif)]);
+            let out = stripped_of(&input);
+            assert_eq!(fx::chunk_names(&out), ["VP8X", "VP8L"], "{exif:?}");
+            assert_eq!(flags(&out) & fx::FLAG_EXIF, 0);
+            assert_well_formed(&out);
+        }
+    }
+
+    #[test]
+    fn decides_on_the_first_exif_chunk_and_drops_any_other() {
+        let image = || fx::chunks_of(&lossless_file(false)).remove(0);
+        let exif = |orientation| {
+            (
+                *b"EXIF",
+                fx::exif_with_orientation(orientation, false, true),
+            )
+        };
+        let vp8x = (*b"VP8X", fx::vp8x_payload(fx::FLAG_EXIF, SIZE, SIZE));
+
+        // Two rotated: only the first stays.
+        let two_rotated = fx::from_chunks(&[vp8x.clone(), image(), exif(6), exif(8)]);
+        let out = stripped_of(&two_rotated);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "VP8L", "EXIF"]);
+        assert_eq!(fx::chunk_payload(&out, b"EXIF"), Some(exif(6).1));
+        assert_eq!(flags(&out), fx::FLAG_EXIF);
+
+        // The first does not rotate: none stays, though the second would.
+        let first_unrotated = fx::from_chunks(&[vp8x, image(), exif(1), exif(6)]);
+        let out = stripped_of(&first_unrotated);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "VP8L"]);
+        assert_eq!(flags(&out), 0);
+    }
+
+    // --- stripped: a simple file (no VP8X) with extra chunks -------------------------
+
+    #[test]
+    fn keeps_an_iccp_chunk_of_a_simple_file_and_adds_no_vp8x() {
+        let image = fx::chunks_of(&lossless_file(false)).remove(0);
+        let input = fx::from_chunks(&[image.clone(), (*b"ICCP", ICC_ODD.to_vec())]);
+        let out = stripped_of(&input);
+        assert_eq!(out, input);
+        assert_eq!(fx::chunk_names(&out), ["VP8L", "ICCP"]);
+
+        // What is not kept still goes, and still no VP8X comes in.
+        let with_xmp =
+            fx::from_chunks(&[image, (*b"ICCP", ICC_ODD.to_vec()), (*b"XMP ", vec![3; 40])]);
+        let out = stripped_of(&with_xmp);
+        assert_eq!(out, input);
+        assert_eq!(fx::chunk_names(&out), ["VP8L", "ICCP"]);
+    }
+
+    #[test]
+    fn keeps_a_rotated_exif_chunk_of_a_simple_file_and_adds_no_vp8x() {
+        let image = || fx::chunks_of(&lossless_file(false)).remove(0);
+        let exif = |orientation| {
+            (
+                *b"EXIF",
+                fx::exif_with_orientation(orientation, true, false),
+            )
+        };
+        let rotated = fx::from_chunks(&[image(), exif(8)]);
+        assert_eq!(stripped_of(&rotated), rotated);
+
+        let unrotated = fx::from_chunks(&[image(), exif(1)]);
+        assert_eq!(fx::chunk_names(&stripped_of(&unrotated)), ["VP8L"]);
     }
 
     #[test]
