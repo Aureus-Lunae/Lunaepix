@@ -27,7 +27,12 @@ use session::{
 /// Extensions the file dialog shows. GTK matches them case-sensitively, so
 /// both spellings are listed; "All files" covers any other spelling, and the
 /// planner skips what it does not handle.
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "svg", "PNG", "JPG", "JPEG", "SVG"];
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "svg", "webp", "PNG", "JPG", "JPEG", "SVG", "WEBP",
+];
+
+/// What the file dialog calls the filter over [`IMAGE_EXTENSIONS`].
+const IMAGE_FILTER_NAME: &str = "PNG, JPG, SVG and WebP images";
 
 /// Everything the backend keeps between calls.
 struct AppState {
@@ -94,7 +99,7 @@ fn choose_files(app: AppHandle) -> Result<(), CommandError> {
     let ticket = ticket(&app)?;
     file_dialog(&app)
         .set_title("Choose images")
-        .add_filter("PNG, JPG and SVG images", IMAGE_EXTENSIONS)
+        .add_filter(IMAGE_FILTER_NAME, IMAGE_EXTENSIONS)
         .add_filter("All files", &["*"])
         .pick_files(move |picked| {
             // The plugin calls this on a thread of its own.
@@ -299,6 +304,29 @@ mod tests {
             stop_on_close(&event, || stops.set(stops.get() + 1));
         }
         assert_eq!(stops.get(), 0);
+    }
+
+    // --- the file dialog's filter ---------------------------------------------
+
+    #[test]
+    fn the_dialog_filter_lists_webp_in_both_cases() {
+        assert!(IMAGE_EXTENSIONS.contains(&"webp"));
+        assert!(IMAGE_EXTENSIONS.contains(&"WEBP"));
+        assert_eq!(IMAGE_FILTER_NAME, "PNG, JPG, SVG and WebP images");
+    }
+
+    #[test]
+    fn the_dialog_filter_lists_exactly_the_five_extensions_each_in_both_cases() {
+        let mut listed = IMAGE_EXTENSIONS.to_vec();
+        listed.sort_unstable();
+        // Upper case sorts before lower case. Nothing else is in the list, so
+        // a lookalike such as "webpx" or "gif" would be caught here.
+        assert_eq!(
+            listed,
+            [
+                "JPEG", "JPG", "PNG", "SVG", "WEBP", "jpeg", "jpg", "png", "svg", "webp"
+            ]
+        );
     }
 
     // --- which worker ---------------------------------------------------------

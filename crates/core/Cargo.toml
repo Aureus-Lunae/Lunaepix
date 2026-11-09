@@ -1,6 +1,6 @@
 [package]
 name = "lunaepix-core"
-description = "Lossless PNG, JPG and SVG optimisation: the Lunaepix core library"
+description = "Lossless PNG, JPG, SVG and WebP optimisation: the Lunaepix core library"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -56,9 +56,15 @@ windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
 [dev-dependencies]
 # Test fixtures: `png` encodes (low compression, redundant chunk), `image`
 # decodes for the pixel comparison and encodes the baseline JPEG fixtures
-# (standard Huffman tables, so there is something to optimise).
+# (standard Huffman tables, so there is something to optimise). Its `webp`
+# feature gives the lossless WebP fixtures, from a pure-Rust encoder.
 png = "0.17.16"
-image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+# Lossy and lossy-with-alpha WebP fixtures, through libwebp's simple
+# `WebPEncodeRGBA` (the `image` crate only encodes lossless WebP). Tests only:
+# no product code links libwebp. Not the `webp` wrapper crate, which links a
+# second copy of libwebp's C symbols.
+libwebp-sys = "=0.14.4"
 # Valid chunk CRCs for hand-made hostile PNGs (already in the tree via `png`).
 crc32fast = "1.5.4"
 # Renders the SVG input and output for the edge-noise comparison. No system

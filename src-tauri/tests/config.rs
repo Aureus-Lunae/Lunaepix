@@ -1683,3 +1683,336 @@ fn a_main_config_with_an_external_bin_is_caught_in_a_fixture() {
     fs::remove_dir_all(&dir).unwrap();
     assert_eq!(found, ["tauri.linux.conf.json", "Tauri.windows.toml"]);
 }
+
+// ---------------------------------------------------------------------
+// WebP is named in every text. The old wording ("PNG, JPG or SVG") must not
+// come back, in the window or in the skip reasons the core sends to it.
+// ---------------------------------------------------------------------
+
+/// True when `text` lists the formats without WebP: the old skip reason and
+/// the old filter wording, or the drop hint "PNG · JPG · SVG" that does not
+/// go on with "· WebP". Whitespace (a line break inside the phrase included)
+/// and letter case do not matter.
+fn names_only_png_jpg_and_svg(text: &str) -> bool {
+    let text = one_line(text).to_lowercase();
+    if text.contains("png, jpg or svg") || text.contains("png, jpg and svg") {
+        return true;
+    }
+    let hint = "png · jpg · svg";
+    text.match_indices(hint)
+        .any(|(at, _)| !text[at + hint.len()..].starts_with(" · webp"))
+}
+
+/// The places in an HTML page where the old wording shows to a reader or to a
+/// screen reader: its text nodes (comments are not text) and every attribute
+/// value. The page is read as tokens, never scanned as text.
+fn old_wording_in_html(html: &str) -> Vec<String> {
+    let mut hits = Vec::new();
+    if names_only_png_jpg_and_svg(&text_outside(html, &[])) {
+        hits.push("text".to_owned());
+    }
+    for tag in start_tags(html) {
+        for (name, value) in &tag.attrs {
+            if names_only_png_jpg_and_svg(value) {
+                hits.push(format!("<{} {name}>", tag.name));
+            }
+        }
+    }
+    hits
+}
+
+/// The files among `files` that carry the old wording. HTML is read as
+/// tokens; every other file (the scripts) is free text and is matched as text,
+/// which makes that half a lint and not a guarantee.
+fn files_with_old_wording(files: &[(String, String)]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|(name, text)| {
+            if name.ends_with(".html") {
+                !old_wording_in_html(text).is_empty()
+            } else {
+                names_only_png_jpg_and_svg(text)
+            }
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Every reason the core can give for skipping a file, as the window shows it.
+fn skip_texts() -> Vec<String> {
+    use lunaepix_core::Skip;
+    [
+        Skip::UnsupportedType,
+        Skip::TooLarge,
+        Skip::OverRunLimit,
+        Skip::IsOwnDestination,
+        Skip::NotAFile,
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
+/// True when the text nodes of `html` hold `phrase`, whitespace aside.
+fn page_says(html: &str, phrase: &str) -> bool {
+    one_line(&text_outside(html, &[])).contains(phrase)
+}
+
+#[test]
+fn no_text_names_only_png_jpg_and_svg() {
+    let files = ui_files();
+    assert_eq!(files_with_old_wording(&files), Vec::<String>::new());
+    let skips = skip_texts();
+    assert_eq!(
+        skips
+            .iter()
+            .filter(|text| names_only_png_jpg_and_svg(text))
+            .collect::<Vec<_>>(),
+        Vec::<&String>::new()
+    );
+    // Not vacuous: the page and the scripts that hold the texts were scanned,
+    // and the skip reason for an unsupported file is among the texts.
+    let scanned: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(scanned.contains(&"index.html") && scanned.contains(&"state.js"));
+    assert!(skips.iter().any(|text| text.starts_with("Not a ")));
+}
+
+#[test]
+fn the_scan_for_the_old_wording_finds_it_in_every_spelling_in_a_fixture() {
+    let page = |body: &str| format!("<!doctype html><html><body>{body}</body></html>");
+    for html in [
+        page("<p>PNG · JPG · SVG</p>"),
+        page("<p>png · jpg · svg</p>"),
+        page("<p>PNG · JPG · <b>SVG</b></p>"),
+        page("<p>Not a PNG, JPG\n   or SVG file</p>"),
+        page("<p>PNG · JPG · SVG\n · Gif</p>"),
+        page("<button aria-label=\"PNG, JPG and SVG images\">x</button>"),
+        page("<p data-hint='No PNG,  JPG or SVG files'>x</p>"),
+    ] {
+        assert!(!old_wording_in_html(&html).is_empty(), "{html}");
+    }
+    let files = [
+        ("a.js", "const a = 'Not a PNG, JPG or SVG file';"),
+        ("b.js", "const b = 'No PNG, JPG\n  or SVG files';"),
+        ("c.js", "dialog('PNG, JPG and SVG images')"),
+        ("d.js", "hint('PNG · JPG · SVG')"),
+        ("e.html", "<p>PNG · JPG · SVG</p>"),
+    ]
+    .map(|(name, text)| (name.to_owned(), text.to_owned()));
+    assert_eq!(
+        files_with_old_wording(&files),
+        ["a.js", "b.js", "c.js", "d.js", "e.html"]
+    );
+    assert!(names_only_png_jpg_and_svg("Not a PNG, JPG or SVG file"));
+}
+
+#[test]
+fn the_scan_for_the_old_wording_leaves_the_new_wording_alone_in_a_fixture() {
+    for html in [
+        "<p>PNG · JPG · SVG · WebP</p>",
+        "<p>PNG · JPG · SVG\n  · WebP</p>",
+        "<p>Not a PNG, JPG, SVG or WebP file</p>",
+        "<p>No PNG, JPG, SVG or WebP files directly in this folder</p>",
+        "<button aria-label=\"PNG, JPG, SVG and WebP images\">x</button>",
+        // A comment is not text a reader sees.
+        "<!-- PNG · JPG · SVG --><p>PNG · JPG · SVG · WebP</p>",
+    ] {
+        assert_eq!(old_wording_in_html(html), Vec::<String>::new(), "{html}");
+    }
+    let files = [
+        ("a.js", "'No PNG, JPG, SVG or WebP files'"),
+        ("b.js", "'PNG, JPG, SVG and WebP images'"),
+        ("c.js", "'PNG · JPG · SVG · WebP'"),
+    ]
+    .map(|(name, text)| (name.to_owned(), text.to_owned()));
+    assert_eq!(files_with_old_wording(&files), Vec::<String>::new());
+}
+
+#[test]
+fn the_window_and_the_skip_reason_name_webp() {
+    let html = index_html();
+    assert!(page_says(&html, "PNG · JPG · SVG · WebP"));
+    let state = ui_files()
+        .into_iter()
+        .find(|(name, _)| name == "state.js")
+        .unwrap()
+        .1;
+    assert!(one_line(&state).contains(
+        "No PNG, JPG, SVG or WebP files directly in this folder (subfolders are not included)"
+    ));
+    assert!(skip_texts().contains(&"Not a PNG, JPG, SVG or WebP file".to_owned()));
+}
+
+#[test]
+fn a_page_without_webp_in_its_text_does_not_say_it_in_a_fixture() {
+    assert!(!page_says(
+        "<p>PNG · JPG · SVG</p>",
+        "PNG · JPG · SVG · WebP"
+    ));
+    // Only in a comment, or in an attribute, is not the page saying it.
+    assert!(!page_says(
+        "<!-- PNG · JPG · SVG · WebP --><p>PNG · JPG · SVG</p>",
+        "PNG · JPG · SVG · WebP"
+    ));
+    assert!(!page_says(
+        "<p title=\"PNG · JPG · SVG · WebP\">PNG · JPG</p>",
+        "PNG · JPG · SVG · WebP"
+    ));
+    assert!(page_says(
+        "<p>PNG · JPG · SVG\n  · WebP</p>",
+        "PNG · JPG · SVG · WebP"
+    ));
+}
+
+// ---------------------------------------------------------------------
+// The moon logo in the window header: one decorative image, loaded from the
+// window folder (the CSP allows `img-src 'self'` only), made from the same
+// SVG as the app icon.
+// ---------------------------------------------------------------------
+
+/// Problems with the images in `html`. The page must hold exactly one `<img>`;
+/// it must be decorative (`alt` present and empty) and its `src` must be a
+/// relative path inside the window folder: no scheme, no leading slash, no
+/// `..` or backslash, and naming a file in `window_files`. Read as tokens.
+fn logo_problems(html: &str, window_files: &[String]) -> Vec<String> {
+    let images: Vec<StartTag> = start_tags(html)
+        .into_iter()
+        .filter(|tag| tag.name == "img")
+        .collect();
+    if images.len() != 1 {
+        return vec![format!(
+            "exactly one <img> expected, found {}",
+            images.len()
+        )];
+    }
+    let image = &images[0];
+    let mut problems = Vec::new();
+    if image.attr("alt") != Some("") {
+        problems.push("the logo needs alt=\"\" (it is decorative)".to_owned());
+    }
+    match image.attr("src") {
+        None => problems.push("the logo has no src".to_owned()),
+        Some(src) => {
+            let outside = src.contains(':')
+                || src.starts_with('/')
+                || src.contains('\\')
+                || src.split('/').any(|part| part == ".." || part == ".");
+            if outside {
+                problems.push(format!("src={src:?} leaves the window folder"));
+            } else if !window_files.iter().any(|name| name == src) {
+                problems.push(format!("src={src:?} names no file under ui/"));
+            }
+        }
+    }
+    problems
+}
+
+/// The index of the first byte where `a` and `b` differ, or the length of the
+/// shorter one when one is a prefix of the other. `None` when they are equal.
+fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+    if a == b {
+        return None;
+    }
+    Some(a.iter().zip(b).take_while(|(x, y)| x == y).count())
+}
+
+fn ui_file_names() -> Vec<String> {
+    ui_entries().into_iter().map(|(name, _)| name).collect()
+}
+
+#[test]
+fn the_header_shows_one_decorative_logo_from_the_window_folder() {
+    assert_eq!(
+        logo_problems(&index_html(), &ui_file_names()),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_logo_without_alt_or_from_outside_the_window_folder_is_caught_in_a_fixture() {
+    let files = vec!["lunaepix-logo.svg".to_owned()];
+    let good = "<header><img class=\"lunaepixHeader__logo\" src=\"lunaepix-logo.svg\" alt=\"\" \
+                width=\"32\" height=\"32\"><h1>Lunaepix</h1></header>";
+    assert_eq!(logo_problems(good, &files), Vec::<String>::new());
+    for (bad, html) in [
+        ("no alt", "<img src=\"lunaepix-logo.svg\">"),
+        (
+            "alt with text",
+            "<img src=\"lunaepix-logo.svg\" alt=\"Moon\">",
+        ),
+        (
+            "https",
+            "<img src=\"https://example.com/lunaepix-logo.svg\" alt=\"\">",
+        ),
+        (
+            "upper-case scheme",
+            "<img src=\"HTTPS://example.com/a.svg\" alt=\"\">",
+        ),
+        (
+            "data uri",
+            "<img src=\"data:image/svg+xml;base64,AAAA\" alt=\"\">",
+        ),
+        (
+            "parent folder",
+            "<img src=\"../src-tauri/icons/lunaepix-icon.svg\" alt=\"\">",
+        ),
+        (
+            "protocol-relative",
+            "<img src=\"//example.com/lunaepix-logo.svg\" alt=\"\">",
+        ),
+        ("absolute path", "<img src=\"/lunaepix-logo.svg\" alt=\"\">"),
+        ("backslash", "<img src=\"..\\lunaepix-logo.svg\" alt=\"\">"),
+        ("no src", "<img alt=\"\">"),
+        ("file not in ui", "<img src=\"missing.svg\" alt=\"\">"),
+        (
+            "two images",
+            "<img src=\"lunaepix-logo.svg\" alt=\"\"><img src=\"lunaepix-logo.svg\" alt=\"\">",
+        ),
+        ("no image", "<h1>Lunaepix</h1>"),
+        // Only a real tag counts: a comment that spells one is not an image.
+        (
+            "tag only in a comment",
+            "<!-- <img src=\"lunaepix-logo.svg\" alt=\"\"> --><h1>Lunaepix</h1>",
+        ),
+    ] {
+        assert!(!logo_problems(html, &files).is_empty(), "{bad}: {html}");
+    }
+}
+
+#[test]
+fn the_window_logo_is_the_icon_source() {
+    let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/lunaepix-logo.svg");
+    let icon = Path::new(env!("CARGO_MANIFEST_DIR")).join("icons/lunaepix-icon.svg");
+    let icon = fs::read(icon).unwrap();
+    assert!(!icon.is_empty(), "the icon source is empty");
+    let logo = fs::read(ui).expect("ui/lunaepix-logo.svg is missing");
+    assert_eq!(first_difference(&logo, &icon), None);
+}
+
+#[test]
+fn the_logo_comparison_reports_a_one_byte_difference() {
+    let a = b"<svg>moon</svg>".to_vec();
+    let mut b = a.clone();
+    b[7] = b'M';
+    assert_eq!(first_difference(&a, &b), Some(7));
+    assert_eq!(first_difference(&a, &a), None);
+    // A copy that is cut short or has a byte added differs as well.
+    assert_eq!(first_difference(&a, &a[..a.len() - 1]), Some(a.len() - 1));
+    let mut longer = a.clone();
+    longer.push(b'\n');
+    assert_eq!(first_difference(&a, &longer), Some(a.len()));
+}
+
+#[test]
+fn the_logo_svg_does_not_trip_the_text_scans() {
+    // The SVG is text, so every scan over `ui/` reads it. It must be among
+    // the scanned files and leave the HTML-attribute check and the JS lint
+    // with nothing to report (the real tests above run over all of `ui/`).
+    let files = ui_files();
+    let (_, svg) = files
+        .iter()
+        .find(|(name, _)| name == "lunaepix-logo.svg")
+        .expect("ui/lunaepix-logo.svg is not among the scanned files");
+    assert_eq!(js_lint_hits(svg), Vec::<&str>::new());
+    assert_eq!(html_attribute_problems(svg), Vec::<String>::new());
+}

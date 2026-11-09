@@ -22,7 +22,7 @@ const done = (index, name = 'a.png', before = 1000, after = 800, millis = 12) =>
   type: 'file-done',
   payload: { index, name, status: 'done', before, after, millis },
 });
-const skipped = (index, name = 'notes.txt', reason = 'Not a PNG, JPG or SVG file') => ({
+const skipped = (index, name = 'notes.txt', reason = 'Not a PNG, JPG, SVG or WebP file') => ({
   type: 'file-done',
   payload: { index, name, status: 'skipped', reason },
 });
@@ -89,7 +89,7 @@ test('file-done adds a done row with the numbers', () => {
 test('file-done adds a skipped row with its reason and no numbers', () => {
   const state = apply(initialState(), started(1), skipped(0));
   assert.deepEqual(state.rows, [
-    { kind: 'skipped', name: 'notes.txt', reason: 'Not a PNG, JPG or SVG file' },
+    { kind: 'skipped', name: 'notes.txt', reason: 'Not a PNG, JPG, SVG or WebP file' },
   ]);
   assert.equal('before' in state.rows[0], false);
 });
@@ -207,7 +207,7 @@ test('run-finished for a single file uses the singular in the announcement', () 
   assert.equal(state.message, 'Optimised 1 file, saved 100 B');
 });
 
-const NO_FILES = 'No PNG, JPG or SVG files directly in this folder (subfolders are not included)';
+const NO_FILES = 'No PNG, JPG, SVG or WebP files directly in this folder (subfolders are not included)';
 
 test('a run that planned no files says so, and that subfolders are not included, in the announcement and the summary', () => {
   const state = apply(initialState(), started(0), finished(0, 0, false));
@@ -363,11 +363,11 @@ test('rowView of a grown file shows a negative saving', () => {
 });
 
 test('rowView of a skipped row has the status word and reason as text, and no numbers', () => {
-  const view = rowView({ kind: 'skipped', name: 'notes.txt', reason: 'Not a PNG, JPG or SVG file' });
+  const view = rowView({ kind: 'skipped', name: 'notes.txt', reason: 'Not a PNG, JPG, SVG or WebP file' });
   assert.deepEqual(view, {
     kind: 'skipped',
     name: 'notes.txt',
-    text: 'skipped: Not a PNG, JPG or SVG file',
+    text: 'skipped: Not a PNG, JPG, SVG or WebP file',
   });
   assert.equal('before' in view, false);
 });

@@ -1,4 +1,4 @@
-//! `lunaepix`: lossless PNG, JPG and SVG optimisation from the command line.
+//! `lunaepix`: lossless PNG, JPG, SVG and WebP optimisation from the command line.
 //!
 //! ```text
 //! lunaepix <file>...       optimise these files; output next to each one

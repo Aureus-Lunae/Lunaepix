@@ -28,6 +28,9 @@ use lunaepix_core::{
 };
 use tempfile::TempDir;
 
+mod common;
+use common::webp_fixtures as fx;
+
 /// Generous: a refusal takes milliseconds; allocating and touching gigabytes
 /// takes far longer.
 const QUICK: Duration = Duration::from_secs(5);
@@ -700,6 +703,239 @@ fn refuses_an_svg_with_more_nodes_than_the_limit() {
     let message = assert_refused("wide.svg", svg.as_bytes());
 
     assert!(message.contains("too large"), "{message}");
+}
+
+// --- WebP ------------------------------------------------------------------------------
+
+const NOT_WEBP: &str = "not a WebP file (the content is not WebP data)";
+
+/// One WebP chunk with the zero pad byte of an odd size.
+fn webp_chunk(fourcc: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut out = webp_chunk_declaring(fourcc, data.len() as u32, data);
+    if data.len() % 2 == 1 {
+        out.push(0);
+    }
+    out
+}
+
+/// A chunk header that declares `size`, then `data` as it is.
+fn webp_chunk_declaring(fourcc: &[u8; 4], size: u32, data: &[u8]) -> Vec<u8> {
+    let mut out = fourcc.to_vec();
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+/// A RIFF header with the given size field, `WEBP`, then the chunks.
+fn webp_riff_declaring(size: u32, chunks: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = b"RIFF".to_vec();
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(b"WEBP");
+    out.extend(chunks.concat());
+    out
+}
+
+/// A WebP file whose RIFF size is right for its chunks.
+fn webp_riff(chunks: &[Vec<u8>]) -> Vec<u8> {
+    let size = 4 + chunks.iter().map(Vec::len).sum::<usize>() as u32;
+    webp_riff_declaring(size, chunks)
+}
+
+/// A `VP8X` chunk for a `w`x`h` canvas, stored as width-1 and height-1.
+fn webp_vp8x(w: u32, h: u32) -> Vec<u8> {
+    let mut data = vec![0, 0, 0, 0];
+    data.extend_from_slice(&(w - 1).to_le_bytes()[..3]);
+    data.extend_from_slice(&(h - 1).to_le_bytes()[..3]);
+    webp_chunk(b"VP8X", &data)
+}
+
+/// A `VP8L` payload that declares `w`x`h`, with a few bytes behind the header.
+fn webp_vp8l_payload(w: u32, h: u32) -> Vec<u8> {
+    let mut data = vec![0x2F];
+    data.extend_from_slice(&((w - 1) | ((h - 1) << 14)).to_le_bytes());
+    data.extend_from_slice(&[0; 5]);
+    data
+}
+
+/// A real lossless WebP from `image`'s encoder.
+fn normal_webp() -> Vec<u8> {
+    let pixels: Vec<u8> = (0..32 * 32 * 4).map(|i| (i * 7 % 251) as u8).collect();
+    let mut out = Vec::new();
+    image::codecs::webp::WebPEncoder::new_lossless(&mut out)
+        .encode(&pixels, 32, 32, image::ExtendedColorType::Rgba8)
+        .unwrap();
+    out
+}
+
+#[test]
+fn still_optimises_a_normal_webp() {
+    // The positive for the chunk walk: a well-formed file is not refused, and
+    // what is written still decodes.
+    let tmp = TempDir::new().unwrap();
+    let original = normal_webp();
+    let src = write(tmp.path(), "a.webp", &original);
+    let dest = tmp.path().join("optimized-a.webp");
+
+    let outcome = optimize_file(&src, &dest).unwrap();
+
+    assert_eq!(outcome.before, original.len() as u64);
+    assert!(outcome.after <= outcome.before);
+    let written = fs::read(&dest).unwrap();
+    let decoded = image::load_from_memory_with_format(&written, image::ImageFormat::WebP).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (32, 32));
+    assert_eq!(
+        fs::read(&src).unwrap(),
+        original,
+        "the original is untouched"
+    );
+}
+
+#[test]
+fn refuses_a_webp_file_of_only_riff() {
+    assert!(assert_refused("a.webp", b"RIFF").ends_with(NOT_WEBP));
+    // Empty, too: no panic, the WebP message.
+    assert!(assert_refused("b.webp", b"").ends_with(NOT_WEBP));
+}
+
+#[test]
+fn refuses_a_webp_that_is_not_webp_data() {
+    assert!(assert_refused("png.webp", &png(&[ihdr(1, 1, 8, 0)])).ends_with(NOT_WEBP));
+    let mut wave = b"RIFF".to_vec();
+    wave.extend_from_slice(&36u32.to_le_bytes());
+    wave.extend_from_slice(b"WAVEfmt ");
+    assert!(assert_refused("wave.webp", &wave).ends_with(NOT_WEBP));
+}
+
+#[test]
+fn refuses_a_webp_chunk_of_u32_max_bytes() {
+    let huge = webp_chunk_declaring(b"VP8L", u32::MAX, &webp_vp8l_payload(8, 8));
+    let message = assert_refused("huge.webp", &webp_riff(&[huge]));
+    assert!(
+        message.contains("could not read the WebP data"),
+        "{message}"
+    );
+}
+
+#[test]
+fn refuses_a_webp_riff_size_past_the_end_of_the_file() {
+    let chunks = [webp_chunk(b"VP8L", &webp_vp8l_payload(8, 8))];
+    let bytes = webp_riff_declaring(u32::MAX, &chunks);
+    let message = assert_refused("long.webp", &bytes);
+    assert!(
+        message.contains("could not read the WebP data"),
+        "{message}"
+    );
+}
+
+#[test]
+fn refuses_a_webp_cut_off_inside_its_vp8l_chunk() {
+    // The chunk size runs past the end of the file: the file stops mid-chunk.
+    let whole = webp_riff(&[webp_chunk(b"VP8L", &webp_vp8l_payload(8, 8))]);
+    let cut = &whole[..whole.len() - 4];
+    let message = assert_refused("cut.webp", cut);
+    assert!(
+        message.contains("could not read the WebP data"),
+        "{message}"
+    );
+}
+
+#[test]
+fn refuses_a_webp_with_a_vp8l_payload_shorter_than_its_header() {
+    let short = webp_chunk(b"VP8L", &webp_vp8l_payload(8, 8)[..3]);
+    let message = assert_refused("short.webp", &webp_riff(&[short]));
+    assert!(
+        message.contains("could not read the WebP data"),
+        "{message}"
+    );
+}
+
+#[test]
+fn refuses_a_webp_with_a_misplaced_vp8x() {
+    let lossless = webp_chunk(b"VP8L", &webp_vp8l_payload(8, 8));
+    let message = assert_refused("late.webp", &webp_riff(&[lossless, webp_vp8x(8, 8)]));
+    assert!(
+        message.contains("could not read the WebP data"),
+        "{message}"
+    );
+}
+
+#[test]
+fn refuses_a_webp_with_a_second_vp8x() {
+    let lossless = webp_chunk(b"VP8L", &webp_vp8l_payload(8, 8));
+    let bytes = webp_riff(&[webp_vp8x(8, 8), webp_vp8x(65_535, 65_535), lossless]);
+    let message = assert_refused("twice.webp", &bytes);
+    assert!(
+        message.contains("could not read the WebP data"),
+        "{message}"
+    );
+}
+
+#[test]
+fn refuses_a_webp_canvas_over_the_pixel_limit() {
+    let bomb = webp_riff(&[webp_vp8x(20_000, 20_000)]);
+    assert!(bomb.len() < 64, "the fixture must be tiny");
+    let message = assert_refused("bomb.webp", &bomb);
+    assert!(
+        message.contains("image too large: 20000×20000 exceeds 100 megapixels"),
+        "{message}"
+    );
+}
+
+#[test]
+fn refuses_a_webp_canvas_at_the_pixel_limit_with_no_image_as_unreadable() {
+    let message = assert_refused("empty.webp", &webp_riff(&[webp_vp8x(10_000, 10_000)]));
+    assert!(
+        message.contains("could not read the WebP data"),
+        "{message}"
+    );
+    assert!(!message.contains("too large"), "{message}");
+}
+
+/// A WebP holding `exif` as its EXIF chunk, optimised: the output.
+fn optimised_with_exif(exif: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let original = fx::with_chunks(&normal_webp(), &[(*b"EXIF", exif)]);
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "exif.webp", &original);
+    let dest = tmp.path().join("optimized-exif.webp");
+
+    let started = Instant::now();
+    let result = optimize_file(&src, &dest);
+    assert!(started.elapsed() < QUICK, "took {:?}", started.elapsed());
+
+    result.expect("a malformed EXIF chunk must not refuse the file");
+    (original, fs::read(&dest).unwrap())
+}
+
+#[test]
+fn optimises_a_webp_with_a_malformed_exif_chunk_and_drops_the_chunk() {
+    let le = |v: u32| v.to_le_bytes();
+    let mut header_cut = fx::EXIF_PREFIX.to_vec();
+    header_cut.extend_from_slice(b"II*");
+    let mut offset_past_end = fx::tiff(false, &[(fx::ORIENTATION, fx::SHORT, 1, 6)]);
+    offset_past_end[4..8].copy_from_slice(&le(u32::MAX));
+    let mut offset_into_header = fx::tiff(true, &[(fx::ORIENTATION, fx::SHORT, 1, 6)]);
+    offset_into_header[4..8].copy_from_slice(&2u32.to_be_bytes());
+    let mut count_too_large = fx::tiff(false, &[]);
+    count_too_large[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+    let wrong_type = fx::tiff(true, &[(fx::ORIENTATION, 4, 1, 6)]);
+    let cases: [(&str, Vec<u8>); 6] = [
+        ("empty", Vec::new()),
+        ("header cut short", header_cut),
+        ("IFD0 offset past the end", offset_past_end),
+        ("IFD0 offset into the header", offset_into_header),
+        ("entry count larger than the payload", count_too_large),
+        ("Orientation of type LONG", wrong_type),
+    ];
+    for (what, exif) in cases {
+        let (original, out) = optimised_with_exif(&exif);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "VP8L"], "{what}");
+        assert_eq!(fx::decode_rgba(&out), fx::decode_rgba(&original), "{what}");
+    }
+
+    // The control: the same file with a well-formed rotation keeps its EXIF.
+    let rotated = fx::exif_with_orientation(6, true, false);
+    let (_, out) = optimised_with_exif(&rotated);
+    assert_eq!(fx::chunk_payload(&out, b"EXIF"), Some(rotated));
 }
 
 // --- Crashes, isolated by the worker process ---------------------------------------

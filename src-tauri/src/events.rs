@@ -233,7 +233,7 @@ mod tests {
         ));
         assert_eq!(
             text,
-            r#"{"index":2,"name":"notes.txt","status":"skipped","reason":"Not a PNG, JPG or SVG file"}"#
+            r#"{"index":2,"name":"notes.txt","status":"skipped","reason":"Not a PNG, JPG, SVG or WebP file"}"#
         );
     }
 

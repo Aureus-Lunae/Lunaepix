@@ -14,7 +14,7 @@ export const MESSAGES = Object.freeze({
   busy: "Already optimising; try again when it's done.",
   noOutput: 'Nothing has been written yet.',
   openFailed: 'The folder could not be opened.',
-  noFiles: 'No PNG, JPG or SVG files directly in this folder (subfolders are not included)',
+  noFiles: 'No PNG, JPG, SVG or WebP files directly in this folder (subfolders are not included)',
   unknown: 'Something went wrong.',
 });
 

@@ -1,0 +1,1330 @@
+//! The RIFF container of a WebP file, walked in safe Rust.
+//!
+//! The walk reads chunk headers and the few header bytes of the image chunks
+//! (`VP8X`, `VP8L`, `VP8 `) and nothing else. It never decodes an image, so a
+//! file that declares a huge image is refused from its headers alone.
+
+use super::exif;
+use crate::plan::check_pixels;
+
+/// Most chunks one file may hold. A real file has a handful, an animation one
+/// `ANMF` per frame; the limit only stops a file of nothing but empty chunks
+/// (13 million of them fit in [`crate::MAX_FILE_BYTES`]) from growing the
+/// chunk list to hundreds of megabytes.
+const MAX_CHUNKS: usize = 1_000_000;
+
+/// The error for content that is not WebP data at all.
+const NOT_WEBP: &str = "not a WebP file (the content is not WebP data)";
+
+/// The size of the `RIFF` header: `"RIFF"`, the size field and `"WEBP"`.
+const RIFF_HEADER: usize = 12;
+
+/// The `VP8X` payload: flags, 3 reserved bytes, then the two canvas sizes.
+const VP8X_LEN: usize = 10;
+
+/// What a file holds, as far as the optimiser needs to tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// A still `VP8 ` image, with or without an `ALPH` chunk.
+    Lossy,
+    /// A still `VP8L` image.
+    Lossless,
+    /// An `ANIM` chunk and at least one `ANMF` frame.
+    Animated,
+}
+
+/// One chunk: its FourCC and its payload, without the padding byte an odd
+/// size is followed by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Chunk<'a> {
+    pub fourcc: [u8; 4],
+    pub data: &'a [u8],
+}
+
+/// A parsed WebP file: its chunks in file order, and what kind of file it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WebpFile<'a> {
+    pub chunks: Vec<Chunk<'a>>,
+    /// Read by the tests only; nothing in a run needs it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub kind: Kind,
+}
+
+/// The chunks a stripped file always keeps: the image, its alpha, the
+/// animation and the colour profile, and the `VP8X` that describes them.
+/// The first `EXIF` chunk is kept too when it turns the picture (see
+/// [`exif::is_rotated`]). Every other chunk is dropped: `XMP `, the other
+/// `EXIF` chunks and whatever else a writer put in.
+const KEPT: [&[u8; 4]; 7] = [
+    b"VP8X", b"ICCP", b"ANIM", b"ANMF", b"ALPH", b"VP8 ", b"VP8L",
+];
+
+/// `VP8X` flag bits: the chunks a file says it holds.
+const FLAG_ICC: u8 = 0x20;
+const FLAG_EXIF: u8 = 0x08;
+const FLAG_XMP: u8 = 0x04;
+
+impl WebpFile<'_> {
+    /// The file rewritten with only the kept chunks (see [`KEPT`]), in their
+    /// original order, each followed by the pad byte its odd size needs, even
+    /// when the source left the last one out. The image chunks are copied byte
+    /// for byte; nothing is decoded.
+    ///
+    /// The `VP8X` flags for EXIF and XMP are set from the chunks that are
+    /// left, whatever the source's flags said. The ICC flag is the source's
+    /// own, set or clear, when an `ICCP` chunk is left, so colour management
+    /// is exactly as before; with no `ICCP` chunk it is cleared. Every other
+    /// bit, the reserved bytes and the canvas are as they were. A file with
+    /// no `VP8X` stays without one. The RIFF size is written to match, so
+    /// bytes the source had after its own RIFF size are not in the result.
+    pub(crate) fn stripped(&self) -> Vec<u8> {
+        // A reader uses the first EXIF chunk; it stays when it turns the
+        // picture, and every other EXIF chunk goes.
+        let rotated_exif = self
+            .chunks
+            .iter()
+            .position(|chunk| &chunk.fourcc == b"EXIF")
+            .filter(|&at| exif::is_rotated(self.chunks[at].data));
+        let kept: Vec<&Chunk<'_>> = self
+            .chunks
+            .iter()
+            .enumerate()
+            .filter(|&(at, chunk)| KEPT.contains(&&chunk.fourcc) || Some(at) == rotated_exif)
+            .map(|(_, chunk)| chunk)
+            .collect();
+        let has_icc = kept.iter().any(|chunk| &chunk.fourcc == b"ICCP");
+
+        let mut body = b"WEBP".to_vec();
+        for chunk in kept {
+            body.extend_from_slice(&chunk.fourcc);
+            // The sizes come from a file of at most `MAX_FILE_BYTES`.
+            body.extend_from_slice(&(chunk.data.len() as u32).to_le_bytes());
+            let payload_at = body.len();
+            body.extend_from_slice(chunk.data);
+            if &chunk.fourcc == b"VP8X" {
+                // `parse` refuses a VP8X shorter than its 10 bytes.
+                let flags = &mut body[payload_at];
+                let source_icc = *flags & FLAG_ICC;
+                *flags &= !(FLAG_ICC | FLAG_EXIF | FLAG_XMP);
+                if has_icc {
+                    *flags |= source_icc;
+                }
+                if rotated_exif.is_some() {
+                    *flags |= FLAG_EXIF;
+                }
+            }
+            if chunk.data.len() % 2 == 1 {
+                body.push(0);
+            }
+        }
+        let mut out = b"RIFF".to_vec();
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+}
+
+/// The error for a file whose RIFF container is broken.
+fn unreadable(why: &str) -> String {
+    format!("could not read the WebP data: {why}")
+}
+
+/// Check that `bytes` is WebP data, walk its chunks and check the size of
+/// the image it declares, in that order.
+///
+/// The walk stops at the RIFF size: bytes after it are ignored, and a chunk
+/// that runs past it is refused. Every offset is computed with checked
+/// arithmetic, so a declared size of 4 GB is an error, not a panic or an
+/// allocation. A `VP8X` must be the first chunk and may occur once, as in the
+/// container specification; a file with no image chunk is refused.
+///
+/// The size check covers the `VP8X` canvas and, as well, the header of every
+/// `VP8L` and `VP8 ` chunk, against [`crate::MAX_PIXELS`]. It comes before
+/// the check for an image chunk, so a canvas over the limit is "too large"
+/// even when the file holds no image.
+///
+/// The errors are messages for the user: "not a WebP file (…)" when the
+/// content is not WebP data, `check_pixels`'s text when the image is too
+/// large, and "could not read the WebP data: …" otherwise.
+pub(crate) fn parse(bytes: &[u8]) -> Result<WebpFile<'_>, String> {
+    let body = riff_body(bytes)?;
+    let chunks = walk(body)?;
+    for chunk in &chunks {
+        if let Some((width, height)) = declared_size(chunk)? {
+            check_pixels(width, height)?;
+        }
+    }
+    let kind = kind_of(&chunks)?;
+    Ok(WebpFile { chunks, kind })
+}
+
+/// The chunks of the file: the bytes between the `RIFF` header and the end
+/// the RIFF size gives. Refuses what is not `RIFF`…`WEBP`, and a size that is
+/// too small for the form type or runs past the end of the file.
+fn riff_body(bytes: &[u8]) -> Result<&[u8], String> {
+    let Some(header) = bytes.first_chunk::<RIFF_HEADER>() else {
+        return Err(NOT_WEBP.to_owned());
+    };
+    if &header[..4] != b"RIFF" || &header[8..] != b"WEBP" {
+        return Err(NOT_WEBP.to_owned());
+    }
+    let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+    // The size counts everything after the first 8 bytes.
+    match size.checked_add(8) {
+        Some(end) if (RIFF_HEADER..=bytes.len()).contains(&end) => Ok(&bytes[RIFF_HEADER..end]),
+        _ => Err(unreadable(
+            "the RIFF size is too small, or runs past the end of the file",
+        )),
+    }
+}
+
+/// Every chunk of `body`, in order: a header of FourCC and little-endian
+/// size, the payload, and one zero byte when the size is odd. A final odd
+/// chunk may lack its padding byte; some writers leave it out.
+fn walk(body: &[u8]) -> Result<Vec<Chunk<'_>>, String> {
+    let mut chunks = Vec::new();
+    let mut at = 0;
+    while at < body.len() {
+        let header = at.checked_add(8).and_then(|end| body.get(at..end));
+        let Some(&[f0, f1, f2, f3, s0, s1, s2, s3]) = header else {
+            return Err(unreadable("a chunk header is cut short"));
+        };
+        let fourcc = [f0, f1, f2, f3];
+        let size = u32::from_le_bytes([s0, s1, s2, s3]) as usize;
+        let start = at + 8;
+        let Some(end) = start.checked_add(size).filter(|&end| end <= body.len()) else {
+            return Err(unreadable(&format!(
+                "the {} chunk runs past the end of the file",
+                name_of(&fourcc)
+            )));
+        };
+        if chunks.len() == MAX_CHUNKS {
+            return Err(unreadable(&format!("it has more than {MAX_CHUNKS} chunks")));
+        }
+        if &fourcc == b"VP8X" {
+            if chunks.first().is_some_and(|c: &Chunk| &c.fourcc == b"VP8X") {
+                return Err(unreadable("it has more than one VP8X chunk"));
+            }
+            if !chunks.is_empty() {
+                return Err(unreadable("the VP8X chunk is not the first chunk"));
+            }
+        }
+        chunks.push(Chunk {
+            fourcc,
+            data: &body[start..end],
+        });
+        // The pad byte is skipped; at most it is the one missing at the end.
+        at = end.saturating_add(size & 1).min(body.len());
+    }
+    Ok(chunks)
+}
+
+/// The FourCC as text for a message; it can be any four bytes.
+fn name_of(fourcc: &[u8; 4]) -> String {
+    String::from_utf8_lossy(fourcc).trim_end().to_owned()
+}
+
+/// The image size a chunk declares in its header, for `VP8X` (the canvas),
+/// `VP8L` and `VP8 `; `None` for every other chunk.
+fn declared_size(chunk: &Chunk<'_>) -> Result<Option<(u32, u32)>, String> {
+    match &chunk.fourcc {
+        // Flags, 3 reserved bytes, then width-1 and height-1, 24 bits each.
+        b"VP8X" => {
+            let &[_, _, _, _, w0, w1, w2, h0, h1, h2, ..] = chunk.data else {
+                return Err(unreadable(&format!(
+                    "the VP8X chunk is shorter than its {VP8X_LEN}-byte header"
+                )));
+            };
+            let width = u32::from_le_bytes([w0, w1, w2, 0]) + 1;
+            let height = u32::from_le_bytes([h0, h1, h2, 0]) + 1;
+            Ok(Some((width, height)))
+        }
+        // The signature 0x2F, then width-1 and height-1 in 14 bits each.
+        b"VP8L" => {
+            let &[signature, b0, b1, b2, b3, ..] = chunk.data else {
+                return Err(unreadable(
+                    "the VP8L chunk is shorter than its 5-byte header",
+                ));
+            };
+            if signature != 0x2F {
+                return Err(unreadable("the VP8L chunk does not start with 0x2F"));
+            }
+            let bits = u32::from_le_bytes([b0, b1, b2, b3]);
+            Ok(Some(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)))
+        }
+        // The 3-byte frame tag, the start code, then width and height in 14
+        // bits each (the top two bits are a scale).
+        b"VP8 " => {
+            let &[_, _, _, 0x9D, 0x01, 0x2A, w0, w1, h0, h1, ..] = chunk.data else {
+                return Err(unreadable(
+                    "the VP8 chunk is too short, or lacks its start code",
+                ));
+            };
+            let width = u32::from(u16::from_le_bytes([w0, w1]) & 0x3FFF);
+            let height = u32::from(u16::from_le_bytes([h0, h1]) & 0x3FFF);
+            Ok(Some((width, height)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// What the chunks make: an animation (`ANIM` and a frame), else the still
+/// image of the first `VP8L` or `VP8 ` chunk. No image chunk is an error.
+fn kind_of(chunks: &[Chunk<'_>]) -> Result<Kind, String> {
+    let has = |fourcc: &[u8; 4]| chunks.iter().any(|c| &c.fourcc == fourcc);
+    if has(b"ANIM") && has(b"ANMF") {
+        return Ok(Kind::Animated);
+    }
+    match chunks
+        .iter()
+        .find(|c| matches!(&c.fourcc, b"VP8L" | b"VP8 "))
+    {
+        Some(c) if &c.fourcc == b"VP8L" => Ok(Kind::Lossless),
+        Some(_) => Ok(Kind::Lossy),
+        None => Err(unreadable("it has no image chunk")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Generous: a refusal takes microseconds; a walk that trusts a declared
+    /// size takes far longer or panics.
+    const QUICK: Duration = Duration::from_secs(5);
+
+    const NOT_WEBP: &str = "not a WebP file (the content is not WebP data)";
+    const UNREADABLE: &str = "could not read the WebP data:";
+
+    // --- fixtures -----------------------------------------------------------
+
+    /// One chunk: FourCC, size, payload, and the zero pad byte of an odd size.
+    fn chunk(fourcc: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut out = raw_chunk(fourcc, data.len() as u32, data);
+        if data.len() % 2 == 1 {
+            out.push(0);
+        }
+        out
+    }
+
+    /// A chunk header declaring `size`, followed by `data` as it is, with no
+    /// padding: for chunks whose declared size is wrong on purpose.
+    fn raw_chunk(fourcc: &[u8; 4], size: u32, data: &[u8]) -> Vec<u8> {
+        let mut out = fourcc.to_vec();
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// A RIFF header whose size is right for `body`, then `body`.
+    fn riff_of(body: &[u8]) -> Vec<u8> {
+        riff_declaring(4 + body.len() as u32, body)
+    }
+
+    /// A RIFF header with the given size field, `WEBP`, then `body`.
+    fn riff_declaring(size: u32, body: &[u8]) -> Vec<u8> {
+        let mut out = b"RIFF".to_vec();
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(b"WEBP");
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn riff(chunks: &[Vec<u8>]) -> Vec<u8> {
+        riff_of(&chunks.concat())
+    }
+
+    /// A `VP8X` chunk for a `w`x`h` canvas (stored as width-1 and height-1,
+    /// 24 bits each).
+    fn vp8x(flags: u8, w: u32, h: u32) -> Vec<u8> {
+        let mut data = vec![flags, 0, 0, 0];
+        data.extend_from_slice(&(w - 1).to_le_bytes()[..3]);
+        data.extend_from_slice(&(h - 1).to_le_bytes()[..3]);
+        chunk(b"VP8X", &data)
+    }
+
+    /// A `VP8L` payload that declares `w`x`h`, with a few bytes of "bitstream"
+    /// behind the header (the walk never decodes it).
+    fn vp8l_payload(w: u32, h: u32) -> Vec<u8> {
+        let bits = (w - 1) | ((h - 1) << 14);
+        let mut data = vec![0x2F];
+        data.extend_from_slice(&bits.to_le_bytes());
+        data.extend_from_slice(&[0; 5]);
+        data
+    }
+
+    fn vp8l(w: u32, h: u32) -> Vec<u8> {
+        chunk(b"VP8L", &vp8l_payload(w, h))
+    }
+
+    /// A `VP8 ` payload that declares `w`x`h`: the key frame tag, the start
+    /// code, the two sizes, and a few bytes of "bitstream".
+    fn vp8_payload(w: u16, h: u16) -> Vec<u8> {
+        let mut data = vec![0x30, 0x01, 0x00, 0x9D, 0x01, 0x2A];
+        data.extend_from_slice(&w.to_le_bytes());
+        data.extend_from_slice(&h.to_le_bytes());
+        data.extend_from_slice(&[0; 4]);
+        data
+    }
+
+    fn vp8(w: u16, h: u16) -> Vec<u8> {
+        chunk(b"VP8 ", &vp8_payload(w, h))
+    }
+
+    /// An `ANMF` frame: the 16-byte frame header and a few bytes of frame data.
+    fn anmf() -> Vec<u8> {
+        chunk(b"ANMF", &[0; 24])
+    }
+
+    /// `ANIM`: background colour and loop count.
+    fn anim() -> Vec<u8> {
+        chunk(b"ANIM", &[0; 6])
+    }
+
+    /// A real lossless WebP from `image`'s encoder.
+    fn real_lossless() -> Vec<u8> {
+        let pixels: Vec<u8> = (0..16 * 16 * 4).map(|i| (i * 7 % 251) as u8).collect();
+        let mut out = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut out)
+            .encode(&pixels, 16, 16, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        out
+    }
+
+    /// `parse`, which must come back quickly whatever the input declares.
+    fn parse_quickly(bytes: &[u8]) -> Result<WebpFile<'_>, String> {
+        let started = Instant::now();
+        let result = parse(bytes);
+        assert!(started.elapsed() < QUICK, "took {:?}", started.elapsed());
+        result
+    }
+
+    /// The error of a file the walk must refuse as unreadable.
+    fn unreadable(bytes: &[u8]) -> String {
+        let err = parse_quickly(bytes).unwrap_err();
+        assert!(err.starts_with(UNREADABLE), "{err}");
+        err
+    }
+
+    fn fourccs(file: &WebpFile<'_>) -> Vec<String> {
+        file.chunks
+            .iter()
+            .map(|c| String::from_utf8_lossy(&c.fourcc).into_owned())
+            .collect()
+    }
+
+    // --- the content check ----------------------------------------------------
+
+    #[test]
+    fn the_fixture_helpers_write_a_riff_size_that_covers_the_file() {
+        // Proof that the hand-made files say what the tests rely on.
+        let file = riff(&[vp8x(0, 1, 1), vp8l(1, 1)]);
+        assert_eq!(
+            u32::from_le_bytes(file[4..8].try_into().unwrap()) as usize,
+            file.len() - 8
+        );
+        assert_eq!(&file[8..12], b"WEBP");
+    }
+
+    #[test]
+    fn refuses_what_is_not_webp_data() {
+        let png = [
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R',
+        ];
+        let mut wave = b"RIFF".to_vec();
+        wave.extend_from_slice(&36u32.to_le_bytes());
+        wave.extend_from_slice(b"WAVEfmt ");
+        let mut not_riff = riff(&[vp8l(1, 1)]);
+        not_riff[0] = b'X';
+        let mut not_webp_form = riff(&[vp8l(1, 1)]);
+        not_webp_form[11] = b'X';
+        let cases: [&[u8]; 7] = [
+            &png,
+            &wave,
+            &[],
+            b"RIFF",
+            // The header cut one byte short of its twelve.
+            b"RIFF\x04\x00\x00\x00WEB",
+            &not_riff,
+            &not_webp_form,
+        ];
+        for case in cases {
+            assert_eq!(parse_quickly(case).unwrap_err(), NOT_WEBP, "{case:?}");
+        }
+    }
+
+    // --- what kind of file it is ------------------------------------------------
+
+    #[test]
+    fn parses_a_simple_lossless_file_as_lossless() {
+        let bytes = real_lossless();
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(file.kind, Kind::Lossless);
+        assert_eq!(fourccs(&file), ["VP8L"]);
+        assert_eq!(file.chunks[0].data[0], 0x2F);
+    }
+
+    #[test]
+    fn parses_a_lossy_file_as_lossy() {
+        let bytes = riff(&[vp8(640, 480)]);
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(file.kind, Kind::Lossy);
+        assert_ne!(file.kind, Kind::Lossless);
+        assert_eq!(fourccs(&file), ["VP8 "]);
+    }
+
+    #[test]
+    fn parses_a_lossy_file_with_alpha_as_lossy() {
+        let bytes = riff(&[vp8x(0x10, 64, 64), chunk(b"ALPH", &[0; 12]), vp8(64, 64)]);
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(file.kind, Kind::Lossy);
+        assert_eq!(fourccs(&file), ["VP8X", "ALPH", "VP8 "]);
+    }
+
+    #[test]
+    fn parses_an_extended_lossless_file_as_lossless() {
+        let bytes = riff(&[vp8x(0, 32, 32), vp8l(32, 32)]);
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(file.kind, Kind::Lossless);
+        assert_eq!(fourccs(&file), ["VP8X", "VP8L"]);
+    }
+
+    #[test]
+    fn parses_an_animated_file_as_animated() {
+        let bytes = riff(&[vp8x(0x02, 100, 100), anim(), anmf(), anmf()]);
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(file.kind, Kind::Animated);
+        assert_eq!(fourccs(&file), ["VP8X", "ANIM", "ANMF", "ANMF"]);
+    }
+
+    #[test]
+    fn does_not_call_the_same_file_without_anim_and_anmf_animated() {
+        // The animation flag alone does not make a still image animated.
+        let flagged_still = riff(&[vp8x(0x02, 100, 100), vp8l(100, 100)]);
+        assert_eq!(parse_quickly(&flagged_still).unwrap().kind, Kind::Lossless);
+
+        // An ANIM chunk without frames does not either.
+        let no_frames = riff(&[vp8x(0x02, 100, 100), anim(), vp8l(100, 100)]);
+        assert_eq!(parse_quickly(&no_frames).unwrap().kind, Kind::Lossless);
+
+        // Frames without ANIM are no animation and no still image.
+        let no_anim = riff(&[vp8x(0x02, 100, 100), anmf(), anmf()]);
+        assert!(unreadable(&no_anim).contains("no image chunk"));
+    }
+
+    // --- VP8X --------------------------------------------------------------------
+
+    #[test]
+    fn parses_a_vp8x_that_comes_first_exactly_once() {
+        let bytes = riff(&[vp8x(0x20, 8, 8), chunk(b"ICCP", &[1, 2, 3, 4]), vp8l(8, 8)]);
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(fourccs(&file), ["VP8X", "ICCP", "VP8L"]);
+        assert_eq!(file.chunks[0].data.len(), 10);
+    }
+
+    #[test]
+    fn refuses_a_vp8x_that_is_not_first() {
+        let err = unreadable(&riff(&[vp8l(8, 8), vp8x(0, 8, 8)]));
+        assert!(err.contains("VP8X") && err.contains("first"), "{err}");
+        let err = unreadable(&riff(&[chunk(b"ICCP", &[0; 4]), vp8x(0, 8, 8), vp8l(8, 8)]));
+        assert!(err.contains("VP8X") && err.contains("first"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_second_vp8x() {
+        let err = unreadable(&riff(&[vp8x(0, 8, 8), vp8x(0, 8, 8), vp8l(8, 8)]));
+        assert!(err.contains("more than one VP8X"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_vp8x_shorter_than_its_header() {
+        let short = chunk(b"VP8X", &[0; 9]);
+        let err = unreadable(&riff(&[short, vp8l(8, 8)]));
+        assert!(err.contains("VP8X"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_file_without_an_image_chunk() {
+        let exif_only = riff(&[vp8x(0x08, 8, 8), chunk(b"EXIF", &[0; 6])]);
+        assert!(unreadable(&exif_only).contains("no image chunk"));
+        // Not even a VP8X.
+        assert!(unreadable(&riff(&[])).contains("no image chunk"));
+    }
+
+    // --- the chunk walk -------------------------------------------------------------
+
+    #[test]
+    fn refuses_a_chunk_past_the_end() {
+        // A declared size of four gigabytes, in a RIFF that is otherwise right.
+        let huge = raw_chunk(b"VP8L", u32::MAX, &vp8l_payload(8, 8));
+        unreadable(&riff_of(&huge));
+        let huge_after_vp8x = [vp8x(0, 8, 8), raw_chunk(b"EXIF", u32::MAX, &[0; 6])].concat();
+        unreadable(&riff_of(&huge_after_vp8x));
+        // Just one byte past the end.
+        let payload = vp8l_payload(8, 8);
+        let one_over = raw_chunk(b"VP8L", payload.len() as u32 + 1, &payload);
+        unreadable(&riff_of(&one_over));
+    }
+
+    #[test]
+    fn refuses_a_riff_size_larger_than_the_file() {
+        let good = riff(&[vp8x(0, 8, 8), vp8l(8, 8)]);
+        let body = &good[12..];
+        for extra in [1u32, 1000, u32::MAX - 4 - body.len() as u32] {
+            let bytes = riff_declaring(4 + body.len() as u32 + extra, body);
+            unreadable(&bytes);
+        }
+        // The size field alone is at its largest.
+        unreadable(&riff_declaring(u32::MAX, body));
+        // And the exact size is accepted.
+        assert!(parse_quickly(&good).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_riff_size_too_small_for_the_form_type() {
+        for size in 0..4u32 {
+            unreadable(&riff_declaring(size, &vp8l(8, 8)));
+        }
+    }
+
+    #[test]
+    fn refuses_a_chunk_that_runs_past_the_riff_size_inside_the_file() {
+        let mut bytes = riff(&[vp8x(0, 8, 8), vp8l(8, 8)]);
+        let size = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        // The RIFF ends 4 bytes early; the file does not.
+        bytes[4..8].copy_from_slice(&(size - 4).to_le_bytes());
+        unreadable(&bytes);
+
+        // The same for a chunk of odd size whose last payload byte is cut off.
+        let odd = riff(&[vp8x(0, 8, 8), chunk(b"VP8L", &vp8l_payload(8, 8)[..9])]);
+        let mut cut = odd.clone();
+        let size = u32::from_le_bytes(cut[4..8].try_into().unwrap());
+        cut[4..8].copy_from_slice(&(size - 2).to_le_bytes());
+        unreadable(&cut);
+        assert!(parse_quickly(&odd).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_chunk_header_cut_short() {
+        for left in 1..8 {
+            let mut body = [vp8x(0, 8, 8), vp8l(8, 8)].concat();
+            body.extend_from_slice(&b"JUNKJUNK"[..left]);
+            unreadable(&riff_of(&body));
+        }
+    }
+
+    #[test]
+    fn ignores_bytes_after_the_riff_size() {
+        let clean = riff(&[vp8x(0, 8, 8), vp8l(8, 8)]);
+        let mut with_tail = clean.clone();
+        // A whole chunk after the RIFF, and then bytes that are no chunk.
+        with_tail.extend(chunk(b"EXIF", &[0; 6]));
+        with_tail.extend_from_slice(b"junk");
+        let file = parse_quickly(&with_tail).unwrap();
+        assert_eq!(fourccs(&file), ["VP8X", "VP8L"]);
+        assert_eq!(file.kind, Kind::Lossless);
+    }
+
+    #[test]
+    fn skips_the_padding_byte_of_an_odd_sized_chunk() {
+        let bytes = riff(&[vp8x(0x20, 8, 8), chunk(b"ICCP", &[1, 2, 3]), vp8l(8, 8)]);
+        let file = parse_quickly(&bytes).unwrap();
+        // The chunk after the odd one is found, and the pad is not its data.
+        assert_eq!(fourccs(&file), ["VP8X", "ICCP", "VP8L"]);
+        assert_eq!(file.chunks[1].data, [1, 2, 3]);
+    }
+
+    #[test]
+    fn accepts_a_final_odd_sized_chunk_without_its_padding_byte() {
+        // Some writers leave the last pad out of the RIFF size.
+        let payload = vp8l_payload(8, 8);
+        assert_eq!(payload.len() % 2, 0);
+        let odd = &payload[..9];
+        let body = [vp8x(0, 8, 8), raw_chunk(b"VP8L", 9, odd)].concat();
+        let bytes = riff_of(&body);
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(file.chunks[1].data, odd);
+    }
+
+    #[test]
+    fn accepts_exactly_the_chunk_limit() {
+        let mut body = vp8l(8, 8);
+        for _ in 1..MAX_CHUNKS {
+            body.extend(chunk(b"JUNK", &[]));
+        }
+        let bytes = riff_of(&body);
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(file.chunks.len(), MAX_CHUNKS);
+    }
+
+    #[test]
+    fn refuses_more_chunks_than_the_limit() {
+        let mut body = vp8l(8, 8);
+        for _ in 0..MAX_CHUNKS {
+            body.extend(chunk(b"JUNK", &[]));
+        }
+        let err = unreadable(&riff_of(&body));
+        assert!(err.contains("chunks"), "{err}");
+    }
+
+    // --- the image headers ---------------------------------------------------------
+
+    #[test]
+    fn refuses_a_vp8l_shorter_than_its_header() {
+        for len in 0..5 {
+            let short = chunk(b"VP8L", &vp8l_payload(8, 8)[..len]);
+            let err = unreadable(&riff(&[short]));
+            assert!(err.contains("VP8L"), "{err}");
+        }
+    }
+
+    #[test]
+    fn refuses_a_vp8l_without_its_signature_byte() {
+        let mut payload = vp8l_payload(8, 8);
+        payload[0] = 0x2E;
+        let err = unreadable(&riff(&[chunk(b"VP8L", &payload)]));
+        assert!(err.contains("VP8L"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_vp8_shorter_than_its_header() {
+        for len in 0..10 {
+            let short = chunk(b"VP8 ", &vp8_payload(8, 8)[..len]);
+            let err = unreadable(&riff(&[short]));
+            assert!(err.contains("VP8"), "{err}");
+        }
+    }
+
+    #[test]
+    fn refuses_a_vp8_without_its_start_code() {
+        let mut payload = vp8_payload(8, 8);
+        payload[3] = 0x9C;
+        let err = unreadable(&riff(&[chunk(b"VP8 ", &payload)]));
+        assert!(err.contains("start code"), "{err}");
+    }
+
+    // --- the pixel limit --------------------------------------------------------------
+
+    #[test]
+    fn refuses_a_canvas_over_the_pixel_limit() {
+        // A VP8X alone, so only the size can be what refuses it.
+        let bomb = riff(&[vp8x(0, 20_000, 20_000)]);
+        assert!(bomb.len() < 64);
+        assert_eq!(
+            parse_quickly(&bomb).unwrap_err(),
+            "image too large: 20000×20000 exceeds 100 megapixels"
+        );
+        // The largest canvas the 24-bit fields hold.
+        let largest = riff(&[vp8x(0, 1 << 24, 1 << 24)]);
+        assert_eq!(
+            parse_quickly(&largest).unwrap_err(),
+            "image too large: 16777216×16777216 exceeds 100 megapixels"
+        );
+        // One row over the limit, next to an image header within it.
+        let over = riff(&[vp8x(0, 10_000, 10_001), vp8l(1, 1)]);
+        assert!(
+            parse_quickly(&over)
+                .unwrap_err()
+                .starts_with("image too large")
+        );
+    }
+
+    #[test]
+    fn refuses_a_canvas_at_the_limit_with_no_image_chunk_as_unreadable_not_too_large() {
+        let err = unreadable(&riff(&[vp8x(0, 10_000, 10_000)]));
+        assert!(!err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn parses_a_vp8x_canvas_at_the_pixel_limit() {
+        let bytes = riff(&[vp8x(0, 10_000, 10_000), vp8l(1, 1)]);
+        assert_eq!(parse_quickly(&bytes).unwrap().kind, Kind::Lossless);
+    }
+
+    #[test]
+    fn parses_a_vp8l_and_a_vp8_header_within_the_limit() {
+        assert!(parse_quickly(&riff(&[vp8l(10_000, 10_000)])).is_ok());
+        assert!(parse_quickly(&riff(&[vp8(10_000, 10_000)])).is_ok());
+        assert!(parse_quickly(&riff(&[vp8l(16_384, 1)])).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_vp8l_header_over_the_limit_under_a_small_canvas() {
+        // The canvas passes; the image header declares the 14-bit largest.
+        let bytes = riff(&[vp8x(0, 100, 100), vp8l(16_384, 16_384)]);
+        assert_eq!(
+            parse_quickly(&bytes).unwrap_err(),
+            "image too large: 16384×16384 exceeds 100 megapixels"
+        );
+        let alone = riff(&[vp8l(10_001, 10_000)]);
+        assert!(
+            parse_quickly(&alone)
+                .unwrap_err()
+                .starts_with("image too large")
+        );
+    }
+
+    #[test]
+    fn refuses_a_vp8_header_over_the_limit() {
+        let bytes = riff(&[vp8(16_383, 16_383)]);
+        assert_eq!(
+            parse_quickly(&bytes).unwrap_err(),
+            "image too large: 16383×16383 exceeds 100 megapixels"
+        );
+    }
+
+    #[test]
+    fn refuses_a_canvas_over_the_limit_over_a_small_vp8l_header() {
+        // Both sizes are checked: a small image header does not excuse the canvas.
+        let bytes = riff(&[vp8x(0, 20_000, 20_000), vp8l(1, 1)]);
+        assert_eq!(
+            parse_quickly(&bytes).unwrap_err(),
+            "image too large: 20000×20000 exceeds 100 megapixels"
+        );
+    }
+
+    // --- stripped: what is kept ---------------------------------------------------
+
+    use crate::webp::fixtures as fx;
+
+    const SIZE: u32 = 16;
+    /// An ICC profile of even size, and one of odd size.
+    const ICC_EVEN: &[u8] = &[0x11; 128];
+    const ICC_ODD: &[u8] = &[0x22; 129];
+
+    fn pixels(alpha: bool) -> Vec<u8> {
+        fx::photo_rgba(SIZE, SIZE, alpha)
+    }
+
+    fn lossless_file(alpha: bool) -> Vec<u8> {
+        fx::lossless(&pixels(alpha), SIZE, SIZE)
+    }
+
+    fn stripped_of(bytes: &[u8]) -> Vec<u8> {
+        parse(bytes).unwrap().stripped()
+    }
+
+    fn flags(file: &[u8]) -> u8 {
+        file[fx::VP8X_FLAGS_AT]
+    }
+
+    /// The stripped file is a whole, well-formed file: the RIFF size covers
+    /// exactly the bytes, every chunk is padded (so the length is even) and
+    /// it parses again.
+    fn assert_well_formed(file: &[u8]) {
+        let size = u32::from_le_bytes(file[4..8].try_into().unwrap()) as usize;
+        assert_eq!(size, file.len() - 8, "the RIFF size");
+        assert_eq!(file.len() % 2, 0, "every chunk is padded");
+        let parsed = parse(file).unwrap();
+        assert_eq!(parsed.chunks.len(), fx::chunks_of(file).len());
+    }
+
+    #[test]
+    fn removes_exif_and_xmp_and_keeps_icc_byte_identical() {
+        let base = lossless_file(true);
+        let input = fx::with_chunks(
+            &base,
+            &[
+                (*b"ICCP", ICC_EVEN),
+                (*b"EXIF", b"Exif\0\0 a camera"),
+                (*b"XMP ", b"<x:xmpmeta/>"),
+            ],
+        );
+        // The fixture holds what the test is about.
+        assert_eq!(
+            flags(&input) & (fx::FLAG_ICC | fx::FLAG_EXIF | fx::FLAG_XMP),
+            fx::FLAG_ICC | fx::FLAG_EXIF | fx::FLAG_XMP
+        );
+
+        let out = stripped_of(&input);
+
+        assert_well_formed(&out);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "ICCP", "VP8L"]);
+        assert_eq!(fx::chunk_payload(&out, b"ICCP").as_deref(), Some(ICC_EVEN));
+        assert_eq!(
+            fx::chunk_payload(&out, b"VP8L"),
+            fx::chunk_payload(&input, b"VP8L")
+        );
+        // The flags match the chunks left; alpha is as it was.
+        assert_eq!(flags(&out), (flags(&input) & fx::FLAG_ALPHA) | fx::FLAG_ICC);
+        // The rest of the VP8X (reserved bytes, canvas) is as it was.
+        assert_eq!(
+            fx::chunk_payload(&out, b"VP8X").unwrap()[1..],
+            fx::chunk_payload(&input, b"VP8X").unwrap()[1..]
+        );
+        assert!(out.len() < input.len());
+        assert_eq!(fx::decode_rgba(&out), fx::decode_rgba(&input));
+    }
+
+    #[test]
+    fn adds_nothing_to_a_file_without_metadata() {
+        // An ICC profile only: no chunk and no flag appears, the profile stays.
+        let with_icc = fx::with_chunks(&lossless_file(false), &[(*b"ICCP", ICC_EVEN)]);
+        let out = stripped_of(&with_icc);
+        assert_eq!(out, with_icc);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "ICCP", "VP8L"]);
+        // The flags are the input's own: ICC (and alpha, which the encoder
+        // sets for any RGBA image), and no EXIF or XMP gained.
+        assert_eq!(flags(&out), flags(&with_icc));
+        assert_eq!(flags(&out) & fx::FLAG_ICC, fx::FLAG_ICC);
+        assert_eq!(flags(&out) & (fx::FLAG_EXIF | fx::FLAG_XMP), 0);
+
+        // An extended file with no flags and no metadata.
+        let image = fx::chunks_of(&lossless_file(false)).remove(0);
+        let plain = fx::from_chunks(&[(*b"VP8X", fx::vp8x_payload(0, SIZE, SIZE)), image]);
+        assert_eq!(stripped_of(&plain), plain);
+        assert_eq!(flags(&plain), 0);
+    }
+
+    #[test]
+    fn keeps_a_simple_file_simple() {
+        let simple = lossless_file(false);
+        assert_eq!(fx::chunk_names(&simple), ["VP8L"]);
+        let out = stripped_of(&simple);
+        assert_eq!(out, simple);
+        assert_eq!(fx::chunk_names(&out), ["VP8L"]);
+
+        // The same image in an extended file keeps its VP8X.
+        let extended = fx::with_chunks(&simple, &[(*b"EXIF", b"exif")]);
+        assert_eq!(fx::chunk_names(&stripped_of(&extended)), ["VP8X", "VP8L"]);
+    }
+
+    #[test]
+    fn drops_unknown_chunks() {
+        let input = fx::with_chunks(
+            &lossless_file(false),
+            &[(*b"ABCD", b"unknown"), (*b"JUNK", b"")],
+        );
+        let out = stripped_of(&input);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "VP8L"]);
+        assert_well_formed(&out);
+        // They set no flag, so the VP8X is unchanged.
+        assert_eq!(flags(&out), flags(&input));
+    }
+
+    #[test]
+    fn keeps_every_kept_chunk_in_its_original_order() {
+        // Distinct payloads, and the dropped chunks between the kept ones.
+        let vp8x = fx::vp8x_payload(fx::FLAG_ANIMATION | fx::FLAG_ICC, SIZE, SIZE);
+        let input = fx::from_chunks(&[
+            (*b"VP8X", vp8x),
+            (*b"ICCP", vec![1; 6]),
+            (*b"ABCD", vec![2; 6]),
+            (*b"ANIM", vec![3; 6]),
+            (*b"ANMF", vec![4; 24]),
+            (*b"EXIF", vec![5; 6]),
+            (*b"ANMF", vec![6; 24]),
+            (*b"XMP ", vec![7; 6]),
+        ]);
+        let out = stripped_of(&input);
+        assert_eq!(
+            fx::chunks_of(&out)[1..],
+            [
+                (*b"ICCP", vec![1; 6]),
+                (*b"ANIM", vec![3; 6]),
+                (*b"ANMF", vec![4; 24]),
+                (*b"ANMF", vec![6; 24]),
+            ]
+        );
+        assert_well_formed(&out);
+    }
+
+    #[test]
+    fn keeps_every_anmf_chunk_of_an_animated_file() {
+        let frames: Vec<Vec<u8>> = (0u8..3)
+            .map(|k| {
+                let rgba: Vec<u8> = pixels(true)
+                    .iter()
+                    .map(|b| b.wrapping_add(k * 40))
+                    .collect();
+                fx::lossless(&rgba, SIZE, SIZE)
+            })
+            .collect();
+        let animated = fx::animated(&frames, SIZE, SIZE);
+        let input = fx::with_chunks(
+            &animated,
+            &[
+                (*b"EXIF", b"exif data"),
+                (*b"XMP ", b"<xmp/>"),
+                (*b"ABCD", b"x"),
+            ],
+        );
+
+        let out = stripped_of(&input);
+
+        assert_well_formed(&out);
+        assert_eq!(
+            fx::chunk_names(&out),
+            ["VP8X", "ANIM", "ANMF", "ANMF", "ANMF"]
+        );
+        let anmf = |file: &[u8]| -> Vec<Vec<u8>> {
+            fx::chunks_of(file)
+                .into_iter()
+                .filter(|(name, _)| name == b"ANMF")
+                .map(|(_, data)| data)
+                .collect()
+        };
+        assert_eq!(anmf(&out), anmf(&input));
+        assert_eq!(anmf(&out).len(), 3);
+        assert_eq!(
+            flags(&out) & (fx::FLAG_EXIF | fx::FLAG_XMP | fx::FLAG_ICC),
+            0
+        );
+        assert_eq!(flags(&out) & fx::FLAG_ANIMATION, fx::FLAG_ANIMATION);
+        let decoded = fx::decode_frames(&out);
+        assert_eq!(decoded, fx::decode_frames(&input));
+        assert_ne!(decoded[0].0, decoded[1].0, "the frames differ");
+    }
+
+    #[test]
+    fn copies_an_animated_file_without_metadata_as_it_is() {
+        let frames = [lossless_file(true), lossless_file(false)];
+        let animated = fx::animated(&frames, SIZE, SIZE);
+        assert_eq!(stripped_of(&animated), animated);
+    }
+
+    #[test]
+    fn keeps_vp8_and_alph_of_a_lossy_file_with_alpha_byte_identical() {
+        let lossy = fx::lossy(&pixels(true), SIZE, SIZE, 75.0);
+        assert_eq!(fx::chunk_names(&lossy), ["VP8X", "ALPH", "VP8 "]);
+        let input = fx::with_chunks(&lossy, &[(*b"ICCP", ICC_EVEN), (*b"EXIF", &[4u8; 2_000])]);
+
+        let out = stripped_of(&input);
+
+        assert_well_formed(&out);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "ICCP", "ALPH", "VP8 "]);
+        for fourcc in [b"ALPH", b"VP8 "] {
+            assert_eq!(
+                fx::chunk_payload(&out, fourcc),
+                fx::chunk_payload(&lossy, fourcc)
+            );
+        }
+        assert_eq!(flags(&out) & fx::FLAG_ALPHA, fx::FLAG_ALPHA);
+        assert!(out.len() <= input.len());
+        assert_eq!(fx::decode_rgba(&out), fx::decode_rgba(&input));
+    }
+
+    #[test]
+    fn does_not_make_a_lossy_file_larger() {
+        for alpha in [false, true] {
+            let lossy = fx::lossy(&pixels(alpha), SIZE, SIZE, 75.0);
+            assert_eq!(stripped_of(&lossy), lossy, "alpha: {alpha}");
+        }
+    }
+
+    // --- stripped: padding, the tail and the flags ----------------------------------
+
+    #[test]
+    fn keeps_the_padding_byte_of_an_odd_sized_chunk() {
+        let base = lossless_file(false);
+        let input = fx::with_chunks(&base, &[(*b"ICCP", ICC_ODD), (*b"EXIF", b"odd")]);
+        // The pad bytes are really in the fixture.
+        let image_len = fx::chunk_payload(&base, b"VP8L").unwrap().len();
+        assert_eq!(
+            input.len(),
+            12 + (8 + 10) + (8 + ICC_ODD.len() + 1) + (8 + image_len + image_len % 2) + (8 + 3 + 1)
+        );
+
+        let out = stripped_of(&input);
+
+        // VP8X, the odd ICCP with its pad, and the image: nothing else.
+        assert_eq!(
+            out.len(),
+            12 + (8 + 10) + (8 + ICC_ODD.len() + 1) + (8 + image_len + image_len % 2)
+        );
+        assert_well_formed(&out);
+        assert_eq!(fx::chunk_payload(&out, b"ICCP").as_deref(), Some(ICC_ODD));
+        assert_eq!(
+            fx::chunk_payload(&out, b"VP8L"),
+            fx::chunk_payload(&base, b"VP8L")
+        );
+        assert_eq!(fx::decode_rgba(&out), fx::decode_rgba(&base));
+    }
+
+    #[test]
+    fn writes_no_padding_byte_after_an_even_sized_chunk() {
+        let base = lossless_file(false);
+        let input = fx::with_chunks(&base, &[(*b"ICCP", ICC_EVEN)]);
+        let out = stripped_of(&input);
+        let image_len = fx::chunk_payload(&base, b"VP8L").unwrap().len();
+        assert_eq!(
+            out.len(),
+            12 + (8 + 10) + (8 + ICC_EVEN.len()) + (8 + image_len + image_len % 2)
+        );
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn writes_the_missing_pad_of_a_final_odd_chunk() {
+        // The last chunk is odd-sized and the file ends without its pad byte,
+        // and the RIFF size leaves it out, as some writers do.
+        let chunks = [
+            fx::chunks_of(&lossless_file(false)).remove(0),
+            (*b"ICCP", vec![1, 2, 3]),
+        ];
+        let with_pad = fx::from_chunks(&chunks);
+        let mut without_pad = with_pad.clone();
+        without_pad.pop();
+        let size = u32::from_le_bytes(without_pad[4..8].try_into().unwrap()) - 1;
+        without_pad[4..8].copy_from_slice(&size.to_le_bytes());
+        assert!(parse(&without_pad).is_ok(), "the fixture is accepted");
+
+        let out = stripped_of(&without_pad);
+
+        assert_eq!(out.len(), without_pad.len() + 1);
+        assert_eq!(out.last(), Some(&0));
+        assert_well_formed(&out);
+        // The same file with its pad is copied byte for byte.
+        assert_eq!(stripped_of(&with_pad), with_pad);
+    }
+
+    #[test]
+    fn drops_bytes_after_the_riff_size() {
+        let base = lossless_file(false);
+        let extended = fx::with_chunks(&base, &[(*b"ICCP", ICC_EVEN)]);
+        for clean in [&base, &extended] {
+            let tail = [0xAB; 100];
+            let mut input = clean.clone();
+            input.extend_from_slice(&tail);
+
+            let out = stripped_of(&input);
+
+            assert!(!out.windows(tail.len()).any(|w| w == tail), "tail kept");
+            assert_eq!(&out, clean);
+            assert_well_formed(&out);
+            assert_eq!(fx::decode_rgba(&out), fx::decode_rgba(clean));
+        }
+        // A whole chunk after the RIFF size does not come in either.
+        let mut with_chunk = base.clone();
+        with_chunk.extend(fx::from_chunks(&[(*b"EXIF", vec![5; 40])])[12..].to_vec());
+        assert_eq!(stripped_of(&with_chunk), base);
+    }
+
+    #[test]
+    fn rewrites_flags_that_disagree_with_the_chunks() {
+        let image = || fx::chunks_of(&lossless_file(false)).remove(0);
+        let vp8x = |flags: u8| (*b"VP8X", fx::vp8x_payload(flags, SIZE, SIZE));
+        let rotated = || (*b"EXIF", fx::exif_with_orientation(6, false, true));
+        // (the chunks, the flags the output must have)
+        let cases: Vec<(Vec<fx::RawChunk>, u8)> = vec![
+            // An EXIF chunk with its flag clear: dropped, flag stays clear.
+            (vec![vp8x(0), image(), (*b"EXIF", vec![1; 8])], 0),
+            // The XMP flag set with no XMP chunk: cleared.
+            (vec![vp8x(fx::FLAG_XMP), image()], 0),
+            // The EXIF flag set with no EXIF chunk: cleared.
+            (vec![vp8x(fx::FLAG_EXIF), image()], 0),
+            // The ICC flag set with no ICCP chunk: cleared, like the others.
+            (vec![vp8x(fx::FLAG_ICC), image()], 0),
+            // A rotated EXIF chunk with its flag clear: kept, the flag set.
+            (vec![vp8x(0), image(), rotated()], fx::FLAG_EXIF),
+            // A rotated EXIF chunk with its flag set, and an XMP flag with no
+            // chunk: EXIF stays set, XMP is cleared.
+            (
+                vec![vp8x(fx::FLAG_EXIF | fx::FLAG_XMP), image(), rotated()],
+                fx::FLAG_EXIF,
+            ),
+            // Several at once, with alpha and animation flags that stay.
+            (
+                vec![
+                    vp8x(fx::FLAG_EXIF | fx::FLAG_XMP | fx::FLAG_ALPHA | fx::FLAG_ANIMATION),
+                    image(),
+                    (*b"XMP ", vec![1; 8]),
+                ],
+                fx::FLAG_ALPHA | fx::FLAG_ANIMATION,
+            ),
+        ];
+        for (chunks, expected) in cases {
+            let input = fx::from_chunks(&chunks);
+            let out = stripped_of(&input);
+            assert_eq!(flags(&out), expected, "{:?}", fx::chunk_names(&input));
+            assert_well_formed(&out);
+            // The EXIF and XMP flags agree with the chunks kept, and no ICC
+            // flag is left without an ICCP chunk.
+            let names = fx::chunk_names(&out);
+            let has = |name: &str| names.iter().any(|n| n == name);
+            assert_eq!(flags(&out) & fx::FLAG_EXIF != 0, has("EXIF"));
+            assert!(!has("XMP "));
+            assert_eq!(flags(&out) & fx::FLAG_XMP, 0);
+            if !has("ICCP") {
+                assert_eq!(flags(&out) & fx::FLAG_ICC, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn keeps_the_sources_icc_flag_when_the_file_has_an_iccp_chunk() {
+        // The ruling "Keep the source's flag": with an ICCP chunk, the ICC
+        // bit is copied, set or clear, whatever else is stripped.
+        let image = || fx::chunks_of(&lossless_file(false)).remove(0);
+        let iccp = || (*b"ICCP", ICC_EVEN.to_vec());
+        for extra in [
+            None,
+            Some((*b"EXIF", vec![1; 8])),
+            Some((*b"XMP ", vec![2; 8])),
+        ] {
+            for source_flags in [0, fx::FLAG_ICC, fx::FLAG_ICC | fx::FLAG_XMP, fx::FLAG_XMP] {
+                let mut chunks = vec![
+                    (*b"VP8X", fx::vp8x_payload(source_flags, SIZE, SIZE)),
+                    iccp(),
+                    image(),
+                ];
+                chunks.extend(extra.clone());
+                let input = fx::from_chunks(&chunks);
+
+                let out = stripped_of(&input);
+
+                assert_eq!(fx::chunk_names(&out), ["VP8X", "ICCP", "VP8L"]);
+                assert_eq!(
+                    flags(&out),
+                    source_flags & fx::FLAG_ICC,
+                    "source flags {source_flags:#04x}, extra {:?}",
+                    extra.as_ref().map(|c| c.0)
+                );
+                assert_well_formed(&out);
+            }
+        }
+    }
+
+    // --- stripped: EXIF that carries a rotation ------------------------------------
+
+    #[test]
+    fn keeps_a_rotated_exif_chunk_byte_identical_and_sets_its_flag() {
+        for (orientation, big_endian, prefix) in [
+            (6, false, true),
+            (8, true, false),
+            (3, false, false),
+            (6, true, true),
+        ] {
+            let exif = fx::exif_with_orientation(orientation, big_endian, prefix);
+            let input = fx::with_chunks(
+                &lossless_file(true),
+                &[(*b"EXIF", &exif), (*b"XMP ", b"<x:xmpmeta/>")],
+            );
+
+            let out = stripped_of(&input);
+
+            assert_well_formed(&out);
+            assert_eq!(fx::chunk_names(&out), ["VP8X", "VP8L", "EXIF"]);
+            assert_eq!(fx::chunk_payload(&out, b"EXIF"), Some(exif));
+            assert_eq!(
+                flags(&out),
+                (flags(&input) & fx::FLAG_ALPHA) | fx::FLAG_EXIF,
+                "orientation {orientation}"
+            );
+            assert!(out.len() < input.len(), "the XMP is gone");
+            assert_eq!(fx::decode_rgba(&out), fx::decode_rgba(&input));
+        }
+    }
+
+    #[test]
+    fn drops_an_exif_chunk_that_carries_no_rotation() {
+        let unrotated: [Vec<u8>; 4] = [
+            fx::exif_with_orientation(1, false, true),
+            fx::exif_with_orientation(1, true, false),
+            // No Orientation tag at all.
+            fx::tiff(false, &[(0x0100, fx::SHORT, 1, 6)]),
+            // Unreadable: the TIFF header cut short.
+            b"Exif\0\0II*".to_vec(),
+        ];
+        for exif in unrotated {
+            let input = fx::with_chunks(&lossless_file(false), &[(*b"EXIF", &exif)]);
+            let out = stripped_of(&input);
+            assert_eq!(fx::chunk_names(&out), ["VP8X", "VP8L"], "{exif:?}");
+            assert_eq!(flags(&out) & fx::FLAG_EXIF, 0);
+            assert_well_formed(&out);
+        }
+    }
+
+    #[test]
+    fn decides_on_the_first_exif_chunk_and_drops_any_other() {
+        let image = || fx::chunks_of(&lossless_file(false)).remove(0);
+        let exif = |orientation| {
+            (
+                *b"EXIF",
+                fx::exif_with_orientation(orientation, false, true),
+            )
+        };
+        let vp8x = (*b"VP8X", fx::vp8x_payload(fx::FLAG_EXIF, SIZE, SIZE));
+
+        // Two rotated: only the first stays.
+        let two_rotated = fx::from_chunks(&[vp8x.clone(), image(), exif(6), exif(8)]);
+        let out = stripped_of(&two_rotated);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "VP8L", "EXIF"]);
+        assert_eq!(fx::chunk_payload(&out, b"EXIF"), Some(exif(6).1));
+        assert_eq!(flags(&out), fx::FLAG_EXIF);
+
+        // The first does not rotate: none stays, though the second would.
+        let first_unrotated = fx::from_chunks(&[vp8x, image(), exif(1), exif(6)]);
+        let out = stripped_of(&first_unrotated);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "VP8L"]);
+        assert_eq!(flags(&out), 0);
+    }
+
+    // --- stripped: a simple file (no VP8X) with extra chunks -------------------------
+
+    #[test]
+    fn keeps_an_iccp_chunk_of_a_simple_file_and_adds_no_vp8x() {
+        let image = fx::chunks_of(&lossless_file(false)).remove(0);
+        let input = fx::from_chunks(&[image.clone(), (*b"ICCP", ICC_ODD.to_vec())]);
+        let out = stripped_of(&input);
+        assert_eq!(out, input);
+        assert_eq!(fx::chunk_names(&out), ["VP8L", "ICCP"]);
+
+        // What is not kept still goes, and still no VP8X comes in.
+        let with_xmp =
+            fx::from_chunks(&[image, (*b"ICCP", ICC_ODD.to_vec()), (*b"XMP ", vec![3; 40])]);
+        let out = stripped_of(&with_xmp);
+        assert_eq!(out, input);
+        assert_eq!(fx::chunk_names(&out), ["VP8L", "ICCP"]);
+    }
+
+    #[test]
+    fn keeps_a_rotated_exif_chunk_of_a_simple_file_and_adds_no_vp8x() {
+        let image = || fx::chunks_of(&lossless_file(false)).remove(0);
+        let exif = |orientation| {
+            (
+                *b"EXIF",
+                fx::exif_with_orientation(orientation, true, false),
+            )
+        };
+        let rotated = fx::from_chunks(&[image(), exif(8)]);
+        assert_eq!(stripped_of(&rotated), rotated);
+
+        let unrotated = fx::from_chunks(&[image(), exif(1)]);
+        assert_eq!(fx::chunk_names(&stripped_of(&unrotated)), ["VP8L"]);
+    }
+
+    #[test]
+    fn keeps_the_reserved_bits_the_canvas_and_a_longer_vp8x_header_as_they_were() {
+        let mut payload = fx::vp8x_payload(0xC1 | fx::FLAG_ALPHA | fx::FLAG_EXIF, SIZE, SIZE);
+        payload[1..4].copy_from_slice(&[7, 8, 9]);
+        payload.extend_from_slice(&[0xEE; 4]);
+        let input = fx::from_chunks(&[
+            (*b"VP8X", payload.clone()),
+            fx::chunks_of(&lossless_file(true)).remove(0),
+        ]);
+
+        let out = stripped_of(&input);
+
+        let mut expected = payload;
+        expected[0] = 0xC1 | fx::FLAG_ALPHA;
+        assert_eq!(fx::chunk_payload(&out, b"VP8X"), Some(expected));
+    }
+
+    #[test]
+    fn writes_a_riff_size_that_covers_exactly_the_file() {
+        let base = lossless_file(true);
+        let inputs = [
+            base.clone(),
+            fx::with_chunks(&base, &[(*b"ICCP", ICC_ODD), (*b"EXIF", &[0; 301])]),
+            fx::animated(std::slice::from_ref(&base), SIZE, SIZE),
+        ];
+        for input in inputs {
+            let out = stripped_of(&input);
+            let declared = u32::from_le_bytes(out[4..8].try_into().unwrap()) as usize;
+            assert_eq!(declared + 8, out.len());
+            assert_eq!(&out[8..12], b"WEBP");
+        }
+    }
+}

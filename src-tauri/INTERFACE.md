@@ -18,7 +18,7 @@ bare string.
 
 | Command | Does | Resolves | Rejects with |
 |---|---|---|---|
-| `choose_files` | Opens a native multi-file dialog (PNG, JPG, SVG; "All files" as a second filter). The files picked are optimised to `optimized-<name>` next to each one. | `null` as soon as the dialog is open. The result arrives as events. | `"busy"` |
+| `choose_files` | Opens a native multi-file dialog (PNG, JPG, SVG, WebP; "All files" as a second filter). The files picked are optimised to `optimized-<name>` next to each one. | `null` as soon as the dialog is open. The result arrives as events. | `"busy"` |
 | `choose_folder` | Opens a native folder dialog. The files in the folder (not its subfolders) are optimised into `<folder>/optimized/`. | `null` as soon as the dialog is open. | `"busy"` |
 | `open_output_folder` | Opens the output folder of the last completed run in the file manager: `<folder>/optimized` for a folder, or the folder of the first file written. | `null` | `"no-output"`: no completed run wrote anything yet. `"open-failed"`: the system could not open it, for example because it was removed. |
 
@@ -40,7 +40,7 @@ with `innerHTML`. A file name may contain any character.
 
 A run starts. `total` is the number of `file-done` events that follow,
 skipped files included. It can be 0, for an empty folder; the window then
-says "No PNG, JPG or SVG files directly in this folder (subfolders are not
+says "No PNG, JPG, SVG or WebP files directly in this folder (subfolders are not
 included)".
 
 ```json
@@ -69,7 +69,7 @@ the reason "the run was stopped"; no later file runs.
 
 ```json
 { "index": 0, "name": "logo-black.svg", "status": "done", "before": 21828, "after": 9631, "millis": 22 }
-{ "index": 1, "name": "notes.txt", "status": "skipped", "reason": "Not a PNG, JPG or SVG file" }
+{ "index": 1, "name": "notes.txt", "status": "skipped", "reason": "Not a PNG, JPG, SVG or WebP file" }
 { "index": 2, "name": "broken.png", "status": "failed", "reason": "the optimiser crashed on this file (it gave no valid result)" }
 ```
 

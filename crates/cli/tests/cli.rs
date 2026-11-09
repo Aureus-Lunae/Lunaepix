@@ -241,7 +241,7 @@ fn a_txt_file_in_the_dir_is_skipped_on_stderr_with_no_output_and_exit_0() {
     assert_eq!(
         text(&output.stderr),
         format!(
-            "lunaepix: skipped (Not a PNG, JPG or SVG file): {}\n",
+            "lunaepix: skipped (Not a PNG, JPG, SVG or WebP file): {}\n",
             notes.display()
         )
     );
@@ -454,7 +454,7 @@ fn a_file_name_with_terminal_escape_codes_is_printed_escaped() {
     assert_no_control_characters(&stderr, 2);
     assert!(stderr.contains("\\x1b[2Jbad.png\n"), "{stderr:?}");
     assert!(
-        stderr.contains("lunaepix: skipped (Not a PNG, JPG or SVG file): ")
+        stderr.contains("lunaepix: skipped (Not a PNG, JPG, SVG or WebP file): ")
             && stderr.contains("\\x1b[31mnotes.txt\n"),
         "{stderr:?}"
     );

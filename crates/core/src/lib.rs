@@ -1,4 +1,4 @@
-//! Lunaepix core: lossless PNG, JPG and SVG optimisation.
+//! Lunaepix core: lossless PNG, JPG, SVG and WebP optimisation.
 //!
 //! All logic and all tests live here. The CLI and the Tauri app are thin
 //! front ends over this crate.
@@ -29,6 +29,7 @@ mod platform;
 mod png;
 mod run;
 mod svg;
+mod webp;
 pub mod worker;
 
 pub use plan::{
@@ -49,7 +50,7 @@ pub struct Outcome {
 /// Why a file is left alone. The `Display` text is shown to the user in the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Skip {
-    /// Not a PNG, JPG or SVG file.
+    /// Not a PNG, JPG, SVG or WebP file.
     UnsupportedType,
     /// Larger than the per-file size limit.
     TooLarge,
@@ -66,7 +67,7 @@ pub enum Skip {
 impl fmt::Display for Skip {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Skip::UnsupportedType => "Not a PNG, JPG or SVG file",
+            Skip::UnsupportedType => "Not a PNG, JPG, SVG or WebP file",
             Skip::TooLarge => "File is too large",
             Skip::OverRunLimit => {
                 return write!(f, "Too many files in one run (max {MAX_RUN_FILES})");
@@ -93,7 +94,7 @@ pub enum OptimizeError {
     /// deliberately not a `source()`, so an error chain does not print it twice.
     #[error("{path}: {cause}", path = path.display())]
     Io { path: PathBuf, cause: io::Error },
-    /// The file is not a PNG, JPG or SVG.
+    /// The file is not a PNG, JPG, SVG or WebP.
     #[error("{path}: unsupported file type", path = path.display())]
     UnsupportedType { path: PathBuf },
     /// The file has a supported extension but its content could not be
@@ -162,6 +163,7 @@ pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> 
         plan::Format::Png => png::optimize(&original),
         plan::Format::Jpg => jpg::optimize(&original),
         plan::Format::Svg => svg::optimize(&original),
+        plan::Format::Webp => webp::optimize(&original),
     }
     .map_err(|message| OptimizeError::Invalid {
         path: src.to_path_buf(),
@@ -239,15 +241,61 @@ fn read_at_most(reader: impl Read, limit: u64) -> io::Result<Option<Vec<u8>>> {
     Ok((bytes.len() as u64 <= limit).then_some(bytes))
 }
 
+/// The first of the smallest candidates, if it is smaller than `original`;
+/// otherwise `original`. On a tie between candidates the first one wins
+/// (for JPG, candidate A, jpegoptim's result); a candidate of the same size
+/// as the original does not count as smaller.
+pub(crate) fn smallest<'a>(original: &'a [u8], candidates: &'a [Vec<u8>]) -> &'a [u8] {
+    candidates
+        .iter()
+        .map(Vec::as_slice)
+        .fold(original, |best, candidate| {
+            if candidate.len() < best.len() {
+                candidate
+            } else {
+                best
+            }
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- the smallest of the candidates, or the original ----------------------
+
+    #[test]
+    fn smallest_returns_the_smallest_candidate() {
+        let original = vec![0u8; 10];
+        let candidates = [vec![1u8; 8], vec![2u8; 6]];
+        assert_eq!(smallest(&original, &candidates), &[2u8; 6]);
+        let reversed = [vec![2u8; 6], vec![1u8; 8]];
+        assert_eq!(smallest(&original, &reversed), &[2u8; 6]);
+    }
+
+    #[test]
+    fn smallest_returns_the_original_when_no_candidate_is_smaller() {
+        let original = vec![0u8; 10];
+        // Equal size is not smaller: the original wins.
+        let candidates = [vec![1u8; 10], vec![2u8; 12]];
+        let chosen = smallest(&original, &candidates);
+        assert_eq!(chosen.as_ptr(), original.as_ptr());
+        assert_eq!(chosen, original.as_slice());
+        assert_eq!(smallest(&original, &[]).as_ptr(), original.as_ptr());
+    }
+
+    #[test]
+    fn smallest_keeps_the_first_candidate_when_two_tie() {
+        let original = vec![0u8; 10];
+        let candidates = [vec![1u8; 7], vec![2u8; 7]];
+        assert_eq!(smallest(&original, &candidates), &[1u8; 7]);
+    }
 
     #[test]
     fn skip_reasons_are_human_readable() {
         assert_eq!(
             Skip::UnsupportedType.to_string(),
-            "Not a PNG, JPG or SVG file"
+            "Not a PNG, JPG, SVG or WebP file"
         );
         assert_eq!(Skip::NotAFile.to_string(), "Not a readable file");
         assert_ne!(Skip::TooLarge.to_string(), Skip::OverRunLimit.to_string());
