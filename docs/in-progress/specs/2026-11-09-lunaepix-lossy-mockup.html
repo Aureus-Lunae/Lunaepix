@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lunaepix lossy: window mock-up</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #e7e9ee; color: #15181e; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .intro { color: #444b57; margin: 0 0 20px; max-width: 70ch; }
+  .states { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 20px; }
+  .states h2 { font-size: 17px; margin: 0 0 6px; }
+  .states .note { font-size: 14px; color: #444b57; margin: 6px 0 0; }
+
+  .lx { background:#f3f4f7; padding:16px; border-radius:6px; font-size:16px; line-height:1.45; border: 1px solid #c9cdd6; }
+  .lx-head { display:flex; align-items:center; gap:10px; font-weight:700; font-size:20px; margin-bottom:12px; }
+  .lx-moon { width:28px; height:28px; border-radius:50%; background:#1b4fc4; }
+  .lx-drop { border:2px dashed #5d6572; border-radius:8px; background:#fff; padding:10px; text-align:center; }
+  .lx-drop.-off { opacity:.5; }
+  .lx-drop b { display:block; }
+  .lx-hint { font-size:14px; color:#444b57; }
+  .lx-btn { display:inline-block; border:1px solid #5d6572; border-radius:5px; padding:3px 12px; background:#fff; margin:6px 3px 0; font-size:15px; }
+  .lx-run { display:inline-block; border-radius:5px; padding:6px 20px; background:#1b4fc4; color:#fff; font-weight:600; }
+  .lx-panel { background:#fff; border:1px solid #c9cdd6; border-radius:8px; padding:12px 14px; margin-top:12px; }
+  .lx-row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  .lx-label { font-weight:600; }
+  .lx-table { width:100%; border-collapse:collapse; margin-top:6px; font-size:15px; }
+  .lx-table th, .lx-table td { border-top:1px solid #c9cdd6; padding:4px; text-align:left; font-weight:normal; }
+  .lx-table thead th { border-top:0; color:#444b57; font-size:14px; }
+  .lx-table .n { text-align:right; font-variant-numeric: tabular-nums; }
+  .lx-muted { color:#444b57; }
+  .lx-skip { color:#444b57; font-style:italic; }
+  .lx-busy { color:#1b4fc4; font-weight:600; }
+  .lx-settings { border-top:1px solid #c9cdd6; margin-top:10px; padding-top:10px; display:grid; gap:8px; }
+  .lx-setLabel { font-weight:600; min-width:96px; }
+  .lx-radio { display:inline-flex; align-items:center; gap:5px; }
+  .lx-dot { width:15px; height:15px; border-radius:50%; border:2px solid #5d6572; display:inline-block; }
+  .lx-dot.-on { background:#1b4fc4; box-shadow: inset 0 0 0 2px #fff; border-color:#1b4fc4; }
+  .lx-slider { display:inline-flex; align-items:center; gap:8px; }
+  .lx-track { width:140px; height:4px; background:#c9cdd6; border-radius:2px; position:relative; }
+  .lx-track::before { content:""; position:absolute; left:0; top:0; height:4px; width:75%; background:#1b4fc4; border-radius:2px; }
+  .lx-track::after { content:""; position:absolute; left:calc(75% - 7px); top:-5px; width:14px; height:14px; border-radius:50%; background:#1b4fc4; }
+  .lx-num { border:1px solid #5d6572; border-radius:4px; padding:0 6px; background:#fff; min-width:40px; text-align:center; }
+  .lx-off { opacity:.45; }
+  .lx-foot { display:flex; justify-content:space-between; align-items:center; margin-top:12px; gap:10px; flex-wrap:wrap; }
+  .lx-linkBtn { color:#1b4fc4; text-decoration:underline; background:none; border:0; padding:0; font:inherit; }
+</style>
+</head>
+<body>
+<h1>Lunaepix lossy: window mock-up (layout B)</h1>
+<p class="intro">Binding for the layout: which blocks exist, their order, and where each control sits. Colours, sizes and spacing follow the existing <code>ui/app.css</code>; the design pass comes later under "Clean and clear UI".</p>
+
+<div class="states">
+
+  <section>
+    <h2>0 · On launch</h2>
+    <div class="lx">
+      <div class="lx-head"><span class="lx-moon"></span>Lunaepix</div>
+      <div class="lx-drop"><b>Drop images or a folder here</b><span class="lx-hint">PNG · JPG · SVG · WebP</span><br><span class="lx-btn">Choose files</span></div>
+    </div>
+    <p class="note">No panel until the first file is added. "Choose folder" is gone; a dropped folder still works.</p>
+  </section>
+
+  <section>
+    <h2>1 · Ready (lossy picked, output folder chosen)</h2>
+    <div class="lx">
+      <div class="lx-head"><span class="lx-moon"></span>Lunaepix</div>
+      <div class="lx-drop"><b>Drop more images or a folder here</b><span class="lx-btn">Choose files</span></div>
+      <div class="lx-panel">
+        <div class="lx-row" style="justify-content:space-between"><span class="lx-label">3 files ready</span><span class="lx-linkBtn">Clear</span></div>
+        <table class="lx-table">
+          <thead><tr><th>File</th><th class="n">Size</th><th></th></tr></thead>
+          <tbody>
+            <tr><th>holiday.jpg</th><td class="n">2.4 MB</td><td></td></tr>
+            <tr><th>logo.png</th><td class="n">88 KB</td><td></td></tr>
+            <tr><th>banner.webp</th><td class="n">410 KB</td><td></td></tr>
+            <tr><th>notes.txt</th><td class="n"></td><td class="lx-skip">Will be skipped: not a PNG, JPG, SVG or WebP file</td></tr>
+          </tbody>
+        </table>
+        <div class="lx-settings">
+          <div class="lx-row">
+            <span class="lx-setLabel">Compression</span>
+            <span class="lx-radio"><span class="lx-dot"></span>Lossless</span>
+            <span class="lx-radio"><span class="lx-dot -on"></span>Lossy</span>
+          </div>
+          <div class="lx-row">
+            <span class="lx-setLabel">Quality</span>
+            <span class="lx-slider"><span class="lx-track"></span><span class="lx-num">75</span></span>
+          </div>
+          <div class="lx-row">
+            <span class="lx-setLabel">Save to</span>
+            <span>exports</span>
+            <span class="lx-btn" style="margin-top:0">Choose output folder</span>
+            <span class="lx-linkBtn">Next to the originals</span>
+          </div>
+        </div>
+        <div class="lx-foot" style="justify-content:flex-end"><span class="lx-run">Run</span></div>
+      </div>
+    </div>
+    <p class="note">With Lossless picked, the Quality row stays visible but cannot be changed. With no output folder chosen, "Save to" reads "Next to the originals" and only the "Choose output folder" button shows.</p>
+  </section>
+
+  <section>
+    <h2>2 · Running</h2>
+    <div class="lx">
+      <div class="lx-head"><span class="lx-moon"></span>Lunaepix</div>
+      <div class="lx-drop -off"><b>Drop more images or a folder here</b><span class="lx-btn">Choose files</span></div>
+      <div class="lx-panel">
+        <div class="lx-row" style="justify-content:space-between"><span class="lx-label">Compressing 2 of 3 · Lossy 75</span><span class="lx-linkBtn lx-off">Clear</span></div>
+        <table class="lx-table">
+          <thead><tr><th>File</th><th class="n">Before</th><th class="n">After</th><th class="n">Saved</th><th class="n">Time</th></tr></thead>
+          <tbody>
+            <tr><th>holiday.jpg</th><td class="n">2.4 MB</td><td class="n">610 KB</td><td class="n">75%</td><td class="n">1.2 s</td></tr>
+            <tr><th>logo.png</th><td class="n">88 KB</td><td colspan="3" class="lx-busy">Compressing…</td></tr>
+            <tr><th>banner.webp</th><td class="n">410 KB</td><td colspan="3" class="lx-muted">Waiting</td></tr>
+            <tr><th>notes.txt</th><td colspan="4" class="lx-skip">Skipped: not a PNG, JPG, SVG or WebP file</td></tr>
+          </tbody>
+        </table>
+        <div class="lx-settings lx-off">
+          <div class="lx-row"><span class="lx-setLabel">Compression</span><span class="lx-radio"><span class="lx-dot"></span>Lossless</span><span class="lx-radio"><span class="lx-dot -on"></span>Lossy</span></div>
+          <div class="lx-row"><span class="lx-setLabel">Quality</span><span class="lx-slider"><span class="lx-track"></span><span class="lx-num">75</span></span></div>
+          <div class="lx-row"><span class="lx-setLabel">Save to</span><span>exports</span></div>
+        </div>
+        <div class="lx-foot" style="justify-content:flex-end"><span class="lx-run lx-off">Run</span></div>
+      </div>
+    </div>
+    <p class="note">Drop area, settings, Clear and Run cannot be used while it runs. One file at a time.</p>
+  </section>
+
+  <section>
+    <h2>3 · Finished</h2>
+    <div class="lx">
+      <div class="lx-head"><span class="lx-moon"></span>Lunaepix</div>
+      <div class="lx-drop"><b>Drop images or a folder here</b><span class="lx-btn">Choose files</span></div>
+      <div class="lx-panel">
+        <div class="lx-row" style="justify-content:space-between"><span class="lx-label">Done · Lossy 75</span><span class="lx-linkBtn">Clear</span></div>
+        <table class="lx-table">
+          <thead><tr><th>File</th><th class="n">Before</th><th class="n">After</th><th class="n">Saved</th><th class="n">Time</th></tr></thead>
+          <tbody>
+            <tr><th>holiday.jpg</th><td class="n">2.4 MB</td><td class="n">610 KB</td><td class="n">75%</td><td class="n">1.2 s</td></tr>
+            <tr><th>logo.png</th><td class="n">88 KB</td><td class="n">31 KB</td><td class="n">65%</td><td class="n">0.4 s</td></tr>
+            <tr><th>banner.webp</th><td class="n">410 KB</td><td class="n">122 KB</td><td class="n">70%</td><td class="n">0.6 s</td></tr>
+            <tr><th>notes.txt</th><td colspan="4" class="lx-skip">Skipped: not a PNG, JPG, SVG or WebP file</td></tr>
+          </tbody>
+        </table>
+        <div class="lx-foot"><span>3 files optimised, 2.1 MB saved</span><span class="lx-btn" style="margin-top:0">Open folder</span></div>
+      </div>
+    </div>
+    <p class="note">The settings and Run are gone. The next drop or pick starts a fresh list.</p>
+  </section>
+
+</div>
+</body>
+</html>
