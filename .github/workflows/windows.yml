@@ -9,6 +9,7 @@
 #   - every action is pinned to a full commit hash, with its release in a comment;
 #   - the token can only read the repository;
 #   - no pull request trigger, and no ${{ }} expression inside a run script.
+#   - every job that runs cargo installs NASM first (mozjpeg's SIMD code).
 
 name: Windows build
 
@@ -60,6 +61,14 @@ jobs:
         with:
           node-version: 22
 
+      # mozjpeg's SIMD code (lunaepix-core) is assembled with NASM when it
+      # builds. Chocolatey does not put NASM on the path, so its folder is
+      # added for the later steps.
+      - name: Install NASM
+        run: |
+          choco install nasm --no-progress -y
+          echo 'C:\Program Files\NASM' >> "$GITHUB_PATH"
+
       - name: Formatting
         run: cargo fmt --all --check
 
@@ -95,6 +104,14 @@ jobs:
       # No build cache here: the test job's cache is a debug-profile cache,
       # which a release build cannot use, and a cache of its own would only
       # add upload time.
+
+      # mozjpeg's SIMD code (lunaepix-core) is assembled with NASM when it
+      # builds. Chocolatey does not put NASM on the path, so its folder is
+      # added for the later steps.
+      - name: Install NASM
+        run: |
+          choco install nasm --no-progress -y
+          echo 'C:\Program Files\NASM' >> "$GITHUB_PATH"
 
       # The repository has no package.json, so the Tauri command line comes
       # from crates.io at a fixed version, built against the lock file of the

@@ -21,12 +21,15 @@ thiserror = { workspace = true }
 # Same settings as the Step 2 evaluation: today's `oxipng -o 4 --strip safe`.
 oxipng = { version = "=10.2.1", default-features = false, features = ["parallel"] }
 tempfile = "3.27.0"
-# Same settings as the Step 2 evaluation: a jpegtran-style coefficient
-# transcode. The default features need nasm for SIMD, which only speeds up the
-# DCT that a coefficient transcode never runs. `unwinding` lets libjpeg errors
-# unwind as Rust panics (`extern "C-unwind"`); `jpegtran` builds transupp.c,
-# which copies the markers.
-mozjpeg-sys = { version = "=2.2.3", default-features = false, features = ["parallel", "unwinding", "jpegtran"] }
+# A jpegtran-style coefficient transcode (the lossless path, as in the Step 2
+# evaluation) and a pixel re-encode (the lossy path). `nasm_simd` builds
+# mozjpeg's SIMD code (DCT, colour conversion, sampling), which speeds up the
+# lossy decode and encode; it needs `nasm` on the PATH at build time
+# (.github/workflows/windows.yml installs it). The lossless transcode runs no
+# DCT, so its output is the same with or without it. `unwinding` lets libjpeg
+# errors unwind as Rust panics (`extern "C-unwind"`); `jpegtran` builds
+# transupp.c, which copies the markers.
+mozjpeg-sys = { version = "=2.2.3", default-features = false, features = ["parallel", "unwinding", "jpegtran", "nasm_simd"] }
 # Same settings as the Step 2 evaluation: `Jobs::default()` (svgo's
 # preset-default) over a roxmltree parse, as the `oxvg optimise` CLI does.
 # Pinned with `=`: the 0.0.x crates declare each other as `>=0.0`, so only

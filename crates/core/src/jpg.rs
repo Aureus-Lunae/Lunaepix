@@ -1,15 +1,18 @@
 //! JPG optimisation: a lossless coefficient transcode with mozjpeg, the
-//! jpegtran route chosen in the Step 2 evaluation.
+//! jpegtran route chosen in the Step 2 evaluation, and (in the child module
+//! `lossy`) a lossy re-encode at a quality.
 //!
 //! The quantised DCT coefficients are read from the source and written back
 //! unchanged; only the entropy coding (Huffman tables and scan layout) is
 //! rebuilt. Nothing is re-quantised, so every decoder sees the same image.
 //!
-//! This is the only module with `unsafe` code; the crate denies it elsewhere.
-//! libjpeg reports a fatal error by calling `error_exit`, which must not
-//! return. Ours unwinds with a [`LibjpegFailure`] payload through the C frames
-//! (`extern "C-unwind"`; mozjpeg-sys's `unwinding` feature compiles libjpeg
-//! with `-fexceptions`), and [`run_libjpeg`] catches it. Every libjpeg object
+//! This module and its child `lossy` hold the libjpeg FFI, so `unsafe` code
+//! is allowed here (lib.rs names the other modules that allow it). Both use
+//! the same guards, error manager and [`run_libjpeg`]. libjpeg reports a
+//! fatal error by calling `error_exit`, which must not return. Ours unwinds
+//! with a [`LibjpegFailure`] payload through the C frames (`extern
+//! "C-unwind"`; mozjpeg-sys's `unwinding` feature compiles libjpeg with
+//! `-fexceptions`), and [`run_libjpeg`] catches it. Every libjpeg object
 //! is owned by a guard whose `Drop` destroys it, so the objects are also freed
 //! when a failure unwinds past them. The unwinding route needs
 //! `panic = "unwind"`, the default: never set `panic = "abort"`.
@@ -29,6 +32,14 @@ use mozjpeg_sys::{
     jpeg_finish_decompress, jpeg_mem_src, jpeg_read_coefficients, jpeg_read_header,
     jpeg_simple_progression, jpeg_std_error, jpeg_write_coefficients, jvirt_barray_control,
 };
+
+mod lossy;
+
+#[expect(
+    unused_imports,
+    reason = "the worker calls it once a run can be lossy (a later task)"
+)]
+pub(crate) use lossy::optimize_lossy;
 
 /// Every JPEG starts with the SOI marker, followed by the next marker's 0xFF.
 const SOI: [u8; 3] = [0xFF, 0xD8, 0xFF];
@@ -72,17 +83,29 @@ const INITIAL_OUTPUT_BYTES: usize = 64 * 1024;
 /// scan, which libjpeg would pad and carry on with) is an error too, so a
 /// damaged file is never written out as if it were whole.
 pub(crate) fn optimize(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    if !bytes.starts_with(&SOI) {
-        return Err("not a JPEG file (the content is not JPEG data)".to_owned());
-    }
+    check_start(bytes)?;
     let candidates = candidates(bytes)?;
     Ok(crate::smallest(bytes, &candidates).to_vec())
 }
 
+/// Refuse bytes that do not start like a JPEG, before libjpeg sees them.
+fn check_start(bytes: &[u8]) -> Result<(), String> {
+    if bytes.starts_with(&SOI) {
+        Ok(())
+    } else {
+        Err("not a JPEG file (the content is not JPEG data)".to_owned())
+    }
+}
+
+/// The length `jpeg_mem_src` takes for `bytes`.
+fn source_len(bytes: &[u8]) -> Result<c_ulong, String> {
+    // `c_ulong` is 32 bits on Windows; the planner's size limit is far below.
+    c_ulong::try_from(bytes.len()).map_err(|_| "the file is too large".to_owned())
+}
+
 /// Candidates A and B (see [`optimize`]), in that order.
 fn candidates(bytes: &[u8]) -> Result<[Vec<u8>; 2], String> {
-    // `c_ulong` is 32 bits on Windows; the planner's size limit is far below.
-    let len = c_ulong::try_from(bytes.len()).map_err(|_| "the file is too large".to_owned())?;
+    let len = source_len(bytes)?;
     // SAFETY: `transcode` must run inside `run_libjpeg`, which it does here,
     // and `len` is `bytes.len()`.
     run_libjpeg(|| unsafe { transcode(bytes, len) })
@@ -524,7 +547,7 @@ mod tests {
     // --- fixtures ---------------------------------------------------------
 
     /// RGB pixels: gradients plus deterministic noise.
-    fn photo_pixels(w: u32, h: u32) -> Vec<u8> {
+    pub(super) fn photo_pixels(w: u32, h: u32) -> Vec<u8> {
         let mut seed = 0x2545_F491_u32;
         let mut noise = move || {
             seed ^= seed << 13;
@@ -564,7 +587,7 @@ mod tests {
     }
 
     /// The start-of-frame marker: 0xC0 baseline, 0xC2 progressive.
-    fn frame_marker(jpeg: &[u8]) -> u8 {
+    pub(super) fn frame_marker(jpeg: &[u8]) -> u8 {
         let mut at = 2;
         while at + 4 <= jpeg.len() {
             let marker = jpeg[at + 1];
