@@ -71,8 +71,24 @@ body {
   margin-inline: auto;
 }
 
+/* The moon logo sits to the left of the heading, centred on its line. The row
+   is on the header; the heading keeps its own margin-free box. */
+.lunaepixHeader {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+/* Decorative (alt=""), about 32 px tall; rem so it follows the text size. */
+.lunaepixHeader__logo {
+  flex: none;
+  width: 2rem;
+  height: 2rem;
+}
+
 .lunaepixHeader__title {
-  margin: 0 0 1rem;
+  margin: 0;
   font-size: 1.5rem;
   line-height: 1.25;
 }
@@ -232,6 +248,15 @@ body {
 @media (max-width: 30rem) {
   body {
     padding: 0.5rem;
+  }
+
+  .lunaepixHeader {
+    gap: 0.5rem;
+  }
+
+  .lunaepixHeader__logo {
+    width: 1.5rem;
+    height: 1.5rem;
   }
 
   .lunaepixHeader__title {
