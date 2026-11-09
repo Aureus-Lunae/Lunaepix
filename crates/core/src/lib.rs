@@ -67,7 +67,7 @@ pub enum Skip {
 impl fmt::Display for Skip {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Skip::UnsupportedType => "Not a PNG, JPG or SVG file",
+            Skip::UnsupportedType => "Not a PNG, JPG, SVG or WebP file",
             Skip::TooLarge => "File is too large",
             Skip::OverRunLimit => {
                 return write!(f, "Too many files in one run (max {MAX_RUN_FILES})");
@@ -295,7 +295,7 @@ mod tests {
     fn skip_reasons_are_human_readable() {
         assert_eq!(
             Skip::UnsupportedType.to_string(),
-            "Not a PNG, JPG or SVG file"
+            "Not a PNG, JPG, SVG or WebP file"
         );
         assert_eq!(Skip::NotAFile.to_string(), "Not a readable file");
         assert_ne!(Skip::TooLarge.to_string(), Skip::OverRunLimit.to_string());

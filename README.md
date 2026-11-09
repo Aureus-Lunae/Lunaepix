@@ -1,6 +1,6 @@
 # Lunaepix
 
-Lunaepix makes PNG, JPG and SVG images smaller without changing how they look.
+Lunaepix makes PNG, JPG, SVG and WebP images smaller without changing how they look.
 It is lossless: the pixels of a PNG or JPG stay exactly as they were, and an
 SVG keeps drawing the same picture (rounding of coordinates can move an
 anti-aliased edge by a hair). It never touches the original.

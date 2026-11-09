@@ -999,7 +999,7 @@ mod tests {
         assert_eq!(rows.len(), MAX_RUN_FILES + 3);
         let unsupported: Vec<&str> = rows
             .iter()
-            .filter(|row| row.reason.as_deref() == Some("Not a PNG, JPG or SVG file"))
+            .filter(|row| row.reason.as_deref() == Some("Not a PNG, JPG, SVG or WebP file"))
             .map(|row| row.name.as_str())
             .collect();
         assert_eq!(unsupported, ["a.gif", "notes.txt"]);

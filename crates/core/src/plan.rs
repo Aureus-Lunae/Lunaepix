@@ -428,6 +428,23 @@ mod tests {
     }
 
     #[test]
+    fn plans_webp_files_in_a_folder_in_either_letter_case_and_skips_lookalikes() {
+        let tmp = TempDir::new().unwrap();
+        let lower = touch(tmp.path(), "a.webp");
+        let upper = touch(tmp.path(), "b.WEBP");
+        let lookalike = touch(tmp.path(), "c.webpx");
+        let out = tmp.path().join("optimized");
+        assert_eq!(
+            plan_folder(tmp.path()),
+            vec![
+                optimize(lower, out.join("a.webp")),
+                optimize(upper, out.join("b.WEBP")),
+                skip(lookalike, Skip::UnsupportedType),
+            ]
+        );
+    }
+
+    #[test]
     fn orders_a_folders_jobs_by_file_name() {
         let tmp = TempDir::new().unwrap();
         for name in ["m.png", "z.png", "b.png", "a.gif"] {
