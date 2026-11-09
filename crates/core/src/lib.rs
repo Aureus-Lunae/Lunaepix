@@ -23,6 +23,7 @@ use std::time::Instant;
 mod atomic;
 #[allow(unsafe_code)]
 mod jpg;
+mod lossy;
 mod plan;
 #[allow(unsafe_code)]
 mod platform;
@@ -32,6 +33,7 @@ mod svg;
 mod webp;
 pub mod worker;
 
+pub use lossy::{DEFAULT_QUALITY, Note, Quality};
 pub use plan::{
     MAX_FILE_BYTES, MAX_PIXELS, MAX_RUN_FILES, MAX_SVG_DEPTH, MAX_SVG_ENTITY_BYTES, MAX_SVG_NODES,
     MAX_WORKER_MESSAGE_BYTES, MAX_WORKER_OUTPUT_BYTES, WORKER_TIMEOUT, plan_files, plan_folder,
@@ -45,6 +47,8 @@ pub struct Outcome {
     pub before: u64,
     pub after: u64,
     pub millis: u64,
+    /// Why a lossy run kept the file's bytes as they were, if it did.
+    pub note: Option<Note>,
 }
 
 /// Why a file is left alone. The `Display` text is shown to the user in the UI.
@@ -176,6 +180,7 @@ pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> 
         before: original.len() as u64,
         after: optimized.len() as u64,
         millis: started.elapsed().as_millis() as u64,
+        note: None,
     })
 }
 

@@ -209,6 +209,7 @@ pub(crate) fn parse_record(
                 before: number(fields.next()?)?,
                 after: number(fields.next()?)?,
                 millis: number(fields.next()?)?,
+                note: None,
             };
             if fields.next().is_some() {
                 return None;
@@ -323,6 +324,7 @@ mod tests {
             before: 2048,
             after: 1024,
             millis: 7,
+            note: None,
         };
         assert_eq!(
             format_record(&Ok(outcome), &src, &dest),
@@ -336,6 +338,7 @@ mod tests {
             before: u64::MAX,
             after: 0,
             millis: 123_456,
+            note: None,
         };
         let (_, parsed) = round_trip(Ok(outcome));
         assert_eq!(parsed.unwrap(), outcome);
@@ -479,6 +482,7 @@ mod tests {
             before: 10,
             after: 4,
             millis: 2,
+            note: None,
         };
         let mut out = Vec::new();
         let code = serve_with(
@@ -524,6 +528,7 @@ mod tests {
                     before: 1,
                     after: 1,
                     millis: 0,
+                    note: None,
                 })
             },
             &mut Closed,

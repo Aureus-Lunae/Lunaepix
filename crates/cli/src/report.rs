@@ -129,6 +129,7 @@ mod tests {
             before,
             after,
             millis,
+            note: None,
         }
     }
 

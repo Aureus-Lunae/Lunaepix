@@ -269,6 +269,7 @@ mod tests {
             before,
             after,
             millis: 1,
+            note: None,
         })
     }
 
