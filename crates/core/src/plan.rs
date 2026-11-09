@@ -352,13 +352,14 @@ mod tests {
     fn plans_webp_in_either_letter_case() {
         let tmp = TempDir::new().unwrap();
         let lower = touch(tmp.path(), "a.webp");
-        let upper = touch(tmp.path(), "a.WEBP");
+        // Different stems: on Windows `a.webp` and `a.WEBP` are one file.
+        let upper = touch(tmp.path(), "b.WEBP");
         let jobs = plan_files(&[lower.clone(), upper.clone()]);
         assert_eq!(
             jobs,
             vec![
                 optimize(lower, tmp.path().join("optimized-a.webp")),
-                optimize(upper, tmp.path().join("optimized-a.WEBP")),
+                optimize(upper, tmp.path().join("optimized-b.WEBP")),
             ]
         );
     }
