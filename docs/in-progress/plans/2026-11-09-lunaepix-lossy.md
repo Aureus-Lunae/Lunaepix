@@ -54,6 +54,7 @@ Copied verbatim from the spec's Handoff, plus what was decided while planning. G
 - Calls made after the spec's builder check (not user decisions): the animation check compares canvas size and total duration, not frame count. `list-changed` carries an optional `notice`. The lossy JPG drops the source's JFIF APP0 and Adobe APP14.
 - Put off: the before/after preview slider, export rename, the "Clean and clear UI" design pass.
 - **Task 1 is a hard gate.** No product code is written before the user has ruled on its numbers and set the animation cap.
+- **Task 1 ruling by the user (2026-11-09):** for the cap the user chose "1,000,000,000 (Recommended)", so `MAX_ANIMATION_PIXELS` = 1,000,000,000 frames × canvas pixels (time binds: worst measured 171 ms per million, with alpha). Asked whether lossy animated WebP also gets a canvas limit, because its memory grows with the canvas (about 50 MB per megapixel with alpha, about 5 GB at 100 MP), the user chose "Yes, 50 MP (Recommended)", so `MAX_ANIMATION_CANVAS_PIXELS` = 50,000,000 canvas pixels. An animation over either limit gets the lossless treatment with the existing note "kept lossless: animation too large for lossy"; no new note. Measurements: `.superpowers/sdd/2026-11-09-lunaepix-lossy/task-1-report.md`.
 
 Calls made while planning (not user decisions; flagged for the plan review):
 
@@ -293,14 +294,14 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
 ### Task 6: Lossy animated WebP
 
 **Files:**
-- Modify: `crates/core/src/webp/codec.rs` (`WebPAnimDecoder`, `WebPAnimEncoder`), `crates/core/src/webp/lossy.rs`, `crates/core/src/plan.rs` (`pub const MAX_ANIMATION_PIXELS: u64` = the value the user set at Task 1, re-exported from `lib.rs`)
+- Modify: `crates/core/src/webp/codec.rs` (`WebPAnimDecoder`, `WebPAnimEncoder`), `crates/core/src/webp/lossy.rs`, `crates/core/src/plan.rs` (`pub const MAX_ANIMATION_PIXELS: u64 = 1_000_000_000` and `pub const MAX_ANIMATION_CANVAS_PIXELS: u64 = 50_000_000`, the values the user set at Task 1, both re-exported from `lib.rs`)
 - Test: `crates/core/tests/optimize_webp.rs`
 
 **Interfaces:**
 - Produces `pub(crate) fn optimize_animated_lossy(bytes: &[u8], file: &WebpFile, quality: Quality) -> Result<Lossy, String>`. The `Codec` trait gains `decode_animation` and `encode_animation`, with a frame type that holds RGBA plus `timestamp_ms`, so tests can use doubles.
 
 **Behaviour:**
-- **Cap check before decoding:** number of `ANMF` chunks × canvas width × height from `VP8X`, read by `riff::parse`. Over `MAX_ANIMATION_PIXELS` gives `kept_lossless(webp::optimize(bytes)?, Note::KeptLosslessAnimationTooLarge)`, and no decoder is called.
+- **Cap check before decoding:** number of `ANMF` chunks × canvas width × height from `VP8X`, read by `riff::parse`, against `MAX_ANIMATION_PIXELS`; and canvas width × height against `MAX_ANIMATION_CANVAS_PIXELS`. Over either gives `kept_lossless(webp::optimize(bytes)?, Note::KeptLosslessAnimationTooLarge)`, and no decoder is called.
 - **Decoding:** every frame as a full canvas with its timestamp.
 - **Encoding:** `WebPAnimEncoderOptions`, with:
   - loop count and background colour from the source `ANIM`;
@@ -316,6 +317,7 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
   - `two_identical_frames_in_a_row_merge_into_one_with_the_same_total_duration`
   - `an_animation_just_over_the_cap_is_kept_lossless_with_the_note_and_never_decoded`. A double records no decode call.
   - `an_animation_just_under_the_cap_is_decoded`
+  - `a_canvas_just_over_50_mp_is_kept_lossless_with_the_note_and_never_decoded`, and its negative `a_canvas_of_exactly_50_mp_within_the_frame_cap_is_decoded`
   - `an_encode_double_with_another_total_duration_fails_with_the_reason`
   - `an_encode_double_with_another_canvas_fails`
   - `a_decode_error_and_an_encode_error_fail_with_their_reasons`

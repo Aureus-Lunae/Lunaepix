@@ -32,6 +32,7 @@ Decided in conversation (2026-11-09). The user's words are quoted as they were s
 - **Command line:** "Yes, it should get parameters for that" (lossy, quality, output folder).
 - **Earlier outputs in a dropped folder:** asked whether files named `optimized-*` should be left out when a folder is dropped (they would be compressed again and become `optimized-optimized-…`), the user said "No". They are listed like any other image.
 - **Calls I made after the builder check** (not user decisions): the animation check compares canvas size and total duration, not frame count; `list-changed` carries an optional `notice`; the lossy JPG drops the source's JFIF APP0 and Adobe APP14. `nasm` must be installed by the user (`sudo dnf install nasm`) before the plan runs, so the plan starts with that.
+- **Task 1 ruling by the user (2026-11-09):** cap "1,000,000,000 (Recommended)" (`MAX_ANIMATION_PIXELS`, frames × canvas pixels); and a canvas limit for lossy animated WebP, "Yes, 50 MP (Recommended)" (`MAX_ANIMATION_CANVAS_PIXELS` = 50,000,000), because animation memory grows with the canvas, not the frame count. Over either: lossless treatment with the note "kept lossless: animation too large for lossy".
 - Put off, not part of this feature: the before/after preview slider, export rename, and the "Clean and clear UI" design pass (all separate roadmap items).
 
 ## Problem
