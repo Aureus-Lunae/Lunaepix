@@ -7,7 +7,7 @@ plan (in `docs/pending-approval/` until approved) when it starts.
 | Item | Status |
 |---|---|
 | Image lossless compression | Done |
-| Lossy image compression | Spec approved; plan next |
+| Lossy image compression | Plan approved; execution next |
 | Preview single image compression before compressing (before/after slider) | Not started |
 | Apple support: a brew formula, and a plain download with one awkward step | Not started |
 | Choose how much it can get compressed (quality, like JPEG 70%) on lossy | Part of lossy compression |
@@ -34,6 +34,7 @@ Smaller files by allowing a change in pixels that the eye should not notice.
 Built together with the quality setting ("Why not. Make them at once."), plus
 a Run button, an output folder and the same options on the command line.
 Spec: `docs/in-progress/specs/2026-11-09-lunaepix-lossy-design.md`.
+Plan: `docs/in-progress/plans/2026-11-09-lunaepix-lossy.md`.
 
 ## Preview single image compression before compressing
 

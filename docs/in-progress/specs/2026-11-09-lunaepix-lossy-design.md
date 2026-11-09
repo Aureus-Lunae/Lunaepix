@@ -6,6 +6,7 @@
 
 Decided in conversation (2026-11-09). The user's words are quoted as they were said.
 
+- **Plan approved by the user (2026-11-09):** "approved". Plan: `docs/in-progress/plans/2026-11-09-lunaepix-lossy.md`. Task 1 is a hard measurement gate that sets the animated-WebP cap.
 - **Spec approved by the user (2026-11-09):** "approved". Branch `feature/lunaepix-lossy`, from `main` at `c3e38e4`.
 
 - Roadmap item started: "Lossy image compression".
