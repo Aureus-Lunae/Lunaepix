@@ -61,10 +61,12 @@ samples/                        gitignored; user-supplied evaluation files
 ## Steps
 
 ### Step 0 — Prerequisites (user runs these; do not install silently)
+Status: Completed
 
 Rust (`rustup`), the Tauri CLI, and Tauri's Linux system packages through `dnf` (webkit2gtk 4.1 and GTK development packages, librsvg, openssl, xdo). The implementer looks up the current Fedora package list on tauri.app's prerequisites page at that time, gives the user the exact commands, and waits.
 
 ### Step 1 — Workspace scaffold
+Status: Completed
 
 Create the workspace, the three crates and `ui/`. `lunaepix-core` exposes:
 
@@ -79,6 +81,7 @@ pub fn plan_folder(dir: &Path) -> Vec<Job>;
 Exact error and skip variants are the implementer's to design. Add `samples/` to `.gitignore`. `cargo test` runs from the root.
 
 ### Step 2 — Compressor evaluation (HARD GATE, no production code yet)
+Status: Completed
 
 Ask the user for a folder of real PNG, JPG and SVG files, and copy a sample set into `samples/` (the set must include `Mobilis Logo - Black.svg`). For each format, measure candidates against today's tools run on the same files:
 
@@ -91,6 +94,7 @@ Report a table (file, original, today's tool, candidate) and verify losslessness
 **Gate.** PNG and JPG must match today's size within a few percent. SVG must be within a few percent of svgo (spec). If any format fails, stop and send the table to the user. Do not fall back to a sidecar or WASM on your own. Do not start Step 3 until the user rules on the numbers.
 
 ### Step 3 — Paths, naming and the job plan (test-first)
+Status: Completed
 
 Pure functions, no compression yet. Behaviour:
 
@@ -111,6 +115,7 @@ Pure functions, no compression yet. Behaviour:
 | the destination differs from the source | a source that is its own destination (symlink or same path) is refused |
 
 ### Step 4 — PNG
+Status: Completed
 
 `optimize_file` for PNG with the settings chosen in Step 2. Writes to a temp file in the destination folder, then renames.
 
@@ -121,14 +126,17 @@ Pure functions, no compression yet. Behaviour:
 | an existing `optimized-<name>` is replaced | a `.png` that holds JPEG bytes is rejected |
 
 ### Step 5 — JPG
+Status: Completed
 
 Same contract, using the route chosen in Step 2. Negative tests mirror Step 4: corrupt JPEG, PNG bytes named `.jpg`, no output on failure, source untouched. Positive: decoded pixels identical and output not larger than the input. An input that is already optimal produces a copy of equal size, not an error.
 
 ### Step 6 — SVG
+Status: Completed
 
 Same contract, using the crate chosen in Step 2. Positive: smaller, parses as SVG, rasterises identically. Negative: invalid XML returns an error with no output; an SVG with a script element or an external reference is **not executed or fetched** during optimisation (test with a fixture that would fail if it were).
 
 ### Step 7 — Batch runner
+Status: Completed
 
 `run(jobs, on_progress) -> Vec<Result<Outcome, ..>>`. Runs files one at a time off the UI thread (a bounded worker pool is optional), reports progress per file, and one file failing never stops the rest.
 
@@ -139,14 +147,17 @@ Same contract, using the crate chosen in Step 2. Positive: smaller, parses as SV
 | a cancelled dialog (empty input) does nothing | a skipped file produces no output file |
 
 ### Step 8 — CLI
+Status: Completed
 
 `lunaepix file...` and `lunaepix --dir <dir>` print exactly the layout the shell function prints today: `<name>:`, `Done in N ms!`, `<before> KiB - <saved>% = <after> KiB`, a blank line, with green only on a terminal. Skips and failures go to stderr, and the exit code is non-zero if any file failed. Tests run the formatter as a pure function: a known outcome gives the expected text, and a zero-byte input does not divide by zero.
 
 ### Step 9 — Tauri app shell
+Status: Completed
 
 `src-tauri` registers commands: `plan_and_run(paths)`, and a folder-pick path using the dialog plugin. Progress and results reach the window as events. Capabilities are minimal: the dialog plugin and the window drag-drop event, with no filesystem or shell permission for the frontend. A strict content security policy: no remote content, no inline script. File names are data and go to the window as JSON, never as HTML.
 
 ### Step 10 — Window UI (vanilla JS)
+Status: Completed
 
 Implements the approved layout. Read `~/.claude/css-conventions.md` and `~/.claude/a11y-rules.md` first. Required:
 
@@ -165,14 +176,17 @@ Manual checks (no UI test automation in v1): drop files; drop a folder; both but
 Install the CLI (`cargo install --path crates/cli`) and rewrite `optimg` and `optimgdir` in `~/.bashrc.d/90-miscCommands.sh` to call it, keeping the names and the output. Keep the old bodies in the existing `.bak`. This edits the user's own shell config, which is why it is a separate step. Verify by running the same files through the old and new commands and comparing the lines.
 
 ### Step 12 — Windows build workflow
+Status: Completed
 
 `.github/workflows/windows.yml`: `windows-latest`, builds the Tauri app and uploads the installer as an artifact, on manual dispatch and on a version tag. Unsigned, which the user knows triggers SmartScreen. The workflow cannot be run locally; the implementer checks it with a syntax lint and the user runs it. Paths in the code already use `PathBuf`, and Step 3 carries the spaces and non-ASCII tests.
 
 ### Step 13 — Licence check and README
+Status: Completed
 
 Run `cargo-deny` or `cargo-about` and list every dependency licence. A GPL or other copyleft dependency is a **stop**: report to the user, since it would override the MIT choice. Write a short README (what it does, Linux build, the Windows artifact, the licence).
 
 ### Step 14 — Linux package and acceptance
+Status: Completed
 
 Build the Linux bundle with `cargo tauri build`. Run the full `cargo test`. Report the manual checks from Step 10 as done or not done. The user then tests live. Pushing is a separate "merge and push" instruction from the user.
 

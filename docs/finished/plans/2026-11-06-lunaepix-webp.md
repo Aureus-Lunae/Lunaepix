@@ -63,6 +63,7 @@ Wrote new:  the RIFF walk and assembly (no container code exists for RIFF), the 
 - Error texts, verbatim: "not a WebP file (the content is not WebP data)"; "could not read the WebP data: …"; "the re-encoded WebP did not decode to the same pixels"; the size refusal is `plan::check_pixels`'s own text.
 - Lossless preset: libwebp `WebPConfigLosslessPreset(&mut config, 9)` and then `config.exact = 1`.
 - Kept chunks: `VP8X`, `ICCP`, `ANIM`, `ANMF`, `ALPH`, `VP8 `, `VP8L`. Dropped: `EXIF`, `XMP `, and every other FourCC.
+  - Superseded (user, 2026-11-09): "Keep EXIF if rotated". The `EXIF` chunk is kept when its Orientation tag is present and not 1. See the Handoff.
 - `unsafe` only in `webp::codec` (and in test helpers). `lib.rs`'s doc line about unsafe names `jpg`, `platform` and `webp::codec`.
 - UI texts, verbatim: "Not a PNG, JPG, SVG or WebP file"; "PNG · JPG · SVG · WebP"; "No PNG, JPG, SVG or WebP files directly in this folder (subfolders are not included)"; dialog filter "PNG, JPG, SVG and WebP images".
 - The header logo is `<img alt="">` and the heading text "Lunaepix" (an `h1`) stays as it is. Class names are BBEM (`lunaepixHeader__logo`). CSS gets no tests.
@@ -75,12 +76,14 @@ Inputs the spec implies but no test row names, most likely to bite first. Each o
 1. **An odd-sized chunk** (a `VP8 ` or `ICCP` of odd length, followed by its padding byte) must keep its padding in the stripped output, or every later chunk shifts and the file breaks. → Task 3, `keeps_the_padding_byte_of_an_odd_sized_chunk`.
 2. **Bytes after the RIFF size** (some tools append data) must not reach the stripped output, and the result must still decode. → Task 3, `drops_bytes_after_the_riff_size`.
 3. **`VP8X` flags that disagree with the chunks** (an EXIF chunk present but its flag clear, or the reverse) must still be stripped, and the output flags must match the chunks it actually holds. → Task 3, `rewrites_flags_that_disagree_with_the_chunks`.
+   - Superseded for the ICC bit (user, 2026-11-09): "Keep the source's flag". See the Handoff.
 4. **An extended lossless file without ICC** (`VP8X` + `VP8L`, no flags) must take the re-encode path, not the lossy one. → Task 5, `re_encodes_an_extended_lossless_file_without_icc`.
 5. **An empty or near-empty `.webp`** (0 bytes, or only `RIFF`) must fail with the WebP message, not panic. → Task 2, in `refuses_what_is_not_webp_data`.
 
 ---
 
 ### Task 1: Measure before building (HARD GATE: no product code)
+Status: Completed
 
 **Files:**
 - Create (throwaway, outside git): `.superpowers/sdd/2026-11-06-lunaepix-webp/gate/` (a scratch cargo project that depends on `libwebp-sys =0.14.4` and `image =0.25.10`). `.superpowers/` is already git-ignored.
@@ -91,6 +94,7 @@ Inputs the spec implies but no test row names, most likely to bite first. Each o
 - [x] **Step 4:** Report a table to the user and **stop**. The table has one row per file: kind, size before, size after, saving %, time and peak memory. The report states the two flags and asks the user to rule: build the re-encode as specified; build it with a different level or limit (the user names it); or drop the re-encode, which removes Tasks 5 and 6. Record the ruling in the spec's and the plan's Handoff before Task 2 starts.
 
 ### Task 2: Recognise WebP and walk the container
+Status: Completed
 
 **Files:**
 - Modify: `crates/core/src/plan.rs` (`Format::Webp`; `format_of` matches `webp`; doc line)
@@ -118,7 +122,7 @@ VP8L payload: 0x2F, then 32 bits: width-1 (14 bits), height-1 (14 bits), alpha h
 VP8  payload: 3-byte frame tag, start code 9D 01 2A, width u16 & 0x3FFF, height u16 & 0x3FFF
 ```
 
-- [ ] **Step 1: Write the failing tests** in `riff.rs` (`#[cfg(test)]`) and `hostile_input.rs`:
+- [x] **Step 1: Write the failing tests** in `riff.rs` (`#[cfg(test)]`) and `hostile_input.rs`:
   - `refuses_what_is_not_webp_data`: PNG bytes, a `RIFF…WAVE` file, 0 bytes and a file of only `RIFF` each give exactly "not a WebP file (the content is not WebP data)" (Review Focus 5).
   - `parses_a_simple_lossless_file_as_lossless`: a fixture from `image`'s WebP encoder gives `Kind::Lossless` and one `VP8L` chunk. The negative is `parses_a_lossy_file_as_lossy`: a hand-built `VP8 ` header (frame tag + start code + size) gives `Kind::Lossy`, not lossless.
   - `parses_an_animated_file_as_animated`: `VP8X` (animation flag) + `ANIM` + two `ANMF`. Negative: the same chunks without `ANIM`/`ANMF` are not `Animated`.
@@ -127,12 +131,13 @@ VP8  payload: 3-byte frame tag, start code 9D 01 2A, width u16 & 0x3FFF, height 
   - `refuses_a_chunk_past_the_end`: a chunk size of `u32::MAX`, and a RIFF size larger than the file. Each gives a "could not read the WebP data" error with no panic, within 5 s.
   - `refuses_a_canvas_over_the_pixel_limit`: a `VP8X` of 20000×20000 gives `check_pixels`'s "image too large: 20000×20000 exceeds 100 megapixels" within 5 s. Negative: 10000×10000 passes the size check and fails as unreadable, not as "too large". Also a `VP8X` canvas within the limit over a `VP8L` header over the limit is refused (both sizes are checked).
   - In `hostile_input.rs`, through `optimize_file` and `assert_refused`: the `u32::MAX` chunk, the long RIFF size, a truncated `VP8L`, the misplaced `VP8X`, the second `VP8X` and the `RIFF`-only file. Each is refused with no output written. Positive counterpart: `still_optimises_a_normal_webp`, which writes an output that `image` decodes.
-- [ ] **Step 2: Run** `cargo test -p lunaepix-core webp` and `cargo test -p lunaepix-core --test hostile_input`. Expected: they fail to compile or fail (no `webp` module yet). Keep this output for the report.
-- [ ] **Step 3: Implement** `Format::Webp`, `format_of`, `riff::parse` (on the pattern of `png::check_chunks`, with checked arithmetic on every offset), and `webp::optimize(bytes: &[u8]) -> Result<Vec<u8>, String>`, which for now returns the original bytes after a successful parse. Also replace the plan test `skips_gif_and_webp_as_unsupported_and_plans_nothing` with `skips_gif_and_lookalike_extensions_as_unsupported`: `a.gif`, `a.webpx` and `a.web` are skipped. Add its positive `plans_webp_in_either_letter_case`: `a.webp` and `a.WEBP` are planned as `optimized-a.webp` and `optimized-a.WEBP`.
-- [ ] **Step 4: Run** `cargo test --workspace`. Expected: all pass.
-- [ ] **Step 5: Commit** with the message "Recognise WebP files and walk their RIFF container".
+- [x] **Step 2: Run** `cargo test -p lunaepix-core webp` and `cargo test -p lunaepix-core --test hostile_input`. Expected: they fail to compile or fail (no `webp` module yet). Keep this output for the report.
+- [x] **Step 3: Implement** `Format::Webp`, `format_of`, `riff::parse` (on the pattern of `png::check_chunks`, with checked arithmetic on every offset), and `webp::optimize(bytes: &[u8]) -> Result<Vec<u8>, String>`, which for now returns the original bytes after a successful parse. Also replace the plan test `skips_gif_and_webp_as_unsupported_and_plans_nothing` with `skips_gif_and_lookalike_extensions_as_unsupported`: `a.gif`, `a.webpx` and `a.web` are skipped. Add its positive `plans_webp_in_either_letter_case`: `a.webp` and `a.WEBP` are planned as `optimized-a.webp` and `optimized-a.WEBP`.
+- [x] **Step 4: Run** `cargo test --workspace`. Expected: all pass.
+- [x] **Step 5: Commit** with the message "Recognise WebP files and walk their RIFF container".
 
 ### Task 3: Strip metadata and choose the smallest
+Status: Completed
 
 **Files:**
 - Modify: `crates/core/src/webp/riff.rs` (`stripped`)
@@ -146,7 +151,7 @@ VP8  payload: 3-byte frame tag, start code 9D 01 2A, width u16 & 0x3FFF, height 
 - Produces: `impl WebpFile<'_> { pub(crate) fn stripped(&self) -> Vec<u8>; pub(crate) fn icc(&self) -> Option<&[u8]> }`. The stripped file keeps only the kept chunks (see Global Constraints) in their original order, padding included. Its `VP8X` flags for ICC, EXIF and XMP are recomputed from the chunks present, alpha and animation are kept as they were, and the RIFF size is rewritten. A simple file (no `VP8X`) stays simple.
 - Produces (test helpers in `webp_fixtures.rs`): `lossless(rgba, w, h) -> Vec<u8>` (via `image`); `lossy(rgba, w, h, quality: f32) -> Vec<u8>` (via `libwebp_sys::WebPEncodeRGBA` and `WebPFree`; with alpha this gives `VP8X`+`ALPH`+`VP8 `); `with_chunks(file, &[([u8;4], &[u8])]) -> Vec<u8>` (adds chunks and sets the matching `VP8X` flags, turning a simple file into an extended one); `animated(frames: &[Vec<u8>], w, h) -> Vec<u8>`; `chunk_payload(file, fourcc) -> Option<Vec<u8>>`.
 
-- [ ] **Step 1: Write the failing tests** (`riff.rs` unit tests, plus `optimize_webp.rs` through `optimize_file`):
+- [x] **Step 1: Write the failing tests** (`riff.rs` unit tests, plus `optimize_webp.rs` through `optimize_file`):
   - `removes_exif_and_xmp_and_keeps_icc_byte_identical`: the flags match afterwards. Negative: `adds_nothing_to_a_file_without_metadata` (no chunk and no flag gained; the ICC chunk is still there).
   - `writes_the_original_when_stripping_gains_nothing`: output bytes == input bytes. Negative: the same file with a 10 KB EXIF comes out smaller.
   - `keeps_every_anmf_chunk_of_an_animated_file`: every `ANMF` is byte-identical, EXIF/XMP are gone, and every frame decodes with `image` to the same pixels. Negative: an animated file without metadata is copied as it is.
@@ -157,12 +162,13 @@ VP8  payload: 3-byte frame tag, start code 9D 01 2A, width u16 & 0x3FFF, height 
   - Review Focus 3, `rewrites_flags_that_disagree_with_the_chunks`: an EXIF chunk with its flag clear, and an XMP flag set with no XMP chunk. Afterwards the flags match exactly the chunks present.
   - `optimize_file` end to end: a `.webp` in a folder run lands in `optimized/` under its own name, and the source bytes are unchanged. Negative: PNG bytes named `.webp` fail with no output.
   - The three moved `smallest` tests pass unchanged from their new place.
-- [ ] **Step 2: Run** `cargo test -p lunaepix-core`. Expected: the new tests fail (no `stripped` yet).
-- [ ] **Step 3: Implement** `stripped`, `icc`, the move of `smallest`, and `webp::optimize` = parse, then `smallest(original, &[file.stripped()])`.
-- [ ] **Step 4: Run** `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`. Expected: all pass, no warnings.
-- [ ] **Step 5: Commit** with the message "Strip WebP metadata and keep the smallest result".
+- [x] **Step 2: Run** `cargo test -p lunaepix-core`. Expected: the new tests fail (no `stripped` yet).
+- [x] **Step 3: Implement** `stripped`, `icc`, the move of `smallest`, and `webp::optimize` = parse, then `smallest(original, &[file.stripped()])`.
+- [x] **Step 4: Run** `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`. Expected: all pass, no warnings.
+- [x] **Step 5: Commit** with the message "Strip WebP metadata and keep the smallest result".
 
 ### Task 4: Name WebP in every text
+Status: Completed
 
 **Files:**
 - Modify: `crates/core/src/lib.rs` (`Skip::UnsupportedType` text, docs, the `skip_reasons_are_human_readable` test)
@@ -171,11 +177,11 @@ VP8  payload: 3-byte frame tag, start code 9D 01 2A, width u16 & 0x3FFF, height 
 - Modify: the texts' tests: `src-tauri/src/session.rs:1002`, `src-tauri/src/events.rs:236`, `crates/cli/src/report.rs:275`, `crates/cli/tests/cli.rs:244,457`, `tests/ui/state.test.js:25,92,210,366-370`
 - Modify: `README.md` first line, the `description` in `crates/core/Cargo.toml`, the doc comments in `crates/cli/src/main.rs:1` and `crates/core/src/atomic.rs:1`
 
-- [ ] **Step 1: Update the tests first** to the new texts (Global Constraints). Add `the_dialog_filter_lists_webp_in_both_cases` in `src-tauri/src/lib.rs` (`IMAGE_EXTENSIONS` contains `webp` and `WEBP`). Its negative is `no_text_names_only_png_jpg_and_svg`: a scan of `ui/` and the `Skip` texts for the old phrase "PNG, JPG or SVG" finds nothing. The same scan, run on a fixture string that holds the phrase, finds it.
-- [ ] **Step 2: Run** `cargo test --workspace` and `node --test "tests/ui/*.test.js"`. Expected: the updated tests fail.
-- [ ] **Step 3: Change the texts.**
-- [ ] **Step 4: Run** both suites. Expected: all pass.
-- [ ] **Step 5: Commit** with the message "Name WebP in the window, the CLI and the skip reason".
+- [x] **Step 1: Update the tests first** to the new texts (Global Constraints). Add `the_dialog_filter_lists_webp_in_both_cases` in `src-tauri/src/lib.rs` (`IMAGE_EXTENSIONS` contains `webp` and `WEBP`). Its negative is `no_text_names_only_png_jpg_and_svg`: a scan of `ui/` and the `Skip` texts for the old phrase "PNG, JPG or SVG" finds nothing. The same scan, run on a fixture string that holds the phrase, finds it.
+- [x] **Step 2: Run** `cargo test --workspace` and `node --test "tests/ui/*.test.js"`. Expected: the updated tests fail.
+- [x] **Step 3: Change the texts.**
+- [x] **Step 4: Run** both suites. Expected: all pass.
+- [x] **Step 5: Commit** with the message "Name WebP in the window, the CLI and the skip reason".
 
 ### Task 5: Re-encode still lossless WebP with libwebp (REMOVED by the gate ruling, 2026-11-06)
 
@@ -238,6 +244,7 @@ VP8  payload: 3-byte frame tag, start code 9D 01 2A, width u16 & 0x3FFF, height 
 - [ ] **Step 5: Commit** with the message "Credit libwebp's licence and patent grant".
 
 ### Task 7: The moon logo in the window header
+Status: Completed
 
 **Files:**
 - Create: `ui/lunaepix-logo.svg` (a byte-identical copy of `src-tauri/icons/lunaepix-icon.svg`)
@@ -253,27 +260,28 @@ Layout (binding, from the spec): the logo sits to the left of "Lunaepix" on one 
 </header>
 ```
 
-- [ ] **Step 1: Write the failing tests** in `config.rs`, reusing `start_tags`:
+- [x] **Step 1: Write the failing tests** in `config.rs`, reusing `start_tags`:
   - `the_header_shows_one_decorative_logo_from_the_window_folder`: exactly one `img` in `index.html`. It has `alt=""`, and its `src` is a relative path with no `..` and no scheme, naming a file that exists under `ui/`.
   - Negative: `a_logo_without_alt_or_from_outside_the_window_folder_is_caught_in_a_fixture`, with three fixtures: no `alt`, `src="https://…"`, and `src="../src-tauri/icons/lunaepix-icon.svg"`.
   - `the_window_logo_is_the_icon_source`: the bytes of `ui/lunaepix-logo.svg` equal those of `src-tauri/icons/lunaepix-icon.svg`. Negative: `the_logo_comparison_reports_a_one_byte_difference`, which runs the same helper on two byte strings that differ in one byte.
   - The existing tests `the_index_page_has_the_structure_the_accessibility_rules_need`, `the_content_security_policy_is_strict` and `the_window_files_pass_the_js_lint` must still pass. The `ui_entries` scan must still skip binary files: the SVG is text, so check that the HTML-attribute checks do not trip on it.
-- [ ] **Step 2: Run** `cargo test -p lunaepix-app --test config`. Expected: the new tests fail.
-- [ ] **Step 3: Implement** the copy, the markup and the CSS. Read `~/.claude/css-conventions.md` and `~/.claude/a11y-rules.md` first.
-- [ ] **Step 4: Run** `cargo test --workspace` and `node --test "tests/ui/*.test.js"`. Expected: all pass. Then run `cargo tauri dev` and look at the header in the wide and the narrow window, in light and dark mode; this is a hand check, not a test.
-- [ ] **Step 5: Commit** with the message "Show the moon logo beside the window heading".
+- [x] **Step 2: Run** `cargo test -p lunaepix-app --test config`. Expected: the new tests fail.
+- [x] **Step 3: Implement** the copy, the markup and the CSS. Read `~/.claude/css-conventions.md` and `~/.claude/a11y-rules.md` first.
+- [x] **Step 4: Run** `cargo test --workspace` and `node --test "tests/ui/*.test.js"`. Expected: all pass. Then run `cargo tauri dev` and look at the header in the wide and the narrow window, in light and dark mode; this is a hand check, not a test.
+- [x] **Step 5: Commit** with the message "Show the moon logo beside the window heading".
 
 ### Task 8: Build, hand check and release candidate
+Status: Completed
 
-- [ ] **Step 1:** Merge the `feature/lunaepix-webp` work back as the SDD flow does, then run `cargo test --workspace`, `node --test "tests/ui/*.test.js"` and `cargo clippy --workspace --all-targets -- -D warnings`. Expected: all green.
-- [ ] **Step 2:** Build Linux with `cargo tauri build --config src-tauri/tauri.bundle.conf.json`. Install the rpm and check by hand:
+- [x] **Step 1:** Merge the `feature/lunaepix-webp` work back as the SDD flow does, then run `cargo test --workspace`, `node --test "tests/ui/*.test.js"` and `cargo clippy --workspace --all-targets -- -D warnings`. Expected: all green.
+- [x] **Step 2:** Build Linux with `cargo tauri build --config src-tauri/tauri.bundle.conf.json`. Install the rpm and check by hand:
   - a lossless WebP gets smaller;
   - a CMS-style lossy WebP is copied unchanged;
   - a lossy WebP with EXIF gets smaller;
   - an animated WebP still animates in a browser;
   - the logo shows beside the heading;
   - the launcher shows the moon icon.
-- [ ] **Step 3:** Ask the user before pushing anything. Pushing the branch and a `v0.1.0-rc4` tag starts the Windows build and is outward-facing. After the user's go-ahead, push and report the Actions run. On Windows the user checks the same items as in Step 2, plus that the C build of libwebp linked statically (no missing-DLL dialog).
+- [x] **Step 3:** Ask the user before pushing anything. Pushing the branch and a `v0.1.0-rc4` tag starts the Windows build and is outward-facing. After the user's go-ahead, push and report the Actions run. On Windows the user checks the same items as in Step 2, plus that the C build of libwebp linked statically (no missing-DLL dialog).
 
 ## CMS changes
 
