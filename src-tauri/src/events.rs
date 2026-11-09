@@ -165,6 +165,7 @@ mod tests {
             before,
             after,
             millis: 7,
+            note: None,
         })
     }
 

@@ -450,7 +450,8 @@ fn takes_a_well_formed_record_from_any_worker_exactly() {
         Outcome {
             before: 4000,
             after: 3000,
-            millis: 12
+            millis: 12,
+            note: None,
         }
     );
 }
