@@ -3,6 +3,7 @@
 //! The container is walked in safe Rust ([`riff`]); no image is decoded, so
 //! nothing here can change a pixel.
 
+mod exif;
 mod riff;
 
 /// The fixture helpers of the integration tests, shared with the unit tests.
@@ -17,8 +18,9 @@ mod fixtures;
 ///
 /// The content must be WebP data, the chunks must be well-formed and the
 /// declared image must be within [`crate::MAX_PIXELS`]. The stripped file
-/// ([`riff::WebpFile::stripped`]) drops `EXIF`, `XMP ` and unknown chunks and
-/// any bytes after the RIFF size, and keeps the image, alpha, animation and
+/// ([`riff::WebpFile::stripped`]) drops `XMP `, unknown chunks, any bytes after
+/// the RIFF size and `EXIF`, unless that EXIF turns the picture (an
+/// Orientation tag that is not 1). It keeps the image, alpha, animation and
 /// colour profile byte for byte, so the picture is the same. When that is not
 /// smaller than the source the source bytes themselves come back, so a file
 /// with nothing to lose is copied as it is.
