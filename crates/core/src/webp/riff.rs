@@ -35,7 +35,6 @@ pub(crate) enum Kind {
 /// One chunk: its FourCC and its payload, without the padding byte an odd
 /// size is followed by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Read by the strip step; until then, only by the tests.
 pub(crate) struct Chunk<'a> {
     pub fourcc: [u8; 4],
     pub data: &'a [u8],
@@ -43,10 +42,67 @@ pub(crate) struct Chunk<'a> {
 
 /// A parsed WebP file: its chunks in file order, and what kind of file it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Read by the strip step; until then, only by the tests.
+#[allow(dead_code)] // `kind` is read by the tests only; nothing in a run needs it.
 pub(crate) struct WebpFile<'a> {
     pub chunks: Vec<Chunk<'a>>,
     pub kind: Kind,
+}
+
+/// The chunks a stripped file keeps: the image, its alpha, the animation and
+/// the colour profile, and the `VP8X` that describes them. Every other chunk
+/// is dropped: `EXIF`, `XMP ` and whatever else a writer put in.
+const KEPT: [&[u8; 4]; 7] = [
+    b"VP8X", b"ICCP", b"ANIM", b"ANMF", b"ALPH", b"VP8 ", b"VP8L",
+];
+
+/// `VP8X` flag bits: the chunks a file says it holds.
+const FLAG_ICC: u8 = 0x20;
+const FLAG_EXIF: u8 = 0x08;
+const FLAG_XMP: u8 = 0x04;
+
+impl WebpFile<'_> {
+    /// The file rewritten with only the kept chunks (see [`KEPT`]), in their
+    /// original order, each followed by the pad byte its odd size needs, even
+    /// when the source left the last one out. The image chunks are copied byte
+    /// for byte; nothing is decoded.
+    ///
+    /// The `VP8X` flags for ICC, EXIF and XMP are set from the chunks that are
+    /// left, whatever the source's flags said; every other bit, the reserved
+    /// bytes and the canvas are as they were. A file with no `VP8X` stays
+    /// without one. The RIFF size is written to match, so bytes the source had
+    /// after its own RIFF size are not in the result.
+    pub(crate) fn stripped(&self) -> Vec<u8> {
+        let kept: Vec<&Chunk<'_>> = self
+            .chunks
+            .iter()
+            .filter(|chunk| KEPT.contains(&&chunk.fourcc))
+            .collect();
+        let has_icc = kept.iter().any(|chunk| &chunk.fourcc == b"ICCP");
+
+        let mut body = b"WEBP".to_vec();
+        for chunk in kept {
+            body.extend_from_slice(&chunk.fourcc);
+            // The sizes come from a file of at most `MAX_FILE_BYTES`.
+            body.extend_from_slice(&(chunk.data.len() as u32).to_le_bytes());
+            let payload_at = body.len();
+            body.extend_from_slice(chunk.data);
+            if &chunk.fourcc == b"VP8X" {
+                // `parse` refuses a VP8X shorter than its 10 bytes.
+                let flags = &mut body[payload_at];
+                *flags &= !(FLAG_ICC | FLAG_EXIF | FLAG_XMP);
+                if has_icc {
+                    *flags |= FLAG_ICC;
+                }
+            }
+            if chunk.data.len() % 2 == 1 {
+                body.push(0);
+            }
+        }
+        let mut out = b"RIFF".to_vec();
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
 }
 
 /// The error for a file whose RIFF container is broken.
@@ -707,5 +763,397 @@ mod tests {
             parse_quickly(&bytes).unwrap_err(),
             "image too large: 20000×20000 exceeds 100 megapixels"
         );
+    }
+
+    // --- stripped: what is kept ---------------------------------------------------
+
+    use crate::webp::fixtures as fx;
+
+    const SIZE: u32 = 16;
+    /// An ICC profile of even size, and one of odd size.
+    const ICC_EVEN: &[u8] = &[0x11; 128];
+    const ICC_ODD: &[u8] = &[0x22; 129];
+
+    fn pixels(alpha: bool) -> Vec<u8> {
+        fx::photo_rgba(SIZE, SIZE, alpha)
+    }
+
+    fn lossless_file(alpha: bool) -> Vec<u8> {
+        fx::lossless(&pixels(alpha), SIZE, SIZE)
+    }
+
+    fn stripped_of(bytes: &[u8]) -> Vec<u8> {
+        parse(bytes).unwrap().stripped()
+    }
+
+    fn flags(file: &[u8]) -> u8 {
+        file[fx::VP8X_FLAGS_AT]
+    }
+
+    /// The stripped file is a whole, well-formed file: the RIFF size covers
+    /// exactly the bytes, every chunk is padded (so the length is even) and
+    /// it parses again.
+    fn assert_well_formed(file: &[u8]) {
+        let size = u32::from_le_bytes(file[4..8].try_into().unwrap()) as usize;
+        assert_eq!(size, file.len() - 8, "the RIFF size");
+        assert_eq!(file.len() % 2, 0, "every chunk is padded");
+        let parsed = parse(file).unwrap();
+        assert_eq!(parsed.chunks.len(), fx::chunks_of(file).len());
+    }
+
+    #[test]
+    fn removes_exif_and_xmp_and_keeps_icc_byte_identical() {
+        let base = lossless_file(true);
+        let input = fx::with_chunks(
+            &base,
+            &[
+                (*b"ICCP", ICC_EVEN),
+                (*b"EXIF", b"Exif\0\0 a camera"),
+                (*b"XMP ", b"<x:xmpmeta/>"),
+            ],
+        );
+        // The fixture holds what the test is about.
+        assert_eq!(
+            flags(&input) & (fx::FLAG_ICC | fx::FLAG_EXIF | fx::FLAG_XMP),
+            fx::FLAG_ICC | fx::FLAG_EXIF | fx::FLAG_XMP
+        );
+
+        let out = stripped_of(&input);
+
+        assert_well_formed(&out);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "ICCP", "VP8L"]);
+        assert_eq!(fx::chunk_payload(&out, b"ICCP").as_deref(), Some(ICC_EVEN));
+        assert_eq!(
+            fx::chunk_payload(&out, b"VP8L"),
+            fx::chunk_payload(&input, b"VP8L")
+        );
+        // The flags match the chunks left; alpha is as it was.
+        assert_eq!(flags(&out), (flags(&input) & fx::FLAG_ALPHA) | fx::FLAG_ICC);
+        // The rest of the VP8X (reserved bytes, canvas) is as it was.
+        assert_eq!(
+            fx::chunk_payload(&out, b"VP8X").unwrap()[1..],
+            fx::chunk_payload(&input, b"VP8X").unwrap()[1..]
+        );
+        assert!(out.len() < input.len());
+        assert_eq!(fx::decode_rgba(&out), fx::decode_rgba(&input));
+    }
+
+    #[test]
+    fn adds_nothing_to_a_file_without_metadata() {
+        // An ICC profile only: no chunk and no flag appears, the profile stays.
+        let with_icc = fx::with_chunks(&lossless_file(false), &[(*b"ICCP", ICC_EVEN)]);
+        let out = stripped_of(&with_icc);
+        assert_eq!(out, with_icc);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "ICCP", "VP8L"]);
+        // The flags are the input's own: ICC (and alpha, which the encoder
+        // sets for any RGBA image), and no EXIF or XMP gained.
+        assert_eq!(flags(&out), flags(&with_icc));
+        assert_eq!(flags(&out) & fx::FLAG_ICC, fx::FLAG_ICC);
+        assert_eq!(flags(&out) & (fx::FLAG_EXIF | fx::FLAG_XMP), 0);
+
+        // An extended file with no flags and no metadata.
+        let image = fx::chunks_of(&lossless_file(false)).remove(0);
+        let plain = fx::from_chunks(&[(*b"VP8X", fx::vp8x_payload(0, SIZE, SIZE)), image]);
+        assert_eq!(stripped_of(&plain), plain);
+        assert_eq!(flags(&plain), 0);
+    }
+
+    #[test]
+    fn keeps_a_simple_file_simple() {
+        let simple = lossless_file(false);
+        assert_eq!(fx::chunk_names(&simple), ["VP8L"]);
+        let out = stripped_of(&simple);
+        assert_eq!(out, simple);
+        assert_eq!(fx::chunk_names(&out), ["VP8L"]);
+
+        // The same image in an extended file keeps its VP8X.
+        let extended = fx::with_chunks(&simple, &[(*b"EXIF", b"exif")]);
+        assert_eq!(fx::chunk_names(&stripped_of(&extended)), ["VP8X", "VP8L"]);
+    }
+
+    #[test]
+    fn drops_unknown_chunks() {
+        let input = fx::with_chunks(
+            &lossless_file(false),
+            &[(*b"ABCD", b"unknown"), (*b"JUNK", b"")],
+        );
+        let out = stripped_of(&input);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "VP8L"]);
+        assert_well_formed(&out);
+        // They set no flag, so the VP8X is unchanged.
+        assert_eq!(flags(&out), flags(&input));
+    }
+
+    #[test]
+    fn keeps_every_kept_chunk_in_its_original_order() {
+        // Distinct payloads, and the dropped chunks between the kept ones.
+        let vp8x = fx::vp8x_payload(fx::FLAG_ANIMATION | fx::FLAG_ICC, SIZE, SIZE);
+        let input = fx::from_chunks(&[
+            (*b"VP8X", vp8x),
+            (*b"ICCP", vec![1; 6]),
+            (*b"ABCD", vec![2; 6]),
+            (*b"ANIM", vec![3; 6]),
+            (*b"ANMF", vec![4; 24]),
+            (*b"EXIF", vec![5; 6]),
+            (*b"ANMF", vec![6; 24]),
+            (*b"XMP ", vec![7; 6]),
+        ]);
+        let out = stripped_of(&input);
+        assert_eq!(
+            fx::chunks_of(&out)[1..],
+            [
+                (*b"ICCP", vec![1; 6]),
+                (*b"ANIM", vec![3; 6]),
+                (*b"ANMF", vec![4; 24]),
+                (*b"ANMF", vec![6; 24]),
+            ]
+        );
+        assert_well_formed(&out);
+    }
+
+    #[test]
+    fn keeps_every_anmf_chunk_of_an_animated_file() {
+        let frames: Vec<Vec<u8>> = (0u8..3)
+            .map(|k| {
+                let rgba: Vec<u8> = pixels(true)
+                    .iter()
+                    .map(|b| b.wrapping_add(k * 40))
+                    .collect();
+                fx::lossless(&rgba, SIZE, SIZE)
+            })
+            .collect();
+        let animated = fx::animated(&frames, SIZE, SIZE);
+        let input = fx::with_chunks(
+            &animated,
+            &[
+                (*b"EXIF", b"exif data"),
+                (*b"XMP ", b"<xmp/>"),
+                (*b"ABCD", b"x"),
+            ],
+        );
+
+        let out = stripped_of(&input);
+
+        assert_well_formed(&out);
+        assert_eq!(
+            fx::chunk_names(&out),
+            ["VP8X", "ANIM", "ANMF", "ANMF", "ANMF"]
+        );
+        let anmf = |file: &[u8]| -> Vec<Vec<u8>> {
+            fx::chunks_of(file)
+                .into_iter()
+                .filter(|(name, _)| name == b"ANMF")
+                .map(|(_, data)| data)
+                .collect()
+        };
+        assert_eq!(anmf(&out), anmf(&input));
+        assert_eq!(anmf(&out).len(), 3);
+        assert_eq!(
+            flags(&out) & (fx::FLAG_EXIF | fx::FLAG_XMP | fx::FLAG_ICC),
+            0
+        );
+        assert_eq!(flags(&out) & fx::FLAG_ANIMATION, fx::FLAG_ANIMATION);
+        let decoded = fx::decode_frames(&out);
+        assert_eq!(decoded, fx::decode_frames(&input));
+        assert_ne!(decoded[0].0, decoded[1].0, "the frames differ");
+    }
+
+    #[test]
+    fn copies_an_animated_file_without_metadata_as_it_is() {
+        let frames = [lossless_file(true), lossless_file(false)];
+        let animated = fx::animated(&frames, SIZE, SIZE);
+        assert_eq!(stripped_of(&animated), animated);
+    }
+
+    #[test]
+    fn keeps_vp8_and_alph_of_a_lossy_file_with_alpha_byte_identical() {
+        let lossy = fx::lossy(&pixels(true), SIZE, SIZE, 75.0);
+        assert_eq!(fx::chunk_names(&lossy), ["VP8X", "ALPH", "VP8 "]);
+        let input = fx::with_chunks(&lossy, &[(*b"ICCP", ICC_EVEN), (*b"EXIF", &[4u8; 2_000])]);
+
+        let out = stripped_of(&input);
+
+        assert_well_formed(&out);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "ICCP", "ALPH", "VP8 "]);
+        for fourcc in [b"ALPH", b"VP8 "] {
+            assert_eq!(
+                fx::chunk_payload(&out, fourcc),
+                fx::chunk_payload(&lossy, fourcc)
+            );
+        }
+        assert_eq!(flags(&out) & fx::FLAG_ALPHA, fx::FLAG_ALPHA);
+        assert!(out.len() <= input.len());
+        assert_eq!(fx::decode_rgba(&out), fx::decode_rgba(&input));
+    }
+
+    #[test]
+    fn does_not_make_a_lossy_file_larger() {
+        for alpha in [false, true] {
+            let lossy = fx::lossy(&pixels(alpha), SIZE, SIZE, 75.0);
+            assert_eq!(stripped_of(&lossy), lossy, "alpha: {alpha}");
+        }
+    }
+
+    // --- stripped: padding, the tail and the flags ----------------------------------
+
+    #[test]
+    fn keeps_the_padding_byte_of_an_odd_sized_chunk() {
+        let base = lossless_file(false);
+        let input = fx::with_chunks(&base, &[(*b"ICCP", ICC_ODD), (*b"EXIF", b"odd")]);
+        // The pad bytes are really in the fixture.
+        let image_len = fx::chunk_payload(&base, b"VP8L").unwrap().len();
+        assert_eq!(
+            input.len(),
+            12 + (8 + 10) + (8 + ICC_ODD.len() + 1) + (8 + image_len + image_len % 2) + (8 + 3 + 1)
+        );
+
+        let out = stripped_of(&input);
+
+        // VP8X, the odd ICCP with its pad, and the image: nothing else.
+        assert_eq!(
+            out.len(),
+            12 + (8 + 10) + (8 + ICC_ODD.len() + 1) + (8 + image_len + image_len % 2)
+        );
+        assert_well_formed(&out);
+        assert_eq!(fx::chunk_payload(&out, b"ICCP").as_deref(), Some(ICC_ODD));
+        assert_eq!(
+            fx::chunk_payload(&out, b"VP8L"),
+            fx::chunk_payload(&base, b"VP8L")
+        );
+        assert_eq!(fx::decode_rgba(&out), fx::decode_rgba(&base));
+    }
+
+    #[test]
+    fn writes_no_padding_byte_after_an_even_sized_chunk() {
+        let base = lossless_file(false);
+        let input = fx::with_chunks(&base, &[(*b"ICCP", ICC_EVEN)]);
+        let out = stripped_of(&input);
+        let image_len = fx::chunk_payload(&base, b"VP8L").unwrap().len();
+        assert_eq!(
+            out.len(),
+            12 + (8 + 10) + (8 + ICC_EVEN.len()) + (8 + image_len + image_len % 2)
+        );
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn writes_the_missing_pad_of_a_final_odd_chunk() {
+        // The last chunk is odd-sized and the file ends without its pad byte,
+        // and the RIFF size leaves it out, as some writers do.
+        let chunks = [
+            fx::chunks_of(&lossless_file(false)).remove(0),
+            (*b"ICCP", vec![1, 2, 3]),
+        ];
+        let with_pad = fx::from_chunks(&chunks);
+        let mut without_pad = with_pad.clone();
+        without_pad.pop();
+        let size = u32::from_le_bytes(without_pad[4..8].try_into().unwrap()) - 1;
+        without_pad[4..8].copy_from_slice(&size.to_le_bytes());
+        assert!(parse(&without_pad).is_ok(), "the fixture is accepted");
+
+        let out = stripped_of(&without_pad);
+
+        assert_eq!(out.len(), without_pad.len() + 1);
+        assert_eq!(out.last(), Some(&0));
+        assert_well_formed(&out);
+        // The same file with its pad is copied byte for byte.
+        assert_eq!(stripped_of(&with_pad), with_pad);
+    }
+
+    #[test]
+    fn drops_bytes_after_the_riff_size() {
+        let base = lossless_file(false);
+        let extended = fx::with_chunks(&base, &[(*b"ICCP", ICC_EVEN)]);
+        for clean in [&base, &extended] {
+            let tail = [0xAB; 100];
+            let mut input = clean.clone();
+            input.extend_from_slice(&tail);
+
+            let out = stripped_of(&input);
+
+            assert!(!out.windows(tail.len()).any(|w| w == tail), "tail kept");
+            assert_eq!(&out, clean);
+            assert_well_formed(&out);
+            assert_eq!(fx::decode_rgba(&out), fx::decode_rgba(clean));
+        }
+        // A whole chunk after the RIFF size does not come in either.
+        let mut with_chunk = base.clone();
+        with_chunk.extend(fx::from_chunks(&[(*b"EXIF", vec![5; 40])])[12..].to_vec());
+        assert_eq!(stripped_of(&with_chunk), base);
+    }
+
+    #[test]
+    fn rewrites_flags_that_disagree_with_the_chunks() {
+        let image = || fx::chunks_of(&lossless_file(false)).remove(0);
+        let vp8x = |flags: u8| (*b"VP8X", fx::vp8x_payload(flags, SIZE, SIZE));
+        // (the chunks, the flags the output must have)
+        let cases: Vec<(Vec<fx::RawChunk>, u8)> = vec![
+            // An EXIF chunk with its flag clear: dropped, flag stays clear.
+            (vec![vp8x(0), image(), (*b"EXIF", vec![1; 8])], 0),
+            // The XMP flag set with no XMP chunk: cleared.
+            (vec![vp8x(fx::FLAG_XMP), image()], 0),
+            // The EXIF flag set with no EXIF chunk: cleared.
+            (vec![vp8x(fx::FLAG_EXIF), image()], 0),
+            // The ICC flag set with no ICCP chunk: cleared.
+            (vec![vp8x(fx::FLAG_ICC), image()], 0),
+            // An ICCP chunk with its flag clear: the flag is set.
+            (vec![vp8x(0), (*b"ICCP", vec![1; 8]), image()], fx::FLAG_ICC),
+            // Several at once, with alpha and animation flags that stay.
+            (
+                vec![
+                    vp8x(fx::FLAG_EXIF | fx::FLAG_XMP | fx::FLAG_ALPHA | fx::FLAG_ANIMATION),
+                    image(),
+                    (*b"XMP ", vec![1; 8]),
+                ],
+                fx::FLAG_ALPHA | fx::FLAG_ANIMATION,
+            ),
+        ];
+        for (chunks, expected) in cases {
+            let input = fx::from_chunks(&chunks);
+            let out = stripped_of(&input);
+            assert_eq!(flags(&out), expected, "{:?}", fx::chunk_names(&input));
+            assert_well_formed(&out);
+            // Flags and chunks agree.
+            let names = fx::chunk_names(&out);
+            assert_eq!(
+                flags(&out) & fx::FLAG_ICC != 0,
+                names.iter().any(|n| n == "ICCP")
+            );
+            assert!(!names.iter().any(|n| n == "EXIF" || n == "XMP "));
+            assert_eq!(flags(&out) & (fx::FLAG_EXIF | fx::FLAG_XMP), 0);
+        }
+    }
+
+    #[test]
+    fn keeps_the_reserved_bits_the_canvas_and_a_longer_vp8x_header_as_they_were() {
+        let mut payload = fx::vp8x_payload(0xC1 | fx::FLAG_ALPHA | fx::FLAG_EXIF, SIZE, SIZE);
+        payload[1..4].copy_from_slice(&[7, 8, 9]);
+        payload.extend_from_slice(&[0xEE; 4]);
+        let input = fx::from_chunks(&[
+            (*b"VP8X", payload.clone()),
+            fx::chunks_of(&lossless_file(true)).remove(0),
+        ]);
+
+        let out = stripped_of(&input);
+
+        let mut expected = payload;
+        expected[0] = 0xC1 | fx::FLAG_ALPHA;
+        assert_eq!(fx::chunk_payload(&out, b"VP8X"), Some(expected));
+    }
+
+    #[test]
+    fn writes_a_riff_size_that_covers_exactly_the_file() {
+        let base = lossless_file(true);
+        let inputs = [
+            base.clone(),
+            fx::with_chunks(&base, &[(*b"ICCP", ICC_ODD), (*b"EXIF", &[0; 301])]),
+            fx::animated(std::slice::from_ref(&base), SIZE, SIZE),
+        ];
+        for input in inputs {
+            let out = stripped_of(&input);
+            let declared = u32::from_le_bytes(out[4..8].try_into().unwrap()) as usize;
+            assert_eq!(declared + 8, out.len());
+            assert_eq!(&out[8..12], b"WEBP");
+        }
     }
 }

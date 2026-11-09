@@ -241,9 +241,55 @@ fn read_at_most(reader: impl Read, limit: u64) -> io::Result<Option<Vec<u8>>> {
     Ok((bytes.len() as u64 <= limit).then_some(bytes))
 }
 
+/// The first of the smallest candidates, if it is smaller than `original`;
+/// otherwise `original`. On a tie between candidates the first one wins
+/// (for JPG, candidate A, jpegoptim's result); a candidate of the same size
+/// as the original does not count as smaller.
+pub(crate) fn smallest<'a>(original: &'a [u8], candidates: &'a [Vec<u8>]) -> &'a [u8] {
+    candidates
+        .iter()
+        .map(Vec::as_slice)
+        .fold(original, |best, candidate| {
+            if candidate.len() < best.len() {
+                candidate
+            } else {
+                best
+            }
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- the smallest of the candidates, or the original ----------------------
+
+    #[test]
+    fn smallest_returns_the_smallest_candidate() {
+        let original = vec![0u8; 10];
+        let candidates = [vec![1u8; 8], vec![2u8; 6]];
+        assert_eq!(smallest(&original, &candidates), &[2u8; 6]);
+        let reversed = [vec![2u8; 6], vec![1u8; 8]];
+        assert_eq!(smallest(&original, &reversed), &[2u8; 6]);
+    }
+
+    #[test]
+    fn smallest_returns_the_original_when_no_candidate_is_smaller() {
+        let original = vec![0u8; 10];
+        // Equal size is not smaller: the original wins.
+        let candidates = [vec![1u8; 10], vec![2u8; 12]];
+        let chosen = smallest(&original, &candidates);
+        assert_eq!(chosen.as_ptr(), original.as_ptr());
+        assert_eq!(chosen, original.as_slice());
+        assert_eq!(smallest(&original, &[]).as_ptr(), original.as_ptr());
+    }
+
+    #[test]
+    fn smallest_keeps_the_first_candidate_when_two_tie() {
+        let original = vec![0u8; 10];
+        let candidates = [vec![1u8; 7], vec![2u8; 7]];
+        assert_eq!(smallest(&original, &candidates), &[1u8; 7]);
+    }
 
     #[test]
     fn skip_reasons_are_human_readable() {

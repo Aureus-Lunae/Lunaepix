@@ -2411,6 +2411,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "libwebp-sys"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b3a87b44e34d17161e4f17d92a463d596cb13825dcd1758ed18fd3a721e189c"
+dependencies = [
+ "cc",
+ "glob",
+ "pkg-config",
+]
+
+[[package]]
 name = "lightningcss"
 version = "1.0.0-alpha.72"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2506,6 +2517,7 @@ dependencies = [
  "crc32fast",
  "image",
  "libc",
+ "libwebp-sys",
  "mozjpeg-sys",
  "oxipng",
  "oxvg_ast",
