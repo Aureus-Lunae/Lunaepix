@@ -1683,3 +1683,183 @@ fn a_main_config_with_an_external_bin_is_caught_in_a_fixture() {
     fs::remove_dir_all(&dir).unwrap();
     assert_eq!(found, ["tauri.linux.conf.json", "Tauri.windows.toml"]);
 }
+
+// ---------------------------------------------------------------------
+// WebP is named in every text. The old wording ("PNG, JPG or SVG") must not
+// come back, in the window or in the skip reasons the core sends to it.
+// ---------------------------------------------------------------------
+
+/// True when `text` lists the formats without WebP: the old skip reason and
+/// the old filter wording, or the drop hint "PNG · JPG · SVG" that does not
+/// go on with "· WebP". Whitespace (a line break inside the phrase included)
+/// and letter case do not matter.
+fn names_only_png_jpg_and_svg(text: &str) -> bool {
+    let text = one_line(text).to_lowercase();
+    if text.contains("png, jpg or svg") || text.contains("png, jpg and svg") {
+        return true;
+    }
+    let hint = "png · jpg · svg";
+    text.match_indices(hint)
+        .any(|(at, _)| !text[at + hint.len()..].starts_with(" · webp"))
+}
+
+/// The places in an HTML page where the old wording shows to a reader or to a
+/// screen reader: its text nodes (comments are not text) and every attribute
+/// value. The page is read as tokens, never scanned as text.
+fn old_wording_in_html(html: &str) -> Vec<String> {
+    let mut hits = Vec::new();
+    if names_only_png_jpg_and_svg(&text_outside(html, &[])) {
+        hits.push("text".to_owned());
+    }
+    for tag in start_tags(html) {
+        for (name, value) in &tag.attrs {
+            if names_only_png_jpg_and_svg(value) {
+                hits.push(format!("<{} {name}>", tag.name));
+            }
+        }
+    }
+    hits
+}
+
+/// The files among `files` that carry the old wording. HTML is read as
+/// tokens; every other file (the scripts) is free text and is matched as text,
+/// which makes that half a lint and not a guarantee.
+fn files_with_old_wording(files: &[(String, String)]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|(name, text)| {
+            if name.ends_with(".html") {
+                !old_wording_in_html(text).is_empty()
+            } else {
+                names_only_png_jpg_and_svg(text)
+            }
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Every reason the core can give for skipping a file, as the window shows it.
+fn skip_texts() -> Vec<String> {
+    use lunaepix_core::Skip;
+    [
+        Skip::UnsupportedType,
+        Skip::TooLarge,
+        Skip::OverRunLimit,
+        Skip::IsOwnDestination,
+        Skip::NotAFile,
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
+/// True when the text nodes of `html` hold `phrase`, whitespace aside.
+fn page_says(html: &str, phrase: &str) -> bool {
+    one_line(&text_outside(html, &[])).contains(phrase)
+}
+
+#[test]
+fn no_text_names_only_png_jpg_and_svg() {
+    let files = ui_files();
+    assert_eq!(files_with_old_wording(&files), Vec::<String>::new());
+    let skips = skip_texts();
+    assert_eq!(
+        skips
+            .iter()
+            .filter(|text| names_only_png_jpg_and_svg(text))
+            .collect::<Vec<_>>(),
+        Vec::<&String>::new()
+    );
+    // Not vacuous: the page and the scripts that hold the texts were scanned,
+    // and the skip reason for an unsupported file is among the texts.
+    let scanned: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(scanned.contains(&"index.html") && scanned.contains(&"state.js"));
+    assert!(skips.iter().any(|text| text.starts_with("Not a ")));
+}
+
+#[test]
+fn the_scan_for_the_old_wording_finds_it_in_every_spelling_in_a_fixture() {
+    let page = |body: &str| format!("<!doctype html><html><body>{body}</body></html>");
+    for html in [
+        page("<p>PNG · JPG · SVG</p>"),
+        page("<p>png · jpg · svg</p>"),
+        page("<p>PNG · JPG · <b>SVG</b></p>"),
+        page("<p>Not a PNG, JPG\n   or SVG file</p>"),
+        page("<p>PNG · JPG · SVG\n · Gif</p>"),
+        page("<button aria-label=\"PNG, JPG and SVG images\">x</button>"),
+        page("<p data-hint='No PNG,  JPG or SVG files'>x</p>"),
+    ] {
+        assert!(!old_wording_in_html(&html).is_empty(), "{html}");
+    }
+    let files = [
+        ("a.js", "const a = 'Not a PNG, JPG or SVG file';"),
+        ("b.js", "const b = 'No PNG, JPG\n  or SVG files';"),
+        ("c.js", "dialog('PNG, JPG and SVG images')"),
+        ("d.js", "hint('PNG · JPG · SVG')"),
+        ("e.html", "<p>PNG · JPG · SVG</p>"),
+    ]
+    .map(|(name, text)| (name.to_owned(), text.to_owned()));
+    assert_eq!(
+        files_with_old_wording(&files),
+        ["a.js", "b.js", "c.js", "d.js", "e.html"]
+    );
+    assert!(names_only_png_jpg_and_svg("Not a PNG, JPG or SVG file"));
+}
+
+#[test]
+fn the_scan_for_the_old_wording_leaves_the_new_wording_alone_in_a_fixture() {
+    for html in [
+        "<p>PNG · JPG · SVG · WebP</p>",
+        "<p>PNG · JPG · SVG\n  · WebP</p>",
+        "<p>Not a PNG, JPG, SVG or WebP file</p>",
+        "<p>No PNG, JPG, SVG or WebP files directly in this folder</p>",
+        "<button aria-label=\"PNG, JPG, SVG and WebP images\">x</button>",
+        // A comment is not text a reader sees.
+        "<!-- PNG · JPG · SVG --><p>PNG · JPG · SVG · WebP</p>",
+    ] {
+        assert_eq!(old_wording_in_html(html), Vec::<String>::new(), "{html}");
+    }
+    let files = [
+        ("a.js", "'No PNG, JPG, SVG or WebP files'"),
+        ("b.js", "'PNG, JPG, SVG and WebP images'"),
+        ("c.js", "'PNG · JPG · SVG · WebP'"),
+    ]
+    .map(|(name, text)| (name.to_owned(), text.to_owned()));
+    assert_eq!(files_with_old_wording(&files), Vec::<String>::new());
+}
+
+#[test]
+fn the_window_and_the_skip_reason_name_webp() {
+    let html = index_html();
+    assert!(page_says(&html, "PNG · JPG · SVG · WebP"));
+    let state = ui_files()
+        .into_iter()
+        .find(|(name, _)| name == "state.js")
+        .unwrap()
+        .1;
+    assert!(one_line(&state).contains(
+        "No PNG, JPG, SVG or WebP files directly in this folder (subfolders are not included)"
+    ));
+    assert!(skip_texts().contains(&"Not a PNG, JPG, SVG or WebP file".to_owned()));
+}
+
+#[test]
+fn a_page_without_webp_in_its_text_does_not_say_it_in_a_fixture() {
+    assert!(!page_says(
+        "<p>PNG · JPG · SVG</p>",
+        "PNG · JPG · SVG · WebP"
+    ));
+    // Only in a comment, or in an attribute, is not the page saying it.
+    assert!(!page_says(
+        "<!-- PNG · JPG · SVG · WebP --><p>PNG · JPG · SVG</p>",
+        "PNG · JPG · SVG · WebP"
+    ));
+    assert!(!page_says(
+        "<p title=\"PNG · JPG · SVG · WebP\">PNG · JPG</p>",
+        "PNG · JPG · SVG · WebP"
+    ));
+    assert!(page_says(
+        "<p>PNG · JPG · SVG\n  · WebP</p>",
+        "PNG · JPG · SVG · WebP"
+    ));
+}

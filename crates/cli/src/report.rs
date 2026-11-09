@@ -272,7 +272,7 @@ mod tests {
         assert_eq!(out, "");
         assert_eq!(
             err,
-            "lunaepix: skipped (Not a PNG, JPG or SVG file): dir/notes.txt\n"
+            "lunaepix: skipped (Not a PNG, JPG, SVG or WebP file): dir/notes.txt\n"
         );
     }
 

@@ -1,4 +1,4 @@
-//! Atomic file output, shared by the PNG, JPG and SVG optimisers.
+//! Atomic file output, shared by the PNG, JPG, SVG and WebP optimisers.
 
 use std::fs;
 use std::io::{self, Write};
