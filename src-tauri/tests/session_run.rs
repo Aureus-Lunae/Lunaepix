@@ -49,6 +49,12 @@ fn worker() -> Worker {
 /// Run the list of `session` with `settings` through the real worker: the
 /// events the window would hear.
 fn run(session: &Session, settings: &Value) -> Vec<Event> {
+    run_after_start(session, settings, || {})
+}
+
+/// [`run`], with `between` called after `start_run` accepted the run and
+/// before any file runs.
+fn run_after_start(session: &Session, settings: &Value, between: impl FnOnce()) -> Vec<Event> {
     let events = RefCell::new(Vec::new());
     let mut prepared: Option<PreparedRun> = None;
     session
@@ -58,6 +64,7 @@ fn run(session: &Session, settings: &Value) -> Vec<Event> {
             |run| prepared = Some(run),
         )
         .unwrap();
+    between();
     session.run_with_worker(
         prepared.expect("the run started"),
         &worker(),
@@ -146,4 +153,99 @@ fn a_lossless_run_through_the_real_worker_writes_next_to_the_original() {
     // Not a pixel changed, and the original is untouched.
     assert_eq!(decoded(&dest), decoded(&src));
     assert_eq!(fs::read(&src).unwrap(), original);
+}
+
+// --- an output that cannot be written: the reason carries no path ----------
+
+/// Make `folder` read-only. `false` when running as root, where it stays
+/// writable and the test has nothing to check.
+#[cfg(unix)]
+fn lock(folder: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(folder, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::write(folder.join("probe"), b"").is_ok() {
+        eprintln!("skipped: the folder stays writable (running as root)");
+        return false;
+    }
+    true
+}
+
+/// `reason` names no part of `path` and no temporary file: the window never
+/// receives a path.
+#[cfg(unix)]
+fn assert_no_path(reason: &str, path: &Path) {
+    assert!(!reason.contains("at path"), "{reason:?}");
+    assert!(!reason.contains(".tmp"), "{reason:?}");
+    for part in path.components() {
+        if let std::path::Component::Normal(name) = part {
+            let name = name.to_string_lossy();
+            assert!(!reason.contains(&*name), "{name:?} in {reason:?}");
+        }
+    }
+}
+
+/// What the system calls a refused write: `EACCES` is 13 on Linux and macOS.
+#[cfg(unix)]
+fn permission_denied() -> String {
+    std::io::Error::from_raw_os_error(13).to_string()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_lossless_run_into_a_read_only_folder_fails_with_a_reason_without_a_path() {
+    // The output goes beside the original, in a folder that cannot be
+    // written to.
+    let dir = TempDir::new().unwrap();
+    let folder = dir.path().join("locked-folder");
+    fs::create_dir(&folder).unwrap();
+    let src = folder.join("a.png");
+    fs::write(&src, gradient_png()).unwrap();
+    if !lock(&folder) {
+        return;
+    }
+
+    let session = Session::new();
+    add(&session, vec![src.clone()]);
+    let events = run(&session, &json!({ "mode": "lossless", "quality": 75 }));
+
+    let rows = done_rows(&events);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, Status::Failed, "{rows:?}");
+    let reason = rows[0].1.clone().expect("a reason");
+    assert_eq!(reason, permission_denied());
+    assert_no_path(&reason, &folder.join("optimized-a.png"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_run_into_an_output_folder_made_read_only_fails_with_a_reason_without_a_path() {
+    // The folder was writable when the run started; it is locked before the
+    // file runs.
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("a.png");
+    fs::write(&src, gradient_png()).unwrap();
+    let out = dir.path().join("locked-folder");
+    fs::create_dir(&out).unwrap();
+
+    let session = Session::new();
+    add(&session, vec![src.clone()]);
+    session
+        .choose_output_folder(&mut |_| {}, |ticket| {
+            session.set_output(ticket, Some(out.clone()), &mut |_| {});
+        })
+        .unwrap();
+    let mut locked = true;
+    let events = run_after_start(&session, &json!({ "mode": "lossy", "quality": 40 }), || {
+        locked = lock(&out);
+    });
+    if !locked {
+        return;
+    }
+
+    let rows = done_rows(&events);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, Status::Failed, "{rows:?}");
+    let reason = rows[0].1.clone().expect("a reason");
+    assert_eq!(reason, permission_denied());
+    assert_no_path(&reason, &out.join("a.png"));
 }
