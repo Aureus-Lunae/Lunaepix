@@ -381,15 +381,16 @@ export function startRunArgs(state) {
 
 /**
  * What the settings controls show: the radios lock while a run is going; the
- * quality fields lock then and while Lossless is picked; the number field is
- * invalid only for Lossy with text that is not a whole number 0–100; the
- * output buttons are gone while a run is going, and "Next to the originals"
- * shows only while a folder is chosen.
+ * whole Quality row shows only while Lossy is picked (also during a lossy
+ * run) and its fields lock during a run; the number field is invalid only for
+ * Lossy with text that is not a whole number 0–100; the output buttons are
+ * gone while a run is going, and "Clear" shows only while a folder is chosen.
  */
 export function settingsView(state) {
   const running = state.phase === 'running';
   return {
     radiosDisabled: running,
+    showQuality: state.mode === 'lossy',
     qualityDisabled: running || state.mode === 'lossless',
     invalid: state.mode === 'lossy' && runSettings(state) === null,
     showChooseOutput: !running,

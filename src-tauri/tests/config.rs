@@ -1260,6 +1260,194 @@ fn a_settings_fixture_without_a_legend_a_label_or_a_bound_is_flagged() {
     );
 }
 
+// --- the Save to buttons and the quality row (Task 13) ---------------------
+
+/// Problems with the Save to buttons and the quality row, read as tokens:
+/// `chooseOutput` says "Choose folder"; `clearOutput` says "Clear" and has the
+/// `aria-label` "Clear output folder" (the visible text is inside the
+/// accessible name); and an element with the id `qualityRow` holds the range
+/// input, the number input and the `qualityError` line, so one `hidden` on the
+/// row hides the whole Quality row.
+fn output_and_quality_problems(html: &str) -> Vec<String> {
+    const VOID: &[&str] = &["input", "br", "img", "hr", "meta", "link"];
+    const ROW: &str = "qualityRow";
+    let mut problems = Vec::new();
+
+    // Each button with an id, as (id, aria-label, text).
+    let mut buttons: Vec<(String, Option<String>, String)> = Vec::new();
+    let mut in_button = false;
+    // The open elements as (name, id), innermost last.
+    let mut open: Vec<(String, Option<String>)> = Vec::new();
+    let mut row_seen = false;
+    // Whether each range input, number input and `qualityError` is inside the row.
+    let (mut ranges, mut numbers, mut errors): (Vec<bool>, Vec<bool>, Vec<bool>) =
+        (Vec::new(), Vec::new(), Vec::new());
+    for piece in pieces(html) {
+        match piece {
+            Piece::Start(tag) => {
+                let inside = open.iter().any(|(_, id)| id.as_deref() == Some(ROW));
+                let id = tag.attr("id");
+                row_seen |= id == Some(ROW);
+                let kind = tag.attr("type").map(str::to_ascii_lowercase);
+                if tag.name == "input" && kind.as_deref() == Some("range") {
+                    ranges.push(inside);
+                } else if tag.name == "input" && kind.as_deref() == Some("number") {
+                    numbers.push(inside);
+                } else if id == Some("qualityError") {
+                    errors.push(inside);
+                }
+                if tag.name == "button"
+                    && let Some(id) = id
+                {
+                    buttons.push((
+                        id.to_owned(),
+                        tag.attr("aria-label").map(str::to_owned),
+                        String::new(),
+                    ));
+                    in_button = true;
+                }
+                if !VOID.contains(&tag.name.as_str()) {
+                    open.push((tag.name.clone(), id.map(str::to_owned)));
+                }
+            }
+            Piece::End(name) => {
+                if name == "button" {
+                    in_button = false;
+                }
+                // An end tag closes the nearest open element of its name
+                // and whatever was left open inside it.
+                if let Some(at) = open.iter().rposition(|(open_name, _)| *open_name == name) {
+                    open.truncate(at);
+                }
+            }
+            Piece::Text(text) if in_button => {
+                if let Some(last) = buttons.last_mut() {
+                    last.2.push_str(&text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (id, text, aria) in [
+        ("chooseOutput", "Choose folder", None),
+        ("clearOutput", "Clear", Some("Clear output folder")),
+    ] {
+        let Some((_, label, content)) = buttons.iter().find(|(button, _, _)| button == id) else {
+            problems.push(format!("a button with the id {id}"));
+            continue;
+        };
+        if one_line(content) != text {
+            problems.push(format!("{id} text \"{text}\""));
+        }
+        if let Some(aria) = aria
+            && label.as_deref() != Some(aria)
+        {
+            problems.push(format!("aria-label=\"{aria}\" on {id}"));
+        }
+    }
+    if !row_seen {
+        problems.push(format!("an element with the id {ROW}"));
+    }
+    for (what, found) in [
+        ("the range input", ranges),
+        ("the number input", numbers),
+        ("qualityError", errors),
+    ] {
+        if found.is_empty() || found.contains(&false) {
+            problems.push(format!("{what} inside {ROW}"));
+        }
+    }
+    problems
+}
+
+/// Markup with everything [`output_and_quality_problems`] asks for.
+const OUTPUT_FIXTURE: &str = "<div id=\"qualityRow\">\
+     <label for=\"r\">Quality</label><input id=\"r\" type=\"range\">\
+     <label for=\"n\">Quality number</label><input id=\"n\" type=\"number\">\
+     <p id=\"qualityError\" hidden>Enter a whole number.</p></div>\
+     <div><button id=\"chooseOutput\" type=\"button\">Choose folder</button>\
+     <button id=\"clearOutput\" type=\"button\" aria-label=\"Clear output folder\" hidden>Clear</button></div>";
+
+#[test]
+fn the_output_buttons_and_the_quality_row_match_the_rules() {
+    assert_eq!(
+        output_and_quality_problems(&index_html()),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn an_output_and_quality_fixture_with_everything_passes_in_any_spelling() {
+    assert_eq!(
+        output_and_quality_problems(OUTPUT_FIXTURE),
+        Vec::<String>::new()
+    );
+    // Upper-case tags and attribute names, other quotes, wrapped button text,
+    // and an input nested deeper inside the row: the same markup to a browser.
+    let spelled = OUTPUT_FIXTURE
+        .replace("<div id=\"qualityRow\">", "<DIV ID='qualityRow'>")
+        .replace(
+            "<input id=\"n\" type=\"number\">",
+            "<span><INPUT ID='n' TYPE='Number'></span>",
+        )
+        .replace(
+            "<button id=\"chooseOutput\" type=\"button\">Choose folder</button>",
+            "<BUTTON ID='chooseOutput'>\n  Choose\n  folder\n</BUTTON>",
+        )
+        .replace("aria-label=", "ARIA-LABEL=");
+    assert_eq!(output_and_quality_problems(&spelled), Vec::<String>::new());
+}
+
+#[test]
+fn an_output_and_quality_fixture_with_old_texts_no_label_or_a_misplaced_input_is_flagged() {
+    let moved_out = |input: &str| OUTPUT_FIXTURE.replace(input, "") + input;
+    let number = "<input id=\"n\" type=\"number\">";
+    let range = "<input id=\"r\" type=\"range\">";
+    let error = "<p id=\"qualityError\" hidden>Enter a whole number.</p>";
+    let cases: Vec<(String, Vec<&str>)> = vec![
+        (
+            OUTPUT_FIXTURE.replace(">Clear</button>", ">Next to the originals</button>"),
+            vec!["clearOutput text \"Clear\""],
+        ),
+        (
+            OUTPUT_FIXTURE.replace(">Choose folder<", ">Choose output folder<"),
+            vec!["chooseOutput text \"Choose folder\""],
+        ),
+        (
+            OUTPUT_FIXTURE.replace(" aria-label=\"Clear output folder\"", ""),
+            vec!["aria-label=\"Clear output folder\" on clearOutput"],
+        ),
+        (
+            OUTPUT_FIXTURE.replace("aria-label=\"Clear output folder\"", "aria-label=\"Clear\""),
+            vec!["aria-label=\"Clear output folder\" on clearOutput"],
+        ),
+        (
+            OUTPUT_FIXTURE.replace("<button id=\"clearOutput\"", "<div id=\"clearOutput\""),
+            vec!["a button with the id clearOutput"],
+        ),
+        (
+            moved_out(number),
+            vec!["the number input inside qualityRow"],
+        ),
+        (moved_out(range), vec!["the range input inside qualityRow"]),
+        (moved_out(error), vec!["qualityError inside qualityRow"]),
+        (
+            OUTPUT_FIXTURE.replace("<div id=\"qualityRow\">", "<div>"),
+            vec![
+                "an element with the id qualityRow",
+                "the range input inside qualityRow",
+                "the number input inside qualityRow",
+                "qualityError inside qualityRow",
+            ],
+        ),
+    ];
+    for (html, problems) in cases {
+        let expected: Vec<String> = problems.into_iter().map(str::to_owned).collect();
+        assert_eq!(output_and_quality_problems(&html), expected, "{html}");
+    }
+}
+
 // ---------------------------------------------------------------------
 // Third-party licences. `THIRD-PARTY-LICENSES.html` is generated by
 // cargo-about from `about.toml`; these checks keep copyleft out of the

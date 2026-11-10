@@ -62,7 +62,7 @@
           </label>
         </fieldset>
 
-        <div class="lunaepixSettings__row">
+        <div class="lunaepixSettings__row" id="qualityRow" hidden>
           <label class="lunaepixSettings__label" for="qualityRange">Quality</label>
           <input class="lunaepixSettings__range" id="qualityRange" type="range" min="0" max="100" step="1" value="75" disabled>
           <label class="lunaepixSettings__hiddenText" for="qualityNumber">Quality, a whole number from 0 to 100</label>
@@ -73,8 +73,8 @@
         <div class="lunaepixSettings__row" role="group" aria-labelledby="saveToLabel">
           <span class="lunaepixSettings__label" id="saveToLabel">Save to</span>
           <span class="lunaepixSettings__value" id="saveTo">Next to the originals</span>
-          <button class="lunaepixSettings__button" id="chooseOutput" type="button">Choose output folder</button>
-          <button class="lunaepixSettings__button" id="clearOutput" type="button" hidden>Next to the originals</button>
+          <button class="lunaepixSettings__button" id="chooseOutput" type="button">Choose folder</button>
+          <button class="lunaepixSettings__button" id="clearOutput" type="button" aria-label="Clear output folder" hidden>Clear</button>
         </div>
       </div>
 
