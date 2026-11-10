@@ -4,9 +4,11 @@
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::atomic::{MAX_NAME_NUMBER, numbered};
 use crate::{Job, Skip};
 
 /// Largest file that is planned, in bytes (100 MiB). One byte more is skipped.
@@ -90,10 +92,29 @@ pub(crate) const OUTPUT_DIR: &str = "optimized";
 /// Prefix of the output name used when a single file is planned.
 const OUTPUT_PREFIX: &str = "optimized-";
 
-/// Plan a run over an explicit list of files. A directory among the inputs is
+/// Plan a run over an explicit list of files, next to the originals: a file
+/// gets `optimized-<name>` beside it, and a directory among the inputs is
 /// planned exactly like [`plan_folder`]. Never writes to the filesystem.
 pub fn plan_files(inputs: &[PathBuf]) -> Vec<Job> {
-    let mut plan = Plan::default();
+    plan_files_to(inputs, None)
+}
+
+/// Plan a run over the files directly inside `dir` (not recursive), into its
+/// `optimized/` folder. Never writes to the filesystem.
+pub fn plan_folder(dir: &Path) -> Vec<Job> {
+    plan_folder_to(dir, None)
+}
+
+/// [`plan_files`], or, with `Some(out)`, a run into the output folder `out`:
+/// every file (also those of a directory among the inputs) goes to
+/// `out/<original name>`. That name gets a number (`logo-2.png`, see
+/// `atomic::numbered`) when it clashes with an entry already in `out` or with
+/// an earlier job's destination in this plan. Names clash case-insensitively
+/// on every platform: they are compared after full Unicode lowercasing of
+/// their lossy UTF-8 form, while the destination keeps the original bytes. A
+/// missing `out` has no entries. Never writes to the filesystem.
+pub fn plan_files_to(inputs: &[PathBuf], out: Option<&Path>) -> Vec<Job> {
+    let mut plan = Plan::new(out);
     for input in inputs {
         match fs::metadata(input) {
             Ok(meta) if meta.is_dir() => plan.add_folder(input),
@@ -110,16 +131,47 @@ pub fn plan_files(inputs: &[PathBuf]) -> Vec<Job> {
     plan.jobs
 }
 
-/// Plan a run over the files directly inside `dir` (not recursive). Never
-/// writes to the filesystem.
-pub fn plan_folder(dir: &Path) -> Vec<Job> {
-    let mut plan = Plan::default();
+/// [`plan_folder`], or, with `Some(out)`, a run of the files directly inside
+/// `dir` into the output folder `out`, named as [`plan_files_to`] names them.
+/// Never writes to the filesystem.
+pub fn plan_folder_to(dir: &Path, out: Option<&Path>) -> Vec<Job> {
+    let mut plan = Plan::new(out);
     plan.add_folder(dir);
     plan.jobs
 }
 
-/// Accumulates jobs for one call, so the run limit and the duplicate check
-/// span every input of that call.
+/// The PNG, JPG, SVG and WebP files directly inside `dir`, sorted by name:
+/// the images of a dropped folder. Only regular files count: subfolders and
+/// symlinks are left out, as [`plan_folder`] leaves them out. Earlier outputs
+/// (`optimized-*`) are listed like any other image. Fails when `dir` cannot
+/// be read.
+pub fn images_in_folder(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    Ok(regular_files(dir)?
+        .into_iter()
+        .map(|(name, _)| dir.join(name))
+        .filter(|path| has_supported_extension(path))
+        .collect())
+}
+
+/// The regular files directly inside `dir` with their sizes, sorted by name.
+/// Subfolders and symlinks are left out; an entry whose type or size cannot
+/// be read is left out too.
+fn regular_files(dir: &Path) -> io::Result<Vec<(OsString, u64)>> {
+    let mut files: Vec<(OsString, u64)> = fs::read_dir(dir)?
+        .flatten()
+        .filter_map(|entry| {
+            // `DirEntry::file_type` does not follow symlinks.
+            let is_file = entry.file_type().ok()?.is_file();
+            let len = entry.metadata().ok()?.len();
+            is_file.then(|| (entry.file_name(), len))
+        })
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
+/// Accumulates jobs for one call, so the run limit, the duplicate check and
+/// the names taken in an output folder span every input of that call.
 #[derive(Default)]
 struct Plan {
     jobs: Vec<Job>,
@@ -127,30 +179,75 @@ struct Plan {
     seen: HashSet<PathBuf>,
     /// Number of `Job::Optimize` entries so far.
     optimizing: usize,
+    /// The chosen output folder, if any.
+    out: Option<OutputFolder>,
+}
+
+/// A chosen output folder and the names taken in it, folded with
+/// [`fold_name`].
+struct OutputFolder {
+    path: PathBuf,
+    taken: HashSet<String>,
+}
+
+impl OutputFolder {
+    /// `path` with its existing entries (files, folders, links) as taken. A
+    /// folder that cannot be read, such as one not created yet, has none.
+    fn read(path: &Path) -> OutputFolder {
+        let taken = fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| fold_name(&entry.file_name()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        OutputFolder {
+            path: path.to_path_buf(),
+            taken,
+        }
+    }
+
+    /// `name`, or its first numbered form up to `MAX_NAME_NUMBER` that is not
+    /// taken. When all are taken, `name` itself: the write then tries every
+    /// number again and fails with "no free name in the output folder".
+    fn free_name(&self, name: &OsStr) -> OsString {
+        let is_free = |candidate: &OsStr| !self.taken.contains(&fold_name(candidate));
+        if is_free(name) {
+            return name.to_owned();
+        }
+        (2..=MAX_NAME_NUMBER)
+            .map(|n| numbered(name, n))
+            .find(|candidate| is_free(candidate))
+            .unwrap_or_else(|| name.to_owned())
+    }
+}
+
+/// A name as compared for a clash in an output folder: its lossy UTF-8 form,
+/// lowercased in full Unicode (`É` and `é` are one name).
+fn fold_name(name: &OsStr) -> String {
+    name.to_string_lossy().to_lowercase()
 }
 
 impl Plan {
+    /// A plan next to the originals (`None`) or into `out`.
+    fn new(out: Option<&Path>) -> Plan {
+        Plan {
+            out: out.map(OutputFolder::read),
+            ..Plan::default()
+        }
+    }
+
     /// Add the regular files directly inside `dir`, sorted by file name.
     /// Subfolders (including `optimized/`) and symlinks are ignored.
     fn add_folder(&mut self, dir: &Path) {
-        let Ok(entries) = fs::read_dir(dir) else {
+        let Ok(files) = regular_files(dir) else {
             self.jobs.push(Job::Skip {
                 src: dir.to_path_buf(),
                 reason: Skip::NotAFile,
             });
             return;
         };
-        let mut files: Vec<(OsString, u64)> = entries
-            .flatten()
-            .filter_map(|entry| {
-                // `DirEntry::file_type` does not follow symlinks.
-                let is_file = entry.file_type().ok()?.is_file();
-                let len = entry.metadata().ok()?.len();
-                is_file.then(|| (entry.file_name(), len))
-            })
-            .collect();
-        files.sort();
-
         let out_dir = dir.join(OUTPUT_DIR);
         for (name, len) in files {
             self.add_file(&dir.join(&name), out_dir.join(&name), len);
@@ -158,12 +255,20 @@ impl Plan {
     }
 
     /// Decide one existing regular file: skip it for a reason, or plan it.
-    fn add_file(&mut self, src: &Path, dest: PathBuf, len: u64) {
+    /// `next_to` is its destination next to the originals; with an output
+    /// folder the destination is chosen there instead.
+    fn add_file(&mut self, src: &Path, next_to: PathBuf, len: u64) {
         // Checked first so that a file given twice is dropped, not re-skipped.
         let canonical_src = fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
         if !self.seen.insert(canonical_src.clone()) {
             return;
         }
+        let dest = match &self.out {
+            Some(out) => out
+                .path
+                .join(out.free_name(src.file_name().unwrap_or_default())),
+            None => next_to,
+        };
         let src = src.to_path_buf();
         let reason = if !has_supported_extension(&src) {
             Some(Skip::UnsupportedType)
@@ -179,6 +284,12 @@ impl Plan {
         match reason {
             Some(reason) => self.jobs.push(Job::Skip { src, reason }),
             None => {
+                // Only a planned output takes its name: a skipped file
+                // writes nothing.
+                if let Some(out) = &mut self.out {
+                    out.taken
+                        .insert(fold_name(dest.file_name().unwrap_or_default()));
+                }
                 self.optimizing += 1;
                 self.jobs.push(Job::Optimize { src, dest });
             }
@@ -852,5 +963,77 @@ mod tests {
         symlink(&a, &link).unwrap();
         let jobs = plan_files(&[a, link]);
         assert_eq!(count_optimize(&jobs), 1);
+    }
+
+    // --- a chosen output folder ------------------------------------------------
+
+    #[test]
+    fn planning_into_a_missing_output_folder_creates_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let originals = tmp.path().join("originals");
+        fs::create_dir(&originals).unwrap();
+        let a = touch(&originals, "a.png");
+        touch(&originals, "b.jpg");
+        let out = tmp.path().join("exports");
+
+        let file_jobs = plan_files_to(std::slice::from_ref(&a), Some(&out));
+        let folder_jobs = plan_folder_to(&originals, Some(&out));
+
+        assert_eq!(file_jobs, vec![optimize(a.clone(), out.join("a.png"))]);
+        assert_eq!(
+            folder_jobs,
+            vec![
+                optimize(a, out.join("a.png")),
+                optimize(originals.join("b.jpg"), out.join("b.jpg")),
+            ]
+        );
+        assert!(!out.exists());
+        assert_eq!(listing(tmp.path()), ["originals"]);
+        assert_eq!(listing(&originals), ["a.png", "b.jpg"]);
+    }
+
+    #[test]
+    fn plan_files_to_without_an_output_folder_is_plan_files() {
+        let tmp = TempDir::new().unwrap();
+        let a = touch(tmp.path(), "a.png");
+        touch(tmp.path(), "b.jpg");
+        touch(tmp.path(), "c.gif");
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        touch(&sub, "d.png");
+        let inputs = [a.clone(), sub.clone(), tmp.path().join("missing.png")];
+
+        assert_eq!(plan_files_to(&inputs, None), plan_files(&inputs));
+        assert_eq!(
+            plan_files_to(&inputs, None),
+            vec![
+                optimize(a, tmp.path().join("optimized-a.png")),
+                optimize(sub.join("d.png"), sub.join("optimized").join("d.png")),
+                skip(tmp.path().join("missing.png"), Skip::NotAFile),
+            ]
+        );
+        assert_eq!(plan_folder_to(tmp.path(), None), plan_folder(tmp.path()));
+        assert_eq!(count_optimize(&plan_folder_to(tmp.path(), None)), 2);
+    }
+
+    #[test]
+    fn a_skipped_file_does_not_take_a_name() {
+        let tmp = TempDir::new().unwrap();
+        let one = tmp.path().join("one");
+        let two = tmp.path().join("two");
+        let out = tmp.path().join("out");
+        for dir in [&one, &two, &out] {
+            fs::create_dir(dir).unwrap();
+        }
+        let big = sized(&one, "logo.png", MAX_FILE_BYTES + 1);
+        let small = touch(&two, "logo.png");
+
+        assert_eq!(
+            plan_files_to(&[big.clone(), small.clone()], Some(&out)),
+            vec![
+                skip(big, Skip::TooLarge),
+                optimize(small, out.join("logo.png")),
+            ]
+        );
     }
 }

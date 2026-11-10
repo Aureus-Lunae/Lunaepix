@@ -39,7 +39,8 @@ pub use lossy::{DEFAULT_QUALITY, Note, Quality};
 pub use plan::{
     MAX_ANIMATION_CANVAS_PIXELS, MAX_ANIMATION_PIXELS, MAX_FILE_BYTES, MAX_PIXELS, MAX_RUN_FILES,
     MAX_SVG_DEPTH, MAX_SVG_ENTITY_BYTES, MAX_SVG_NODES, MAX_WORKER_MESSAGE_BYTES,
-    MAX_WORKER_OUTPUT_BYTES, WORKER_TIMEOUT, plan_files, plan_folder,
+    MAX_WORKER_OUTPUT_BYTES, WORKER_TIMEOUT, images_in_folder, plan_files, plan_files_to,
+    plan_folder, plan_folder_to,
 };
 pub use run::{
     Crash, FileResult, RunError, StopHandle, Worker, run, run_observed, run_until_stopped,
@@ -168,9 +169,13 @@ impl OptimizeError {
 /// permissions. A `dest` that is the same file as `src` (after resolving
 /// symlinks and `.`/`..`) is refused. With [`WriteMode::Replace`] a `dest`
 /// whose folder is not the source's folder or its `optimized/` subfolder is
-/// refused (checked before anything is created). [`WriteMode::NoReplace`] is
-/// refused at the write step for now: writing without replacing comes with
-/// the output folder. A source of more than [`MAX_FILE_BYTES`] when it is
+/// refused (checked before anything is created). With
+/// [`WriteMode::NoReplace`] `dest` may be in any folder: the output is
+/// written as a new file and nothing existing is replaced. When `dest` is
+/// taken by then (a file appeared after planning), the first free numbered
+/// name beside it is used (`logo-2.png`, up to `logo-9999.png`), and past
+/// that the file fails with "no free name in the output folder". A source of
+/// more than [`MAX_FILE_BYTES`] when it is
 /// read (it grew after planning) is refused with the planner's size reason,
 /// having read one byte past the limit at most. On Windows the output does
 /// not get the source's read-only attribute, so a later run can replace it.
@@ -276,10 +281,9 @@ pub(crate) fn optimize_file_with(
                 .map_err(io_error(dest))?;
         }
         WriteMode::NoReplace => {
-            return Err(OptimizeError::Invalid {
-                path: dest.to_path_buf(),
-                message: "writing without replacing is not supported yet".to_owned(),
-            });
+            // Any folder: nothing existing can be overwritten. The name
+            // actually written is not reported back (plan handoff).
+            atomic::write_new(dest, &optimized.bytes, permissions).map_err(io_error(dest))?;
         }
     }
 
@@ -792,33 +796,44 @@ mod tests {
     }
 
     #[test]
-    fn a_no_replace_run_is_refused_for_now_and_writes_nothing() {
-        // Writing without replacing comes with the output folder (Task 8b);
-        // until then the mode reaches the write step and is refused there.
-        for compression in [Compression::Lossless, lossy(75).compression] {
+    fn a_no_replace_run_writes_beside_an_existing_file_without_replacing_it() {
+        let original = png_fixture();
+        let cases = [
+            (
+                Compression::Lossless,
+                crate::png::optimize(&original).unwrap(),
+            ),
+            (
+                lossy(75).compression,
+                b"written by the lossy double".to_vec(),
+            ),
+        ];
+        for (compression, expected) in cases {
             let tmp = TempDir::new().unwrap();
+            let existing = tmp.path().join("optimized-a.png");
+            fs::write(&existing, b"an earlier output").unwrap();
             let options = Options {
                 compression,
                 write: WriteMode::NoReplace,
             };
+            let double = marked_double();
 
-            let (src, dest, result) = optimise_with(
-                tmp.path(),
-                "a.png",
-                &png_fixture(),
-                &options,
-                &marked_double(),
-            );
+            let (src, dest, result) =
+                optimise_with(tmp.path(), "a.png", &original, &options, &double);
 
-            match result.unwrap_err() {
-                OptimizeError::Invalid { path, message } => {
-                    assert_eq!(path, dest);
-                    assert_eq!(message, "writing without replacing is not supported yet");
-                }
-                other => panic!("{other:?}"),
-            }
-            assert!(!dest.exists());
-            assert!(src.exists());
+            let outcome = result.unwrap();
+            assert_eq!(dest, existing);
+            assert_eq!(fs::read(&dest).unwrap(), b"an earlier output");
+            let numbered = tmp.path().join("optimized-a-2.png");
+            assert_eq!(fs::read(&numbered).unwrap(), expected, "{compression:?}");
+            assert_eq!(outcome.after, expected.len() as u64);
+            assert_eq!(fs::read(&src).unwrap(), original);
+            let mut names: Vec<_> = fs::read_dir(tmp.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            names.sort();
+            assert_eq!(names, ["a.png", "optimized-a-2.png", "optimized-a.png"]);
         }
     }
 

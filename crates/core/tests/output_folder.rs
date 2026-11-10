@@ -1,0 +1,660 @@
+//! A chosen output folder: original names, a number on a clash, and writes
+//! that never replace anything. Through the public API only: the planner
+//! (`plan_files_to`, `plan_folder_to`), `optimize_file` with
+//! `WriteMode::NoReplace`, and `images_in_folder`.
+
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use lunaepix_core::{
+    Compression, Job, OptimizeError, Options, Quality, WriteMode, images_in_folder, optimize_file,
+    plan_files_to, plan_folder_to,
+};
+use tempfile::TempDir;
+
+/// A lossless run into a chosen output folder.
+const NO_REPLACE: Options = Options {
+    compression: Compression::Lossless,
+    write: WriteMode::NoReplace,
+};
+
+/// Today's run next to the originals.
+const REPLACE: Options = Options {
+    compression: Compression::Lossless,
+    write: WriteMode::Replace,
+};
+
+// --- fixtures ---------------------------------------------------------------
+
+/// A small RGBA PNG at the fastest compression, so oxipng has work to do.
+/// `seed` gives different pixels, so two sources give different outputs.
+fn png(seed: u32) -> Vec<u8> {
+    let (w, h) = (24u32, 16u32);
+    let pixels: Vec<u8> = (0..w * h * 4)
+        .map(|i| ((i * 7 + seed * 31) % 251) as u8)
+        .collect();
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, w, h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&pixels).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+/// A small baseline JPG.
+fn jpg() -> Vec<u8> {
+    let (w, h) = (24u32, 16u32);
+    let pixels: Vec<u8> = (0..w * h * 3).map(|i| (i * 13 % 241) as u8).collect();
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
+        .encode(&pixels, w, h, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    out
+}
+
+/// What a lossless run writes for `bytes` named `name`: made with today's
+/// write (next to the original, replacing), in a scratch folder of its own,
+/// so the expectation does not depend on the code under test.
+fn lossless(name: &str, bytes: &[u8]) -> Vec<u8> {
+    let scratch = TempDir::new().unwrap();
+    let src = write(scratch.path(), name, bytes);
+    let dest = scratch.path().join(format!("optimized-{name}"));
+    optimize_file(&src, &dest, &REPLACE).unwrap();
+    fs::read(dest).unwrap()
+}
+
+fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+    let path = dir.join(name);
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+fn folder(parent: &Path, name: &str) -> PathBuf {
+    let path = parent.join(name);
+    fs::create_dir(&path).unwrap();
+    path
+}
+
+fn listing(dir: &Path) -> Vec<OsString> {
+    let mut names: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The destinations of `jobs`, which must all be optimised.
+fn dests(jobs: &[Job]) -> Vec<PathBuf> {
+    jobs.iter()
+        .map(|job| match job {
+            Job::Optimize { dest, .. } => dest.clone(),
+            Job::Skip { src, reason } => panic!("{} skipped: {reason}", src.display()),
+        })
+        .collect()
+}
+
+/// Run every job of `jobs` with `options`; each must succeed.
+fn run_all(jobs: &[Job], options: &Options) {
+    for job in jobs {
+        let Job::Optimize { src, dest } = job else {
+            panic!("unexpected {job:?}");
+        };
+        optimize_file(src, dest, options).unwrap();
+    }
+}
+
+// --- original names ---------------------------------------------------------
+
+#[test]
+fn original_names_land_in_the_output_folder() {
+    let tmp = TempDir::new().unwrap();
+    let originals = folder(tmp.path(), "originals");
+    let out = folder(tmp.path(), "exports");
+    let a = write(&originals, "a.png", &png(1));
+    let b = write(&originals, "b.jpg", &jpg());
+
+    let jobs = plan_files_to(&[a, b], Some(&out));
+    assert_eq!(dests(&jobs), [out.join("a.png"), out.join("b.jpg")]);
+    run_all(&jobs, &NO_REPLACE);
+
+    assert_eq!(listing(&out), ["a.png", "b.jpg"]);
+    assert_eq!(
+        fs::read(out.join("a.png")).unwrap(),
+        lossless("a.png", &png(1))
+    );
+    assert_eq!(
+        fs::read(out.join("b.jpg")).unwrap(),
+        lossless("b.jpg", &jpg())
+    );
+    assert_eq!(listing(&originals), ["a.png", "b.jpg"]);
+}
+
+#[test]
+fn no_optimized_prefix_in_the_output_folder() {
+    // A folder input, with and without going through `plan_files_to`: its
+    // files land in the output folder itself, not in `optimized/` or as
+    // `optimized-<name>`.
+    for through_files in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let originals = folder(tmp.path(), "originals");
+        let out = folder(tmp.path(), "exports");
+        write(&originals, "a.png", &png(1));
+        write(&originals, "b.jpg", &jpg());
+
+        let jobs = if through_files {
+            plan_files_to(std::slice::from_ref(&originals), Some(&out))
+        } else {
+            plan_folder_to(&originals, Some(&out))
+        };
+        assert_eq!(dests(&jobs), [out.join("a.png"), out.join("b.jpg")]);
+        run_all(&jobs, &NO_REPLACE);
+
+        assert_eq!(listing(&out), ["a.png", "b.jpg"]);
+        assert_eq!(listing(&originals), ["a.png", "b.jpg"]);
+    }
+}
+
+// --- a clash with an existing file ------------------------------------------
+
+#[test]
+fn an_existing_logo_png_makes_logo_2_and_stays_byte_identical() {
+    let tmp = TempDir::new().unwrap();
+    let originals = folder(tmp.path(), "originals");
+    let out = folder(tmp.path(), "exports");
+    let src = write(&originals, "logo.png", &png(1));
+    write(&out, "logo.png", b"an existing logo");
+
+    let jobs = plan_files_to(&[src], Some(&out));
+    assert_eq!(dests(&jobs), [out.join("logo-2.png")]);
+    run_all(&jobs, &NO_REPLACE);
+
+    assert_eq!(fs::read(out.join("logo.png")).unwrap(), b"an existing logo");
+    assert_eq!(
+        fs::read(out.join("logo-2.png")).unwrap(),
+        lossless("logo.png", &png(1))
+    );
+    assert_eq!(listing(&out), ["logo-2.png", "logo.png"]);
+}
+
+#[test]
+fn no_clash_no_number() {
+    let tmp = TempDir::new().unwrap();
+    let originals = folder(tmp.path(), "originals");
+    let out = folder(tmp.path(), "exports");
+    let src = write(&originals, "logo.png", &png(1));
+    write(&out, "other.png", b"another file");
+
+    let jobs = plan_files_to(&[src], Some(&out));
+    assert_eq!(dests(&jobs), [out.join("logo.png")]);
+    run_all(&jobs, &NO_REPLACE);
+
+    assert_eq!(listing(&out), ["logo.png", "other.png"]);
+}
+
+// --- a clash within a run ---------------------------------------------------
+
+#[test]
+fn two_sources_named_logo_png_give_logo_and_logo_2() {
+    let tmp = TempDir::new().unwrap();
+    let one = folder(tmp.path(), "one");
+    let two = folder(tmp.path(), "two");
+    let out = folder(tmp.path(), "exports");
+    let first = write(&one, "logo.png", &png(1));
+    let second = write(&two, "logo.png", &png(2));
+
+    let jobs = plan_files_to(&[first, second], Some(&out));
+    assert_eq!(dests(&jobs), [out.join("logo.png"), out.join("logo-2.png")]);
+    run_all(&jobs, &NO_REPLACE);
+
+    assert_eq!(
+        fs::read(out.join("logo.png")).unwrap(),
+        lossless("logo.png", &png(1))
+    );
+    assert_eq!(
+        fs::read(out.join("logo-2.png")).unwrap(),
+        lossless("logo.png", &png(2))
+    );
+    assert_eq!(listing(&out), ["logo-2.png", "logo.png"]);
+}
+
+#[test]
+fn different_names_get_no_number() {
+    let tmp = TempDir::new().unwrap();
+    let one = folder(tmp.path(), "one");
+    let two = folder(tmp.path(), "two");
+    let out = folder(tmp.path(), "exports");
+    let logo = write(&one, "logo.png", &png(1));
+    let mark = write(&two, "mark.png", &png(2));
+
+    let jobs = plan_files_to(&[logo, mark], Some(&out));
+    assert_eq!(dests(&jobs), [out.join("logo.png"), out.join("mark.png")]);
+    run_all(&jobs, &NO_REPLACE);
+
+    assert_eq!(listing(&out), ["logo.png", "mark.png"]);
+}
+
+// --- letter case ------------------------------------------------------------
+
+#[allow(non_snake_case)]
+#[test]
+fn an_existing_Logo_PNG_makes_logo_png_become_logo_2() {
+    let tmp = TempDir::new().unwrap();
+    let originals = folder(tmp.path(), "originals");
+    let out = folder(tmp.path(), "exports");
+    let src = write(&originals, "logo.png", &png(1));
+    write(&out, "Logo.PNG", b"an existing logo");
+
+    let jobs = plan_files_to(&[src], Some(&out));
+    assert_eq!(dests(&jobs), [out.join("logo-2.png")]);
+    run_all(&jobs, &NO_REPLACE);
+
+    assert_eq!(fs::read(out.join("Logo.PNG")).unwrap(), b"an existing logo");
+    assert_eq!(listing(&out), ["Logo.PNG", "logo-2.png"]);
+}
+
+#[test]
+fn logo_png_and_logo_jpg_do_not_clash() {
+    // Against an existing file.
+    let tmp = TempDir::new().unwrap();
+    let one = folder(tmp.path(), "one");
+    let two = folder(tmp.path(), "two");
+    let out = folder(tmp.path(), "exports");
+    let logo_png = write(&one, "logo.png", &png(1));
+    write(&out, "logo.jpg", b"an existing jpg");
+
+    let jobs = plan_files_to(std::slice::from_ref(&logo_png), Some(&out));
+    assert_eq!(dests(&jobs), [out.join("logo.png")]);
+
+    // Within a run.
+    let fresh = folder(tmp.path(), "fresh");
+    let logo_jpg = write(&two, "logo.jpg", &jpg());
+    let jobs = plan_files_to(&[logo_png, logo_jpg], Some(&fresh));
+    assert_eq!(
+        dests(&jobs),
+        [fresh.join("logo.png"), fresh.join("logo.jpg")]
+    );
+    run_all(&jobs, &NO_REPLACE);
+    assert_eq!(listing(&fresh), ["logo.jpg", "logo.png"]);
+}
+
+// --- names beyond ASCII (Review Focus 4) --------------------------------------
+
+#[test]
+fn non_ascii_names_clash_case_insensitively_and_keep_their_bytes() {
+    let tmp = TempDir::new().unwrap();
+    let originals = folder(tmp.path(), "originals");
+    let out = folder(tmp.path(), "exports");
+    let src = write(&originals, "Mobilis Logo – zwart é.png", &png(1));
+    write(&out, "MOBILIS LOGO – ZWART É.PNG", b"an existing logo");
+
+    let jobs = plan_files_to(&[src], Some(&out));
+    assert_eq!(dests(&jobs), [out.join("Mobilis Logo – zwart é-2.png")]);
+    run_all(&jobs, &NO_REPLACE);
+
+    assert_eq!(
+        fs::read(out.join("MOBILIS LOGO – ZWART É.PNG")).unwrap(),
+        b"an existing logo"
+    );
+    assert_eq!(
+        listing(&out),
+        ["MOBILIS LOGO – ZWART É.PNG", "Mobilis Logo – zwart é-2.png"]
+    );
+
+    // Within a run: `Ä.png` and `ä.png` clash too.
+    let one = folder(tmp.path(), "one");
+    let two = folder(tmp.path(), "two");
+    let fresh = folder(tmp.path(), "fresh");
+    let upper = write(&one, "Ä.png", &png(1));
+    let lower = write(&two, "ä.png", &png(2));
+    let jobs = plan_files_to(&[upper, lower], Some(&fresh));
+    assert_eq!(dests(&jobs), [fresh.join("Ä.png"), fresh.join("ä-2.png")]);
+}
+
+#[test]
+fn non_ascii_names_that_differ_beyond_case_do_not_clash() {
+    let tmp = TempDir::new().unwrap();
+    let originals = folder(tmp.path(), "originals");
+    let out = folder(tmp.path(), "exports");
+    let src = write(&originals, "Mobilis Logo – zwart é.png", &png(1));
+    write(&out, "MOBILIS LOGO – ZWART E.PNG", b"no accent");
+    write(&out, "Mobilis Logo - zwart é.png", b"a hyphen, not a dash");
+
+    let jobs = plan_files_to(&[src], Some(&out));
+    assert_eq!(dests(&jobs), [out.join("Mobilis Logo – zwart é.png")]);
+    run_all(&jobs, &NO_REPLACE);
+
+    assert_eq!(listing(&out).len(), 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_name_gets_its_number_with_its_bytes_intact() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let tmp = TempDir::new().unwrap();
+    let originals = folder(tmp.path(), "originals");
+    let out = folder(tmp.path(), "exports");
+    // Latin-1 é: not valid UTF-8. The existing name differs in letter case.
+    let src = originals.join(OsString::from_vec(b"caf\xE9.png".to_vec()));
+    fs::write(&src, png(1)).unwrap();
+    let existing = out.join(OsString::from_vec(b"CAF\xE9.PNG".to_vec()));
+    fs::write(&existing, b"an existing file").unwrap();
+
+    let jobs = plan_files_to(&[src], Some(&out));
+    let dest = dests(&jobs).remove(0);
+    assert_eq!(dest.parent().unwrap(), out);
+    assert_eq!(dest.file_name().unwrap().as_bytes(), b"caf\xE9-2.png");
+    run_all(&jobs, &NO_REPLACE);
+
+    assert_eq!(fs::read(&existing).unwrap(), b"an existing file");
+    assert_eq!(fs::read(&dest).unwrap(), lossless("a.png", &png(1)));
+    assert_eq!(listing(&out).len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_name_without_a_clash_keeps_its_exact_bytes() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let tmp = TempDir::new().unwrap();
+    let originals = folder(tmp.path(), "originals");
+    let out = folder(tmp.path(), "exports");
+    let src = originals.join(OsString::from_vec(b"caf\xE9.png".to_vec()));
+    fs::write(&src, png(1)).unwrap();
+
+    let jobs = plan_files_to(&[src], Some(&out));
+    run_all(&jobs, &NO_REPLACE);
+
+    let names = listing(&out);
+    assert_eq!(names.len(), 1);
+    assert_eq!(names[0].as_bytes(), b"caf\xE9.png");
+}
+
+// --- a file that appears while the run goes ----------------------------------
+
+#[test]
+fn a_file_appearing_before_the_write_is_not_overwritten_and_the_next_number_is_used() {
+    let tmp = TempDir::new().unwrap();
+    let originals = folder(tmp.path(), "originals");
+    let out = folder(tmp.path(), "exports");
+    let src = write(&originals, "logo.png", &png(1));
+    let jobs = plan_files_to(std::slice::from_ref(&src), Some(&out));
+    assert_eq!(dests(&jobs), [out.join("logo.png")]);
+
+    // Planned, not yet written: now the name is taken.
+    write(&out, "logo.png", b"appeared after planning");
+    let outcome = optimize_file(&src, &out.join("logo.png"), &NO_REPLACE).unwrap();
+
+    assert_eq!(
+        fs::read(out.join("logo.png")).unwrap(),
+        b"appeared after planning"
+    );
+    let written = fs::read(out.join("logo-2.png")).unwrap();
+    assert_eq!(written, lossless("logo.png", &png(1)));
+    assert_eq!(outcome.after, written.len() as u64);
+    assert_eq!(listing(&out), ["logo-2.png", "logo.png"]);
+}
+
+#[test]
+fn with_nothing_appearing_the_planned_name_is_used() {
+    let tmp = TempDir::new().unwrap();
+    let originals = folder(tmp.path(), "originals");
+    let out = folder(tmp.path(), "exports");
+    let src = write(&originals, "logo.png", &png(1));
+
+    let jobs = plan_files_to(&[src], Some(&out));
+    run_all(&jobs, &NO_REPLACE);
+
+    assert_eq!(listing(&out), ["logo.png"]);
+    assert_eq!(
+        fs::read(out.join("logo.png")).unwrap(),
+        lossless("logo.png", &png(1))
+    );
+}
+
+// --- the originals' own folder -----------------------------------------------
+
+#[test]
+fn the_originals_own_folder_writes_photo_2_and_leaves_photo_unchanged() {
+    for through_folder in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let src = write(tmp.path(), "photo.jpg", &jpg());
+
+        let jobs = if through_folder {
+            plan_folder_to(tmp.path(), Some(tmp.path()))
+        } else {
+            plan_files_to(std::slice::from_ref(&src), Some(tmp.path()))
+        };
+        assert_eq!(dests(&jobs), [tmp.path().join("photo-2.jpg")]);
+        run_all(&jobs, &NO_REPLACE);
+
+        assert_eq!(fs::read(&src).unwrap(), jpg());
+        assert_eq!(
+            fs::read(tmp.path().join("photo-2.jpg")).unwrap(),
+            lossless("photo.jpg", &jpg())
+        );
+        assert_eq!(listing(tmp.path()), ["photo-2.jpg", "photo.jpg"]);
+    }
+}
+
+#[test]
+fn another_folder_writes_photo_without_number() {
+    let tmp = TempDir::new().unwrap();
+    let originals = folder(tmp.path(), "originals");
+    let out = folder(tmp.path(), "exports");
+    let src = write(&originals, "photo.jpg", &jpg());
+
+    let jobs = plan_files_to(&[src], Some(&out));
+    run_all(&jobs, &NO_REPLACE);
+
+    assert_eq!(listing(&out), ["photo.jpg"]);
+    assert_eq!(listing(&originals), ["photo.jpg"]);
+}
+
+// --- the numbering bound ------------------------------------------------------
+
+/// An output folder holding `logo.png` and `logo-2.png` … `logo-<last>.png`.
+fn taken_up_to(out: &Path, last: u32) {
+    fs::write(out.join("logo.png"), b"").unwrap();
+    for n in 2..=last {
+        fs::write(out.join(format!("logo-{n}.png")), b"").unwrap();
+    }
+}
+
+#[test]
+fn an_output_folder_with_every_number_taken_fails_the_file_with_the_reason() {
+    let tmp = TempDir::new().unwrap();
+    let originals = folder(tmp.path(), "originals");
+    let out = folder(tmp.path(), "exports");
+    let src = write(&originals, "logo.png", &png(1));
+    taken_up_to(&out, 9999);
+
+    let jobs = plan_files_to(std::slice::from_ref(&src), Some(&out));
+    let dest = dests(&jobs).remove(0);
+    let error = optimize_file(&src, &dest, &NO_REPLACE).unwrap_err();
+
+    match &error {
+        OptimizeError::Io { path, .. } => assert_eq!(path, &dest),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(error.reason(), "no free name in the output folder");
+    let names = listing(&out);
+    assert_eq!(names.len(), 9999);
+    assert!(
+        names
+            .iter()
+            .all(|n| fs::read(out.join(n)).unwrap().is_empty()),
+        "an existing file was written to"
+    );
+    assert!(!out.join("logo-10000.png").exists());
+}
+
+#[test]
+fn the_last_number_is_used_when_only_it_is_free() {
+    let tmp = TempDir::new().unwrap();
+    let originals = folder(tmp.path(), "originals");
+    let out = folder(tmp.path(), "exports");
+    let src = write(&originals, "logo.png", &png(1));
+    taken_up_to(&out, 9998);
+
+    let jobs = plan_files_to(&[src], Some(&out));
+    assert_eq!(dests(&jobs), [out.join("logo-9999.png")]);
+    run_all(&jobs, &NO_REPLACE);
+
+    assert_eq!(
+        fs::read(out.join("logo-9999.png")).unwrap(),
+        lossless("logo.png", &png(1))
+    );
+}
+
+// --- next to the originals ------------------------------------------------------
+
+#[test]
+fn without_an_output_folder_optimized_name_replaces_as_today() {
+    // A loose file: `optimized-<name>` beside it, replacing an earlier one.
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &png(1));
+    write(tmp.path(), "optimized-a.png", b"an earlier output");
+
+    let jobs = plan_files_to(std::slice::from_ref(&src), None);
+    assert_eq!(dests(&jobs), [tmp.path().join("optimized-a.png")]);
+    run_all(&jobs, &REPLACE);
+
+    assert_eq!(
+        fs::read(tmp.path().join("optimized-a.png")).unwrap(),
+        lossless("a.png", &png(1))
+    );
+
+    // A folder: its `optimized/` subfolder, replacing an earlier output.
+    let dir = TempDir::new().unwrap();
+    write(dir.path(), "b.png", &png(2));
+    let earlier = folder(dir.path(), "optimized");
+    write(&earlier, "b.png", b"an earlier output");
+
+    let jobs = plan_folder_to(dir.path(), None);
+    assert_eq!(dests(&jobs), [earlier.join("b.png")]);
+    run_all(&jobs, &REPLACE);
+
+    assert_eq!(
+        fs::read(earlier.join("b.png")).unwrap(),
+        lossless("b.png", &png(2))
+    );
+}
+
+#[test]
+fn nothing_is_written_outside_the_originals_folder() {
+    let tmp = TempDir::new().unwrap();
+    let originals = folder(tmp.path(), "originals");
+    let exports = folder(tmp.path(), "exports");
+    let src = write(&originals, "a.png", &png(1));
+    write(&originals, "optimized-a.png", b"an earlier output");
+
+    let jobs = plan_files_to(&[src], None);
+    run_all(&jobs, &REPLACE);
+
+    assert_eq!(listing(tmp.path()), ["exports", "originals"]);
+    assert_eq!(listing(&exports), Vec::<OsString>::new());
+    assert_eq!(listing(&originals), ["a.png", "optimized-a.png"]);
+}
+
+// --- where a no-replace run may write ----------------------------------------------
+
+#[test]
+fn no_replace_mode_accepts_any_folder() {
+    let lossy = Compression::Lossy(Quality::new(75).unwrap());
+    for compression in [Compression::Lossless, lossy] {
+        let tmp = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let src = write(tmp.path(), "a.png", &png(1));
+        let options = Options {
+            compression,
+            write: WriteMode::NoReplace,
+        };
+
+        for dest in [
+            tmp.path().join("elsewhere").join("deeper").join("a.png"),
+            elsewhere.path().join("a.png"),
+        ] {
+            let outcome = optimize_file(&src, &dest, &options).unwrap();
+            assert_eq!(
+                fs::metadata(&dest).unwrap().len(),
+                outcome.after,
+                "{compression:?}"
+            );
+        }
+        assert_eq!(fs::read(&src).unwrap(), png(1));
+    }
+}
+
+#[test]
+fn a_no_replace_write_that_fails_names_the_destination_and_writes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &png(1));
+    write(tmp.path(), "blocker", b"a file, not a folder");
+    let dest = tmp.path().join("blocker").join("a.png");
+
+    let error = optimize_file(&src, &dest, &NO_REPLACE).unwrap_err();
+
+    match &error {
+        OptimizeError::Io { path, .. } => assert_eq!(path, &dest),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(listing(tmp.path()), ["a.png", "blocker"]);
+    assert_eq!(
+        fs::read(tmp.path().join("blocker")).unwrap(),
+        b"a file, not a folder"
+    );
+}
+
+// --- the images in a dropped folder -------------------------------------------------
+
+#[test]
+fn images_in_folder_lists_supported_files_only_sorted_and_skips_subfolders() {
+    let tmp = TempDir::new().unwrap();
+    for name in [
+        "b.png",
+        "optimized-a.jpg",
+        "a.jpg",
+        "d.webp",
+        "c.SVG",
+        "notes.txt",
+    ] {
+        write(tmp.path(), name, b"x");
+    }
+    let sub = folder(tmp.path(), "sub");
+    write(&sub, "deep.png", b"x");
+    let optimized = folder(tmp.path(), "optimized");
+    write(&optimized, "x.png", b"x");
+    folder(tmp.path(), "folder.png");
+
+    let images = images_in_folder(tmp.path()).unwrap();
+
+    let expected: Vec<PathBuf> = ["a.jpg", "b.png", "c.SVG", "d.webp", "optimized-a.jpg"]
+        .iter()
+        .map(|name| tmp.path().join(name))
+        .collect();
+    assert_eq!(images, expected);
+}
+
+#[test]
+fn a_folder_with_no_images_gives_an_empty_list() {
+    let tmp = TempDir::new().unwrap();
+    write(tmp.path(), "notes.txt", b"x");
+    write(tmp.path(), "a.png.txt", b"x");
+    let sub = folder(tmp.path(), "sub");
+    write(&sub, "deep.png", b"x");
+
+    assert_eq!(images_in_folder(tmp.path()).unwrap(), Vec::<PathBuf>::new());
+}
+
+#[test]
+fn images_in_folder_fails_for_a_missing_folder() {
+    let tmp = TempDir::new().unwrap();
+    let file = write(tmp.path(), "a.png", b"x");
+
+    assert!(images_in_folder(&tmp.path().join("missing")).is_err());
+    assert!(images_in_folder(&file).is_err());
+}
