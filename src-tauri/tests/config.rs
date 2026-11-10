@@ -1,5 +1,5 @@
 //! Guards on the window's security settings, so a later change cannot widen
-//! them silently: the capability grants the three app commands and event
+//! them silently: the capability grants the six app commands and event
 //! listening only, and the content security policy stays strict.
 
 use std::cell::RefCell;
@@ -16,7 +16,10 @@ use serde_json::Value;
 /// Every permission the window may have.
 const ALLOWED: &[&str] = &[
     "allow-choose-files",
-    "allow-choose-folder",
+    "allow-clear-list",
+    "allow-choose-output-folder",
+    "allow-clear-output-folder",
+    "allow-start-run",
     "allow-open-output-folder",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
@@ -79,22 +82,45 @@ fn csp_problems(csp: &str) -> Vec<String> {
     problems
 }
 
-#[test]
-fn the_capability_grants_the_three_commands_and_event_listening_only() {
-    let capability = read_json("capabilities/default.json");
-    assert_eq!(unexpected_permissions(&capability), Vec::<String>::new());
-    let granted: Vec<&str> = capability["permissions"]
+/// The permissions a capability grants that are plain names, in order.
+fn granted(capability: &Value) -> Vec<&str> {
+    capability["permissions"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(Value::as_str)
-        .collect();
-    for needed in ALLOWED {
-        assert!(granted.contains(needed), "missing {needed}");
-    }
+        .collect()
+}
+
+#[test]
+fn the_capability_grants_exactly_the_six_commands_and_event_listening() {
+    let capability = read_json("capabilities/default.json");
+    assert_eq!(unexpected_permissions(&capability), Vec::<String>::new());
+    let granted = granted(&capability);
+    // Each exactly once, nothing else.
+    let mut sorted = granted.clone();
+    sorted.sort_unstable();
+    let mut allowed = ALLOWED.to_vec();
+    allowed.sort_unstable();
+    assert_eq!(sorted, allowed);
+    assert_eq!(
+        granted.iter().filter(|p| p.starts_with("allow-")).count(),
+        6
+    );
     assert_eq!(capability["windows"], serde_json::json!(["main"]));
     // No `remote` block: no web page may use the capability.
     assert!(capability.get("remote").is_none());
+}
+
+#[test]
+fn a_capability_listing_choose_folder_is_flagged() {
+    let mut permissions: Vec<Value> = ALLOWED.iter().map(|p| Value::from(*p)).collect();
+    permissions.push(Value::from("allow-choose-folder"));
+    let capability = serde_json::json!({ "permissions": permissions });
+    assert_eq!(
+        unexpected_permissions(&capability),
+        [r#""allow-choose-folder""#]
+    );
 }
 
 #[test]
