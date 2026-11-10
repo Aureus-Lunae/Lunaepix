@@ -63,10 +63,6 @@ struct Quantised {
 /// The result is never larger than the source (see [`finish`]); an animated
 /// PNG gets the lossless treatment with [`Note::KeptLosslessAnimatedPng`].
 /// The error is a message for the user, as for the lossless path.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the run by a later task")
-)]
 pub(crate) fn optimize_lossy(bytes: &[u8], quality: Quality) -> Result<Lossy, String> {
     optimize_lossy_with(bytes, quality, quantise)
 }

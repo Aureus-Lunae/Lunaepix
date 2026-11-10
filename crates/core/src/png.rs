@@ -4,10 +4,6 @@ use crate::plan::{MAX_PIXELS, check_pixels};
 
 mod lossy;
 
-#[expect(
-    unused_imports,
-    reason = "the worker calls it once a run can be lossy (a later task)"
-)]
 pub(crate) use lossy::optimize_lossy;
 
 /// The eight bytes every PNG file starts with.

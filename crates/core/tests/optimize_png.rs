@@ -6,8 +6,16 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use lunaepix_core::{OptimizeError, optimize_file};
+use lunaepix_core::{
+    Compression, Note, OptimizeError, Options, Outcome, Quality, WriteMode, optimize_file,
+};
 use tempfile::TempDir;
+
+/// Today's run: lossless, replacing an earlier output.
+const LOSSLESS: Options = Options {
+    compression: Compression::Lossless,
+    write: WriteMode::Replace,
+};
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -96,7 +104,7 @@ fn optimizes_a_png_to_a_smaller_file_with_identical_pixels() {
     let src = write(tmp.path(), "a.png", &original);
     let dest = tmp.path().join("optimized-a.png");
 
-    let outcome = optimize_file(&src, &dest).unwrap();
+    let outcome = optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     let optimized = fs::read(&dest).unwrap();
     assert!(
@@ -133,7 +141,7 @@ fn optimizes_a_png_with_an_uppercase_extension() {
     let tmp = TempDir::new().unwrap();
     let src = write(tmp.path(), "A.PNG", &wasteful_png());
     let dest = tmp.path().join("optimized-A.PNG");
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
     assert!(fs::metadata(&dest).unwrap().len() < fs::metadata(&src).unwrap().len());
 }
 
@@ -142,10 +150,10 @@ fn reports_equal_sizes_for_a_png_that_cannot_shrink_further() {
     let tmp = TempDir::new().unwrap();
     let first = write(tmp.path(), "a.png", &wasteful_png());
     let once = tmp.path().join("once.png");
-    optimize_file(&first, &once).unwrap();
+    optimize_file(&first, &once, &LOSSLESS).unwrap();
     let twice = tmp.path().join("twice.png");
 
-    let outcome = optimize_file(&once, &twice).unwrap();
+    let outcome = optimize_file(&once, &twice, &LOSSLESS).unwrap();
 
     assert_eq!(outcome.before, outcome.after);
     assert_eq!(fs::read(&once).unwrap(), fs::read(&twice).unwrap());
@@ -158,7 +166,7 @@ fn keeps_the_source_bytes_unchanged_after_a_successful_run() {
     let tmp = TempDir::new().unwrap();
     let original = wasteful_png();
     let src = write(tmp.path(), "a.png", &original);
-    optimize_file(&src, &tmp.path().join("optimized-a.png")).unwrap();
+    optimize_file(&src, &tmp.path().join("optimized-a.png"), &LOSSLESS).unwrap();
     assert_eq!(fs::read(&src).unwrap(), original);
 }
 
@@ -169,7 +177,7 @@ fn keeps_the_source_unchanged_and_leaves_no_temp_file_when_the_source_is_corrupt
     let src = write(tmp.path(), "a.png", &corrupt);
     let before = listing(tmp.path());
 
-    assert!(optimize_file(&src, &tmp.path().join("optimized-a.png")).is_err());
+    assert!(optimize_file(&src, &tmp.path().join("optimized-a.png"), &LOSSLESS).is_err());
 
     assert_eq!(fs::read(&src).unwrap(), corrupt);
     assert_eq!(listing(tmp.path()), before);
@@ -187,7 +195,7 @@ fn keeps_the_source_unchanged_and_leaves_no_temp_file_when_the_final_rename_fail
     write(&dest, "keep.txt", b"keep");
     let before = listing(tmp.path());
 
-    let err = optimize_file(&src, &dest).unwrap_err();
+    let err = optimize_file(&src, &dest, &LOSSLESS).unwrap_err();
 
     assert!(matches!(err, OptimizeError::Io { .. }), "{err:?}");
     assert_eq!(fs::read(&src).unwrap(), original);
@@ -203,7 +211,7 @@ fn rejects_a_corrupt_png_and_leaves_no_output_file() {
     let src = write(tmp.path(), "a.png", &truncated_png());
     let dest = tmp.path().join("optimized-a.png");
 
-    let err = optimize_file(&src, &dest).unwrap_err();
+    let err = optimize_file(&src, &dest, &LOSSLESS).unwrap_err();
 
     assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
     assert!(!dest.exists());
@@ -222,7 +230,7 @@ fn rejects_a_png_with_damaged_image_data_and_leaves_no_output_file() {
     let src = write(tmp.path(), "a.png", &bytes);
     let dest = tmp.path().join("optimized-a.png");
 
-    assert!(optimize_file(&src, &dest).is_err());
+    assert!(optimize_file(&src, &dest, &LOSSLESS).is_err());
     assert!(!dest.exists());
 }
 
@@ -232,7 +240,7 @@ fn rejects_a_png_extension_that_holds_jpeg_bytes() {
     let src = write(tmp.path(), "photo.png", &jpeg_bytes());
     let dest = tmp.path().join("optimized-photo.png");
 
-    let err = optimize_file(&src, &dest).unwrap_err();
+    let err = optimize_file(&src, &dest, &LOSSLESS).unwrap_err();
 
     assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
     assert!(err.to_string().contains("not a PNG"), "{err}");
@@ -246,7 +254,7 @@ fn rejects_an_empty_png_file() {
     let src = write(tmp.path(), "empty.png", b"");
     let dest = tmp.path().join("optimized-empty.png");
     assert!(matches!(
-        optimize_file(&src, &dest),
+        optimize_file(&src, &dest, &LOSSLESS),
         Err(OptimizeError::Invalid { .. })
     ));
     assert!(!dest.exists());
@@ -256,7 +264,12 @@ fn rejects_an_empty_png_file() {
 fn rejects_a_missing_source_with_an_io_error_and_writes_nothing() {
     let tmp = TempDir::new().unwrap();
     let dest_dir = tmp.path().join("optimized");
-    let err = optimize_file(&tmp.path().join("gone.png"), &dest_dir.join("gone.png")).unwrap_err();
+    let err = optimize_file(
+        &tmp.path().join("gone.png"),
+        &dest_dir.join("gone.png"),
+        &LOSSLESS,
+    )
+    .unwrap_err();
     assert!(matches!(err, OptimizeError::Io { .. }), "{err:?}");
     assert!(!dest_dir.exists());
 }
@@ -268,7 +281,7 @@ fn rejects_a_gif_as_unsupported_and_writes_nothing() {
     let tmp = TempDir::new().unwrap();
     let src = write(tmp.path(), "a.gif", b"GIF89a");
     let dest = tmp.path().join("optimized-a.gif");
-    let err = optimize_file(&src, &dest).unwrap_err();
+    let err = optimize_file(&src, &dest, &LOSSLESS).unwrap_err();
     assert!(
         matches!(err, OptimizeError::UnsupportedType { .. }),
         "{err:?}"
@@ -288,7 +301,7 @@ fn replaces_an_existing_optimized_file() {
         b"stale output from an earlier run",
     );
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     let written = fs::read(&dest).unwrap();
     assert_ne!(written, b"stale output from an earlier run");
@@ -310,7 +323,7 @@ fn keeps_an_existing_optimized_file_when_the_new_run_fails() {
         b"output of an earlier good run",
     );
 
-    assert!(optimize_file(&src, &dest).is_err());
+    assert!(optimize_file(&src, &dest, &LOSSLESS).is_err());
 
     assert_eq!(fs::read(&dest).unwrap(), b"output of an earlier good run");
 }
@@ -321,7 +334,7 @@ fn creates_the_missing_destination_folder_when_it_writes() {
     let src = write(tmp.path(), "a.png", &wasteful_png());
     let dest = tmp.path().join("optimized").join("a.png");
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     assert!(dest.is_file());
     assert_eq!(
@@ -336,7 +349,7 @@ fn does_not_create_the_destination_folder_when_the_source_is_rejected() {
     let src = write(tmp.path(), "a.png", &truncated_png());
     let dest = tmp.path().join("optimized").join("a.png");
 
-    assert!(optimize_file(&src, &dest).is_err());
+    assert!(optimize_file(&src, &dest, &LOSSLESS).is_err());
 
     assert!(!tmp.path().join("optimized").exists());
 }
@@ -349,7 +362,12 @@ fn fails_cleanly_when_the_destination_folder_cannot_be_created() {
     write(tmp.path(), "optimized", b"a file");
     let before = listing(tmp.path());
 
-    let err = optimize_file(&src, &tmp.path().join("optimized").join("out.png")).unwrap_err();
+    let err = optimize_file(
+        &src,
+        &tmp.path().join("optimized").join("out.png"),
+        &LOSSLESS,
+    )
+    .unwrap_err();
 
     assert!(matches!(err, OptimizeError::Io { .. }), "{err:?}");
     assert_eq!(listing(tmp.path()), before);
@@ -369,7 +387,7 @@ fn replaces_a_symlink_at_the_destination_instead_of_writing_through_it() {
     let dest = tmp.path().join("optimized-a.png");
     symlink(&other, &dest).unwrap();
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     assert_eq!(
         fs::read(&other).unwrap(),
@@ -390,7 +408,7 @@ fn optimize_with_source_mode(mode: u32) -> u32 {
     let src = write(tmp.path(), "a.png", &wasteful_png());
     fs::set_permissions(&src, fs::Permissions::from_mode(mode)).unwrap();
     let dest = tmp.path().join("optimized-a.png");
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
     fs::metadata(&dest).unwrap().permissions().mode() & 0o777
 }
 
@@ -416,7 +434,7 @@ fn refuses_to_optimize_a_file_onto_itself_and_keeps_it_byte_identical() {
     let original = wasteful_png();
     let src = write(tmp.path(), "a.png", &original);
 
-    let err = optimize_file(&src, &src).unwrap_err();
+    let err = optimize_file(&src, &src, &LOSSLESS).unwrap_err();
 
     assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
     assert!(err.to_string().contains("same file"), "{err}");
@@ -431,7 +449,7 @@ fn refuses_the_same_file_spelled_with_a_different_path() {
     let src = write(tmp.path(), "a.png", &original);
     let spelled = tmp.path().join(".").join("a.png");
 
-    assert!(optimize_file(&src, &spelled).is_err());
+    assert!(optimize_file(&src, &spelled, &LOSSLESS).is_err());
 
     assert_eq!(fs::read(&src).unwrap(), original);
 }
@@ -445,7 +463,7 @@ fn refuses_a_destination_that_is_a_symlink_to_the_source() {
     let dest = tmp.path().join("optimized-a.png");
     std::os::unix::fs::symlink(&src, &dest).unwrap();
 
-    assert!(optimize_file(&src, &dest).is_err());
+    assert!(optimize_file(&src, &dest, &LOSSLESS).is_err());
 
     assert_eq!(fs::read(&src).unwrap(), original);
     assert!(
@@ -462,7 +480,7 @@ fn optimizes_into_the_same_file_name_in_another_folder() {
     let tmp = TempDir::new().unwrap();
     let src = write(tmp.path(), "a.png", &wasteful_png());
     let dest = tmp.path().join("optimized").join("a.png");
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
     assert!(dest.is_file());
 }
 
@@ -479,7 +497,12 @@ fn writes_beside_a_source_that_is_reached_through_a_symlinked_folder() {
     std::os::unix::fs::symlink(&real, &link).unwrap();
     write(&real, "a.png", &wasteful_png());
 
-    optimize_file(&link.join("a.png"), &link.join("optimized-a.png")).unwrap();
+    optimize_file(
+        &link.join("a.png"),
+        &link.join("optimized-a.png"),
+        &LOSSLESS,
+    )
+    .unwrap();
 
     assert!(real.join("optimized-a.png").is_file());
 }
@@ -494,7 +517,12 @@ fn writes_into_optimized_under_a_source_folder_reached_through_a_symlink() {
     std::os::unix::fs::symlink(&real, &link).unwrap();
     write(&real, "a.png", &wasteful_png());
 
-    optimize_file(&link.join("a.png"), &link.join("optimized").join("a.png")).unwrap();
+    optimize_file(
+        &link.join("a.png"),
+        &link.join("optimized").join("a.png"),
+        &LOSSLESS,
+    )
+    .unwrap();
 
     assert!(real.join("optimized").join("a.png").is_file());
 }
@@ -510,7 +538,7 @@ fn refuses_an_optimized_folder_that_is_a_symlink_elsewhere_and_writes_nothing_th
     let src = write(&dir, "a.png", &wasteful_png());
     std::os::unix::fs::symlink(&elsewhere, dir.join("optimized")).unwrap();
 
-    let result = optimize_file(&src, &dir.join("optimized").join("a.png"));
+    let result = optimize_file(&src, &dir.join("optimized").join("a.png"), &LOSSLESS);
 
     assert!(
         matches!(result, Err(OptimizeError::Invalid { .. })),
@@ -532,7 +560,7 @@ fn refuses_an_optimized_folder_that_is_a_symlink_to_a_sibling_folder() {
     fs::create_dir(&other).unwrap();
     std::os::unix::fs::symlink(&other, dir.join("optimized")).unwrap();
 
-    let result = optimize_file(&src, &dir.join("optimized").join("a.png"));
+    let result = optimize_file(&src, &dir.join("optimized").join("a.png"), &LOSSLESS);
 
     assert!(
         matches!(result, Err(OptimizeError::Invalid { .. })),
@@ -549,7 +577,7 @@ fn refuses_a_destination_in_an_unrelated_folder_and_does_not_create_it() {
     let src = write(&dir, "a.png", &wasteful_png());
     let unrelated = tmp.path().join("unrelated");
 
-    let result = optimize_file(&src, &unrelated.join("a.png"));
+    let result = optimize_file(&src, &unrelated.join("a.png"), &LOSSLESS);
 
     assert!(
         matches!(result, Err(OptimizeError::Invalid { .. })),
@@ -565,10 +593,10 @@ fn refuses_a_destination_in_an_existing_unrelated_folder_and_a_nested_one() {
     let unrelated = tmp.path().join("unrelated");
     fs::create_dir(&unrelated).unwrap();
 
-    assert!(optimize_file(&src, &unrelated.join("a.png")).is_err());
+    assert!(optimize_file(&src, &unrelated.join("a.png"), &LOSSLESS).is_err());
     // Deeper than `optimized/` is not `optimized/` either.
     let nested = tmp.path().join("optimized").join("deeper").join("a.png");
-    assert!(optimize_file(&src, &nested).is_err());
+    assert!(optimize_file(&src, &nested, &LOSSLESS).is_err());
 
     assert!(listing(&unrelated).is_empty());
     assert!(!tmp.path().join("optimized").exists());
@@ -583,7 +611,7 @@ fn accepts_a_relative_source_and_destination_in_the_current_folder_layout() {
     fs::write(src, wasteful_png()).unwrap();
     let dest_name = format!("optimized-{name}");
 
-    let result = optimize_file(src, Path::new(&dest_name));
+    let result = optimize_file(src, Path::new(&dest_name), &LOSSLESS);
 
     let _ = fs::remove_file(src);
     let _ = fs::remove_file(&dest_name);
@@ -619,7 +647,7 @@ fn strips_text_chunks_but_keeps_display_chunks() {
     let src = write(tmp.path(), "a.png", &original);
     let dest = tmp.path().join("optimized-a.png");
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     let types = chunk_types(&fs::read(&dest).unwrap());
     // Positive: metadata that does not affect display is gone.
@@ -636,7 +664,7 @@ fn shows_the_io_cause_once_in_the_message_and_not_again_as_a_source() {
     let missing = tmp.path().join("gone.png");
     // The platform's own wording of the cause, whatever the OS.
     let cause = fs::read(&missing).unwrap_err().to_string();
-    let err = optimize_file(&missing, &tmp.path().join("out.png")).unwrap_err();
+    let err = optimize_file(&missing, &tmp.path().join("out.png"), &LOSSLESS).unwrap_err();
     let message = err.to_string();
     assert_eq!(message.matches(&cause).count(), 1, "{message}");
     assert!(message.contains("gone.png"), "{message}");
@@ -661,8 +689,8 @@ fn replaces_the_output_of_a_read_only_source_on_a_second_run() {
     set_read_only(&src, true);
     let dest = tmp.path().join("optimized-a.png");
 
-    let first = optimize_file(&src, &dest);
-    let second = optimize_file(&src, &dest);
+    let first = optimize_file(&src, &dest, &LOSSLESS);
+    let second = optimize_file(&src, &dest, &LOSSLESS);
 
     // Writable again, so the temporary folder can be removed on every system.
     set_read_only(&src, false);
@@ -687,7 +715,7 @@ fn does_not_copy_the_read_only_attribute_to_the_output_on_windows() {
     set_read_only(&src, true);
     let dest = tmp.path().join("optimized-a.png");
 
-    let result = optimize_file(&src, &dest);
+    let result = optimize_file(&src, &dest, &LOSSLESS);
 
     let source_read_only = fs::metadata(&src).unwrap().permissions().readonly();
     let output_read_only = fs::metadata(&dest).map(|m| m.permissions().readonly());
@@ -724,7 +752,7 @@ fn writes_into_an_existing_optimized_folder_spelled_in_another_letter_case() {
     fs::create_dir(tmp.path().join("Optimized")).unwrap();
     let dest = tmp.path().join("optimized").join("a.png");
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     assert_eq!(
         listing(tmp.path()),
@@ -746,7 +774,7 @@ fn refuses_a_folder_named_optimized_in_another_letter_case_on_linux() {
     let other = tmp.path().join("Optimized");
     fs::create_dir(&other).unwrap();
 
-    let err = optimize_file(&src, &other.join("a.png")).unwrap_err();
+    let err = optimize_file(&src, &other.join("a.png"), &LOSSLESS).unwrap_err();
 
     assert!(err.to_string().contains("'optimized' folder"), "{err}");
     assert!(listing(&other).is_empty());
@@ -760,8 +788,200 @@ fn writes_into_the_optimized_folder_beside_a_differently_spelled_one_on_linux() 
     fs::create_dir(tmp.path().join("Optimized")).unwrap();
     let dest = tmp.path().join("optimized").join("a.png");
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     assert!(dest.is_file());
     assert!(listing(&tmp.path().join("Optimized")).is_empty());
+}
+
+// --- a lossy run -----------------------------------------------------------------
+
+fn lossy(quality: u8) -> Options {
+    Options {
+        compression: Compression::Lossy(Quality::new(quality).unwrap()),
+        write: WriteMode::Replace,
+    }
+}
+
+/// Optimise `bytes` as `name` twice, lossy at `quality` and lossless: the
+/// outcome and output of the lossy run, and the output of the lossless one.
+/// The source must be unchanged by both.
+fn lossy_and_lossless(name: &str, bytes: &[u8], quality: u8) -> (Outcome, Vec<u8>, Vec<u8>) {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), name, bytes);
+    let dest = tmp.path().join(format!("optimized-{name}"));
+    let reference = tmp.path().join("optimized").join(name);
+
+    let outcome = optimize_file(&src, &dest, &lossy(quality)).unwrap();
+    optimize_file(&src, &reference, &LOSSLESS).unwrap();
+
+    assert_eq!(fs::read(&src).unwrap(), bytes, "the source is untouched");
+    (
+        outcome,
+        fs::read(&dest).unwrap(),
+        fs::read(&reference).unwrap(),
+    )
+}
+
+/// A 64x64 opaque RGBA gradient with noise: thousands of colours, so a
+/// lossless run keeps it true colour and a lossy run has a palette to make.
+/// (`wasteful_png` has three colours, which the lossless run already turns
+/// into a palette, so a lossy run gives the same file.)
+fn gradient_png() -> Vec<u8> {
+    let (w, h) = (64u32, 64u32);
+    let mut pixels = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let noise = ((x * 31 + y * 17) % 13) as u8;
+            pixels.extend_from_slice(&[
+                (x * 4) as u8 ^ noise,
+                (y * 4) as u8,
+                ((x + y) * 2) as u8 ^ noise,
+                255,
+            ]);
+        }
+    }
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, w, h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&pixels).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+#[test]
+fn a_lossy_run_writes_a_smaller_png_of_the_same_size() {
+    let original = gradient_png();
+
+    let (outcome, written, lossless) = lossy_and_lossless("a.png", &original, 75);
+
+    assert_eq!(outcome.note, None);
+    assert!(
+        written.len() < original.len(),
+        "{} !< {}",
+        written.len(),
+        original.len()
+    );
+    assert_eq!(outcome.before, original.len() as u64);
+    assert_eq!(outcome.after, written.len() as u64);
+    let (w, h, _) = decode(&written);
+    assert_eq!((w, h), (64, 64));
+    // Encoded lossy: an indexed PNG, not the lossless output.
+    assert_eq!(written[25], 3, "colour type");
+    assert_ne!(written, lossless);
+}
+
+/// A 64x64 PNG of 16 palette colours at 4 bits, already optimised by a
+/// lossless run: a lossy run has nothing left to gain.
+fn optimised_16_colour_png() -> Vec<u8> {
+    let (w, h) = (64u32, 64u32);
+    let mut palette = Vec::new();
+    for i in 0..16u8 {
+        palette.extend_from_slice(&[i * 16, 255 - i * 16, (u32::from(i) * 37 % 255) as u8]);
+    }
+    let mut packed = Vec::new();
+    for y in 0..h {
+        for x in (0..w).step_by(2) {
+            let a = ((x / 4 + y / 4) % 16) as u8;
+            let b = (((x + 1) / 4 + y / 4) % 16) as u8;
+            packed.push((a << 4) | b);
+        }
+    }
+    let mut raw = Vec::new();
+    let mut encoder = png::Encoder::new(&mut raw, w, h);
+    encoder.set_color(png::ColorType::Indexed);
+    encoder.set_depth(png::BitDepth::Four);
+    encoder.set_palette(palette);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&packed).unwrap();
+    writer.finish().unwrap();
+
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "raw.png", &raw);
+    let dest = tmp.path().join("optimized-raw.png");
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
+    fs::read(&dest).unwrap()
+}
+
+#[test]
+fn a_lossy_png_that_is_not_smaller_keeps_the_original_bytes_with_the_note() {
+    let original = optimised_16_colour_png();
+
+    let (outcome, written, _) = lossy_and_lossless("a.png", &original, 75);
+
+    assert_eq!(outcome.note, Some(Note::OriginalKept));
+    assert_eq!(
+        outcome.note.unwrap().to_string(),
+        "original kept: lossy was not smaller"
+    );
+    assert_eq!(written, original);
+    assert_eq!(outcome.after, outcome.before);
+}
+
+/// An animated PNG of two 16x16 RGBA frames.
+fn apng() -> Vec<u8> {
+    let (w, h) = (16u32, 16u32);
+    let first: Vec<u8> = (0..w * h * 4).map(|i| (i * 7 % 251) as u8).collect();
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, w, h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
+    encoder.set_animated(2, 0).unwrap();
+    encoder.set_frame_delay(1, 10).unwrap();
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&first).unwrap();
+    writer.write_image_data(&[90; 16 * 16 * 4]).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+#[test]
+fn an_animated_png_in_a_lossy_run_gets_the_lossless_output_with_the_note() {
+    let original = apng();
+    assert!(
+        chunk_types(&original).contains(b"acTL"),
+        "the fixture is an APNG"
+    );
+
+    let (outcome, written, lossless) = lossy_and_lossless("a.png", &original, 75);
+
+    assert_eq!(outcome.note, Some(Note::KeptLosslessAnimatedPng));
+    assert_eq!(
+        outcome.note.unwrap().to_string(),
+        "kept lossless: animated PNG"
+    );
+    assert_eq!(written, lossless);
+    assert!(chunk_types(&written).contains(b"acTL"));
+}
+
+// --- where a lossy run may write ---------------------------------------------------
+
+#[test]
+fn replace_mode_still_refuses_a_destination_outside_the_two_allowed_folders() {
+    for options in [LOSSLESS, lossy(75)] {
+        let tmp = TempDir::new().unwrap();
+        let src = write(tmp.path(), "a.png", &wasteful_png());
+        let elsewhere = tmp.path().join("elsewhere");
+        let dest = elsewhere.join("a.png");
+
+        let err = optimize_file(&src, &dest, &options).unwrap_err();
+
+        match &err {
+            OptimizeError::Invalid { path, message } => {
+                assert_eq!(path, &dest, "{options:?}");
+                assert!(message.contains("'optimized' folder"), "{message}");
+            }
+            other => panic!("{options:?}: {other:?}"),
+        }
+        assert!(!elsewhere.exists(), "{options:?}");
+        assert_eq!(
+            listing(tmp.path()),
+            [OsString::from("a.png")],
+            "{options:?}"
+        );
+    }
 }

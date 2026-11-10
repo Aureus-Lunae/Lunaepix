@@ -35,10 +35,6 @@ use mozjpeg_sys::{
 
 mod lossy;
 
-#[expect(
-    unused_imports,
-    reason = "the worker calls it once a run can be lossy (a later task)"
-)]
 pub(crate) use lossy::optimize_lossy;
 
 /// Every JPEG starts with the SOI marker, followed by the next marker's 0xFF.

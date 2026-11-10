@@ -11,10 +11,6 @@ mod exif;
 mod lossy;
 mod riff;
 
-#[expect(
-    unused_imports,
-    reason = "the worker calls it once a run can be lossy (a later task)"
-)]
 pub(crate) use lossy::optimize_lossy;
 
 /// The fixture helpers of the integration tests, shared with the unit tests.
