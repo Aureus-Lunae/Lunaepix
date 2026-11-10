@@ -1068,6 +1068,198 @@ fn only_a_real_html_lang_and_real_column_headers_satisfy_the_structure() {
     );
 }
 
+// --- the run settings (Task 11) ---------------------------------------------
+
+/// Problems with the settings controls the accessibility rules need, read as
+/// tokens: the "Compression" choice is a `<fieldset>` whose `<legend>` says
+/// "Compression" and that holds two radio inputs, and the quality range and
+/// number inputs each have a `<label for>` and the bounds min 0, max 100,
+/// step 1.
+fn settings_problems(html: &str) -> Vec<String> {
+    let pieces = pieces(html);
+    let mut problems = Vec::new();
+
+    // Each fieldset as (its legend's text, the radio inputs inside it).
+    let mut fieldsets: Vec<(String, usize)> = Vec::new();
+    let mut open: Vec<(String, usize)> = Vec::new();
+    let mut in_legend = 0usize;
+    for piece in &pieces {
+        match piece {
+            Piece::Start(tag) if tag.name == "fieldset" => open.push((String::new(), 0)),
+            Piece::End(name) if name == "fieldset" => {
+                if let Some(closed) = open.pop() {
+                    fieldsets.push(closed);
+                }
+            }
+            Piece::Start(tag) if tag.name == "legend" && !open.is_empty() => in_legend += 1,
+            Piece::End(name) if name == "legend" => in_legend = in_legend.saturating_sub(1),
+            Piece::Text(text) if in_legend > 0 => {
+                if let Some(current) = open.last_mut() {
+                    current.0.push_str(text);
+                }
+            }
+            Piece::Start(tag)
+                if tag.name == "input"
+                    && tag
+                        .attr("type")
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("radio")) =>
+            {
+                if let Some(current) = open.last_mut() {
+                    current.1 += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    fieldsets.extend(open);
+    match fieldsets
+        .iter()
+        .find(|(legend, _)| one_line(legend) == "Compression")
+    {
+        None => problems.push("a fieldset with the legend \"Compression\"".to_owned()),
+        Some((_, radios)) if *radios != 2 => {
+            problems.push("two radio inputs in the Compression fieldset".to_owned());
+        }
+        Some(_) => {}
+    }
+
+    let tags: Vec<&StartTag> = pieces
+        .iter()
+        .filter_map(|piece| match piece {
+            Piece::Start(tag) => Some(tag),
+            _ => None,
+        })
+        .collect();
+    let labelled: HashSet<&str> = tags
+        .iter()
+        .filter(|tag| tag.name == "label")
+        .filter_map(|tag| tag.attr("for"))
+        .collect();
+    for kind in ["range", "number"] {
+        let inputs: Vec<&&StartTag> = tags
+            .iter()
+            .filter(|tag| {
+                tag.name == "input"
+                    && tag
+                        .attr("type")
+                        .is_some_and(|value| value.eq_ignore_ascii_case(kind))
+            })
+            .collect();
+        let [input] = inputs.as_slice() else {
+            problems.push(format!("one {kind} input"));
+            continue;
+        };
+        if !input.attr("id").is_some_and(|id| labelled.contains(id)) {
+            problems.push(format!("a <label for> on the {kind} input"));
+        }
+        for (name, value) in [("min", "0"), ("max", "100"), ("step", "1")] {
+            if input.attr(name) != Some(value) {
+                problems.push(format!("{name}=\"{value}\" on the {kind} input"));
+            }
+        }
+    }
+    problems
+}
+
+/// Settings markup with everything [`settings_problems`] asks for.
+const SETTINGS_FIXTURE: &str = "<fieldset><legend>Compression</legend>\
+     <label><input type=\"radio\" name=\"m\"> Lossless</label>\
+     <label><input type=\"radio\" name=\"m\"> Lossy</label></fieldset>\
+     <label for=\"r\">Quality</label>\
+     <input id=\"r\" type=\"range\" min=\"0\" max=\"100\" step=\"1\">\
+     <label for=\"n\">Quality number</label>\
+     <input id=\"n\" type=\"number\" min=\"0\" max=\"100\" step=\"1\">";
+
+#[test]
+fn the_settings_have_a_compression_fieldset_and_two_labelled_bounded_quality_inputs() {
+    assert_eq!(settings_problems(&index_html()), Vec::<String>::new());
+}
+
+#[test]
+fn a_settings_fixture_with_everything_passes_in_any_spelling() {
+    assert_eq!(settings_problems(SETTINGS_FIXTURE), Vec::<String>::new());
+    // Upper-case tags, attribute names and type values, other quotes, a
+    // wrapped legend: the same markup to a browser.
+    let spelled = SETTINGS_FIXTURE
+        .replace(
+            "<legend>Compression</legend>",
+            "<LEGEND>\n  Compression\n</LEGEND>",
+        )
+        .replace("type=\"radio\"", "TYPE='RADIO'")
+        .replace(
+            "<input id=\"r\" type=\"range\"",
+            "<INPUT ID='r' TYPE='Range'",
+        );
+    assert_eq!(settings_problems(&spelled), Vec::<String>::new());
+}
+
+#[test]
+fn a_settings_fixture_without_a_legend_a_label_or_a_bound_is_flagged() {
+    let cases: [(String, &str); 10] = [
+        (
+            SETTINGS_FIXTURE.replace("<legend>Compression</legend>", ""),
+            "a fieldset with the legend \"Compression\"",
+        ),
+        (
+            SETTINGS_FIXTURE.replace(
+                "<legend>Compression</legend>",
+                "<!-- <legend>Compression</legend> -->",
+            ),
+            "a fieldset with the legend \"Compression\"",
+        ),
+        (
+            SETTINGS_FIXTURE.replace("<legend>Compression</legend>", "<legend>Mode</legend>"),
+            "a fieldset with the legend \"Compression\"",
+        ),
+        (
+            SETTINGS_FIXTURE.replacen("type=\"radio\"", "type=\"checkbox\"", 1),
+            "two radio inputs in the Compression fieldset",
+        ),
+        (
+            SETTINGS_FIXTURE.replace("<label for=\"r\">Quality</label>", ""),
+            "a <label for> on the range input",
+        ),
+        (
+            SETTINGS_FIXTURE.replace("<label for=\"n\">", "<label for=\"x\">"),
+            "a <label for> on the number input",
+        ),
+        (
+            SETTINGS_FIXTURE.replace("<label for=\"n\">", "<label data-for=\"n\">"),
+            "a <label for> on the number input",
+        ),
+        (
+            SETTINGS_FIXTURE.replace(
+                "type=\"number\" min=\"0\" max=\"100\"",
+                "type=\"number\" min=\"0\" max=\"101\"",
+            ),
+            "max=\"100\" on the number input",
+        ),
+        (
+            SETTINGS_FIXTURE.replace(
+                "type=\"range\" min=\"0\" max=\"100\" step=\"1\"",
+                "type=\"range\" min=\"0\" max=\"100\"",
+            ),
+            "step=\"1\" on the range input",
+        ),
+        (
+            SETTINGS_FIXTURE.replace("type=\"range\" min=\"0\"", "type=\"range\" min=\"1\""),
+            "min=\"0\" on the range input",
+        ),
+    ];
+    for (html, problem) in cases {
+        assert_eq!(settings_problems(&html), vec![problem.to_owned()], "{html}");
+    }
+    // A quality input that is missing altogether.
+    let no_number = SETTINGS_FIXTURE.replace(
+        "<input id=\"n\" type=\"number\" min=\"0\" max=\"100\" step=\"1\">",
+        "",
+    );
+    assert_eq!(
+        settings_problems(&no_number),
+        vec!["one number input".to_owned()]
+    );
+}
+
 // ---------------------------------------------------------------------
 // Third-party licences. `THIRD-PARTY-LICENSES.html` is generated by
 // cargo-about from `about.toml`; these checks keep copyleft out of the

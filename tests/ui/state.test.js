@@ -971,3 +971,168 @@ test('the_new_actions_change_a_new_state_and_leave_the_given_one_as_it_was', () 
     assert.equal(JSON.stringify(ready), snapshot, action.type);
   }
 });
+
+// ---------------------------------------------------------------------
+// Post-code coverage, ruled by the controller (Task 11 pre-review): the
+// branches the first report listed as untested, each with its partner.
+// ---------------------------------------------------------------------
+
+// (a) set-mode to the mode already picked
+
+test('set_mode_to_the_mode_already_picked_returns_the_same_state', () => {
+  const ready = reduce(initialState(), threeFiles());
+  assert.equal(reduce(ready, setMode('lossless')), ready);
+  const lossy = reduce(ready, setMode('lossy'));
+  assert.equal(reduce(lossy, setMode('lossy')), lossy);
+});
+
+test('set_mode_to_the_other_mode_returns_a_new_state', () => {
+  const ready = reduce(initialState(), threeFiles());
+  const lossy = reduce(ready, setMode('lossy'));
+  assert.notEqual(lossy, ready);
+  assert.equal(lossy.mode, 'lossy');
+  assert.equal(ready.mode, 'lossless');
+});
+
+// (b) set-quality-text with a payload that is not a string
+
+test('set_quality_text_with_a_non_string_payload_changes_nothing', () => {
+  const lossy = apply(initialState(), threeFiles(), setMode('lossy'));
+  for (const payload of [40, null, undefined, ['40'], { value: '40' }]) {
+    assert.equal(reduce(lossy, setQuality(payload)), lossy, String(payload));
+  }
+});
+
+test('set_quality_text_with_a_string_payload_sets_the_text_and_the_quality', () => {
+  const lossy = apply(initialState(), threeFiles(), setMode('lossy'));
+  const state = reduce(lossy, setQuality('40'));
+  assert.equal(state.qualityText, '40');
+  assert.equal(state.quality, 40);
+});
+
+// (c) run-started with a mode it does not know
+
+test('a_run_with_an_unknown_mode_shows_no_settings_in_the_heading', () => {
+  for (const mode of ['fast', 'Lossy', null, undefined]) {
+    const running = apply(
+      initialState(),
+      threeFiles(),
+      { type: 'run-started', payload: { total: 3, mode, quality: 75 } },
+      fileStarted(0),
+    );
+    assert.equal(running.run, null, String(mode));
+    assert.equal(headingLine(running), 'Compressing 1 of 3', String(mode));
+    const finishedRun = apply(running, done(0), done(1), done(2), finished(3, 1, true));
+    assert.equal(headingLine(finishedRun), 'Done', String(mode));
+  }
+});
+
+test('a_run_with_a_known_mode_shows_its_settings_in_the_heading', () => {
+  const lossy = apply(initialState(), threeFiles(), started(3, 'lossy', 40), fileStarted(0));
+  assert.equal(headingLine(lossy), 'Compressing 1 of 3 · Lossy 40');
+  const lossless = apply(initialState(), threeFiles(), started(3, 'lossless', null), fileStarted(0));
+  assert.equal(headingLine(lossless), 'Compressing 1 of 3 · Lossless');
+});
+
+// (d) and "settingsText lossy without N": a lossy run with no usable quality
+
+test('a_lossy_run_without_a_usable_quality_reads_lossy_without_a_number', () => {
+  for (const quality of [null, undefined, 101, -1, 7.5, '75']) {
+    const running = apply(initialState(), threeFiles(), started(3, 'lossy', quality), fileStarted(0));
+    assert.deepEqual(running.run, { mode: 'lossy', quality: null }, String(quality));
+    assert.equal(headingLine(running), 'Compressing 1 of 3 · Lossy', String(quality));
+    const finishedRun = apply(running, done(0), done(1), done(2), finished(3, 1, true));
+    assert.equal(headingLine(finishedRun), 'Done · Lossy', String(quality));
+  }
+});
+
+test('a_lossy_run_with_a_quality_at_its_bounds_shows_the_number', () => {
+  for (const quality of [0, 100]) {
+    const running = apply(initialState(), threeFiles(), started(3, 'lossy', quality), fileStarted(0));
+    assert.equal(headingLine(running), `Compressing 1 of 3 · Lossy ${quality}`);
+  }
+});
+
+// (e) the heading while running before the first file-started, and with no
+// row to compress
+
+test('the_heading_before_the_first_file_started_counts_from_one', () => {
+  const running = apply(initialState(), threeFiles(), started(3, 'lossless', null));
+  assert.equal(headingLine(running), 'Compressing 1 of 3 · Lossless');
+  // A skipped first row does not move the count either.
+  const skippedFirst = apply(
+    initialState(),
+    listed([entry('notes.txt', null, SKIP), entry('a.png'), entry('b.png')]),
+    started(3),
+    skipped(0, 'notes.txt'),
+  );
+  assert.equal(headingLine(skippedFirst), 'Compressing 1 of 2 · Lossless');
+});
+
+test('the_heading_counts_the_started_files_once_they_start', () => {
+  const third = apply(
+    initialState(),
+    threeFiles(),
+    started(3),
+    fileStarted(0),
+    done(0),
+    fileStarted(1),
+    failed(1),
+    fileStarted(2),
+  );
+  assert.equal(headingLine(third), 'Compressing 3 of 3 · Lossless');
+});
+
+test('a_run_with_no_row_to_compress_reads_compressing_without_a_count', () => {
+  const running = apply(
+    initialState(),
+    listed([entry('notes.txt', null, SKIP), entry('readme.md', null, SKIP)]),
+    started(2, 'lossy', 75),
+  );
+  assert.equal(headingLine(running), 'Compressing · Lossy 75');
+  assert.doesNotMatch(headingLine(running), / of /);
+});
+
+test('a_run_with_a_row_to_compress_reads_compressing_with_a_count', () => {
+  const running = apply(
+    initialState(),
+    listed([entry('notes.txt', null, SKIP), entry('a.png')]),
+    started(2, 'lossy', 75),
+  );
+  assert.equal(headingLine(running), 'Compressing 1 of 1 · Lossy 75');
+});
+
+// (f) file-started with a payload that is not an object
+
+test('file_started_with_a_non_object_payload_changes_nothing', () => {
+  const running = apply(initialState(), threeFiles(), started(3));
+  const rowsBefore = JSON.stringify(running.rows);
+  for (const payload of [null, 0, '0', [0]]) {
+    assert.equal(reduce(running, { type: 'file-started', payload }), running, JSON.stringify(payload));
+  }
+  assert.equal(JSON.stringify(running.rows), rowsBefore);
+});
+
+test('file_started_with_an_object_payload_marks_its_row', () => {
+  const running = apply(initialState(), threeFiles(), started(3));
+  const state = reduce(running, { type: 'file-started', payload: { index: 0 } });
+  assert.equal(state.current, 0);
+  assert.equal(state.rows[0].kind, 'compressing');
+});
+
+// (g) file-done for a row other than the one compressing
+
+test('file_done_for_another_row_keeps_the_current_row', () => {
+  const running = apply(initialState(), threeFiles(), started(3), fileStarted(1));
+  const state = reduce(running, skipped(0, 'holiday.jpg'));
+  assert.equal(state.current, 1);
+  assert.equal(state.rows[0].kind, 'skipped');
+  assert.equal(state.rows[1].kind, 'compressing');
+});
+
+test('file_done_for_the_current_row_clears_it', () => {
+  const running = apply(initialState(), threeFiles(), started(3), fileStarted(1));
+  const state = reduce(running, done(1, 'logo.png'));
+  assert.equal(state.current, null);
+  assert.equal(state.rows[1].kind, 'done');
+});
