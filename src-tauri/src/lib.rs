@@ -1,28 +1,24 @@
-//! Thin Tauri shell over `lunaepix-core`: three commands, the window's
-//! drag and drop, and events back to the window. `INTERFACE.md` is the
-//! contract for the window.
+//! Thin Tauri shell over `lunaepix-core`: six commands, the window's drag
+//! and drop, and events back to the window. `INTERFACE.md` is the contract
+//! for the window; `session` holds what the commands do.
 //!
 //! The window never hands the backend a path. Paths come only from a native
 //! dialog opened here, or from a drop that Tauri delivers here as a window
-//! event; the window hears file names and numbers, never paths.
+//! event; the window hears file names, folder names and numbers, never paths.
 
 pub mod events;
 pub mod session;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use lunaepix_core::{Job, StopHandle, Worker, plan_files, plan_folder};
+use lunaepix_core::{StopHandle, Worker};
 use tauri::{AppHandle, DragDropEvent, Emitter, Manager, Window, WindowEvent, Wry};
 use tauri_plugin_dialog::{DialogExt, FileDialogBuilder, FilePath};
 
 use events::{DragState, Event};
-use session::{
-    CommandError, RunGuard, RunTicket, answer_dialog, claim_run, open_last_output, plan_pick,
-    run_session,
-};
+use session::{CommandError, Session};
 
 /// Extensions the file dialog shows. GTK matches them case-sensitively, so
 /// both spellings are listed; "All files" covers any other spelling, and the
@@ -36,12 +32,11 @@ const IMAGE_FILTER_NAME: &str = "PNG, JPG, SVG and WebP images";
 
 /// Everything the backend keeps between calls.
 struct AppState {
-    guard: RunGuard,
+    /// The list, the output setting, the busy guard and the last output.
+    session: Session,
     worker: Worker,
     /// Stops the active run when the window closes.
     stop: StopHandle,
-    /// Output folder of the last completed run, if it wrote anything.
-    last_output: Mutex<Option<PathBuf>>,
     /// Last `drag-state` sent, so a stream of drag-over events sends one.
     drag_over: AtomicBool,
 }
@@ -55,24 +50,21 @@ fn emit(app: &AppHandle, event: Event) {
     }
 }
 
-/// A ticket for a new run, or `run-busy` and [`CommandError::Busy`].
-fn ticket(app: &AppHandle) -> Result<RunTicket, CommandError> {
-    claim_run(&app.state::<AppState>().guard, &mut |event| {
-        emit(app, event)
-    })
+/// The session in the app's state.
+fn session(app: &AppHandle) -> &Session {
+    &app.state::<AppState>().inner().session
 }
 
-/// Run planned jobs on the calling thread (never the main one).
-fn run_jobs(app: &AppHandle, ticket: RunTicket, jobs: &[Job]) {
-    let state = app.state::<AppState>();
-    run_session(
-        ticket,
-        jobs,
-        &state.worker,
-        &state.stop,
-        &state.last_output,
-        &mut |event| emit(app, event),
-    );
+/// Run `work` on a thread of its own: reading folders and running files
+/// never block the main thread. If the thread cannot be started, `work` is
+/// dropped unrun, and with it any ticket it holds, so the guard is free.
+fn on_own_thread(work: impl FnOnce() + Send + 'static) {
+    let spawned = std::thread::Builder::new()
+        .name("lunaepix-run".to_owned())
+        .spawn(work);
+    if let Err(error) = spawned {
+        eprintln!("lunaepix: could not start a thread: {error}");
+    }
 }
 
 /// Dialog paths as plain paths. On desktop every entry is a path.
@@ -92,56 +84,75 @@ fn file_dialog(app: &AppHandle) -> FileDialogBuilder<Wry> {
     }
 }
 
-/// Open a native multi-file dialog, then optimise the chosen files. Returns
-/// at once; the dialog's outcome arrives as events.
+/// Open a native multi-file dialog; the files picked are added to the list.
+/// Returns at once; the outcome arrives as events.
 #[tauri::command]
 fn choose_files(app: AppHandle) -> Result<(), CommandError> {
-    let ticket = ticket(&app)?;
-    file_dialog(&app)
-        .set_title("Choose images")
-        .add_filter(IMAGE_FILTER_NAME, IMAGE_EXTENSIONS)
-        .add_filter("All files", &["*"])
-        .pick_files(move |picked| {
-            // The plugin calls this on a thread of its own.
-            answer_dialog(
-                ticket,
-                picked.map(into_paths),
-                plan_files,
-                &mut |event| emit(&app, event),
-                |ticket, jobs| run_jobs(&app, ticket, &jobs),
-            );
-        });
-    Ok(())
+    session(&app).choose_files(&mut |event| emit(&app, event), |ticket| {
+        let answer = app.clone();
+        file_dialog(&app)
+            .set_title("Choose images")
+            .add_filter(IMAGE_FILTER_NAME, IMAGE_EXTENSIONS)
+            .add_filter("All files", &["*"])
+            .pick_files(move |picked| {
+                // The plugin calls this on a thread of its own.
+                session(&answer).add_paths(ticket, picked.map(into_paths), &mut |event| {
+                    emit(&answer, event)
+                });
+            });
+    })
 }
 
-/// Open a native folder dialog, then optimise the folder into
-/// `<folder>/optimized/`. Returns at once; the outcome arrives as events.
+/// Empty the list.
 #[tauri::command]
-fn choose_folder(app: AppHandle) -> Result<(), CommandError> {
-    let ticket = ticket(&app)?;
-    file_dialog(&app)
-        .set_title("Choose a folder")
-        .pick_folder(move |picked| {
-            let picked = picked.map(|folder| into_paths(vec![folder]));
-            let plan =
-                |folders: &[PathBuf]| folders.iter().flat_map(|dir| plan_folder(dir)).collect();
-            answer_dialog(
-                ticket,
-                picked,
-                plan,
-                &mut |event| emit(&app, event),
-                |ticket, jobs| run_jobs(&app, ticket, &jobs),
-            );
+fn clear_list(app: AppHandle) -> Result<(), CommandError> {
+    session(&app).clear_list(&mut |event| emit(&app, event))
+}
+
+/// Open a native folder dialog; the folder picked becomes the output folder.
+/// Returns at once; the outcome arrives as events.
+#[tauri::command]
+fn choose_output_folder(app: AppHandle) -> Result<(), CommandError> {
+    session(&app).choose_output_folder(&mut |event| emit(&app, event), |ticket| {
+        let answer = app.clone();
+        file_dialog(&app)
+            .set_title("Choose the output folder")
+            .pick_folder(move |picked| {
+                let folder = picked.and_then(|folder| folder.into_path().ok());
+                session(&answer).set_output(ticket, folder, &mut |event| emit(&answer, event));
+            });
+    })
+}
+
+/// Back to writing next to the originals.
+#[tauri::command]
+fn clear_output_folder(app: AppHandle) -> Result<(), CommandError> {
+    session(&app).clear_output_folder(&mut |event| emit(&app, event))
+}
+
+/// Run the list with the window's `settings` (checked by
+/// [`session::parse_settings`]). Returns once the run has started; its
+/// progress arrives as events. Not on the main thread (`async`): planning
+/// the list reads every file's metadata.
+#[tauri::command(async)]
+fn start_run(app: AppHandle, settings: serde_json::Value) -> Result<(), CommandError> {
+    session(&app).start_run(&settings, &mut |event| emit(&app, event), |prepared| {
+        let app = app.clone();
+        on_own_thread(move || {
+            let state = app.state::<AppState>();
+            state
+                .session
+                .run_with_worker(prepared, &state.worker, &state.stop, &mut |event| {
+                    emit(&app, event)
+                });
         });
-    Ok(())
+    })
 }
 
 /// Open the output folder of the last completed run in the file manager.
 #[tauri::command]
 fn open_output_folder(app: AppHandle) -> Result<(), CommandError> {
-    open_last_output(&app.state::<AppState>().last_output, |folder| {
-        tauri_plugin_opener::open_path(folder, None::<&str>)
-    })
+    session(&app).open_output_folder(|folder| tauri_plugin_opener::open_path(folder, None::<&str>))
 }
 
 /// Call `stop` when `event` is the window closing. The app ends with its one
@@ -159,7 +170,8 @@ fn stop_on_close(event: &WindowEvent, stop: impl FnOnce()) {
 }
 
 /// Drag and drop, handled here so that no path reaches the window: the
-/// window hears `drag-state` only, and a drop starts a run.
+/// window hears `drag-state` and `list-changed` only, and a drop adds to the
+/// list.
 fn on_window_event(window: &Window, event: &WindowEvent) {
     stop_on_close(event, || {
         window.app_handle().state::<AppState>().stop.stop()
@@ -178,25 +190,18 @@ fn on_window_event(window: &Window, event: &WindowEvent) {
     if state.drag_over.swap(over, Ordering::SeqCst) != over {
         emit(app, Event::DragState(DragState { over }));
     }
-    let Some(paths) = dropped.filter(|paths| !paths.is_empty()) else {
+    let Some(paths) = dropped else {
         return;
     };
-    let Ok(ticket) = ticket(app) else {
-        return;
-    };
-    // Planning reads the folder, so it runs off the main thread too.
-    let app = app.clone();
-    let spawned = std::thread::Builder::new()
-        .name("lunaepix-run".to_owned())
-        .spawn(move || {
-            if let Some(jobs) = plan_pick(Some(paths), plan_files) {
-                run_jobs(&app, ticket, &jobs);
-            }
+    state
+        .session
+        .drop_paths(paths, &mut |event| emit(app, event), |ticket, paths| {
+            // Adding reads folders, so it runs off the main thread.
+            let app = app.clone();
+            on_own_thread(move || {
+                session(&app).add_paths(ticket, Some(paths), &mut |event| emit(&app, event));
+            });
         });
-    if let Err(error) = spawned {
-        // The closure, and with it the ticket, is gone: the guard is free.
-        eprintln!("lunaepix: could not start the run: {error}");
-    }
 }
 
 /// The worker binary the bundle installs beside the app (Tauri's
@@ -248,11 +253,12 @@ pub fn run() -> ExitCode {
     if let Some(warning) = warning {
         eprintln!("{warning}");
     }
+    // Every launch starts on Lossless (the window's choice), with an empty
+    // list and the output next to the originals.
     let state = AppState {
-        guard: RunGuard::new(),
+        session: Session::new(),
         worker,
         stop: StopHandle::new(),
-        last_output: Mutex::new(None),
         drag_over: AtomicBool::new(false),
     };
     // The opener plugin is not registered: its Rust function is all that is
@@ -264,7 +270,10 @@ pub fn run() -> ExitCode {
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             choose_files,
-            choose_folder,
+            clear_list,
+            choose_output_folder,
+            clear_output_folder,
+            start_run,
             open_output_folder
         ])
         .on_window_event(on_window_event)
