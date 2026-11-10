@@ -115,6 +115,19 @@ function waitingRow(row) {
   return { kind: 'waiting', name: row.name, size: row.size ?? null, skip: row.skip ?? null };
 }
 
+/**
+ * A backend reason as it reads after a prefix such as "Will be skipped: ":
+ * its first letter in lower case ("not a PNG, JPG, SVG or WebP file"). A
+ * reason that starts with an acronym ("PNG …") keeps it.
+ */
+function afterPrefix(reason) {
+  const second = reason.charAt(1);
+  if (second !== second.toLowerCase()) {
+    return reason;
+  }
+  return reason.charAt(0).toLowerCase() + reason.slice(1);
+}
+
 /** The run's settings from a `run-started` payload: a lossless run has no quality. */
 function runFrom(payload) {
   if (!MODES.includes(payload.mode)) {
@@ -183,8 +196,12 @@ function writeRow(state, index, row) {
   return false;
 }
 
+/**
+ * A run row that was to be compressed but got no `file-done`. A waiting row
+ * the list showed as skipped is not one: it keeps its own skip reason.
+ */
 function isUnfinished(row) {
-  return row.kind === 'waiting' || row.kind === 'compressing';
+  return row.kind === 'compressing' || (row.kind === 'waiting' && row.skip === null);
 }
 
 export function reduce(state, action) {
@@ -357,6 +374,64 @@ export function runSettings(state) {
 }
 
 /**
+ * The argument of `start_run` (INTERFACE.md): `{ settings: { mode, quality } }`
+ * while Run can be used, or null, in which case nothing is sent.
+ */
+export function startRunArgs(state) {
+  return canRun(state) ? { settings: runSettings(state) } : null;
+}
+
+/**
+ * What the settings controls show: the radios lock while a run is going; the
+ * quality fields lock then and while Lossless is picked; the number field is
+ * invalid only for Lossy with text that is not a whole number 0–100; the
+ * output buttons are gone while a run is going, and "Next to the originals"
+ * shows only while a folder is chosen.
+ */
+export function settingsView(state) {
+  const running = state.phase === 'running';
+  return {
+    radiosDisabled: running,
+    qualityDisabled: running || state.mode === 'lossless',
+    invalid: state.mode === 'lossy' && runSettings(state) === null,
+    showChooseOutput: !running,
+    showClearOutput: !running && state.folder !== null,
+  };
+}
+
+/**
+ * Which blocks of the window show: the panel once there is a list or a run;
+ * the list heads before a run, the run heads from Run on; the table while it
+ * has rows; the summary in place of the settings and Run once a run is
+ * finished; the drop area marked busy while a run is going.
+ */
+export function panelView(state) {
+  const running = state.phase === 'running';
+  const finished = state.phase === 'finished';
+  return {
+    showPanel: state.phase !== 'empty',
+    listing: !running && !finished,
+    showTable: state.rows.length > 0,
+    showSummary: finished,
+    showSettings: !finished,
+    dropBusy: running,
+  };
+}
+
+/**
+ * What the page does after a command was rejected: the action to dispatch
+ * (none for "busy", which the backend's `run-busy` event already announces),
+ * and whether to log the reason to the console (only one it does not know).
+ */
+export function afterRejection(reason) {
+  const kind = classifyRejection(reason);
+  return {
+    log: kind === 'unknown',
+    action: kind === 'busy' ? null : { type: 'command-rejected', payload: reason },
+  };
+}
+
+/**
  * What the page does with a rejected command: "busy" is already announced by
  * the `run-busy` event the backend sends with it, so the page says nothing
  * more; "known" rejections get their message; anything else is "unknown" and
@@ -486,12 +561,12 @@ export function rowView(row) {
         kind: 'listed',
         name,
         size: sizeText(row.size),
-        text: row.skip === null ? '' : `Will be skipped: ${row.skip}`,
+        text: row.skip === null ? '' : `Will be skipped: ${afterPrefix(row.skip)}`,
       };
     case 'waiting':
       return row.skip === null
         ? { kind: 'waiting', name, size: sizeText(row.size), text: 'Waiting' }
-        : { kind: 'skipped', name, text: `skipped: ${row.skip}` };
+        : { kind: 'skipped', name, text: `skipped: ${afterPrefix(row.skip)}` };
     case 'compressing':
       return { kind: 'compressing', name, size: sizeText(row.size), text: 'Compressing…' };
     default:

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   MESSAGES,
+  afterRejection,
   canChoose,
   canOpenFolder,
   canRun,
@@ -10,11 +11,14 @@ import {
   dropTitleText,
   headingLine,
   initialState,
+  panelView,
   reduce,
   rowView,
   runSettings,
   saveToText,
+  settingsView,
   settledFailures,
+  startRunArgs,
   summaryLine,
 } from '../../ui/state.js';
 
@@ -463,6 +467,8 @@ test('settledFailures is empty when every result is fulfilled', () => {
 // ---------------------------------------------------------------------
 
 const SKIP = 'Not a PNG, JPG, SVG or WebP file';
+// How the window shows it after "Will be skipped: " (spec and mock-up).
+const SKIP_LOWER = 'not a PNG, JPG, SVG or WebP file';
 const NO_IMAGES = 'No PNG, JPG, SVG or WebP files directly in this folder (subfolders are not included)';
 const entry = (name, size = 1000, skip = null) => ({ name, size, skip });
 const listed = (files, notice = null) => ({ type: 'list-changed', payload: { files, notice } });
@@ -526,7 +532,7 @@ test('list_changed_fills_rows_and_writes_a_notice_to_the_status', () => {
     kind: 'listed',
     name: 'notes.txt',
     size: '',
-    text: `Will be skipped: ${SKIP}`,
+    text: `Will be skipped: ${SKIP_LOWER}`,
   });
 });
 
@@ -626,7 +632,7 @@ test('run_started_shows_the_list_rows_as_waiting_and_the_skips_as_skipped', () =
   );
   assert.equal(state.phase, 'running');
   assert.deepEqual(rowView(state.rows[0]), { kind: 'waiting', name: 'holiday.jpg', size: '2.3 MiB', text: 'Waiting' });
-  assert.deepEqual(rowView(state.rows[1]), { kind: 'skipped', name: 'notes.txt', text: `skipped: ${SKIP}` });
+  assert.deepEqual(rowView(state.rows[1]), { kind: 'skipped', name: 'notes.txt', text: `skipped: ${SKIP_LOWER}` });
 });
 
 test('run_started_with_fewer_rows_than_the_list_shows_only_the_run_rows', () => {
@@ -1135,4 +1141,226 @@ test('file_done_for_the_current_row_clears_it', () => {
   const state = reduce(running, done(1, 'logo.png'));
   assert.equal(state.current, null);
   assert.equal(state.rows[1].kind, 'done');
+});
+
+// ---------------------------------------------------------------------
+// Fix round 1 (Task 11 review): what app.js decided, now pure and tested.
+// ---------------------------------------------------------------------
+
+const readyList = () => reduce(initialState(), threeFiles());
+const onlySkipped = () => reduce(initialState(), listed([entry('notes.txt', null, SKIP)]));
+const finishedRun = () =>
+  apply(readyList(), started(1), fileStarted(0), done(0, 'holiday.jpg'), finished(1, 10, true));
+
+// 1(a) the argument of start_run
+
+test('start_run_args_are_the_exact_settings_for_lossy_40_and_for_lossless', () => {
+  assert.deepEqual(startRunArgs(apply(readyList(), setMode('lossy'), setQuality('40'))), {
+    settings: { mode: 'lossy', quality: 40 },
+  });
+  // Lossless still sends the quality (INTERFACE.md); the backend ignores it.
+  assert.deepEqual(startRunArgs(readyList()), { settings: { mode: 'lossless', quality: 75 } });
+  assert.deepEqual(startRunArgs(apply(readyList(), setMode('lossy'), setQuality('40'), setMode('lossless'))), {
+    settings: { mode: 'lossless', quality: 40 },
+  });
+});
+
+test('start_run_args_are_null_for_bad_quality_only_skipped_rows_running_or_finished', () => {
+  for (const text of ['7.5', '101', '', 'abc']) {
+    assert.equal(startRunArgs(apply(readyList(), setMode('lossy'), setQuality(text))), null, text);
+  }
+  assert.equal(startRunArgs(onlySkipped()), null);
+  assert.equal(startRunArgs(reduce(readyList(), started(3))), null);
+  assert.equal(startRunArgs(finishedRun()), null);
+  assert.equal(startRunArgs(initialState()), null);
+});
+
+// 1(b) the settings lock
+
+test('settings_view_locks_the_radios_while_running', () => {
+  assert.equal(settingsView(reduce(readyList(), started(3))).radiosDisabled, true);
+});
+
+test('settings_view_leaves_the_radios_free_while_ready', () => {
+  assert.equal(settingsView(readyList()).radiosDisabled, false);
+  assert.equal(settingsView(reduce(readyList(), setMode('lossy'))).radiosDisabled, false);
+});
+
+test('settings_view_locks_quality_while_running_or_lossless', () => {
+  assert.equal(settingsView(readyList()).qualityDisabled, true);
+  const lossyRunning = apply(readyList(), setMode('lossy'), started(3, 'lossy', 75));
+  assert.equal(settingsView(lossyRunning).qualityDisabled, true);
+});
+
+test('settings_view_leaves_quality_editable_while_lossy_and_ready', () => {
+  assert.equal(settingsView(reduce(readyList(), setMode('lossy'))).qualityDisabled, false);
+});
+
+test('settings_view_is_invalid_for_lossy_with_bad_text', () => {
+  for (const text of ['7.5', '101', '']) {
+    assert.equal(settingsView(apply(readyList(), setMode('lossy'), setQuality(text))).invalid, true, text);
+  }
+});
+
+test('settings_view_is_not_invalid_for_lossless_with_bad_text_or_lossy_with_good_text', () => {
+  // A lossless state holding bad text (switching restores it, so build it).
+  assert.equal(settingsView({ ...readyList(), mode: 'lossless', qualityText: '7.5' }).invalid, false);
+  assert.equal(settingsView(apply(readyList(), setMode('lossy'), setQuality('40'))).invalid, false);
+});
+
+test('settings_view_shows_choose_output_with_and_without_a_folder_while_not_running', () => {
+  assert.equal(settingsView(readyList()).showChooseOutput, true);
+  assert.equal(settingsView(reduce(readyList(), outputChanged('exports'))).showChooseOutput, true);
+});
+
+test('settings_view_hides_choose_output_while_running', () => {
+  assert.equal(settingsView(reduce(readyList(), started(3))).showChooseOutput, false);
+  assert.equal(settingsView(apply(readyList(), outputChanged('exports'), started(3))).showChooseOutput, false);
+});
+
+test('settings_view_shows_next_to_the_originals_with_a_folder_while_not_running', () => {
+  assert.equal(settingsView(reduce(readyList(), outputChanged('exports'))).showClearOutput, true);
+  assert.equal(settingsView(reduce(readyList(), outputChanged(''))).showClearOutput, true);
+});
+
+test('settings_view_hides_next_to_the_originals_without_a_folder_or_while_running', () => {
+  assert.equal(settingsView(readyList()).showClearOutput, false);
+  assert.equal(settingsView(apply(readyList(), outputChanged('exports'), started(3))).showClearOutput, false);
+});
+
+// the panel: which blocks show
+
+test('panel_view_shows_the_panel_once_there_is_a_list_or_a_run', () => {
+  for (const state of [readyList(), reduce(readyList(), started(3)), finishedRun()]) {
+    assert.equal(panelView(state).showPanel, true, state.phase);
+  }
+});
+
+test('panel_view_hides_the_panel_while_the_list_is_empty', () => {
+  assert.equal(panelView(initialState()).showPanel, false);
+  assert.equal(panelView(reduce(readyList(), listed([]))).showPanel, false);
+});
+
+test('panel_view_uses_the_list_heads_before_a_run', () => {
+  assert.equal(panelView(readyList()).listing, true);
+  assert.equal(panelView(initialState()).listing, true);
+});
+
+test('panel_view_uses_the_run_heads_while_running_and_finished', () => {
+  assert.equal(panelView(reduce(readyList(), started(3))).listing, false);
+  assert.equal(panelView(finishedRun()).listing, false);
+});
+
+test('panel_view_shows_the_table_when_it_has_rows', () => {
+  assert.equal(panelView(readyList()).showTable, true);
+  assert.equal(panelView(finishedRun()).showTable, true);
+});
+
+test('panel_view_hides_a_table_without_rows', () => {
+  assert.equal(panelView(initialState()).showTable, false);
+  assert.equal(panelView(apply(readyList(), started(0), finished(0, 0, false))).showTable, false);
+});
+
+test('panel_view_shows_the_summary_and_hides_the_settings_and_run_when_finished', () => {
+  const view = panelView(finishedRun());
+  assert.equal(view.showSummary, true);
+  assert.equal(view.showSettings, false);
+});
+
+test('panel_view_shows_the_settings_and_run_and_no_summary_before_finishing', () => {
+  for (const state of [readyList(), reduce(readyList(), started(3))]) {
+    const view = panelView(state);
+    assert.equal(view.showSummary, false, state.phase);
+    assert.equal(view.showSettings, true, state.phase);
+  }
+});
+
+test('panel_view_marks_the_drop_area_busy_while_running', () => {
+  assert.equal(panelView(reduce(readyList(), started(3))).dropBusy, true);
+});
+
+test('panel_view_leaves_the_drop_area_free_when_not_running', () => {
+  for (const state of [initialState(), readyList(), finishedRun()]) {
+    assert.equal(panelView(state).dropBusy, false, state.phase);
+  }
+});
+
+// what the page does with a rejected command
+
+test('after_a_known_or_unknown_rejection_the_page_says_so_and_logs_only_the_unknown', () => {
+  assert.deepEqual(afterRejection('output-missing'), {
+    log: false,
+    action: { type: 'command-rejected', payload: 'output-missing' },
+  });
+  assert.deepEqual(afterRejection('/home/x failed'), {
+    log: true,
+    action: { type: 'command-rejected', payload: '/home/x failed' },
+  });
+});
+
+test('after_a_busy_rejection_the_page_says_nothing_more_and_logs_nothing', () => {
+  assert.deepEqual(afterRejection('busy'), { log: false, action: null });
+});
+
+// Minor 1: a skipped row stays skipped when a run breaks off
+
+test('a_waiting_row_without_a_skip_becomes_the_broken_off_failure', () => {
+  const state = apply(
+    initialState(),
+    listed([entry('a.png'), entry('b.png')]),
+    started(2),
+    fileStarted(0),
+    done(0, 'a.png'),
+    finished(1, 1, true),
+  );
+  assert.deepEqual(rowView(state.rows[1]), {
+    kind: 'failed',
+    name: 'b.png',
+    text: 'failed: The run ended before this file was done',
+  });
+});
+
+test('a_waiting_row_with_a_skip_stays_skipped_with_its_own_reason_after_the_break', () => {
+  const state = apply(
+    initialState(),
+    listed([entry('a.png'), entry('notes.txt', null, SKIP)]),
+    started(2),
+    fileStarted(0),
+    done(0, 'a.png'),
+    finished(1, 1, true),
+  );
+  assert.deepEqual(rowView(state.rows[1]), { kind: 'skipped', name: 'notes.txt', text: `skipped: ${SKIP_LOWER}` });
+});
+
+// Minor 3: the reason after "Will be skipped: " and "skipped: " starts in lower case
+
+test('a_skip_reason_reads_in_lower_case_after_its_prefix', () => {
+  const ready = reduce(
+    initialState(),
+    listed([entry('notes.txt', null, SKIP), entry('gone.png', null, 'Not a readable file')]),
+  );
+  assert.equal(rowView(ready.rows[0]).text, 'Will be skipped: not a PNG, JPG, SVG or WebP file');
+  assert.equal(rowView(ready.rows[1]).text, 'Will be skipped: not a readable file');
+  const running = reduce(ready, started(2));
+  assert.equal(rowView(running.rows[0]).text, 'skipped: not a PNG, JPG, SVG or WebP file');
+});
+
+test('a_skip_reason_is_not_capitalised_and_a_lower_case_or_acronym_start_is_kept', () => {
+  const ready = reduce(
+    initialState(),
+    listed([
+      entry('notes.txt', null, SKIP),
+      entry('a.png', null, 'already lower case'),
+      entry('b.png', null, 'PNG decoder refused it'),
+      entry('(over the limit)', null, '3 more files not optimised: over the 2000-file limit'),
+    ]),
+  );
+  const texts = ready.rows.map((row) => rowView(row).text);
+  assert.doesNotMatch(texts[0], /: Not /);
+  assert.equal(texts[1], 'Will be skipped: already lower case');
+  assert.equal(texts[2], 'Will be skipped: PNG decoder refused it');
+  assert.equal(texts[3], 'Will be skipped: 3 more files not optimised: over the 2000-file limit');
+  const running = reduce(ready, started(4));
+  assert.doesNotMatch(rowView(running.rows[0]).text, /: Not /);
+  assert.equal(rowView(running.rows[2]).text, 'skipped: PNG decoder refused it');
 });

@@ -1,23 +1,28 @@
 // The Lunaepix window. The backend does the work and sends events (see
 // src-tauri/INTERFACE.md); `state.js` turns each event or local action into
-// the next state and `render` shows it. File and folder names, reasons and
-// notes are written with textContent only.
+// the next state and decides what shows, and `table.js` writes it into the
+// page. This file only looks up the elements, applies those decisions and
+// wires the events: every choice about what is sent or shown is made in a
+// tested function. File and folder names, reasons and notes are written with
+// textContent only.
 
 import {
+  afterRejection,
   canChoose,
   canOpenFolder,
   canRun,
-  classifyRejection,
   dropTitleText,
   headingLine,
   initialState,
+  panelView,
   reduce,
-  runSettings,
   saveToText,
+  settingsView,
   settledFailures,
+  startRunArgs,
   summaryLine,
 } from './state.js';
-import { buildRow, setHeads } from './table.js';
+import { hideKeepingFocus, markInvalid, setHeads, syncNumber, syncRows, syncStatus } from './table.js';
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -42,8 +47,7 @@ const summary = document.getElementById('summary');
 const summaryText = document.getElementById('summaryText');
 const openFolder = document.getElementById('openFolder');
 const settings = document.getElementById('settings');
-const modeLossless = document.getElementById('modeLossless');
-const modeLossy = document.getElementById('modeLossy');
+const modeRadios = [document.getElementById('modeLossless'), document.getElementById('modeLossy')];
 const qualityRange = document.getElementById('qualityRange');
 const qualityNumber = document.getElementById('qualityNumber');
 const qualityError = document.getElementById('qualityError');
@@ -54,121 +58,62 @@ const runRow = document.getElementById('runRow');
 const run = document.getElementById('run');
 
 let state = initialState();
-// What is already on screen: the row list shown, its row objects and their
-// <tr> elements, whether the heads are the list's, and the last message.
-let shownRows = null;
-let shownRowObjects = [];
-let rowElements = [];
-let shownListing = true;
-let renderedMessageSeq = 0;
+// What is already on screen: the table's rows (see `syncRows`) and the
+// sequence number of the last message in the live region.
+const shownRows = { rows: null, objects: [], elements: [] };
+let shownMessageSeq = 0;
 
 function setDisabled(button, disabled) {
   button.setAttribute('aria-disabled', String(disabled));
 }
 
-/** Hides `element`; if focus is inside it, moves focus to `fallback` first. */
-function hide(element, hidden, fallback) {
-  if (hidden && !element.hidden && element.contains(document.activeElement)) {
-    fallback.focus();
+function renderSettings() {
+  const view = settingsView(state);
+  settings.classList.toggle('-busy', view.radiosDisabled);
+  for (const radio of modeRadios) {
+    radio.checked = radio.value === state.mode;
+    radio.disabled = view.radiosDisabled;
   }
-  element.hidden = hidden;
-}
-
-function renderRows() {
-  // A new list or a new run: build every row.
-  if (state.rows !== shownRows) {
-    rowElements = state.rows.map((row) => buildRow(document, row));
-    resultsBody.replaceChildren(...rowElements);
-    shownRows = state.rows;
-    shownRowObjects = state.rows.slice();
-    return;
-  }
-  // The same run: rebuild only the rows that changed.
-  for (let index = 0; index < state.rows.length; index += 1) {
-    if (state.rows[index] === shownRowObjects[index]) {
-      continue;
-    }
-    const tr = buildRow(document, state.rows[index]);
-    if (index < rowElements.length) {
-      rowElements[index].replaceWith(tr);
-    } else {
-      resultsBody.append(tr);
-    }
-    rowElements[index] = tr;
-    shownRowObjects[index] = state.rows[index];
-  }
-}
-
-function renderSettings(running) {
-  settings.classList.toggle('-busy', running);
-  modeLossless.checked = state.mode === 'lossless';
-  modeLossy.checked = state.mode === 'lossy';
-  modeLossless.disabled = running;
-  modeLossy.disabled = running;
-
-  const qualityLocked = running || state.mode === 'lossless';
   qualityRange.value = String(state.quality);
-  qualityRange.disabled = qualityLocked;
-  // Written only when it differs, so typing is never interrupted.
-  if (qualityNumber.value !== state.qualityText) {
-    qualityNumber.value = state.qualityText;
-  }
-  qualityNumber.disabled = qualityLocked;
-
-  const invalid = state.mode === 'lossy' && runSettings(state) === null;
-  qualityNumber.setAttribute('aria-invalid', String(invalid));
-  if (invalid) {
-    qualityNumber.setAttribute('aria-describedby', 'qualityError');
-  } else {
-    qualityNumber.removeAttribute('aria-describedby');
-  }
-  qualityError.hidden = !invalid;
+  qualityRange.disabled = view.qualityDisabled;
+  syncNumber(qualityNumber, state.qualityText);
+  qualityNumber.disabled = view.qualityDisabled;
+  markInvalid(qualityNumber, qualityError, view.invalid);
 
   saveTo.textContent = saveToText(state);
-  hide(clearOutput, running || state.folder === null, running ? run : chooseOutput);
-  chooseOutput.hidden = running;
+  // Focus on a button that goes moves to the next one that stays.
+  hideKeepingFocus(document, clearOutput, !view.showClearOutput, chooseOutput);
+  hideKeepingFocus(document, chooseOutput, !view.showChooseOutput, run);
 }
 
 function render() {
-  const running = state.phase === 'running';
-  const finished = state.phase === 'finished';
+  const view = panelView(state);
 
   drop.classList.toggle('-over', state.dragOver);
-  drop.classList.toggle('-busy', running);
+  drop.classList.toggle('-busy', view.dropBusy);
   dropTitle.textContent = dropTitleText(state);
   setDisabled(chooseFiles, !canChoose(state));
 
-  hide(panel, state.phase === 'empty', chooseFiles);
+  hideKeepingFocus(document, panel, !view.showPanel, chooseFiles);
   panelHeading.textContent = headingLine(state);
   setDisabled(clearList, !canChoose(state));
 
-  const listing = !running && !finished;
-  if (listing !== shownListing) {
-    setHeads(document, heads, listing);
-    shownListing = listing;
-  }
-  renderRows();
-  results.hidden = state.rows.length === 0;
+  setHeads(document, heads, view.listing);
+  syncRows(document, resultsBody, shownRows, state.rows);
+  results.hidden = !view.showTable;
 
   // Finished: the summary and Open folder take the place of the settings and
   // Run. The summary shows first, so focus on Run can move to Open folder.
-  hide(summary, !finished, chooseFiles);
-  if (finished) {
-    summaryText.textContent = summaryLine(state);
-  }
+  hideKeepingFocus(document, summary, !view.showSummary, chooseFiles);
+  summaryText.textContent = summaryLine(state);
   setDisabled(openFolder, !canOpenFolder(state));
-  hide(settings, finished, openFolder);
-  hide(runRow, finished, openFolder);
-  if (!finished) {
-    renderSettings(running);
-  }
+  hideKeepingFocus(document, settings, !view.showSettings, openFolder);
+  hideKeepingFocus(document, runRow, !view.showSettings, openFolder);
+  renderSettings();
   setDisabled(run, !canRun(state));
 
   // The one live region: written only when there is a new message.
-  if (state.messageSeq !== renderedMessageSeq) {
-    status.textContent = state.message;
-    renderedMessageSeq = state.messageSeq;
-  }
+  shownMessageSeq = syncStatus(status, shownMessageSeq, state);
 }
 
 function dispatch(action) {
@@ -180,20 +125,18 @@ async function call(command, args) {
   try {
     await invoke(command, args);
   } catch (reason) {
-    const kind = classifyRejection(reason);
-    // "busy" is announced by the run-busy event that comes with it.
-    if (kind === 'busy') {
-      return;
-    }
-    if (kind === 'unknown') {
+    const after = afterRejection(reason);
+    if (after.log) {
       console.error(command, reason);
     }
-    dispatch({ type: 'command-rejected', payload: reason });
+    if (after.action !== null) {
+      dispatch(after.action);
+    }
   }
 }
 
 // A button that cannot be used right now stays focusable (aria-disabled), so
-// its click does nothing.
+// its click asks the same gate and does nothing.
 function onClick(button, gate, command) {
   button.addEventListener('click', () => {
     if (gate(state)) {
@@ -209,14 +152,13 @@ onClick(clearOutput, canChoose, 'clear_output_folder');
 onClick(openFolder, canOpenFolder, 'open_output_folder');
 
 run.addEventListener('click', () => {
-  const runWith = runSettings(state);
-  // Only valid settings are ever sent; the backend checks them again.
-  if (canRun(state) && runWith !== null) {
-    call('start_run', { settings: runWith });
+  const args = startRunArgs(state);
+  if (args !== null) {
+    call('start_run', args);
   }
 });
 
-for (const radio of [modeLossless, modeLossy]) {
+for (const radio of modeRadios) {
   radio.addEventListener('change', () => {
     if (radio.checked) {
       dispatch({ type: 'set-mode', payload: radio.value });
