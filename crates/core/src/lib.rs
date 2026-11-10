@@ -36,8 +36,9 @@ pub mod worker;
 
 pub use lossy::{DEFAULT_QUALITY, Note, Quality};
 pub use plan::{
-    MAX_FILE_BYTES, MAX_PIXELS, MAX_RUN_FILES, MAX_SVG_DEPTH, MAX_SVG_ENTITY_BYTES, MAX_SVG_NODES,
-    MAX_WORKER_MESSAGE_BYTES, MAX_WORKER_OUTPUT_BYTES, WORKER_TIMEOUT, plan_files, plan_folder,
+    MAX_ANIMATION_CANVAS_PIXELS, MAX_ANIMATION_PIXELS, MAX_FILE_BYTES, MAX_PIXELS, MAX_RUN_FILES,
+    MAX_SVG_DEPTH, MAX_SVG_ENTITY_BYTES, MAX_SVG_NODES, MAX_WORKER_MESSAGE_BYTES,
+    MAX_WORKER_OUTPUT_BYTES, WORKER_TIMEOUT, plan_files, plan_folder,
 };
 pub use run::{Crash, FileResult, RunError, StopHandle, Worker, run, run_until_stopped};
 pub use worker::WORKER_FLAG;

@@ -206,18 +206,33 @@ pub fn with_chunks(file: &[u8], extra: &[([u8; 4], &[u8])]) -> Vec<u8> {
 /// image chunks of one of `frames` (whole simple files of `w`x`h` pixels),
 /// shown for 100 ms.
 pub fn animated(frames: &[Vec<u8>], w: u32, h: u32) -> Vec<u8> {
+    let durations = vec![100; frames.len()];
+    animated_with(frames, w, h, &durations, 0, 0)
+}
+
+/// [`animated`] with a duration per frame, a loop count (0 is forever) and a
+/// background colour (as `ANIM` stores it: blue, green, red, alpha bytes,
+/// read as one little-endian number).
+pub fn animated_with(
+    frames: &[Vec<u8>],
+    w: u32,
+    h: u32,
+    durations: &[u32],
+    loop_count: u16,
+    background: u32,
+) -> Vec<u8> {
+    assert_eq!(frames.len(), durations.len());
     let mut chunks: Vec<RawChunk> = vec![
         (*b"VP8X", vp8x_payload(FLAG_ANIMATION | FLAG_ALPHA, w, h)),
-        // Background colour, then a loop count of 0 (forever).
-        (*b"ANIM", vec![0; 6]),
+        (*b"ANIM", anim_payload(loop_count, background)),
     ];
-    for frame in frames {
+    for (frame, &duration) in frames.iter().zip(durations) {
         // The frame header: X and Y (halved), width-1, height-1, the
         // duration, and a flags byte, 3 bytes each but the last.
         let mut data = vec![0u8; 6];
         data.extend_from_slice(&(w - 1).to_le_bytes()[..3]);
         data.extend_from_slice(&(h - 1).to_le_bytes()[..3]);
-        data.extend_from_slice(&100u32.to_le_bytes()[..3]);
+        data.extend_from_slice(&duration.to_le_bytes()[..3]);
         data.push(0);
         let inner: Vec<RawChunk> = chunks_of(frame)
             .into_iter()
@@ -228,6 +243,55 @@ pub fn animated(frames: &[Vec<u8>], w: u32, h: u32) -> Vec<u8> {
         chunks.push((*b"ANMF", data));
     }
     from_chunks(&chunks)
+}
+
+/// `file` (an animation) with frame `index` moved to `x`,`y` on the canvas.
+/// The frame header stores half of each, so both must be even.
+pub fn with_frame_at(file: &[u8], index: usize, x: u32, y: u32) -> Vec<u8> {
+    assert!(
+        x.is_multiple_of(2) && y.is_multiple_of(2),
+        "frame offsets are stored halved"
+    );
+    let mut chunks = chunks_of(file);
+    let (_, data) = chunks
+        .iter_mut()
+        .filter(|(name, _)| name == b"ANMF")
+        .nth(index)
+        .expect("no such frame");
+    data[..3].copy_from_slice(&(x / 2).to_le_bytes()[..3]);
+    data[3..6].copy_from_slice(&(y / 2).to_le_bytes()[..3]);
+    from_chunks(&chunks)
+}
+
+/// An `ANIM` payload: the background colour, then the loop count.
+pub fn anim_payload(loop_count: u16, background: u32) -> Vec<u8> {
+    let mut data = background.to_le_bytes().to_vec();
+    data.extend_from_slice(&loop_count.to_le_bytes());
+    data
+}
+
+/// The duration in every `ANMF` frame header of a file, in order.
+pub fn anmf_durations(file: &[u8]) -> Vec<u32> {
+    chunks_of(file)
+        .into_iter()
+        .filter(|(name, _)| name == b"ANMF")
+        .map(|(_, data)| u32::from_le_bytes([data[12], data[13], data[14], 0]))
+        .collect()
+}
+
+/// The FourCCs of the image chunks inside every `ANMF` frame, in order.
+pub fn anmf_image_chunks(file: &[u8]) -> Vec<Vec<String>> {
+    chunks_of(file)
+        .into_iter()
+        .filter(|(name, _)| name == b"ANMF")
+        .map(|(_, data)| {
+            let mut inner = b"RIFF".to_vec();
+            inner.extend_from_slice(&(data.len() as u32 - 12).to_le_bytes());
+            inner.extend_from_slice(b"WEBP");
+            inner.extend_from_slice(&data[16..]);
+            chunk_names(&inner)
+        })
+        .collect()
 }
 
 // --- EXIF ---------------------------------------------------------------------------

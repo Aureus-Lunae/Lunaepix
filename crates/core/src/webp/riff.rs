@@ -64,6 +64,7 @@ const FLAG_ICC: u8 = 0x20;
 const FLAG_ALPHA: u8 = 0x10;
 const FLAG_EXIF: u8 = 0x08;
 const FLAG_XMP: u8 = 0x04;
+const FLAG_ANIMATION: u8 = 0x02;
 
 impl WebpFile<'_> {
     /// The file rewritten with only the kept chunks (see [`KEPT`]), in their
@@ -150,36 +151,68 @@ fn riff_file(body: &[u8], size: u32) -> Vec<u8> {
     out
 }
 
-/// A lossy result (libwebp's simple `VP8 ` file, or its `VP8X`, `ALPH`,
-/// `VP8 ` file) with the source's metadata, under exactly the rules of
+/// A lossy result with the source's metadata, under exactly the rules of
 /// [`WebpFile::stripped`]: every `ICCP` chunk of the source, byte for byte;
 /// its first `EXIF` chunk only when that turns the picture; never `XMP ` or
-/// an unknown chunk.
+/// an unknown chunk. Every odd chunk is padded and the RIFF size rewritten.
 ///
-/// The file is written as `VP8X`, `ICCP`…, `ALPH`, the image, `EXIF`, every
-/// odd chunk padded and the RIFF size rewritten. A `VP8X` is written when
-/// there is a profile, a rotation or alpha, and none otherwise, so a result
-/// with nothing to add comes back as it is. Its canvas is the image's own
-/// size, its reserved bits are zero, and its flags match the chunks written:
-/// alpha for an `ALPH` chunk (or a `VP8L` image that uses alpha), EXIF for
-/// the `EXIF` chunk, never XMP or animation, and the ICC flag by the source's
-/// rule ([`WebpFile::kept_icc_flag`]).
+/// A still result (libwebp's simple `VP8 ` file, or its `VP8X`, `ALPH`,
+/// `VP8 ` file) is written as `VP8X`, `ICCP`…, `ALPH`, the image, `EXIF`. A
+/// `VP8X` is written when there is a profile, a rotation or alpha, and none
+/// otherwise, so a result with nothing to add comes back as it is. Its
+/// canvas is the image's own size, its reserved bits are zero, and its flags
+/// match the chunks written: alpha for an `ALPH` chunk (or a `VP8L` image
+/// that uses alpha), EXIF for the `EXIF` chunk, never XMP or animation, and
+/// the ICC flag by the source's rule ([`WebpFile::kept_icc_flag`]).
 ///
-/// Refuses a result that is not a readable WebP file, that is not a still
-/// image, or whose image declares a zero width or height.
+/// An animated result (libwebp's `VP8X`, `ANIM`, `ANMF`… file) is written as
+/// `VP8X`, `ICCP`…, `ANIM`, `ANMF`…, `EXIF`, the animation chunks byte for
+/// byte. Its `VP8X` is the result's own (canvas, alpha flag and reserved
+/// bits as libwebp wrote them) with the animation flag set, EXIF set for the
+/// `EXIF` chunk, XMP clear and the ICC flag by the source's rule.
+///
+/// Refuses a result that is not a readable WebP file, a still image that
+/// declares a zero width or height, and an animation without a `VP8X`.
 pub(crate) fn with_metadata(encoded: &[u8], source: &WebpFile<'_>) -> Result<Vec<u8>, String> {
     let result = parse(encoded)
         .map_err(|reason| format!("the lossy result is not a readable WebP file ({reason})"))?;
+    let metadata = Metadata {
+        profiles: source
+            .chunks
+            .iter()
+            .filter(|chunk| &chunk.fourcc == b"ICCP")
+            .collect(),
+        rotation: source.rotated_exif().map(|at| &source.chunks[at]),
+        icc_flag: source.kept_icc_flag(),
+    };
+    let body = if result.kind == Kind::Animated {
+        animation_body(&result, &metadata)?
+    } else {
+        still_body(&result, &metadata)?
+    };
+    let size = u32::try_from(body.len())
+        .map_err(|_| "the lossy result is too large for a WebP file".to_owned())?;
+    Ok(riff_file(&body, size))
+}
+
+/// What [`with_metadata`] carries over from the source.
+struct Metadata<'s> {
+    /// Every `ICCP` chunk, in order.
+    profiles: Vec<&'s Chunk<'s>>,
+    /// The first `EXIF` chunk, when it turns the picture.
+    rotation: Option<&'s Chunk<'s>>,
+    /// The ICC flag to write ([`WebpFile::kept_icc_flag`]).
+    icc_flag: u8,
+}
+
+/// The chunks of a still result with the metadata, after `WEBP`.
+fn still_body(result: &WebpFile<'_>, metadata: &Metadata<'_>) -> Result<Vec<u8>, String> {
     // A file that is not an animation has a still image chunk (`kind_of`).
-    let image = (result.kind != Kind::Animated)
-        .then(|| {
-            result
-                .chunks
-                .iter()
-                .find(|chunk| matches!(&chunk.fourcc, b"VP8 " | b"VP8L"))
-        })
-        .flatten()
-        .ok_or_else(|| "the lossy result is not a still WebP image".to_owned())?;
+    let image = result
+        .chunks
+        .iter()
+        .find(|chunk| matches!(&chunk.fourcc, b"VP8 " | b"VP8L"))
+        .ok_or_else(|| "the lossy result has no image".to_owned())?;
     let alph = (&image.fourcc == b"VP8 ")
         .then(|| result.chunks.iter().find(|chunk| &chunk.fourcc == b"ALPH"))
         .flatten();
@@ -191,20 +224,14 @@ pub(crate) fn with_metadata(encoded: &[u8], source: &WebpFile<'_>) -> Result<Vec
         ));
     }
     let alpha = alph.is_some() || (&image.fourcc == b"VP8L" && vp8l_uses_alpha(image.data));
-    let profiles: Vec<&Chunk<'_>> = source
-        .chunks
-        .iter()
-        .filter(|chunk| &chunk.fourcc == b"ICCP")
-        .collect();
-    let rotation = source.rotated_exif().map(|at| &source.chunks[at]);
 
     let mut body = b"WEBP".to_vec();
-    if alpha || !profiles.is_empty() || rotation.is_some() {
-        let mut flags = source.kept_icc_flag();
+    if alpha || !metadata.profiles.is_empty() || metadata.rotation.is_some() {
+        let mut flags = metadata.icc_flag;
         if alpha {
             flags |= FLAG_ALPHA;
         }
-        if rotation.is_some() {
+        if metadata.rotation.is_some() {
             flags |= FLAG_EXIF;
         }
         let mut vp8x = vec![flags, 0, 0, 0];
@@ -212,17 +239,99 @@ pub(crate) fn with_metadata(encoded: &[u8], source: &WebpFile<'_>) -> Result<Vec
         vp8x.extend_from_slice(&(height - 1).to_le_bytes()[..3]);
         push_chunk(&mut body, b"VP8X", &vp8x);
     }
-    for chunk in profiles
-        .into_iter()
+    for chunk in metadata
+        .profiles
+        .iter()
+        .copied()
         .chain(alph)
         .chain([image])
-        .chain(rotation)
+        .chain(metadata.rotation)
     {
         push_chunk(&mut body, &chunk.fourcc, chunk.data);
     }
-    let size = u32::try_from(body.len())
-        .map_err(|_| "the lossy result is too large for a WebP file".to_owned())?;
-    Ok(riff_file(&body, size))
+    Ok(body)
+}
+
+/// The chunks of an animated result with the metadata, after `WEBP`.
+fn animation_body(result: &WebpFile<'_>, metadata: &Metadata<'_>) -> Result<Vec<u8>, String> {
+    let vp8x = result
+        .chunks
+        .first()
+        .filter(|chunk| &chunk.fourcc == b"VP8X")
+        .ok_or_else(|| "the lossy result is an animation without a VP8X chunk".to_owned())?;
+    // `parse` refuses a VP8X shorter than its 10 bytes.
+    let mut header = vp8x.data.to_vec();
+    header[0] &= !(FLAG_ICC | FLAG_EXIF | FLAG_XMP);
+    header[0] |= metadata.icc_flag | FLAG_ANIMATION;
+    if metadata.rotation.is_some() {
+        header[0] |= FLAG_EXIF;
+    }
+
+    let mut body = b"WEBP".to_vec();
+    push_chunk(&mut body, b"VP8X", &header);
+    let animation = result
+        .chunks
+        .iter()
+        .filter(|chunk| matches!(&chunk.fourcc, b"ANIM" | b"ANMF"));
+    for chunk in metadata
+        .profiles
+        .iter()
+        .copied()
+        .chain(animation)
+        .chain(metadata.rotation)
+    {
+        push_chunk(&mut body, &chunk.fourcc, chunk.data);
+    }
+    Ok(body)
+}
+
+/// The length of an `ANMF` frame header: X and Y offsets, width and height,
+/// duration (3 bytes each) and a flags byte.
+const ANMF_HEADER_LEN: usize = 16;
+
+/// What an animation's headers declare, read without decoding: the `VP8X`
+/// canvas, the number of `ANMF` frames and the sum of their durations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AnimationHeader {
+    pub width: u32,
+    pub height: u32,
+    pub frames: u64,
+    pub duration_ms: u64,
+}
+
+/// The canvas, frame count and total duration of an animation, from its
+/// `VP8X` and `ANMF` headers; nothing is decoded. The total is the sum of
+/// the 24-bit frame durations, which is what libwebp's animation decoder
+/// counts up to. At most [`MAX_CHUNKS`] frames of at most 2^24 ms each, so
+/// neither number can overflow.
+///
+/// Refuses a file without a `VP8X` (an animation needs one for its canvas)
+/// and an `ANMF` chunk shorter than its frame header.
+pub(crate) fn animation_header(file: &WebpFile<'_>) -> Result<AnimationHeader, String> {
+    let vp8x = file
+        .chunks
+        .first()
+        .filter(|chunk| &chunk.fourcc == b"VP8X")
+        .ok_or_else(|| unreadable("the animation has no VP8X chunk"))?;
+    // `parse` read this header already, so it is there and well-formed.
+    let (width, height) = declared_size(vp8x)?.unwrap_or_default();
+    let mut frames = 0;
+    let mut duration_ms = 0;
+    for frame in file.chunks.iter().filter(|chunk| &chunk.fourcc == b"ANMF") {
+        let Some(&[.., d0, d1, d2, _flags]) = frame.data.first_chunk::<ANMF_HEADER_LEN>() else {
+            return Err(unreadable(&format!(
+                "an ANMF chunk is shorter than its {ANMF_HEADER_LEN}-byte header"
+            )));
+        };
+        frames += 1;
+        duration_ms += u64::from(u32::from_le_bytes([d0, d1, d2, 0]));
+    }
+    Ok(AnimationHeader {
+        width,
+        height,
+        frames,
+        duration_ms,
+    })
 }
 
 /// Whether a `VP8L` image says it uses alpha: bit 28 of its header, after
@@ -484,6 +593,18 @@ pub(super) mod tests {
     /// An `ANMF` frame: the 16-byte frame header and a few bytes of frame data.
     fn anmf() -> Vec<u8> {
         chunk(b"ANMF", &[0; 24])
+    }
+
+    /// An `ANMF` chunk of only its 16-byte frame header: at 0,0, `w`x`h`,
+    /// shown for `duration_ms`, with every flag bit set (so a reader that
+    /// takes 32 bits for the 24-bit duration reads a different number).
+    pub(in crate::webp) fn anmf_header(w: u32, h: u32, duration_ms: u32) -> Vec<u8> {
+        let mut data = vec![0u8; 6];
+        data.extend_from_slice(&(w - 1).to_le_bytes()[..3]);
+        data.extend_from_slice(&(h - 1).to_le_bytes()[..3]);
+        data.extend_from_slice(&duration_ms.to_le_bytes()[..3]);
+        data.push(0xFF);
+        chunk(b"ANMF", &data)
     }
 
     /// `ANIM`: background colour and loop count.
@@ -1573,13 +1694,8 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn with_metadata_refuses_an_animation_and_an_empty_image() {
+    fn with_metadata_refuses_an_empty_image() {
         let source = lossless_file(false);
-        let animation = fx::animated(&[lossless_file(false), lossless_file(true)], SIZE, SIZE);
-        assert_eq!(
-            with_metadata_of(&animation, &source).unwrap_err(),
-            "the lossy result is not a still WebP image"
-        );
         assert_eq!(
             with_metadata_of(&riff(&[vp8(0, 16)]), &source).unwrap_err(),
             "the lossy result has an empty image (0×16)"
@@ -1590,6 +1706,162 @@ pub(super) mod tests {
         );
         // The same headers with a size are taken.
         assert!(with_metadata_of(&riff(&[vp8(16, 16)]), &source).is_ok());
+    }
+
+    // --- with_metadata: an animated result ----------------------------------------------
+
+    /// An animation as a lossy encoder could write it: two frames of
+    /// `size`x`size`, timed 120 and 80 ms, looping twice, on a background.
+    fn animated_result(size: u32) -> Vec<u8> {
+        let frames = [
+            fx::lossy(&fx::photo_rgba(size, size, true), size, size, 70.0),
+            fx::lossy(&fx::photo_rgba(size, size, false), size, size, 70.0),
+        ];
+        fx::animated_with(&frames, size, size, &[120, 80], 2, 0x8040_2010)
+    }
+
+    /// An animated source with a profile, a rotation and XMP.
+    fn animated_source() -> Vec<u8> {
+        let frames = [lossless_file(false), lossless_file(true)];
+        let animation = fx::animated(&frames, SIZE, SIZE);
+        fx::with_chunks(
+            &animation,
+            &[
+                (*b"ICCP", ICC_ODD),
+                (*b"EXIF", &rotated_exif()),
+                (*b"XMP ", b"<x:xmpmeta/>"),
+            ],
+        )
+    }
+
+    fn payloads_of(file: &[u8], fourcc: &[u8; 4]) -> Vec<Vec<u8>> {
+        fx::chunks_of(file)
+            .into_iter()
+            .filter(|(name, _)| name == fourcc)
+            .map(|(_, data)| data)
+            .collect()
+    }
+
+    #[test]
+    fn with_metadata_keeps_an_animation_and_adds_the_sources_metadata() {
+        // The result's canvas differs from the source's: the canvas written
+        // is the result's own.
+        let result = animated_result(24);
+        let source = animated_source();
+
+        let out = with_metadata_of(&result, &source).unwrap();
+
+        assert_eq!(
+            fx::chunk_names(&out),
+            ["VP8X", "ICCP", "ANIM", "ANMF", "ANMF", "EXIF"]
+        );
+        assert_eq!(payloads_of(&out, b"ANIM"), payloads_of(&result, b"ANIM"));
+        assert_eq!(payloads_of(&out, b"ANMF"), payloads_of(&result, b"ANMF"));
+        assert_eq!(payloads_of(&out, b"ICCP"), [ICC_ODD]);
+        assert_eq!(payloads_of(&out, b"EXIF"), [rotated_exif()]);
+        assert_eq!(
+            flags(&out),
+            fx::FLAG_ANIMATION | fx::FLAG_ALPHA | fx::FLAG_ICC | fx::FLAG_EXIF
+        );
+        assert_eq!(canvas(&out), (24, 24));
+        assert_well_formed(&out);
+        // An independent decoder sees the result's frames and timings.
+        assert_eq!(fx::decode_frames(&out), fx::decode_frames(&result));
+    }
+
+    #[test]
+    fn with_metadata_keeps_a_clear_icc_flag_on_an_animation() {
+        let mut source = animated_source();
+        source[fx::VP8X_FLAGS_AT] &= !fx::FLAG_ICC;
+        let out = with_metadata_of(&animated_result(24), &source).unwrap();
+        assert_eq!(payloads_of(&out, b"ICCP"), [ICC_ODD]);
+        assert_eq!(flags(&out) & fx::FLAG_ICC, 0);
+        assert_eq!(flags(&out) & fx::FLAG_ANIMATION, fx::FLAG_ANIMATION);
+    }
+
+    #[test]
+    fn with_metadata_gives_a_still_result_no_animation_flag() {
+        // An animated source, a still result: the result decides.
+        let out = with_metadata_of(&encoded(false), &animated_source()).unwrap();
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "ICCP", "VP8 ", "EXIF"]);
+        assert_eq!(flags(&out), fx::FLAG_ICC | fx::FLAG_EXIF);
+    }
+
+    #[test]
+    fn with_metadata_refuses_an_animation_without_vp8x() {
+        let result = riff(&[anim(), anmf_header(SIZE, SIZE, 100)]);
+        assert_eq!(parse(&result).unwrap().kind, Kind::Animated, "fixture");
+        assert_eq!(
+            with_metadata_of(&result, &lossless_file(false)).unwrap_err(),
+            "the lossy result is an animation without a VP8X chunk"
+        );
+    }
+
+    // --- animation_header ------------------------------------------------------------
+
+    #[test]
+    fn animation_header_reads_the_canvas_the_frames_and_the_total_duration() {
+        let bytes = riff(&[
+            vp8x(0x02, 300, 200),
+            anim(),
+            anmf_header(300, 200, 100),
+            anmf_header(10, 10, 250),
+            anmf_header(300, 200, 70),
+        ]);
+        let file = parse_quickly(&bytes).unwrap();
+        assert_eq!(
+            animation_header(&file),
+            Ok(AnimationHeader {
+                width: 300,
+                height: 200,
+                frames: 3,
+                duration_ms: 420,
+            })
+        );
+        // The largest 24-bit duration, twice: the flags byte after it is not
+        // part of the number.
+        let bytes = riff(&[
+            vp8x(0x02, 1, 1),
+            anim(),
+            anmf_header(1, 1, 0xFF_FFFF),
+            anmf_header(1, 1, 0xFF_FFFF),
+        ]);
+        let header = animation_header(&parse_quickly(&bytes).unwrap()).unwrap();
+        assert_eq!((header.frames, header.duration_ms), (2, 2 * 0xFF_FFFF));
+        // A real animation from the fixtures.
+        let frames = [lossless_file(true), lossless_file(false)];
+        let real = fx::animated_with(&frames, SIZE, SIZE, &[40, 960], 0, 0);
+        let header = animation_header(&parse_quickly(&real).unwrap()).unwrap();
+        assert_eq!(
+            header,
+            AnimationHeader {
+                width: SIZE,
+                height: SIZE,
+                frames: 2,
+                duration_ms: 1000,
+            }
+        );
+    }
+
+    #[test]
+    fn animation_header_refuses_an_animation_without_vp8x_or_with_a_cut_anmf_header() {
+        let no_vp8x = riff(&[anim(), anmf_header(8, 8, 100)]);
+        let err = animation_header(&parse_quickly(&no_vp8x).unwrap()).unwrap_err();
+        assert_eq!(
+            err,
+            "could not read the WebP data: the animation has no VP8X chunk"
+        );
+        let mut cut = anmf_header(8, 8, 100);
+        // 15 bytes of header: the chunk size, the payload and its pad.
+        cut[4] = 15;
+        cut.truncate(8 + 15);
+        cut.push(0);
+        let bytes = riff(&[vp8x(0x02, 8, 8), anim(), anmf_header(8, 8, 100), cut]);
+        let err = animation_header(&parse_quickly(&bytes).unwrap()).unwrap_err();
+        assert_eq!(
+            err,
+            "could not read the WebP data: an ANMF chunk is shorter than its 16-byte header"
+        );
     }
 
     #[test]
