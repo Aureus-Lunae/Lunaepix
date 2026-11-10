@@ -4,10 +4,6 @@
 //! The format modules (JPG, PNG, WebP) build on these; nothing here knows a
 //! format.
 
-// Tasks 3-6 (lossy JPG, PNG, still and animated WebP) consume the crate-private
-// items below; until they land, only the tests use them.
-#![allow(dead_code)]
-
 use std::fmt;
 
 /// A lossy quality, an integer from 0 to 100. A higher number keeps more
