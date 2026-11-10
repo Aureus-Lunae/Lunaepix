@@ -27,7 +27,9 @@ use mozjpeg_sys::{
 };
 
 use super::{Compress, Decompress, check_start, fail, run_libjpeg, source_len};
-use crate::lossy::{Lossy, Note, Quality, Shape, check_shape, finish, kept_lossless};
+use crate::lossy::{
+    Lossy, Note, Quality, Shape, check_shape, finish, kept_lossless, reserve_pixels,
+};
 
 /// The first APPn marker code; APP15 is `APP0 + 15`.
 const APP0: u8 = 0xE0;
@@ -204,17 +206,6 @@ unsafe fn read_pixels(bytes: &[u8], len: c_ulong) -> Source {
             markers,
         })
     }
-}
-
-/// A zeroed pixel buffer of `len` bytes, or an error when that memory cannot
-/// be had (instead of aborting the process).
-fn reserve_pixels(len: usize) -> Result<Vec<u8>, String> {
-    let mut pixels = Vec::new();
-    pixels
-        .try_reserve_exact(len)
-        .map_err(|_| "not enough memory for the pixels".to_owned())?;
-    pixels.resize(len, 0);
-    Ok(pixels)
 }
 
 /// Copies of the markers libjpeg saved, in source order.
@@ -722,13 +713,6 @@ mod tests {
         };
         let err = encode(&decoded, q(75)).unwrap_err();
         assert!(err.contains("65500"), "{err}");
-    }
-
-    #[test]
-    fn reserving_an_impossible_pixel_buffer_fails_with_a_reason() {
-        let err = reserve_pixels(usize::MAX).unwrap_err();
-        assert_eq!(err, "not enough memory for the pixels");
-        assert_eq!(reserve_pixels(12).unwrap().len(), 12);
     }
 
     #[test]

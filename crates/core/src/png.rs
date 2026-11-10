@@ -2,6 +2,14 @@
 
 use crate::plan::{MAX_PIXELS, check_pixels};
 
+mod lossy;
+
+#[expect(
+    unused_imports,
+    reason = "the worker calls it once a run can be lossy (a later task)"
+)]
+pub(crate) use lossy::optimize_lossy;
+
 /// The eight bytes every PNG file starts with.
 const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
@@ -42,29 +50,94 @@ pub(crate) fn optimize(bytes: &[u8]) -> Result<Vec<u8>, String> {
     run_oxipng(bytes)
 }
 
-/// Walk every chunk header (length and type only; the data is not read),
-/// from the signature up to IEND, as oxipng does. A PNG must have exactly one
-/// IHDR, as its first chunk, and its declared size must be within
-/// [`MAX_PIXELS`]. oxipng is more lenient: it accepts an IHDR anywhere and
-/// keeps the last one. So a file that breaks the rule is refused here, before
-/// a later IHDR can slip a huge size past the check.
+/// One chunk header of a PNG file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkHeader {
+    /// The offset of the chunk's length field in the file.
+    at: usize,
+    /// The declared length of the chunk's data.
+    length: u32,
+    kind: [u8; 4],
+}
+
+impl ChunkHeader {
+    /// The whole chunk (length, type, data and CRC), if the file holds all
+    /// of it.
+    fn whole<'a>(&self, bytes: &'a [u8]) -> Option<&'a [u8]> {
+        // Length, type and CRC are 12 bytes; `usize` holds any `u32`.
+        let end = (self.at + 12).checked_add(self.length as usize)?;
+        bytes.get(self.at..end)
+    }
+}
+
+/// The chunk headers after the signature, in order, as oxipng reads them
+/// (length and type only; the data is not read). The walk ends after IEND,
+/// and also after a chunk that runs past the end of the file (that chunk is
+/// still yielded, so its type is seen) or at a header cut short.
+fn chunk_headers(bytes: &[u8]) -> impl Iterator<Item = ChunkHeader> + '_ {
+    let mut next = Some(SIGNATURE.len());
+    std::iter::from_fn(move || {
+        let at = next?;
+        let header = bytes.get(at..at + 8)?;
+        let chunk = ChunkHeader {
+            at,
+            length: u32::from_be_bytes([header[0], header[1], header[2], header[3]]),
+            kind: [header[4], header[5], header[6], header[7]],
+        };
+        next = match chunk.whole(bytes) {
+            Some(whole) if &chunk.kind != b"IEND" => Some(at + whole.len()),
+            _ => None,
+        };
+        Some(chunk)
+    })
+}
+
+/// The type of the first chunk, in file order up to IEND, whose stored CRC
+/// does not match its type and data; `None` when every whole chunk is
+/// right. oxipng reads the same chunks in the same order and refuses the
+/// file at the first mismatch, so this names the chunk its error names. IEND
+/// is not checked (oxipng stops before its CRC), nor is a chunk that runs
+/// past the end of the file (that truncation is reported elsewhere).
+fn first_bad_crc(bytes: &[u8]) -> Option<[u8; 4]> {
+    chunk_headers(bytes)
+        .filter(|chunk| &chunk.kind != b"IEND")
+        .find(|chunk| {
+            chunk.whole(bytes).is_some_and(|whole| {
+                let (body, crc) = whole[4..].split_at(whole.len() - 8);
+                crc32fast::hash(body).to_be_bytes() != crc
+            })
+        })
+        .map(|chunk| chunk.kind)
+}
+
+/// What [`check_chunks`] found besides the checks it passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkCheck {
+    /// The file has an `acTL` chunk: it is an animated PNG.
+    has_actl: bool,
+}
+
+/// Walk every chunk header ([`chunk_headers`]) up to IEND. A PNG must have
+/// exactly one IHDR, as its first chunk, and its declared size must be
+/// within [`MAX_PIXELS`]. oxipng is more lenient: it accepts an IHDR anywhere
+/// and keeps the last one. So a file that breaks the rule is refused here,
+/// before a later IHDR can slip a huge size past the check.
 ///
 /// The walk stops at IEND, and also at a chunk that runs past the end of the
 /// file (or a header cut short), leaving that truncation to oxipng to report.
-fn check_chunks(bytes: &[u8]) -> Result<(), String> {
-    let mut at = SIGNATURE.len();
+/// It also reports whether the file has an `acTL` chunk.
+fn check_chunks(bytes: &[u8]) -> Result<ChunkCheck, String> {
     let mut seen_ihdr = false;
-    while let Some(header) = bytes.get(at..at + 8) {
-        let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-        let kind = &header[4..8];
-        if kind == b"IHDR" {
+    let mut has_actl = false;
+    for chunk in chunk_headers(bytes) {
+        if &chunk.kind == b"IHDR" {
             if seen_ihdr {
                 return Err(
                     "could not read the PNG data: it has more than one IHDR chunk".to_owned(),
                 );
             }
             seen_ihdr = true;
-            if let Some(size) = bytes.get(at + 8..at + 16) {
+            if let Some(size) = bytes.get(chunk.at + 8..chunk.at + 16) {
                 let width = u32::from_be_bytes([size[0], size[1], size[2], size[3]]);
                 let height = u32::from_be_bytes([size[4], size[5], size[6], size[7]]);
                 check_pixels(width, height)?;
@@ -72,16 +145,9 @@ fn check_chunks(bytes: &[u8]) -> Result<(), String> {
         } else if !seen_ihdr {
             return Err("could not read the PNG data: the first chunk is not IHDR".to_owned());
         }
-        if kind == b"IEND" {
-            break;
-        }
-        // Length, type and CRC are 12 bytes; `usize` holds any `u32`.
-        match (at + 12).checked_add(length as usize) {
-            Some(next) if next <= bytes.len() => at = next,
-            _ => break,
-        }
+        has_actl |= &chunk.kind == b"acTL";
     }
-    Ok(())
+    Ok(ChunkCheck { has_actl })
 }
 
 /// Run oxipng with the Step 2 settings and the decompressed-size limit.
@@ -90,7 +156,12 @@ fn run_oxipng(bytes: &[u8]) -> Result<Vec<u8>, String> {
     options.strip = oxipng::StripChunks::Safe;
     // oxipng checks this against the IHDR it uses, before it inflates.
     options.max_decompressed_size = Some(MAX_DECOMPRESSED_BYTES);
-    oxipng::optimize_from_memory(bytes, &options).map_err(|error| match error {
+    oxipng::optimize_from_memory(bytes, &options).map_err(oxipng_reason)
+}
+
+/// The message for the user for an oxipng error.
+fn oxipng_reason(error: oxipng::PngError) -> String {
+    match error {
         // oxipng raises the same error when the stream overflows a small
         // IHDR's size (a corrupt file); only our own limit is "too large".
         oxipng::PngError::InflatedDataTooLong(max) if max == MAX_DECOMPRESSED_BYTES => format!(
@@ -98,7 +169,7 @@ fn run_oxipng(bytes: &[u8]) -> Result<Vec<u8>, String> {
             MAX_PIXELS / 1_000_000
         ),
         other => format!("could not read the PNG data: {other}"),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -117,7 +188,7 @@ mod tests {
     }
 
     /// One chunk with a valid CRC (oxipng checks them).
-    fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    pub(super) fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
         let mut out = (data.len() as u32).to_be_bytes().to_vec();
         let mut body = kind.to_vec();
         body.extend_from_slice(data);
@@ -126,7 +197,7 @@ mod tests {
         out
     }
 
-    fn ihdr(w: u32, h: u32, depth: u8, colour: u8) -> Vec<u8> {
+    pub(super) fn ihdr(w: u32, h: u32, depth: u8, colour: u8) -> Vec<u8> {
         let mut data = w.to_be_bytes().to_vec();
         data.extend_from_slice(&h.to_be_bytes());
         data.extend_from_slice(&[depth, colour, 0, 0, 0]);
@@ -134,12 +205,12 @@ mod tests {
     }
 
     /// A zlib stream of one empty stored block.
-    const TOKEN_IDAT: [u8; 11] = [
+    pub(super) const TOKEN_IDAT: [u8; 11] = [
         0x78, 0x01, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01,
     ];
 
     /// Signature, the given chunks, IEND.
-    fn file(chunks: &[Vec<u8>]) -> Vec<u8> {
+    pub(super) fn file(chunks: &[Vec<u8>]) -> Vec<u8> {
         let mut bytes = SIGNATURE.to_vec();
         for c in chunks {
             bytes.extend_from_slice(c);
@@ -160,7 +231,84 @@ mod tests {
         out
     }
 
+    /// What `check_chunks` reports for a PNG without `acTL`.
+    const STILL: ChunkCheck = ChunkCheck { has_actl: false };
+
+    /// An `acTL` chunk: 2 frames, played forever.
+    fn actl() -> Vec<u8> {
+        chunk(b"acTL", &[0, 0, 0, 2, 0, 0, 0, 0])
+    }
+
     // --- the chunk walk -----------------------------------------------------------
+
+    #[test]
+    fn check_chunks_reports_an_actl_chunk() {
+        let png = file(&[ihdr(16, 16, 8, 0), actl(), chunk(b"IDAT", &TOKEN_IDAT)]);
+        assert_eq!(check_chunks(&png), Ok(ChunkCheck { has_actl: true }));
+        // Also when it is not the first chunk after IHDR.
+        let png = file(&[
+            ihdr(16, 16, 8, 0),
+            chunk(b"tEXt", b"Comment\0x"),
+            actl(),
+            chunk(b"IDAT", &TOKEN_IDAT),
+        ]);
+        assert_eq!(check_chunks(&png), Ok(ChunkCheck { has_actl: true }));
+    }
+
+    #[test]
+    fn check_chunks_reports_no_actl_for_a_still_png() {
+        // A chunk type that only resembles acTL (another letter case, or the
+        // name as data inside another chunk) is not one, and nothing after
+        // IEND is read.
+        let mut png = file(&[
+            ihdr(16, 16, 8, 0),
+            chunk(b"tEXt", b"acTL\0acTL"),
+            chunk(b"aCTL", &[0, 0, 0, 2, 0, 0, 0, 0]),
+            chunk(b"IDAT", &TOKEN_IDAT),
+        ]);
+        png.extend(actl());
+        assert_eq!(check_chunks(&png), Ok(STILL));
+    }
+
+    /// `png` with the last CRC byte of the chunk at `at` flipped.
+    fn flip_crc(png: &mut [u8], at: usize) {
+        let len = u32::from_be_bytes(png[at..at + 4].try_into().unwrap()) as usize;
+        png[at + 11 + len] ^= 0x01;
+    }
+
+    #[test]
+    fn first_bad_crc_names_the_first_chunk_whose_crc_is_wrong() {
+        let good = real_png();
+        assert_eq!(first_bad_crc(&good), None);
+        let headers: Vec<ChunkHeader> = chunk_headers(&good).collect();
+        let idat = headers.iter().find(|c| &c.kind == b"IDAT").unwrap().at;
+        let mut bad = good.clone();
+        flip_crc(&mut bad, idat);
+        assert_eq!(first_bad_crc(&bad), Some(*b"IDAT"));
+        // Two bad chunks: the first in file order is named, as oxipng does.
+        flip_crc(&mut bad, SIGNATURE.len());
+        assert_eq!(first_bad_crc(&bad), Some(*b"IHDR"));
+        let reason = optimize(&bad).unwrap_err();
+        assert!(reason.contains("IHDR"), "{reason}");
+    }
+
+    #[test]
+    fn first_bad_crc_skips_iend_and_a_chunk_running_past_the_end() {
+        // oxipng does not check IEND's CRC either: the file still optimises.
+        let mut png = real_png();
+        let iend = chunk_headers(&png).find(|c| &c.kind == b"IEND").unwrap().at;
+        flip_crc(&mut png, iend);
+        assert_eq!(first_bad_crc(&png), None);
+        assert!(optimize(&png).is_ok());
+        // A chunk cut short has no CRC to check; its truncation is reported
+        // by the decoder or oxipng.
+        let mut cut = SIGNATURE.to_vec();
+        cut.extend(ihdr(16, 16, 8, 0));
+        cut.extend_from_slice(&u32::MAX.to_be_bytes());
+        cut.extend_from_slice(b"IDAT");
+        cut.extend_from_slice(&[0; 16]);
+        assert_eq!(first_bad_crc(&cut), None);
+    }
 
     #[test]
     fn accepts_an_ihdr_that_comes_first_and_only_once() {
@@ -169,8 +317,8 @@ mod tests {
             chunk(b"tEXt", b"Comment\0x"),
             chunk(b"IDAT", &TOKEN_IDAT),
         ]);
-        assert_eq!(check_chunks(&png), Ok(()));
-        assert_eq!(check_chunks(&real_png()), Ok(()));
+        assert_eq!(check_chunks(&png), Ok(STILL));
+        assert_eq!(check_chunks(&real_png()), Ok(STILL));
     }
 
     #[test]
@@ -193,7 +341,7 @@ mod tests {
         // oxipng or by the walk, so an IHDR there is not a second one.
         let mut png = file(&[ihdr(1, 1, 8, 0), chunk(b"IDAT", &TOKEN_IDAT)]);
         png.extend(ihdr(65_535, 65_535, 8, 6));
-        assert_eq!(check_chunks(&png), Ok(()));
+        assert_eq!(check_chunks(&png), Ok(STILL));
     }
 
     #[test]
@@ -212,7 +360,7 @@ mod tests {
         png.extend_from_slice(&u32::MAX.to_be_bytes());
         png.extend_from_slice(b"IDAT");
         png.extend_from_slice(&[0; 16]);
-        assert_eq!(check_chunks(&png), Ok(()));
+        assert_eq!(check_chunks(&png), Ok(STILL));
         let err = optimize(&png).unwrap_err();
         assert!(err.contains("could not read the PNG data"), "{err}");
     }
@@ -221,7 +369,7 @@ mod tests {
     fn leaves_a_file_without_a_whole_chunk_header_to_oxipng() {
         let mut png = SIGNATURE.to_vec();
         png.extend_from_slice(&[0, 0, 0]);
-        assert_eq!(check_chunks(&png), Ok(()));
+        assert_eq!(check_chunks(&png), Ok(STILL));
         assert!(optimize(&png).is_err());
     }
 
