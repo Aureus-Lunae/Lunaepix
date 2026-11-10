@@ -10,6 +10,18 @@
 //! (tRNS, bKGD, sBIT, hIST) or its frames (acTL, fcTL, fdAT) are not put
 //! back: the indexed output has its own format.
 //!
+//! One exception to the indexed output: a greyscale source with an iCCP
+//! chunk. Its profile is a GRAY profile, which the PNG format allows only on
+//! a greyscale image (and oxipng never turns an image with an iCCP back into
+//! greyscale). So it is written as 8-bit greyscale (with alpha when the
+//! quantised palette has any) from the quantised grey levels, and keeps its
+//! profile.
+//!
+//! Every chunk's CRC is checked before decoding. The decoder would skip an
+//! ancillary chunk with a bad CRC, but the chunk would then be carried over
+//! and oxipng would refuse it after the whole decode; the lossless path
+//! refuses such a file at once, with the reason given here too.
+//!
 //! An animated PNG (with an `acTL` chunk) gets the lossless treatment with
 //! [`Note::KeptLosslessAnimatedPng`].
 //!
@@ -17,7 +29,10 @@
 
 use std::io::Cursor;
 
-use super::{MAX_DECOMPRESSED_BYTES, SIGNATURE, check_chunks, chunk_headers, run_oxipng};
+use super::{
+    MAX_DECOMPRESSED_BYTES, SIGNATURE, check_chunks, chunk_headers, first_bad_crc, oxipng_reason,
+    run_oxipng,
+};
 use crate::lossy::{
     Lossy, Note, Quality, Shape, check_shape, finish, kept_lossless, reserve_pixels,
 };
@@ -73,14 +88,23 @@ fn optimize_lossy_with(
             Note::KeptLosslessAnimatedPng,
         ));
     }
+    // A bad CRC fails here, with oxipng's reason, as the lossless path does.
+    if let Some(kind) = first_bad_crc(bytes) {
+        return Err(oxipng_reason(oxipng::PngError::CRCMismatch(kind)));
+    }
     let image = decode(bytes)?;
     let (width, height) = (image.width, image.height);
     let quantised = quantise(&image, quality)?;
     drop(image);
     check_quantised(&quantised, width, height)?;
-    let indexed = write_indexed(width, height, &quantised, &carried_chunks(bytes))?;
+    let carried = carried_chunks(bytes);
+    let written = if is_grey(bytes) && carried.iter().any(|chunk| &chunk[4..8] == b"iCCP") {
+        write_grey(width, height, &quantised, &carried)?
+    } else {
+        write_indexed(width, height, &quantised, &carried)?
+    };
     drop(quantised);
-    let result = run_oxipng(&indexed)?;
+    let result = run_oxipng(&written)?;
     check_output(&result, width, height)?;
     Ok(finish(bytes, result))
 }
@@ -288,7 +312,6 @@ fn write_indexed(
     quantised: &Quantised,
     carried: &[&[u8]],
 ) -> Result<Vec<u8>, String> {
-    let failed = |error: ::png::EncodingError| format!("could not write the lossy PNG: {error}");
     let depth = bit_depth_for(quantised.palette.len());
     let packed = pack(&quantised.indices, width as usize, depth as usize)?;
     let rgb: Vec<u8> = quantised
@@ -297,22 +320,84 @@ fn write_indexed(
         .flat_map(|c| [c[0], c[1], c[2]])
         .collect();
     let alpha: Vec<u8> = quantised.palette.iter().map(|c| c[3]).collect();
+    encode_png(width, height, &packed, carried, |encoder| {
+        encoder.set_color(::png::ColorType::Indexed);
+        encoder.set_depth(depth);
+        encoder.set_palette(rgb);
+        if alpha.iter().any(|&a| a < 255) {
+            encoder.set_trns(alpha);
+        }
+    })
+}
+
+/// Whether the source's IHDR (its first chunk, as [`check_chunks`] made
+/// sure) declares greyscale, with or without alpha.
+fn is_grey(bytes: &[u8]) -> bool {
+    // Signature 8, length 4, type 4, width 4, height 4, bit depth 1.
+    matches!(bytes.get(25), Some(0 | 4))
+}
+
+/// Write an 8-bit greyscale PNG from the quantised grey levels (with alpha,
+/// colour type 4, when any palette entry has alpha below 255; otherwise
+/// colour type 0): IHDR, the `carried` chunks, the image data, IEND. Each
+/// entry's grey level is the mean of its channels: quantizr averages grey
+/// colours into grey entries, so the three are equal for a grey source.
+/// `quantised` must fit the image ([`check_quantised`]).
+fn write_grey(
+    width: u32,
+    height: u32,
+    quantised: &Quantised,
+    carried: &[&[u8]],
+) -> Result<Vec<u8>, String> {
+    let alpha = quantised.palette.iter().any(|entry| entry[3] < 255);
+    let samples = if alpha { 2 } else { 1 };
+    let levels: Vec<[u8; 2]> = quantised
+        .palette
+        .iter()
+        .map(|&[r, g, b, a]| {
+            let sum = u16::from(r) + u16::from(g) + u16::from(b);
+            // At most 255 after rounding, so the cast keeps the value.
+            [((sum + 1) / 3) as u8, a]
+        })
+        .collect();
+    let mut data = Vec::new();
+    data.try_reserve_exact(quantised.indices.len() * samples)
+        .map_err(|_| "not enough memory for the pixels".to_owned())?;
+    for &index in &quantised.indices {
+        data.extend_from_slice(&levels[usize::from(index)][..samples]);
+    }
+    let colour = if alpha {
+        ::png::ColorType::GrayscaleAlpha
+    } else {
+        ::png::ColorType::Grayscale
+    };
+    encode_png(width, height, &data, carried, |encoder| {
+        encoder.set_color(colour);
+        encoder.set_depth(::png::BitDepth::Eight);
+    })
+}
+
+/// Encode `data` with the header that `setup` sets, then put the `carried`
+/// chunks right after IHDR.
+fn encode_png(
+    width: u32,
+    height: u32,
+    data: &[u8],
+    carried: &[&[u8]],
+    setup: impl FnOnce(&mut ::png::Encoder<&mut Vec<u8>>),
+) -> Result<Vec<u8>, String> {
+    let failed = |error: ::png::EncodingError| format!("could not write the lossy PNG: {error}");
     let mut out = Vec::new();
     let mut encoder = ::png::Encoder::new(&mut out, width, height);
-    encoder.set_color(::png::ColorType::Indexed);
-    encoder.set_depth(depth);
-    encoder.set_palette(rgb);
-    if alpha.iter().any(|&a| a < 255) {
-        encoder.set_trns(alpha);
-    }
+    setup(&mut encoder);
     // oxipng compresses the data again; this copy only has to be quick.
     encoder.set_compression(::png::Compression::Fast);
     let mut writer = encoder.write_header().map_err(failed)?;
-    writer.write_image_data(&packed).map_err(failed)?;
+    writer.write_image_data(data).map_err(failed)?;
     writer.finish().map_err(failed)?;
     // The encoder writes IHDR (always 13 bytes of data, so 25 in all) right
-    // after the signature. The carried chunks go after it, before PLTE,
-    // where every one of them may stand.
+    // after the signature. The carried chunks go after it, before PLTE (if
+    // any), where every one of them may stand.
     let after_ihdr = SIGNATURE.len() + 25;
     let tail = out.split_off(after_ihdr);
     for chunk in carried {
@@ -512,12 +597,18 @@ mod tests {
         out
     }
 
-    /// A made-up colour profile: not sRGB, so oxipng keeps it as iCCP.
+    /// A made-up RGB colour profile: not sRGB, so oxipng keeps it as iCCP.
     fn profile() -> Vec<u8> {
+        profile_in(b"RGB ")
+    }
+
+    /// A made-up colour profile whose header names the colour space `space`
+    /// (bytes 16 to 20 of an ICC header).
+    fn profile_in(space: &[u8; 4]) -> Vec<u8> {
         let mut profile = vec![0u8; 400];
         profile[0..4].copy_from_slice(&400u32.to_be_bytes());
         profile[12..16].copy_from_slice(b"mntr");
-        profile[16..20].copy_from_slice(b"RGB ");
+        profile[16..20].copy_from_slice(space);
         profile[36..40].copy_from_slice(b"acsp");
         for (i, byte) in profile.iter_mut().enumerate().skip(128) {
             *byte = (i * 7 % 251) as u8;
@@ -526,9 +617,65 @@ mod tests {
     }
 
     fn iccp_chunk() -> Vec<u8> {
+        iccp_chunk_of(&profile())
+    }
+
+    fn iccp_chunk_of(profile: &[u8]) -> Vec<u8> {
         let mut data = b"Lunaepix test\0\0".to_vec();
-        data.extend(zlib_stored(&profile()));
+        data.extend(zlib_stored(profile));
         chunk(b"iCCP", &data)
+    }
+
+    /// The colour type of a greyscale PNG, and of one with alpha.
+    const GREY: u8 = 0;
+    const GREY_ALPHA: u8 = 4;
+
+    /// A 96x64 greyscale gradient (with alpha: the left quarter fully
+    /// transparent, the next quarter alpha 128) carrying a GRAY profile.
+    fn grey_icc_png(alpha: bool) -> Vec<u8> {
+        let (w, h) = (96u32, 64u32);
+        let mut data = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                data.push(((x * 255 / (w - 1) + y) % 256) as u8);
+                if alpha {
+                    data.push(match x {
+                        0..=23 => 0,
+                        24..=47 => 128,
+                        _ => 255,
+                    });
+                }
+            }
+        }
+        let colour = if alpha {
+            ::png::ColorType::GrayscaleAlpha
+        } else {
+            ::png::ColorType::Grayscale
+        };
+        encode(
+            w,
+            h,
+            colour,
+            ::png::BitDepth::Eight,
+            &data,
+            |_| {},
+            &[iccp_chunk_of(&profile_in(b"GRAY"))],
+        )
+    }
+
+    /// `png` with the CRC of its first `kind` chunk made wrong.
+    fn with_bad_crc(png: &[u8], kind: &[u8; 4]) -> Vec<u8> {
+        let mut bad = png.to_vec();
+        let mut at = 8;
+        while at + 8 <= bad.len() {
+            let len = u32::from_be_bytes(bad[at..at + 4].try_into().unwrap()) as usize;
+            if &bad[at + 4..at + 8] == kind {
+                bad[at + 8 + len + 3] ^= 0x01;
+                return bad;
+            }
+            at += 12 + len;
+        }
+        panic!("no {kind:?} chunk");
     }
 
     fn icc_of(png: &[u8]) -> Option<Vec<u8>> {
@@ -882,6 +1029,102 @@ mod tests {
         assert_eq!(lossy.note, None);
         assert_eq!(icc_of(&lossy.bytes), None);
         assert!(!chunk_types(&lossy.bytes).contains(b"iCCP"));
+    }
+
+    #[test]
+    fn the_grey_fixtures_really_are_grey_with_a_gray_profile() {
+        for (alpha, colour) in [(false, GREY), (true, GREY_ALPHA)] {
+            let source = grey_icc_png(alpha);
+            assert_eq!(depth_and_colour(&source), (8, colour));
+            let profile = icc_of(&source).expect("an iCCP chunk");
+            assert_eq!(&profile[16..20], b"GRAY");
+        }
+        // And the RGB fixture's profile is not GRAY.
+        assert_eq!(&profile()[16..20], b"RGB ");
+    }
+
+    #[test]
+    fn a_greyscale_png_with_a_gray_profile_stays_grey_and_keeps_it() {
+        for (alpha, colour) in [(false, GREY), (true, GREY_ALPHA)] {
+            let source = grey_icc_png(alpha);
+            let lossy = optimize_lossy(&source, q(75)).unwrap();
+            assert_eq!(lossy.note, None, "alpha {alpha}");
+            assert_eq!(depth_and_colour(&lossy.bytes).1, colour, "alpha {alpha}");
+            // The profile is kept, and its chunk is the one today's lossless
+            // path writes for the same file.
+            assert_eq!(icc_of(&lossy.bytes), Some(profile_in(b"GRAY")));
+            let lossless = crate::png::optimize(&source).unwrap();
+            assert_eq!(
+                chunk_data(&lossy.bytes, b"iCCP"),
+                chunk_data(&lossless, b"iCCP")
+            );
+            let before = decode_rgba(&source);
+            let after = decode_rgba(&lossy.bytes);
+            assert_eq!(after.dimensions(), before.dimensions());
+            for (x, y, pixel) in before.enumerate_pixels() {
+                let found = after.get_pixel(x, y);
+                // Still grey.
+                assert!(found[0] == found[1] && found[1] == found[2], "({x},{y})");
+                if pixel[3] == 0 {
+                    assert_eq!(found[3], 0, "alpha at ({x},{y})");
+                }
+            }
+            if alpha {
+                assert!(after.pixels().any(|p| p[3] == 128));
+            }
+        }
+    }
+
+    #[test]
+    fn an_rgb_png_with_an_rgb_profile_is_still_indexed() {
+        let source = rgba_png(GW, GH, &gradient_pixels(GW, GH), &[iccp_chunk()]);
+        let lossy = optimize_lossy(&source, q(75)).unwrap();
+        assert_eq!(lossy.note, None);
+        assert_eq!(depth_and_colour(&lossy.bytes).1, INDEXED);
+        assert_eq!(icc_of(&lossy.bytes), Some(profile()));
+    }
+
+    #[test]
+    fn a_carried_chunk_with_a_bad_crc_fails_like_lossless_without_decoding() {
+        let good = rgba_png(
+            GW,
+            GH,
+            &gradient_pixels(GW, GH),
+            &[
+                chunk(b"pHYs", &[0, 0, 11, 19, 0, 0, 11, 19, 1]),
+                chunk(b"tEXt", b"Comment\0lunaepix"),
+            ],
+        );
+        for kind in [b"tEXt", b"pHYs", b"IDAT"] {
+            let bad = with_bad_crc(&good, kind);
+            let lossless = crate::png::optimize(&bad).unwrap_err();
+            assert!(lossless.contains("CRC"), "{lossless}");
+            // `never` panics if the quantiser is reached.
+            let start = Instant::now();
+            let lossy = optimize_lossy_with(&bad, q(75), never).unwrap_err();
+            assert_eq!(lossy, lossless, "{kind:?}");
+            assert!(start.elapsed() < Duration::from_secs(5));
+        }
+    }
+
+    #[test]
+    fn the_same_file_with_correct_crcs_is_encoded_lossy() {
+        let good = rgba_png(
+            GW,
+            GH,
+            &gradient_pixels(GW, GH),
+            &[
+                chunk(b"pHYs", &[0, 0, 11, 19, 0, 0, 11, 19, 1]),
+                chunk(b"tEXt", b"Comment\0lunaepix"),
+            ],
+        );
+        let lossy = optimize_lossy(&good, q(75)).unwrap();
+        assert_eq!(lossy.note, None);
+        assert_eq!(depth_and_colour(&lossy.bytes).1, INDEXED);
+        // tEXt is handled as today: stripped, while pHYs is kept.
+        let types = chunk_types(&lossy.bytes);
+        assert!(!types.contains(b"tEXt"), "{types:?}");
+        assert!(types.contains(b"pHYs"), "{types:?}");
     }
 
     fn with_metadata() -> Vec<u8> {

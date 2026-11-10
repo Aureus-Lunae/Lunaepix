@@ -92,6 +92,24 @@ fn chunk_headers(bytes: &[u8]) -> impl Iterator<Item = ChunkHeader> + '_ {
     })
 }
 
+/// The type of the first chunk, in file order up to IEND, whose stored CRC
+/// does not match its type and data; `None` when every whole chunk is
+/// right. oxipng reads the same chunks in the same order and refuses the
+/// file at the first mismatch, so this names the chunk its error names. IEND
+/// is not checked (oxipng stops before its CRC), nor is a chunk that runs
+/// past the end of the file (that truncation is reported elsewhere).
+fn first_bad_crc(bytes: &[u8]) -> Option<[u8; 4]> {
+    chunk_headers(bytes)
+        .filter(|chunk| &chunk.kind != b"IEND")
+        .find(|chunk| {
+            chunk.whole(bytes).is_some_and(|whole| {
+                let (body, crc) = whole[4..].split_at(whole.len() - 8);
+                crc32fast::hash(body).to_be_bytes() != crc
+            })
+        })
+        .map(|chunk| chunk.kind)
+}
+
 /// What [`check_chunks`] found besides the checks it passed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChunkCheck {
@@ -138,7 +156,12 @@ fn run_oxipng(bytes: &[u8]) -> Result<Vec<u8>, String> {
     options.strip = oxipng::StripChunks::Safe;
     // oxipng checks this against the IHDR it uses, before it inflates.
     options.max_decompressed_size = Some(MAX_DECOMPRESSED_BYTES);
-    oxipng::optimize_from_memory(bytes, &options).map_err(|error| match error {
+    oxipng::optimize_from_memory(bytes, &options).map_err(oxipng_reason)
+}
+
+/// The message for the user for an oxipng error.
+fn oxipng_reason(error: oxipng::PngError) -> String {
+    match error {
         // oxipng raises the same error when the stream overflows a small
         // IHDR's size (a corrupt file); only our own limit is "too large".
         oxipng::PngError::InflatedDataTooLong(max) if max == MAX_DECOMPRESSED_BYTES => format!(
@@ -146,7 +169,7 @@ fn run_oxipng(bytes: &[u8]) -> Result<Vec<u8>, String> {
             MAX_PIXELS / 1_000_000
         ),
         other => format!("could not read the PNG data: {other}"),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -245,6 +268,46 @@ mod tests {
         ]);
         png.extend(actl());
         assert_eq!(check_chunks(&png), Ok(STILL));
+    }
+
+    /// `png` with the last CRC byte of the chunk at `at` flipped.
+    fn flip_crc(png: &mut [u8], at: usize) {
+        let len = u32::from_be_bytes(png[at..at + 4].try_into().unwrap()) as usize;
+        png[at + 11 + len] ^= 0x01;
+    }
+
+    #[test]
+    fn first_bad_crc_names_the_first_chunk_whose_crc_is_wrong() {
+        let good = real_png();
+        assert_eq!(first_bad_crc(&good), None);
+        let headers: Vec<ChunkHeader> = chunk_headers(&good).collect();
+        let idat = headers.iter().find(|c| &c.kind == b"IDAT").unwrap().at;
+        let mut bad = good.clone();
+        flip_crc(&mut bad, idat);
+        assert_eq!(first_bad_crc(&bad), Some(*b"IDAT"));
+        // Two bad chunks: the first in file order is named, as oxipng does.
+        flip_crc(&mut bad, SIGNATURE.len());
+        assert_eq!(first_bad_crc(&bad), Some(*b"IHDR"));
+        let reason = optimize(&bad).unwrap_err();
+        assert!(reason.contains("IHDR"), "{reason}");
+    }
+
+    #[test]
+    fn first_bad_crc_skips_iend_and_a_chunk_running_past_the_end() {
+        // oxipng does not check IEND's CRC either: the file still optimises.
+        let mut png = real_png();
+        let iend = chunk_headers(&png).find(|c| &c.kind == b"IEND").unwrap().at;
+        flip_crc(&mut png, iend);
+        assert_eq!(first_bad_crc(&png), None);
+        assert!(optimize(&png).is_ok());
+        // A chunk cut short has no CRC to check; its truncation is reported
+        // by the decoder or oxipng.
+        let mut cut = SIGNATURE.to_vec();
+        cut.extend(ihdr(16, 16, 8, 0));
+        cut.extend_from_slice(&u32::MAX.to_be_bytes());
+        cut.extend_from_slice(b"IDAT");
+        cut.extend_from_slice(&[0; 16]);
+        assert_eq!(first_bad_crc(&cut), None);
     }
 
     #[test]

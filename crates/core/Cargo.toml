@@ -48,6 +48,10 @@ roxmltree = "=0.21.2"
 # The tests also use `png` to encode their fixtures.
 png = "0.17.16"
 quantizr = "=1.4.3"
+# Chunk CRCs: the lossy PNG path checks them before decoding, as oxipng
+# does, and the tests make valid ones for hand-made hostile PNGs. Already in
+# the tree via `png`.
+crc32fast = "1.5.4"
 
 # The worker's start-up calls (see src/platform.rs). Both versions are the ones
 # already in Cargo.lock, so no new package.
@@ -74,8 +78,6 @@ image = { version = "=0.25.10", default-features = false, features = ["png", "jp
 # no product code links libwebp. Not the `webp` wrapper crate, which links a
 # second copy of libwebp's C symbols.
 libwebp-sys = "=0.14.4"
-# Valid chunk CRCs for hand-made hostile PNGs (already in the tree via `png`).
-crc32fast = "1.5.4"
 # Renders the SVG input and output for the edge-noise comparison. No system
 # fonts are loaded, so the fixtures carry no text.
 resvg = { version = "=0.49.0", default-features = false }
