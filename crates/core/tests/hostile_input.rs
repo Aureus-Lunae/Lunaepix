@@ -1160,6 +1160,13 @@ fn hostile_pngs() -> Vec<(&'static str, Vec<u8>, &'static str)> {
             "more than one IHDR",
         ),
         (
+            // The lossless path's own message, word for word: the 16x16
+            // grey IHDR holds 272 bytes of raw data.
+            "an IDAT that inflates past its IHDR",
+            png_whose_idat_inflates_past_its_ihdr(),
+            "could not read the PNG data: Inflated data would exceed the maximum size (272 bytes)",
+        ),
+        (
             "cut off at two thirds",
             full[..full.len() * 2 / 3].to_vec(),
             "could not read the PNG data",
@@ -1178,36 +1185,6 @@ fn every_hostile_png_is_refused_in_a_lossy_run_too() {
     for (what, bytes, reason) in hostile_pngs() {
         let message = assert_refused_in(&lossy(), "bomb.png", &bytes);
         assert!(message.contains(reason), "{what}: {message}");
-    }
-}
-
-#[test]
-fn a_png_whose_idat_inflates_past_its_ihdr_stays_within_its_ihdr_in_a_lossy_run() {
-    // The lossless path refuses this file (oxipng's inflate overflows its
-    // IHDR-sized buffer). The lossy path's decoder reads only the 16x16 rows
-    // the IHDR declares and stops, so it is not refused: whether it should
-    // be is an open question for the controller (see the Task 8a report).
-    // What must hold either way: quick, no panic, and never the stream's
-    // 2048x2048.
-    let tmp = TempDir::new().unwrap();
-    let src = write(
-        tmp.path(),
-        "bomb.png",
-        &png_whose_idat_inflates_past_its_ihdr(),
-    );
-    let dest = tmp.path().join("optimized-bomb.png");
-
-    let started = Instant::now();
-    let result = optimize_file(&src, &dest, &lossy());
-
-    assert!(started.elapsed() < QUICK, "took {:?}", started.elapsed());
-    if result.is_ok() {
-        let written = fs::read(&dest).unwrap();
-        let decoded =
-            image::load_from_memory_with_format(&written, image::ImageFormat::Png).unwrap();
-        assert_eq!((decoded.width(), decoded.height()), (16, 16));
-    } else {
-        assert!(!dest.exists());
     }
 }
 

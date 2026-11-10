@@ -52,6 +52,11 @@ quantizr = "=1.4.3"
 # does, and the tests make valid ones for hand-made hostile PNGs. Already in
 # the tree via `png`.
 crc32fast = "1.5.4"
+# The lossy PNG path inflates the image data once before decoding, in a small
+# window, to refuse a stream longer than its IHDR as oxipng does
+# (png::lossy::check_image_data_size). Already in the tree via `png`, at this
+# version.
+miniz_oxide = "0.8.9"
 # The lossy WebP path (src/webp/codec.rs, the only libwebp FFI): libwebp
 # decodes the source to RGBA and encodes it again with its simple lossy
 # encoder. Failures come back as return codes, so nothing unwinds through C.

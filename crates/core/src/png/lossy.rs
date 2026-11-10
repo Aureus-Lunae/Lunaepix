@@ -20,7 +20,10 @@
 //! Every chunk's CRC is checked before decoding. The decoder would skip an
 //! ancillary chunk with a bad CRC, but the chunk would then be carried over
 //! and oxipng would refuse it after the whole decode; the lossless path
-//! refuses such a file at once, with the reason given here too.
+//! refuses such a file at once, with the reason given here too. Image data
+//! that inflates past the size its IHDR declares is refused the same way,
+//! before quantising ([`check_image_data_size`]): the decoder would read the
+//! rows it needs and silently discard the rest.
 //!
 //! An animated PNG (with an `acTL` chunk) gets the lossless treatment with
 //! [`Note::KeptLosslessAnimatedPng`].
@@ -222,6 +225,16 @@ fn decode(bytes: &[u8]) -> Result<Rgba, String> {
     decoder.set_ignore_text_chunk(true);
     decoder.set_ignore_iccp_chunk(true);
     let mut reader = decoder.read_info().map_err(unreadable)?;
+    let info = reader.info();
+    check_image_data_size(
+        bytes,
+        raw_data_size(
+            info.width,
+            info.height,
+            info.bits_per_pixel(),
+            info.interlaced,
+        ),
+    )?;
     let mut buffer = reserve_pixels(reader.output_buffer_size())?;
     let frame = reader.next_frame(&mut buffer).map_err(unreadable)?;
     buffer.truncate(frame.buffer_size());
@@ -230,6 +243,75 @@ fn decode(bytes: &[u8]) -> Result<Rgba, String> {
         height: frame.height,
         pixels: to_rgba(frame.color_type, frame.bit_depth, buffer)?,
     })
+}
+
+/// The raw (inflated) image data an IHDR declares, in bytes: every row's
+/// bytes plus its filter byte, over the seven Adam7 passes when interlaced.
+/// The same sum as oxipng's `IhdrData::raw_data_size`, so the size in the
+/// reason [`check_image_data_size`] gives is the one the lossless path names.
+fn raw_data_size(width: u32, height: u32, bits_per_pixel: usize, interlaced: bool) -> usize {
+    let (w, h) = (width as usize, height as usize);
+    // Rows of `w` pixels, `h` of them, each with its filter byte.
+    let rows = |w: usize, h: usize| ((w * bits_per_pixel).div_ceil(8) + 1) * h;
+    if !interlaced {
+        return rows(w, h);
+    }
+    // A pass with no columns has no rows either (no filter bytes).
+    let pass = |w: usize, h: usize| if w == 0 { 0 } else { rows(w, h) };
+    pass((w + 7) >> 3, (h + 7) >> 3)
+        + pass((w + 3) >> 3, (h + 7) >> 3)
+        + pass((w + 3) >> 2, (h + 3) >> 3)
+        + pass((w + 1) >> 2, (h + 3) >> 2)
+        + pass((w + 1) >> 1, (h + 1) >> 2)
+        + pass(w >> 1, (h + 1) >> 1)
+        + pass(w, h >> 1)
+}
+
+/// Refuse image data that inflates past `size`, the raw size its IHDR
+/// declares ([`raw_data_size`]), with the lossless path's reason. oxipng
+/// inflates into a buffer of exactly that size and refuses the file when the
+/// stream overflows it; the `png` decoder reads only the rows the IHDR
+/// declares and discards the rest, so without this check a damaged file
+/// would silently give an output.
+///
+/// The IDAT payloads are inflated in order, in a fixed 64 KiB window: the
+/// bytes are counted, not kept, and the count stops as soon as it passes
+/// `size`. So neither the stream's size nor the image's is allocated here.
+/// A stream that is corrupt or ends early is left to the decoder, which
+/// refuses it.
+fn check_image_data_size(bytes: &[u8], size: usize) -> Result<(), String> {
+    use miniz_oxide::inflate::stream::{InflateState, inflate};
+    use miniz_oxide::{DataFormat, MZFlush, MZStatus};
+
+    let mut state = InflateState::new_boxed(DataFormat::Zlib);
+    let mut window = vec![0; 64 * 1024];
+    let mut inflated = 0usize;
+    let payloads = chunk_headers(bytes)
+        .filter(|chunk| &chunk.kind == b"IDAT")
+        .filter_map(|chunk| chunk.whole(bytes))
+        // Length and type before the data, the CRC after it.
+        .map(|whole| &whole[8..whole.len() - 4]);
+    for mut input in payloads {
+        loop {
+            let result = inflate(&mut state, input, &mut window, MZFlush::None);
+            input = &input[result.bytes_consumed..];
+            inflated += result.bytes_written;
+            if inflated > size {
+                return Err(oxipng_reason(oxipng::PngError::InflatedDataTooLong(size)));
+            }
+            match result.status {
+                Ok(MZStatus::StreamEnd) => return Ok(()),
+                Ok(MZStatus::Ok) => {}
+                // Corrupt data, or no progress: the decoder's to report.
+                _ => return Ok(()),
+            }
+            // A full window may hold back more output: ask again.
+            if input.is_empty() && result.bytes_written < window.len() {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Decoded 8-bit samples as RGBA. With the transformations [`decode`] asks
@@ -1622,6 +1704,185 @@ mod tests {
             let err = result.expect("no panic").unwrap_err();
             assert!(err.contains("could not read the PNG data"), "{err}");
             assert!(start.elapsed() < Duration::from_secs(5));
+        }
+    }
+
+    // --- image data past the IHDR's size -------------------------------------
+
+    /// An IHDR chunk like [`ihdr`], with Adam7 interlacing.
+    fn interlaced_ihdr(w: u32, h: u32, depth: u8, colour: u8) -> Vec<u8> {
+        let mut data = w.to_be_bytes().to_vec();
+        data.extend_from_slice(&h.to_be_bytes());
+        data.extend_from_slice(&[depth, colour, 0, 0, 1]);
+        chunk(b"IHDR", &data)
+    }
+
+    /// `stream` cut into `parts` IDAT chunks of about the same length.
+    fn idat_chunks(stream: &[u8], parts: usize) -> Vec<Vec<u8>> {
+        stream
+            .chunks(stream.len().div_ceil(parts))
+            .map(|part| chunk(b"IDAT", part))
+            .collect()
+    }
+
+    /// The image data of a 512x512 all-black greyscale image (256 KiB raw,
+    /// a few hundred bytes compressed) under a 16x16 IHDR, which holds
+    /// 272 bytes: in one IDAT chunk and split over three.
+    fn pngs_with_more_image_data_than_their_ihdr() -> Vec<Vec<u8>> {
+        let big = encode(
+            512,
+            512,
+            ::png::ColorType::Grayscale,
+            ::png::BitDepth::Eight,
+            &vec![0; 512 * 512],
+            |_| {},
+            &[],
+        );
+        let stream = chunk_data(&big, b"IDAT").unwrap();
+        let mut split = vec![ihdr(16, 16, 8, 0)];
+        split.extend(idat_chunks(&stream, 3));
+        vec![
+            file(&[ihdr(16, 16, 8, 0), chunk(b"IDAT", &stream)]),
+            file(&split),
+        ]
+    }
+
+    #[test]
+    fn a_png_with_more_image_data_than_its_ihdr_is_refused_before_quantising() {
+        for png in pngs_with_more_image_data_than_their_ihdr() {
+            let err = optimize_lossy_with(&png, q(75), never).unwrap_err();
+            // The lossless path's reason, word for word.
+            assert_eq!(err, crate::png::optimize(&png).unwrap_err());
+            assert_eq!(
+                err,
+                "could not read the PNG data: Inflated data would exceed the maximum size (272 bytes)"
+            );
+        }
+    }
+
+    /// Run the lossy path with a quantiser double that records the image it
+    /// gets and then fails, so nothing is written.
+    fn quantised_image(png: &[u8]) -> Result<Option<Rgba>, String> {
+        let seen = RefCell::new(None);
+        match optimize_lossy_with(png, q(75), |image, _| {
+            *seen.borrow_mut() = Some(image.clone());
+            Err("recorded".to_owned())
+        }) {
+            Err(reason) if reason == "recorded" => Ok(seen.into_inner()),
+            Err(reason) => Err(reason),
+            Ok(_) => panic!("the double fails, so the run cannot succeed"),
+        }
+    }
+
+    #[test]
+    fn a_png_whose_image_data_fits_its_ihdr_is_quantised_also_when_split_over_several_idat_chunks()
+    {
+        let whole = gradient_png();
+        let stream = chunk_data(&whole, b"IDAT").unwrap();
+        let mut split = vec![chunk(b"IHDR", &chunk_data(&whole, b"IHDR").unwrap())];
+        split.extend(idat_chunks(&stream, 4));
+        let split = file(&split);
+        assert_eq!(
+            chunk_types(&split)
+                .iter()
+                .filter(|kind| *kind == b"IDAT")
+                .count(),
+            4
+        );
+        let expected = Rgba {
+            width: GW,
+            height: GH,
+            pixels: gradient_pixels(GW, GH),
+        };
+        for png in [whole, split] {
+            assert_eq!(quantised_image(&png), Ok(Some(expected.clone())));
+        }
+    }
+
+    #[test]
+    fn image_data_of_exactly_the_ihdr_size_is_quantised_and_one_byte_more_is_refused() {
+        let palette = chunk(b"PLTE", &[0, 0, 0]);
+        // (what, header chunks, the IHDR's raw size: rows of bytes, each
+        // with its filter byte)
+        let cases: Vec<(&str, Vec<Vec<u8>>, usize)> = vec![
+            ("16x16 grey 8-bit", vec![ihdr(16, 16, 8, 0)], 16 * (1 + 16)),
+            ("10x3 grey 1-bit", vec![ihdr(10, 3, 1, 0)], 3 * (1 + 2)),
+            ("3x2 RGB 8-bit", vec![ihdr(3, 2, 8, 2)], 2 * (1 + 9)),
+            (
+                "3x3 palette 4-bit",
+                vec![ihdr(3, 3, 4, 3), palette],
+                3 * (1 + 2),
+            ),
+            ("2x2 grey-alpha 8-bit", vec![ihdr(2, 2, 8, 4)], 2 * (1 + 4)),
+            ("5x2 RGBA 16-bit", vec![ihdr(5, 2, 16, 6)], 2 * (1 + 40)),
+            // Adam7: seven passes of 2x2, 2x2, 4x2, 4x4, 8x4, 8x8 and 16x8
+            // pixels, 30 rows in all.
+            (
+                "16x16 grey 8-bit interlaced",
+                vec![interlaced_ihdr(16, 16, 8, 0)],
+                256 + 30,
+            ),
+        ];
+        for (what, header, size) in cases {
+            let with = |length: usize| {
+                let mut chunks = header.clone();
+                chunks.push(chunk(b"IDAT", &zlib_stored(&vec![0; length])));
+                file(&chunks)
+            };
+            let image = quantised_image(&with(size)).unwrap_or_else(|err| panic!("{what}: {err}"));
+            assert!(image.is_some(), "{what}");
+
+            let over = with(size + 1);
+            let err = optimize_lossy_with(&over, q(75), never).unwrap_err();
+            assert_eq!(err, crate::png::optimize(&over).unwrap_err(), "{what}");
+            assert!(
+                err.ends_with(&format!(
+                    "Inflated data would exceed the maximum size ({size} bytes)"
+                )),
+                "{what}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_corrupt_or_short_stream_is_left_to_the_decoder_which_refuses_it() {
+        // 16x16 grey holds 272 bytes. A stream one byte short, and one whose
+        // zlib header is broken (with a valid chunk CRC): the size check
+        // lets both through and the decoder refuses them.
+        let mut broken = zlib_stored(&[0; 272]);
+        broken[0] = 0x00;
+        for stream in [zlib_stored(&[0; 271]), broken] {
+            let png = file(&[ihdr(16, 16, 8, 0), chunk(b"IDAT", &stream)]);
+            let err = optimize_lossy_with(&png, q(75), never).unwrap_err();
+            assert!(err.starts_with("could not read the PNG data"), "{err}");
+            assert!(!err.contains("Inflated data would exceed"), "{err}");
+        }
+    }
+
+    #[test]
+    fn raw_data_size_is_the_size_oxipng_names_for_every_adam7_corner() {
+        // Widths and heights 1 to 9 at 1, 8 and 64 bits per pixel, where the
+        // passes a small image lacks have no rows. oxipng names its size in
+        // its reason for one byte too many, and accepts exactly that size.
+        for (bits, depth, colour) in [(1, 1, 0), (8, 8, 0), (64, 16, 6)] {
+            for w in 1..=9u32 {
+                for h in 1..=9u32 {
+                    let size = raw_data_size(w, h, bits, true);
+                    let png = |length: usize| {
+                        file(&[
+                            interlaced_ihdr(w, h, depth, colour),
+                            chunk(b"IDAT", &zlib_stored(&vec![0; length])),
+                        ])
+                    };
+                    let what = format!("{w}x{h} at {bits} bits");
+                    assert_eq!(
+                        crate::png::optimize(&png(size + 1)).unwrap_err(),
+                        oxipng_reason(oxipng::PngError::InflatedDataTooLong(size)),
+                        "{what}"
+                    );
+                    assert!(crate::png::optimize(&png(size)).is_ok(), "{what}");
+                }
+            }
         }
     }
 }
