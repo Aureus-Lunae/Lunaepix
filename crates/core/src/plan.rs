@@ -20,6 +20,22 @@ pub const MAX_RUN_FILES: usize = 2000;
 /// all of them, so a larger image is refused before it is decoded.
 pub const MAX_PIXELS: u64 = 100_000_000;
 
+/// Most work a lossy animated WebP may declare: its frame count times its
+/// canvas pixels (1,000,000,000), read from the headers before decoding. Set
+/// by the user from the Task 1 measurements: time binds, not memory (worst
+/// measured 171 ms per million frames x pixels, with alpha, so about 3
+/// minutes at the cap, and three times that on a slow laptop, within
+/// [`WORKER_TIMEOUT`]). An animation over it gets the lossless treatment with
+/// the note "kept lossless: animation too large for lossy".
+pub const MAX_ANIMATION_PIXELS: u64 = 1_000_000_000;
+
+/// Largest canvas a lossy animated WebP may declare, in pixels (50
+/// megapixels). Set by the user from the Task 1 measurements: memory grows
+/// with the canvas, not the frame count (about 50 MB per megapixel with
+/// alpha, so about 2.5 GB here). Over it: the lossless treatment with the
+/// same note as over [`MAX_ANIMATION_PIXELS`].
+pub const MAX_ANIMATION_CANVAS_PIXELS: u64 = 50_000_000;
+
 /// Deepest element nesting an SVG may have: the root `<svg>` is level 1. oxvg
 /// walks the tree recursively (parse, every job, the writer), so a deeper
 /// file could overflow the stack, which aborts the process. Measured with
@@ -242,6 +258,18 @@ pub(crate) fn check_pixels(width: u32, height: u32) -> Result<(), String> {
     ))
 }
 
+/// Whether an animation of `frames` frames on a `width`×`height` canvas is
+/// within both lossy animation caps: [`MAX_ANIMATION_CANVAS_PIXELS`] for the
+/// canvas and [`MAX_ANIMATION_PIXELS`] for frames times canvas.
+pub(crate) fn animation_within_caps(frames: u64, width: u32, height: u32) -> bool {
+    // Both factors fit in 32 bits, so the canvas cannot overflow 64.
+    let canvas = u64::from(width) * u64::from(height);
+    canvas <= MAX_ANIMATION_CANVAS_PIXELS
+        && frames
+            .checked_mul(canvas)
+            .is_some_and(|work| work <= MAX_ANIMATION_PIXELS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +293,39 @@ mod tests {
     fn refuses_the_largest_declarable_dimensions_without_overflowing() {
         assert!(check_pixels(65_535, 65_535).is_err());
         assert!(check_pixels(u32::MAX, u32::MAX).is_err());
+    }
+
+    // --- animation caps -----------------------------------------------------
+
+    #[test]
+    fn animation_caps_are_the_values_the_user_set() {
+        assert_eq!(MAX_ANIMATION_PIXELS, 1_000_000_000);
+        assert_eq!(MAX_ANIMATION_CANVAS_PIXELS, 50_000_000);
+    }
+
+    #[test]
+    fn an_animation_at_both_caps_is_within_them() {
+        // 1000 frames of one megapixel: exactly the frame cap.
+        assert!(animation_within_caps(1000, 1000, 1000));
+        // 20 frames of exactly 50 MP: both caps at once.
+        assert!(animation_within_caps(20, 10_000, 5000));
+        assert!(animation_within_caps(1, 10_000, 5000));
+        assert!(animation_within_caps(1, 1, 1));
+    }
+
+    #[test]
+    fn an_animation_one_over_either_cap_is_not_within_them() {
+        // One frame more than the frame cap allows.
+        assert!(!animation_within_caps(1001, 1000, 1000));
+        // A canvas one column over 50 MP, with a single frame.
+        assert!(!animation_within_caps(1, 10_001, 5000));
+        // 21 frames of 50 MP: the canvas is allowed, the work is not.
+        assert!(!animation_within_caps(21, 10_000, 5000));
+        // No overflow, whatever the numbers.
+        assert!(!animation_within_caps(u64::MAX, 16_384, 16_384));
+        assert!(!animation_within_caps(u64::MAX, 1, 1));
+        // Frames times canvas past u64: refused, not wrapped.
+        assert!(!animation_within_caps(u64::MAX, 2, 1));
     }
     use std::ffi::OsString;
     use std::fs::{self, File};
