@@ -76,6 +76,11 @@ licence of the Independent JPEG Group:
 
 This software is based in part on the work of the Independent JPEG Group.
 
+WebP uses Google's libwebp (through the `libwebp-sys` crate): its code is
+BSD-3-Clause, and Google's additional patent grant for it (`PATENTS`) is
+printed in the same page. PNG colour reduction uses the `quantizr` crate (MIT).
+`about.toml` clarifies both crates from their own licence files, with checksums.
+
 `THIRD-PARTY-LICENSES.html` is generated from the dependencies the app ships
 (not the test-only ones) and the rules in `about.toml`. Regenerate it after a
 dependency changes, and read the failure if cargo-about refuses a licence:

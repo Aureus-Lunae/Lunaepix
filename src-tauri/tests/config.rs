@@ -393,12 +393,13 @@ fn js_lint_hits(text: &str) -> Vec<&'static str> {
 // ---------------------------------------------------------------------
 
 /// What the tokenizer found, reduced to what the checks need: start tags with
-/// their attributes (names in lower case, values decoded), end tags, and text.
-/// Comments and doctypes are dropped.
+/// their attributes (names in lower case, values decoded), end tags, text and
+/// comments. Doctypes are dropped.
 enum Piece {
     Start(StartTag),
     End(String),
     Text(String),
+    Comment(String),
 }
 
 struct StartTag {
@@ -425,8 +426,14 @@ impl TokenSink for Collector {
 
     fn process_token(&self, token: Token, _line_number: u64) -> TokenSinkResult<()> {
         let Token::TagToken(tag) = token else {
-            if let Token::CharacterTokens(text) = token {
-                self.0.borrow_mut().push(Piece::Text(text.to_string()));
+            match token {
+                Token::CharacterTokens(text) => {
+                    self.0.borrow_mut().push(Piece::Text(text.to_string()));
+                }
+                Token::CommentToken(text) => {
+                    self.0.borrow_mut().push(Piece::Comment(text.to_string()));
+                }
+                _ => {}
             }
             return TokenSinkResult::Continue;
         };
@@ -473,6 +480,17 @@ fn start_tags(html: &str) -> Vec<StartTag> {
         .into_iter()
         .filter_map(|piece| match piece {
             Piece::Start(tag) => Some(tag),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The comments of `html`, in order.
+fn comments(html: &str) -> Vec<String> {
+    pieces(html)
+        .into_iter()
+        .filter_map(|piece| match piece {
+            Piece::Comment(text) => Some(text),
             _ => None,
         })
         .collect()
@@ -1534,6 +1552,302 @@ fn a_text_without_the_ijg_wording_or_the_libdeflate_notice_is_caught_in_a_fixtur
     assert!(!has_libdeflate_notice("<pre>MIT License</pre>"));
     assert!(has_libdeflate_notice(
         "<pre>Copyright 2016 Eric Biggers\nCopyright 2024 Google LLC</pre>"
+    ));
+}
+
+// --- the licences of libwebp and quantizr ------------------------------------------
+
+/// SHA-256 of `vendor/COPYING` in libwebp-sys 0.14.4 (libwebp's BSD-3-Clause).
+const LIBWEBP_COPYING_SHA256: &str =
+    "5aec868f669e384a22372a4e8a1a6cd7d44c64cd451f960ca69cc170d1e13acf";
+/// SHA-256 of `vendor/PATENTS` in libwebp-sys 0.14.4 (Google's patent grant).
+const LIBWEBP_PATENTS_SHA256: &str =
+    "cc3273e0694ea5896145e0677699b53471b03ea43021ddc50e7923fbb9f5023c";
+/// SHA-256 of `LICENSE` in quantizr 1.4.3 (MIT).
+const QUANTIZR_LICENSE_SHA256: &str =
+    "407b2d167f73ef78da1fcbfb6c2f1051f195b1984b9bfeeac0a39b34c198a7fe";
+
+/// What `about.toml` must clarify, as `(crate, licence expression, file path,
+/// file checksum, file licence)`. libwebp-sys declares only MIT but vendors
+/// BSD-3-Clause C code; quantizr declares no licence in its manifest at all
+/// (`license-file` only), so cargo-about cannot guess it.
+const CLARIFICATIONS: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "libwebp-sys",
+        "MIT AND BSD-3-Clause",
+        "vendor/COPYING",
+        LIBWEBP_COPYING_SHA256,
+        "BSD-3-Clause",
+    ),
+    ("quantizr", "MIT", "LICENSE", QUANTIZR_LICENSE_SHA256, "MIT"),
+];
+
+/// What is missing or wrong in `about.toml`'s clarifications of libwebp-sys
+/// and quantizr: the table, the licence expression, and the licence file with
+/// its path, checksum and licence.
+fn clarification_problems(about_toml: &str) -> Vec<String> {
+    let table = match about_toml.parse::<toml::Table>() {
+        Ok(table) => table,
+        Err(error) => return vec![format!("about.toml does not parse: {error}")],
+    };
+    let mut problems = Vec::new();
+    for (name, expression, path, checksum, file_licence) in CLARIFICATIONS {
+        let Some(clarify) = table
+            .get(*name)
+            .and_then(toml::Value::as_table)
+            .and_then(|krate| krate.get("clarify"))
+            .and_then(toml::Value::as_table)
+        else {
+            problems.push(format!("{name}: no clarify table"));
+            continue;
+        };
+        if clarify.get("license").and_then(toml::Value::as_str) != Some(*expression) {
+            problems.push(format!("{name}: license is not {expression}"));
+        }
+        let listed = clarify
+            .get("files")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_table)
+            .any(|file| {
+                let field = |key: &str| file.get(key).and_then(toml::Value::as_str);
+                field("path") == Some(*path)
+                    && field("checksum") == Some(*checksum)
+                    && field("license") == Some(*file_licence)
+            });
+        if !listed {
+            problems.push(format!(
+                "{name}: no file {path} with checksum {checksum} and licence {file_licence}"
+            ));
+        }
+    }
+    problems
+}
+
+/// libwebp's BSD-3-Clause text (its copyright line and the clause that names
+/// Google), quantizr's MIT notice, Google's patent grant (its heading, the
+/// definition and the scope sentence) and the checksum of the `PATENTS` file
+/// in a comment beside it. Text in a comment, script or style does not count
+/// as shown; the checksum counts only as a comment.
+fn licence_page_problems(html: &str) -> Vec<String> {
+    let text = page_text(html);
+    let mut problems = Vec::new();
+    for (what, needle) in [
+        ("libwebp-sys in the list of users", "libwebp-sys"),
+        (
+            "libwebp's copyright line",
+            "Copyright (c) 2010, Google Inc.",
+        ),
+        (
+            "libwebp's BSD-3-Clause text",
+            "Neither the name of Google nor the names of its contributors",
+        ),
+        ("quantizr in the list of users", "quantizr"),
+        (
+            "quantizr's copyright line",
+            "Copyright (c) 2017 Sergey Alexandrovich",
+        ),
+        (
+            "the patent grant heading",
+            "Additional IP Rights Grant (Patents)",
+        ),
+        // Not the Apache-2.0 wording the page also holds: the grant's own words.
+        (
+            "the patent grant's definition",
+            "implement the WebM codecs distributed by Google as part of the WebM Project.",
+        ),
+        (
+            "the patent grant's scope",
+            "necessarily infringed by these implementations of WebM.",
+        ),
+    ] {
+        if !text.contains(needle) {
+            problems.push(format!("the page does not show {what}"));
+        }
+    }
+    if !comments(html)
+        .iter()
+        .any(|comment| comment.contains(LIBWEBP_PATENTS_SHA256))
+    {
+        problems.push("no comment gives the PATENTS checksum".to_owned());
+    }
+    problems
+}
+
+const LIBWEBP_FIXTURE: &str = "<li>libwebp-sys 0.14.4</li><pre>Copyright (c) 2010, Google Inc. \
+    All rights reserved. Neither the name of Google nor the names of its contributors may be used</pre>";
+const QUANTIZR_FIXTURE: &str =
+    "<li>quantizr 1.4.3</li><pre>MIT License Copyright (c) 2017 Sergey Alexandrovich</pre>";
+const PATENTS_TEXT_FIXTURE: &str = "<h3>libwebp: Additional IP Rights Grant (Patents)</h3><pre>\
+    \"These implementations\" means the copyrightable works that implement the WebM codecs distributed \
+    by Google as part of the WebM Project. ... necessarily infringed by these implementations of WebM. ...</pre>";
+const PATENTS_SUM_FIXTURE: &str = "<!-- vendor/PATENTS of libwebp-sys 0.14.4, sha256 cc3273e0694ea5896145e0677699b53471b03ea43021ddc50e7923fbb9f5023c -->";
+
+fn licence_fixture(parts: &[&str]) -> String {
+    format!("<main>{}</main>", parts.concat())
+}
+
+fn full_licence_fixture() -> String {
+    licence_fixture(&[
+        LIBWEBP_FIXTURE,
+        QUANTIZR_FIXTURE,
+        PATENTS_SUM_FIXTURE,
+        PATENTS_TEXT_FIXTURE,
+    ])
+}
+
+/// An `about.toml` fixture with the clarification of libwebp-sys and/or
+/// quantizr, each as the real file should have it.
+fn about_fixture(libwebp: bool, quantizr: bool) -> String {
+    let mut about = String::from("accepted = [\"MIT\", \"BSD-3-Clause\"]\n");
+    for (include, (name, expression, path, checksum, licence)) in
+        [libwebp, quantizr].into_iter().zip(CLARIFICATIONS)
+    {
+        if include {
+            about.push_str(&format!(
+                "[{name}.clarify]\nlicense = \"{expression}\"\n\
+                 [[{name}.clarify.files]]\npath = \"{path}\"\nchecksum = \"{checksum}\"\nlicense = \"{licence}\"\n"
+            ));
+        }
+    }
+    about
+}
+
+#[test]
+fn about_toml_clarifies_libwebp_sys_and_quantizr_with_checksums() {
+    let about = repo_file("about.toml");
+    assert_eq!(clarification_problems(&about), Vec::<String>::new());
+    // Not vacuous: the parse saw both entries, and the policy is still sound.
+    let table = about.parse::<toml::Table>().unwrap();
+    assert_eq!(
+        table["libwebp-sys"]["clarify"]["license"].as_str(),
+        Some("MIT AND BSD-3-Clause")
+    );
+    assert_eq!(
+        table["quantizr"]["clarify"]["license"].as_str(),
+        Some("MIT")
+    );
+    assert_eq!(about_problems(&about), Vec::<String>::new());
+}
+
+#[test]
+fn a_clarification_that_is_missing_or_wrong_is_caught_in_a_fixture() {
+    // The pair is right: nothing to flag (so each case below fails on its own).
+    assert_eq!(
+        clarification_problems(&about_fixture(true, true)),
+        Vec::<String>::new()
+    );
+    let no_quantizr = clarification_problems(&about_fixture(true, false));
+    assert!(
+        names(&no_quantizr, "quantizr: no clarify table"),
+        "{no_quantizr:?}"
+    );
+    assert!(!names(&no_quantizr, "libwebp-sys"), "{no_quantizr:?}");
+    let no_libwebp = clarification_problems(&about_fixture(false, true));
+    assert!(
+        names(&no_libwebp, "libwebp-sys: no clarify table"),
+        "{no_libwebp:?}"
+    );
+    assert!(!names(&no_libwebp, "quantizr"), "{no_libwebp:?}");
+    // A changed checksum is a changed file: flagged for that crate only.
+    let wrong_sum = about_fixture(true, true).replace(QUANTIZR_LICENSE_SHA256, "00");
+    let problems = clarification_problems(&wrong_sum);
+    assert!(
+        names(&problems, "quantizr: no file LICENSE"),
+        "{problems:?}"
+    );
+    assert!(!names(&problems, "libwebp-sys"), "{problems:?}");
+    // libwebp-sys left at MIT alone drops the BSD-3-Clause notice.
+    let mit_only = about_fixture(true, true).replace("MIT AND BSD-3-Clause", "MIT");
+    let problems = clarification_problems(&mit_only);
+    assert!(
+        names(
+            &problems,
+            "libwebp-sys: license is not MIT AND BSD-3-Clause"
+        ),
+        "{problems:?}"
+    );
+    // A file entry under another path is not the file.
+    let wrong_path = about_fixture(true, true).replace("vendor/COPYING", "COPYING");
+    let problems = clarification_problems(&wrong_path);
+    assert!(
+        names(&problems, "libwebp-sys: no file vendor/COPYING"),
+        "{problems:?}"
+    );
+    // A file that does not parse says so, instead of reading as "nothing wrong".
+    assert!(names(
+        &clarification_problems("accepted = ["),
+        "does not parse"
+    ));
+}
+
+#[test]
+fn the_licence_page_names_libwebp_quantizr_and_the_patents_grant() {
+    let html = repo_file(LICENCE_FILE);
+    assert_eq!(licence_page_problems(&html), Vec::<String>::new());
+}
+
+#[test]
+fn a_licence_page_without_libwebp_quantizr_or_the_patents_grant_is_caught_in_a_fixture() {
+    // The full fixture is right: nothing to flag (so each case below fails on its own).
+    assert_eq!(
+        licence_page_problems(&full_licence_fixture()),
+        Vec::<String>::new()
+    );
+    let without = |parts: &[&str]| licence_page_problems(&licence_fixture(parts));
+    let no_libwebp = without(&[QUANTIZR_FIXTURE, PATENTS_SUM_FIXTURE, PATENTS_TEXT_FIXTURE]);
+    assert!(
+        names(&no_libwebp, "libwebp's copyright line"),
+        "{no_libwebp:?}"
+    );
+    assert!(
+        names(&no_libwebp, "libwebp's BSD-3-Clause text"),
+        "{no_libwebp:?}"
+    );
+    assert!(!names(&no_libwebp, "quantizr"), "{no_libwebp:?}");
+    let no_quantizr = without(&[LIBWEBP_FIXTURE, PATENTS_SUM_FIXTURE, PATENTS_TEXT_FIXTURE]);
+    assert!(
+        names(&no_quantizr, "quantizr's copyright line"),
+        "{no_quantizr:?}"
+    );
+    assert!(!names(&no_quantizr, "libwebp"), "{no_quantizr:?}");
+    let no_patents = without(&[LIBWEBP_FIXTURE, QUANTIZR_FIXTURE, PATENTS_SUM_FIXTURE]);
+    assert!(names(&no_patents, "the patent grant"), "{no_patents:?}");
+    assert!(!names(&no_patents, "PATENTS checksum"), "{no_patents:?}");
+    // The patent text without the checksum comment: the file cannot be re-checked.
+    let no_sum = without(&[LIBWEBP_FIXTURE, QUANTIZR_FIXTURE, PATENTS_TEXT_FIXTURE]);
+    assert_eq!(
+        no_sum,
+        vec!["no comment gives the PATENTS checksum".to_owned()]
+    );
+    // The checksum as page text is not a comment, and another file's checksum is not it.
+    let sum_as_text = full_licence_fixture()
+        .replace("<!-- ", "<p>")
+        .replace(" -->", "</p>");
+    assert_eq!(
+        licence_page_problems(&sum_as_text),
+        vec!["no comment gives the PATENTS checksum".to_owned()]
+    );
+    let other_sum = full_licence_fixture().replace(LIBWEBP_PATENTS_SHA256, LIBWEBP_COPYING_SHA256);
+    assert_eq!(
+        licence_page_problems(&other_sum),
+        vec!["no comment gives the PATENTS checksum".to_owned()]
+    );
+    // A notice that stands only in a comment, a script or a style is not on the page.
+    let in_comment = format!(
+        "<!-- {LIBWEBP_FIXTURE} -->{QUANTIZR_FIXTURE}{PATENTS_SUM_FIXTURE}{PATENTS_TEXT_FIXTURE}"
+    );
+    assert!(names(
+        &licence_page_problems(&in_comment),
+        "libwebp's copyright line"
+    ));
+    let in_script = format!(
+        "<script>'{PATENTS_TEXT_FIXTURE}'</script>{LIBWEBP_FIXTURE}{QUANTIZR_FIXTURE}{PATENTS_SUM_FIXTURE}"
+    );
+    assert!(names(
+        &licence_page_problems(&in_script),
+        "the patent grant"
     ));
 }
 

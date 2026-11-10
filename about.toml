@@ -52,3 +52,26 @@ license = "Apache-2.0"
 path = "libdeflate/COPYING"
 checksum = "4ad69099cb4374836fd27583d9991e2838cd86b6e4666ab26b2d32582c91e73a"
 license = "MIT"
+
+# libwebp-sys declares only MIT, but vendors libwebp's C code, which is
+# BSD-3-Clause (vendor/COPYING in the crate), with Google's patent grant
+# (vendor/PATENTS, which about.hbs prints). The crate ships no MIT file of its
+# own, so the MIT part uses cargo-about's standard text.
+[libwebp-sys.clarify]
+license = "MIT AND BSD-3-Clause"
+
+[[libwebp-sys.clarify.files]]
+path = "vendor/COPYING"
+checksum = "5aec868f669e384a22372a4e8a1a6cd7d44c64cd451f960ca69cc170d1e13acf"
+license = "BSD-3-Clause"
+
+# quantizr declares no licence in its manifest (only `license-file`), so
+# cargo-about cannot read it: the crate is clarified from that file, which is
+# MIT ("Copyright (c) 2017 Sergey Alexandrovich").
+[quantizr.clarify]
+license = "MIT"
+
+[[quantizr.clarify.files]]
+path = "LICENSE"
+checksum = "407b2d167f73ef78da1fcbfb6c2f1051f195b1984b9bfeeac0a39b34c198a7fe"
+license = "MIT"
