@@ -1,6 +1,6 @@
 [package]
 name = "lunaepix-core"
-description = "Lossless PNG, JPG, SVG and WebP optimisation: the Lunaepix core library"
+description = "Lossless and lossy PNG, JPG, SVG and WebP optimisation: the Lunaepix core library"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
