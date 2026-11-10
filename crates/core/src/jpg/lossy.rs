@@ -10,8 +10,9 @@
 //!
 //! The source's APPn and COM segments (EXIF, ICC, XMP, comments) are copied
 //! byte for byte, in source order, except its JFIF APP0 and Adobe APP14:
-//! libjpeg writes its own JFIF for the YCbCr or greyscale output, and an
-//! Adobe segment describes a colour transform the output no longer has.
+//! libjpeg writes its own JFIF for the YCbCr or greyscale output, carrying
+//! the source's density (DPI), and an Adobe segment describes a colour
+//! transform the output no longer has.
 //!
 //! A source in another colour space (CMYK, YCCK) gets the lossless treatment
 //! with [`Note::KeptLosslessCmyk`].
@@ -51,6 +52,19 @@ struct Decoded {
     pixels: Vec<u8>,
     /// Every saved APPn and COM segment, in source order.
     markers: Vec<Marker>,
+    /// The source's JFIF density, which the output's JFIF APP0 carries.
+    density: Density,
+}
+
+/// A JFIF density: the unit (0 none, so only the aspect ratio; 1 dots per
+/// inch; 2 dots per cm) and the horizontal and vertical density. libjpeg
+/// reads unit 0 and 1:1 for a source without a JFIF APP0, which is also what
+/// it writes by default, so such a source gains no DPI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Density {
+    unit: u8,
+    x: u16,
+    y: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +191,11 @@ unsafe fn read_pixels(bytes: &[u8], len: c_ulong) -> Source {
         };
         source.out_color_space = colour.space();
         let markers = saved_markers(source);
+        let density = Density {
+            unit: source.density_unit,
+            x: source.X_density,
+            y: source.Y_density,
+        };
         jpeg_start_decompress(source);
         let width = source.output_width;
         let height = source.output_height;
@@ -200,6 +219,7 @@ unsafe fn read_pixels(bytes: &[u8], len: c_ulong) -> Source {
             colour,
             pixels,
             markers,
+            density,
         })
     }
 }
@@ -264,6 +284,14 @@ unsafe fn write_jpeg(decoded: &Decoded, quality: Quality) -> Vec<u8> {
         jpeg_c_set_int_param(output, JINT_COMPRESS_PROFILE, JCP_MAX_COMPRESSION as c_int);
         // Picks YCbCr for RGB input and greyscale for greyscale input.
         jpeg_set_defaults(output);
+        // After `jpeg_set_defaults`, which resets the density to unit 0,
+        // 1:1. libjpeg's own JFIF APP0 (`write_JFIF_header`, set for YCbCr
+        // and greyscale) then carries the source's DPI, as lossless keeps
+        // it. Its JFIF version stays libjpeg's 1.01: the density fields mean
+        // the same in 1.01 and 1.02.
+        output.density_unit = decoded.density.unit;
+        output.X_density = decoded.density.x;
+        output.Y_density = decoded.density.y;
         jpeg_set_quality(output, c_int::from(quality.get()), 1);
         jpeg_start_compress(output, 1);
         for marker in decoded.markers.iter().filter(|marker| marker.is_copied()) {
@@ -565,9 +593,10 @@ mod tests {
     }
 
     #[test]
-    fn a_source_jfif_app0_is_not_copied_twice() {
+    fn a_source_jfif_app0_is_not_copied_twice_and_its_density_is_kept() {
         // A JFIF APP0 with a distinctive density (300 dpi): libjpeg writes
-        // its own JFIF, and the source's is not copied next to it.
+        // its own JFIF, the source's is not copied next to it, and libjpeg's
+        // carries the source's density.
         let jfif = b"JFIF\0\x01\x02\x01\x01\x2C\x01\x2C\0\0".to_vec();
         let source = with_segments(&photo(95), &[(0xE0, jfif.clone())]);
         let in_source = segments(&source)
@@ -582,7 +611,133 @@ mod tests {
             .collect();
         assert_eq!(app0.len(), 1, "{app0:?}");
         assert!(app0[0].1.starts_with(b"JFIF\0"));
-        assert_ne!(app0[0].1, jfif);
+        assert_eq!(density(&lossy.bytes), (1, 300, 300));
+    }
+
+    /// A baseline-quality RGB photo written by libjpeg: `Some((unit, x, y))`
+    /// writes a JFIF APP0 with that density, `None` writes no JFIF APP0.
+    fn jpeg_with_density(jfif: Option<(u8, u16, u16)>) -> Vec<u8> {
+        let pixels = photo_pixels(W, H);
+        run_libjpeg(|| {
+            let mut compress = Compress::new();
+            let output = compress.cinfo();
+            let row = W as usize * 3;
+            // SAFETY: the standard libjpeg compression sequence on a
+            // compressor `Compress` owns; each row pointer points at `row`
+            // bytes of `pixels`.
+            unsafe {
+                output.image_width = W;
+                output.image_height = H;
+                output.input_components = 3;
+                output.in_color_space = J_COLOR_SPACE::JCS_RGB;
+                jpeg_set_defaults(output);
+                match jfif {
+                    Some((unit, x, y)) => {
+                        output.density_unit = unit;
+                        output.X_density = x;
+                        output.Y_density = y;
+                    }
+                    None => output.write_JFIF_header = 0,
+                }
+                jpeg_set_quality(output, 95, 1);
+                jpeg_start_compress(output, 1);
+                for line in pixels.chunks_exact(row) {
+                    let rows = [line.as_ptr()];
+                    jpeg_write_scanlines(output, rows.as_ptr(), 1);
+                }
+                jpeg_finish_compress(output);
+            }
+            compress.into_output()
+        })
+        .unwrap()
+    }
+
+    /// The density unit and the X and Y density as libjpeg reads them from
+    /// the header: unit 0 and 1:1 when there is no JFIF APP0.
+    fn density(bytes: &[u8]) -> (u8, u16, u16) {
+        let len = c_ulong::try_from(bytes.len()).unwrap();
+        run_libjpeg(|| {
+            let mut decompress = Decompress::new();
+            let source = decompress.cinfo();
+            // SAFETY: `bytes` outlives `decompress`.
+            unsafe {
+                jpeg_mem_src(source, bytes.as_ptr(), len);
+                jpeg_read_header(source, 1);
+            }
+            (source.density_unit, source.X_density, source.Y_density)
+        })
+        .unwrap()
+    }
+
+    /// The JFIF APP0 segments of `jpeg`.
+    fn jfif_segments(jpeg: &[u8]) -> usize {
+        segments(jpeg)
+            .into_iter()
+            .filter(|(code, data)| *code == 0xE0 && data.starts_with(b"JFIF\0"))
+            .count()
+    }
+
+    /// The density `decode` reads from `bytes`.
+    fn decoded_density(bytes: &[u8]) -> Density {
+        match decode(bytes).unwrap() {
+            Source::Pixels(decoded) => decoded.density,
+            Source::OtherColourSpace => panic!("not RGB or greyscale"),
+        }
+    }
+
+    #[test]
+    fn a_300_dpi_source_keeps_its_density_and_unit() {
+        // Dots per inch, and dots per cm with X and Y unequal.
+        for (unit, x, y) in [(1, 300, 300), (2, 118, 59)] {
+            let source = jpeg_with_density(Some((unit, x, y)));
+            assert_eq!(density(&source), (unit, x, y), "fixture");
+            assert_eq!(decoded_density(&source), Density { unit, x, y });
+
+            let lossy = optimize_lossy(&source, q(75)).unwrap();
+
+            assert_eq!(lossy.note, None, "{unit}");
+            assert_eq!(density(&lossy.bytes), (unit, x, y));
+            assert_eq!(jfif_segments(&lossy.bytes), 1);
+        }
+    }
+
+    #[test]
+    fn a_source_without_a_jfif_segment_gains_no_density() {
+        let source = jpeg_with_density(None);
+        assert_eq!(jfif_segments(&source), 0, "fixture");
+        assert_eq!(
+            decoded_density(&source),
+            Density {
+                unit: 0,
+                x: 1,
+                y: 1
+            }
+        );
+
+        let lossy = optimize_lossy(&source, q(75)).unwrap();
+
+        assert_eq!(lossy.note, None);
+        // libjpeg's own JFIF APP0, saying "no unit, square pixels".
+        assert_eq!(density(&lossy.bytes), (0, 1, 1));
+    }
+
+    #[test]
+    fn a_source_with_density_1_1_and_no_unit_gains_no_dpi() {
+        let source = jpeg_with_density(Some((0, 1, 1)));
+        assert_eq!(jfif_segments(&source), 1, "fixture");
+        assert_eq!(
+            decoded_density(&source),
+            Density {
+                unit: 0,
+                x: 1,
+                y: 1
+            }
+        );
+
+        let lossy = optimize_lossy(&source, q(75)).unwrap();
+
+        assert_eq!(lossy.note, None);
+        assert_eq!(density(&lossy.bytes), (0, 1, 1));
     }
 
     #[test]
@@ -706,6 +861,11 @@ mod tests {
             colour: Colour::Grey,
             pixels: vec![0; 70_000],
             markers: Vec::new(),
+            density: Density {
+                unit: 0,
+                x: 1,
+                y: 1,
+            },
         };
         let err = encode(&decoded, q(75)).unwrap_err();
         assert!(err.contains("65500"), "{err}");
