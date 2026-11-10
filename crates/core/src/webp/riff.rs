@@ -126,6 +126,37 @@ impl WebpFile<'_> {
             _ => 0,
         }
     }
+
+    /// The EXIF flag a lossy file written from this one carries. The `EXIF`
+    /// chunk kept is [`WebpFile::rotated_exif`]'s. The flag is set when there
+    /// is one and the source has a `VP8X` (the flag then matches the chunk
+    /// kept); clear for a source without a `VP8X`, where readers ignore an
+    /// `EXIF` chunk, so the picture renders exactly as before, as with the
+    /// ICC flag ([`WebpFile::kept_icc_flag`]); clear when no chunk is kept.
+    fn kept_exif_flag(&self) -> u8 {
+        let extended = self
+            .chunks
+            .first()
+            .is_some_and(|first| &first.fourcc == b"VP8X");
+        if extended && self.rotated_exif().is_some() {
+            FLAG_EXIF
+        } else {
+            0
+        }
+    }
+
+    /// The largest width or height any size header of the file declares:
+    /// the `VP8X` canvas and the `VP8L` and `VP8 ` image headers. Nothing is
+    /// decoded. `parse` read every header already, so each is there and
+    /// well-formed.
+    pub(crate) fn largest_side(&self) -> u32 {
+        self.chunks
+            .iter()
+            .filter_map(|chunk| declared_size(chunk).ok().flatten())
+            .map(|(width, height)| width.max(height))
+            .max()
+            .unwrap_or_default()
+    }
 }
 
 /// Append one chunk to `body`: FourCC, size, payload and the pad byte an odd
@@ -162,14 +193,15 @@ fn riff_file(body: &[u8], size: u32) -> Vec<u8> {
 /// otherwise, so a result with nothing to add comes back as it is. Its
 /// canvas is the image's own size, its reserved bits are zero, and its flags
 /// match the chunks written: alpha for an `ALPH` chunk (or a `VP8L` image
-/// that uses alpha), EXIF for the `EXIF` chunk, never XMP or animation, and
-/// the ICC flag by the source's rule ([`WebpFile::kept_icc_flag`]).
+/// that uses alpha), never XMP or animation, and the ICC flag and the EXIF
+/// flag by the source's rule
+/// ([`WebpFile::kept_icc_flag`], [`WebpFile::kept_exif_flag`]).
 ///
 /// An animated result (libwebp's `VP8X`, `ANIM`, `ANMF`… file) is written as
 /// `VP8X`, `ICCP`…, `ANIM`, `ANMF`…, `EXIF`, the animation chunks byte for
 /// byte. Its `VP8X` is the result's own (canvas, alpha flag and reserved
-/// bits as libwebp wrote them) with the animation flag set, EXIF set for the
-/// `EXIF` chunk, XMP clear and the ICC flag by the source's rule.
+/// bits as libwebp wrote them) with the animation flag set, XMP clear and
+/// the ICC and EXIF flags by the source's rule.
 ///
 /// Refuses a result that is not a readable WebP file, a still image that
 /// declares a zero width or height, and an animation without a `VP8X`.
@@ -184,6 +216,7 @@ pub(crate) fn with_metadata(encoded: &[u8], source: &WebpFile<'_>) -> Result<Vec
             .collect(),
         rotation: source.rotated_exif().map(|at| &source.chunks[at]),
         icc_flag: source.kept_icc_flag(),
+        exif_flag: source.kept_exif_flag(),
     };
     let body = if result.kind == Kind::Animated {
         animation_body(&result, &metadata)?
@@ -203,6 +236,8 @@ struct Metadata<'s> {
     rotation: Option<&'s Chunk<'s>>,
     /// The ICC flag to write ([`WebpFile::kept_icc_flag`]).
     icc_flag: u8,
+    /// The EXIF flag to write ([`WebpFile::kept_exif_flag`]).
+    exif_flag: u8,
 }
 
 /// The image of a still result: its `ALPH` chunk (for a `VP8 ` image that
@@ -269,9 +304,7 @@ fn still_body(result: &WebpFile<'_>, metadata: &Metadata<'_>) -> Result<Vec<u8>,
         if alpha {
             flags |= FLAG_ALPHA;
         }
-        if metadata.rotation.is_some() {
-            flags |= FLAG_EXIF;
-        }
+        flags |= metadata.exif_flag;
         push_chunk(&mut body, b"VP8X", &vp8x_payload(flags, width, height));
     }
     for chunk in metadata
@@ -297,10 +330,7 @@ fn animation_body(result: &WebpFile<'_>, metadata: &Metadata<'_>) -> Result<Vec<
     // `parse` refuses a VP8X shorter than its 10 bytes.
     let mut header = vp8x.data.to_vec();
     header[0] &= !(FLAG_ICC | FLAG_EXIF | FLAG_XMP);
-    header[0] |= metadata.icc_flag | FLAG_ANIMATION;
-    if metadata.rotation.is_some() {
-        header[0] |= FLAG_EXIF;
-    }
+    header[0] |= metadata.icc_flag | metadata.exif_flag | FLAG_ANIMATION;
 
     let mut body = b"WEBP".to_vec();
     push_chunk(&mut body, b"VP8X", &header);
@@ -1714,6 +1744,52 @@ pub(super) mod tests {
         assert_well_formed(&out);
     }
 
+    /// A simple source (no `VP8X`): the lossless image, then these chunks.
+    fn simple_source_with(extra: &[fx::RawChunk]) -> Vec<u8> {
+        let mut chunks = vec![fx::chunks_of(&lossless_file(false)).remove(0)];
+        chunks.extend(extra.iter().cloned());
+        fx::from_chunks(&chunks)
+    }
+
+    #[test]
+    fn a_simple_source_with_a_rotated_exif_keeps_the_chunk_with_its_flag_clear() {
+        // The ruling "Keep the source's flag": readers ignore an EXIF chunk
+        // in a file without VP8X, so the VP8X written for it must not say
+        // there is one, exactly as for the ICC flag.
+        let iccp = (*b"ICCP", ICC_EVEN.to_vec());
+        let exif = (*b"EXIF", rotated_exif());
+        for extra in [vec![exif.clone()], vec![iccp, exif]] {
+            let source = simple_source_with(&extra);
+            assert_eq!(fx::chunk_names(&source)[0], "VP8L", "fixture has no VP8X");
+
+            let out = with_metadata_of(&encoded(false), &source).unwrap();
+
+            assert_eq!(fx::chunk_names(&out)[0], "VP8X");
+            assert_eq!(fx::chunk_names(&out).last().unwrap(), "EXIF");
+            assert_eq!(fx::chunk_payload(&out, b"EXIF"), Some(rotated_exif()));
+            assert_eq!(
+                flags(&out) & (fx::FLAG_EXIF | fx::FLAG_ICC),
+                0,
+                "chunks {:?}",
+                fx::chunk_names(&out)
+            );
+            assert_eq!(canvas(&out), (SIZE, SIZE));
+            assert_well_formed(&out);
+        }
+    }
+
+    #[test]
+    fn an_extended_source_with_a_rotated_exif_keeps_the_chunk_with_its_flag_set() {
+        let source = fx::with_chunks(&lossless_file(false), &[(*b"EXIF", &rotated_exif())]);
+        assert_eq!(fx::chunk_names(&source)[0], "VP8X", "fixture has a VP8X");
+
+        let out = with_metadata_of(&encoded(false), &source).unwrap();
+
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "VP8 ", "EXIF"]);
+        assert_eq!(fx::chunk_payload(&out, b"EXIF"), Some(rotated_exif()));
+        assert_eq!(flags(&out) & fx::FLAG_EXIF, fx::FLAG_EXIF);
+    }
+
     #[test]
     fn with_metadata_keeps_alph_before_the_image_and_sets_the_alpha_flag() {
         let result = encoded(true);
@@ -1885,6 +1961,33 @@ pub(super) mod tests {
         assert_eq!(payloads_of(&out, b"ICCP"), [ICC_ODD]);
         assert_eq!(flags(&out) & fx::FLAG_ICC, 0);
         assert_eq!(flags(&out) & fx::FLAG_ANIMATION, fx::FLAG_ANIMATION);
+    }
+
+    #[test]
+    fn a_simple_source_with_a_rotated_exif_keeps_the_chunk_with_its_flag_clear_on_an_animation() {
+        let source = simple_source_with(&[(*b"EXIF", rotated_exif())]);
+        assert_eq!(fx::chunk_names(&source)[0], "VP8L", "fixture has no VP8X");
+
+        let out = with_metadata_of(&animated_result(24), &source).unwrap();
+
+        assert_eq!(
+            fx::chunk_names(&out),
+            ["VP8X", "ANIM", "ANMF", "ANMF", "EXIF"]
+        );
+        assert_eq!(payloads_of(&out, b"EXIF"), [rotated_exif()]);
+        assert_eq!(flags(&out) & fx::FLAG_EXIF, 0);
+        assert_eq!(flags(&out) & fx::FLAG_ANIMATION, fx::FLAG_ANIMATION);
+    }
+
+    #[test]
+    fn an_extended_source_with_a_rotated_exif_keeps_the_chunk_with_its_flag_set_on_an_animation() {
+        let source = fx::with_chunks(&lossless_file(false), &[(*b"EXIF", &rotated_exif())]);
+        assert_eq!(fx::chunk_names(&source)[0], "VP8X", "fixture has a VP8X");
+
+        let out = with_metadata_of(&animated_result(24), &source).unwrap();
+
+        assert_eq!(payloads_of(&out, b"EXIF"), [rotated_exif()]);
+        assert_eq!(flags(&out) & fx::FLAG_EXIF, fx::FLAG_EXIF);
     }
 
     #[test]

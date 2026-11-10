@@ -32,7 +32,9 @@ pub(crate) fn optimize_lossy(bytes: &[u8], quality: Quality) -> Result<Lossy, St
 /// double for it.
 ///
 /// The container is walked and the declared size checked against
-/// [`crate::MAX_PIXELS`] ([`riff::parse`]) before anything is decoded.
+/// [`crate::MAX_PIXELS`] ([`riff::parse`]) before anything is decoded. A
+/// still image with a side over [`codec::MAX_DIMENSION`] fails there too,
+/// with [`TOO_LARGE_FOR_LOSSY`].
 fn optimize_lossy_with(
     bytes: &[u8],
     quality: Quality,
@@ -42,6 +44,7 @@ fn optimize_lossy_with(
     if file.kind == Kind::Animated {
         return optimize_animated_lossy(bytes, &file, quality, codec);
     }
+    within_lossy_dimension(&file)?;
     let image = codec.decode_rgba(bytes)?;
     let expected = Shape {
         width: image.width,
@@ -56,6 +59,20 @@ fn optimize_lossy_with(
     Ok(finish(bytes, result))
 }
 
+/// What a user reads for a WebP whose width or height libwebp's lossy
+/// encoder cannot take ([`codec::MAX_DIMENSION`]).
+const TOO_LARGE_FOR_LOSSY: &str =
+    "too large for lossy WebP: width and height must be 16383 px or less";
+
+/// Refuses a file with a side over [`codec::MAX_DIMENSION`], from its
+/// headers, before anything is decoded.
+fn within_lossy_dimension(file: &riff::WebpFile<'_>) -> Result<(), String> {
+    if file.largest_side() > codec::MAX_DIMENSION {
+        return Err(TOO_LARGE_FOR_LOSSY.to_owned());
+    }
+    Ok(())
+}
+
 /// An animated WebP in a lossy run: every frame decoded as a full canvas
 /// and encoded again by libwebp's animation encoder, lossy at `quality`,
 /// one frame at a time, with the source's loop count, background colour and
@@ -66,7 +83,9 @@ fn optimize_lossy_with(
 /// checked against the animation caps ([`animation_within_caps`]) and
 /// against the longest total duration libwebp can count
 /// ([`codec::MAX_TIMESTAMP_MS`]). Over any of them the file gets the
-/// lossless treatment with [`Note::KeptLosslessAnimationTooLarge`].
+/// lossless treatment with [`Note::KeptLosslessAnimationTooLarge`]. After
+/// that, a canvas with a side over [`codec::MAX_DIMENSION`] fails
+/// ([`TOO_LARGE_FOR_LOSSY`]).
 ///
 /// The result must have the source's canvas and total duration; it may
 /// have fewer frames, because libwebp merges a frame that matches the one
@@ -88,6 +107,7 @@ fn optimize_animated_lossy(
             Note::KeptLosslessAnimationTooLarge,
         ));
     }
+    within_lossy_dimension(file)?;
     let expected = Shape {
         width: header.width,
         height: header.height,
@@ -576,12 +596,11 @@ mod tests {
                     "{what}"
                 );
             } else {
-                // A simple source has no flags to keep. The lossy file needs
-                // a VP8X for its metadata: its EXIF flag matches the chunk,
-                // and its ICC flag is the source's, which is none.
-                let has_exif = !payloads(&out.bytes, b"EXIF").is_empty();
-                let expected = if has_exif { fx::FLAG_EXIF } else { 0 };
-                assert_eq!(metadata_flags(&out.bytes), expected, "{what}");
+                // A simple source has no flags to keep, so the lossy file's
+                // VP8X (which it needs for its metadata) keeps them clear: an
+                // EXIF chunk stays, as it did in a file where readers ignore
+                // it, and the ICC flag is the source's, which is none.
+                assert_eq!(metadata_flags(&out.bytes), 0, "{what}");
             }
         }
     }
@@ -746,6 +765,89 @@ mod tests {
             "could not read the WebP data: libwebp could not decode the image"
         );
         assert_eq!(calls(&codec), (1, 0));
+    }
+
+    // --- the 16383 px limit of lossy WebP -------------------------------------------------
+
+    /// The exact reason the user decided on, written out so a change to the
+    /// production text fails here.
+    const REASON: &str = "too large for lossy WebP: width and height must be 16383 px or less";
+
+    /// A still double whose decoder answers with a recognisable error, and
+    /// whose encoder must never be reached.
+    fn still_decoding_refused() -> Double {
+        double(
+            |_| Err("the double decoded it".to_owned()),
+            |_, _| panic!("the encoder must not be called"),
+        )
+    }
+
+    /// Header-only still files of `w`x`h` (nothing in them can be decoded):
+    /// a `VP8L` header alone, and the same under a `VP8X` of that canvas.
+    /// A `VP8L` header holds 14 bits, so 16384 is its largest side.
+    fn declared_stills(w: u32, h: u32) -> [Vec<u8>; 2] {
+        [riff(&[vp8l(w, h)]), riff(&[vp8x(0, w, h), vp8l(w, h)])]
+    }
+
+    #[test]
+    fn a_16384_wide_still_webp_fails_with_the_dimension_reason_and_is_never_decoded() {
+        // 16384 wide and 16384 tall, each alone, in both file layouts.
+        for (w, h) in [(16_384, 16), (16, 16_384)] {
+            for source in declared_stills(w, h) {
+                let codec = still_decoding_refused();
+                let started = Instant::now();
+                let err = optimize_lossy_with(&source, q(75), &codec).unwrap_err();
+                assert_eq!(err, REASON, "{w}x{h}");
+                assert!(started.elapsed() < QUICK);
+                assert_eq!(calls(&codec), (0, 0), "{w}x{h}");
+                assert_eq!(animation_calls(&codec), (0, 0), "{w}x{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_16383_wide_still_webp_is_decoded() {
+        for (w, h) in [(16_383, 16), (16, 16_383)] {
+            for source in declared_stills(w, h) {
+                let codec = still_decoding_refused();
+                let err = optimize_lossy_with(&source, q(75), &codec).unwrap_err();
+                assert_eq!(err, "the double decoded it", "{w}x{h}");
+                assert_eq!(calls(&codec), (1, 0), "{w}x{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_16384_wide_animated_webp_fails_with_the_dimension_reason_and_is_never_decoded() {
+        // Within both caps: 2 frames of 16384x16 (and 16x16384) pixels.
+        for (w, h) in [(16_384, 16), (16, 16_384)] {
+            let codec = decoding_refused();
+            let started = Instant::now();
+            let err = optimize_lossy_with(&declared_animation(w, h, 2), q(75), &codec).unwrap_err();
+            assert_eq!(err, REASON, "{w}x{h}");
+            assert!(started.elapsed() < QUICK);
+            assert_eq!(animation_calls(&codec), (0, 0), "{w}x{h}");
+            assert_eq!(calls(&codec), (0, 0), "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn a_16383_wide_animated_webp_is_decoded() {
+        for (w, h) in [(16_383, 16), (16, 16_383)] {
+            assert_decoded(&declared_animation(w, h, 2));
+        }
+    }
+
+    #[test]
+    fn an_animation_over_the_duration_bound_and_16384_wide_is_kept_lossless_with_the_note() {
+        // The caps and the duration bound are checked first: this canvas is
+        // also too wide, but the animation gets the lossless treatment, not
+        // the dimension error.
+        assert_kept_lossless_without_decoding(&declared_with_durations(
+            16_384,
+            1,
+            &durations_ending_in(128),
+        ));
     }
 
     #[test]
