@@ -43,14 +43,50 @@ pub(crate) fn write_atomically(
 
     // Dropping a `NamedTempFile` deletes it, so every early return below
     // (including a failed `persist`) leaves no temporary file behind.
-    let mut temp = NamedTempFile::new_in(parent)?;
-    temp.write_all(bytes)?;
-    temp.flush()?;
+    let mut temp = new_temp_file(parent)?;
+    temp.as_file_mut().write_all(bytes)?;
+    temp.as_file_mut().flush()?;
     temp.as_file()
         .set_permissions(output_permissions(permissions))?;
     temp.as_file().sync_all()?;
     temp.persist(dest).map_err(|failed| failed.error)?;
     Ok(())
+}
+
+/// A new, empty temporary file in `folder` (`.tmp` and six random
+/// characters), deleted again when it is dropped.
+///
+/// The reason a file failed reaches the window, which never receives a path,
+/// so no error from here or from the writes may carry one. tempfile adds the
+/// temporary file's path to the errors of `NamedTempFile::new_in` and of the
+/// `NamedTempFile` `Write` impl, so the file is opened here through
+/// `Builder::make_in`, which returns this `open`'s error as it is (the
+/// system's, with its OS code), and the callers write through
+/// `as_file_mut()`, a plain `File`. The open is tempfile's own on unix: a
+/// new file, readable and writable by the owner only, until the caller sets
+/// the permissions. `persist` and `persist_noclobber` return the system's
+/// rename error as it is; the file they hand back is not part of the error.
+fn new_temp_file(folder: &Path) -> io::Result<NamedTempFile> {
+    tempfile::Builder::new()
+        .make_in(folder, |path| {
+            let mut options = fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            options.open(path)
+        })
+        .map_err(without_path)
+}
+
+/// `error` without a path: an error from the system (it has an OS code, and
+/// its text is the system's) stays as it is; any other, such as tempfile's
+/// "too many temporary files exist at path …", keeps only its kind.
+fn without_path(error: io::Error) -> io::Error {
+    if error.raw_os_error().is_some() {
+        error
+    } else {
+        io::Error::new(error.kind(), "could not create a temporary file")
+    }
 }
 
 /// Highest number an output name in a chosen output folder may get:
@@ -100,9 +136,11 @@ fn write_new_with(
 
     // Dropping a `NamedTempFile` deletes it, so every early return below
     // (including a failed `persist_noclobber`) leaves no temporary file.
-    let mut temp = NamedTempFile::new_in(parent)?;
-    temp.write_all(bytes)?;
-    temp.flush()?;
+    // Created and written as in `write_atomically`, so no error carries a
+    // path (see `new_temp_file`).
+    let mut temp = new_temp_file(parent)?;
+    temp.as_file_mut().write_all(bytes)?;
+    temp.as_file_mut().flush()?;
     temp.as_file()
         .set_permissions(output_permissions(permissions))?;
     temp.as_file().sync_all()?;
@@ -547,6 +585,103 @@ mod tests {
 
         assert_eq!(written, dest);
         assert_eq!(listing(&tmp.path().join("exports")), ["logo.png"]);
+    }
+
+    // --- failure reasons carry no path ---------------------------------------
+
+    /// A folder `locked-folder` in `dir` that nothing can be created in, or
+    /// `None` when running as root, where every folder stays writable.
+    #[cfg(unix)]
+    fn read_only_folder(dir: &Path) -> Option<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = dir.join("locked-folder");
+        fs::create_dir(&folder).unwrap();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(folder.join("probe"), b"").is_ok() {
+            eprintln!("skipped: the folder stays writable (running as root)");
+            return None;
+        }
+        Some(folder)
+    }
+
+    /// `message` names no part of `path` and no temporary file: the reason a
+    /// file failed reaches the window, which never receives a path.
+    fn assert_no_path(message: &str, path: &Path) {
+        assert!(!message.contains("at path"), "{message}");
+        assert!(!message.contains(".tmp"), "{message}");
+        for part in path.components() {
+            if let std::path::Component::Normal(name) = part {
+                let name = name.to_string_lossy();
+                assert!(!message.contains(&*name), "{name:?} in {message:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_temp_file_error_without_an_os_code_keeps_its_kind_and_loses_the_path() {
+        // What tempfile returns when every name it tries is taken: its own
+        // error, with the folder's path added.
+        let folder = Path::new("/home/someone/private-folder");
+        let error = io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("too many temporary files exist at path {folder:?}"),
+        );
+
+        let mapped = without_path(error);
+
+        assert_eq!(mapped.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(mapped.raw_os_error(), None);
+        assert_no_path(&mapped.to_string(), folder);
+        assert!(!mapped.to_string().contains('/'), "{mapped}");
+    }
+
+    #[test]
+    fn a_temp_file_error_with_an_os_code_keeps_the_code() {
+        let mapped = without_path(io::Error::from_raw_os_error(13));
+
+        assert_eq!(mapped.raw_os_error(), Some(13));
+        assert_eq!(
+            mapped.to_string(),
+            io::Error::from_raw_os_error(13).to_string()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_into_a_read_only_folder_gives_the_os_permission_error() {
+        let tmp = TempDir::new().unwrap();
+        let Some(folder) = read_only_folder(tmp.path()) else {
+            return;
+        };
+
+        let error = write_atomically(&folder.join("out.bin"), b"x", perms(tmp.path())).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        let code = error.raw_os_error().expect("the system's error code");
+        assert_eq!(
+            error.to_string(),
+            io::Error::from_raw_os_error(code).to_string()
+        );
+        assert_no_path(&error.to_string(), &folder);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_new_into_a_read_only_folder_gives_the_os_permission_error() {
+        let tmp = TempDir::new().unwrap();
+        let Some(folder) = read_only_folder(tmp.path()) else {
+            return;
+        };
+
+        let error = write_new(&folder.join("out.bin"), b"x", perms(tmp.path())).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        let code = error.raw_os_error().expect("the system's error code");
+        assert_eq!(
+            error.to_string(),
+            io::Error::from_raw_os_error(code).to_string()
+        );
+        assert_no_path(&error.to_string(), &folder);
     }
 
     #[cfg(unix)]

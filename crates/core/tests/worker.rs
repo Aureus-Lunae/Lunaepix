@@ -95,6 +95,187 @@ fn exits_1_with_an_io_record_when_the_source_is_missing() {
     );
 }
 
+// --- an output that cannot be written: the reason carries no path ----------
+
+/// The OS error code and the message of an `io dest` record.
+#[cfg(unix)]
+fn io_dest(record: &str) -> (i32, String) {
+    let body = record
+        .strip_prefix("lunaepix-worker 2 io dest ")
+        .and_then(|body| body.strip_suffix('\n'))
+        .unwrap_or_else(|| panic!("not an io dest record: {record:?}"));
+    let (code, message) = body.split_once(' ').unwrap();
+    let code = code
+        .parse()
+        .unwrap_or_else(|_| panic!("no OS error code: {record:?}"));
+    (code, message.to_owned())
+}
+
+/// `record` names no part of `path` and no temporary file: the reason a file
+/// failed reaches the window, which never receives a path.
+#[cfg(unix)]
+fn assert_no_path(record: &str, path: &Path) {
+    assert!(!record.contains("at path"), "{record:?}");
+    assert!(!record.contains(".tmp"), "{record:?}");
+    for part in path.components() {
+        if let std::path::Component::Normal(name) = part {
+            let name = name.to_string_lossy();
+            assert!(!record.contains(&*name), "{name:?} in {record:?}");
+        }
+    }
+}
+
+/// Make `folder` read-only. `false` when running as root, where it stays
+/// writable and the test has nothing to check.
+#[cfg(unix)]
+fn lock(folder: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(folder, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::write(folder.join("probe"), b"").is_ok() {
+        eprintln!("skipped: the folder stays writable (running as root)");
+        return false;
+    }
+    true
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_destination_folder_gives_an_io_record_with_the_os_code_and_no_path() {
+    // The default mode: the output goes beside the source.
+    let tmp = TempDir::new().unwrap();
+    let folder = tmp.path().join("locked-folder");
+    fs::create_dir(&folder).unwrap();
+    let src = write(&folder, "a.png", &png_bytes());
+    let dest = folder.join("optimized-a.png");
+    if !lock(&folder) {
+        return;
+    }
+
+    let output = serve(&[WORKER_FLAG.as_ref(), src.as_os_str(), dest.as_os_str()]);
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let record = stdout(&output);
+    let (code, message) = io_dest(&record);
+    let system = std::io::Error::from_raw_os_error(code);
+    assert_eq!(
+        system.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "{record:?}"
+    );
+    assert_eq!(message, system.to_string());
+    assert_no_path(&record, &dest);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_output_folder_with_no_replace_gives_an_io_record_with_the_os_code_and_no_path() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &png_bytes());
+    let folder = tmp.path().join("locked-folder");
+    fs::create_dir(&folder).unwrap();
+    let dest = folder.join("a.png");
+    if !lock(&folder) {
+        return;
+    }
+
+    let output = serve(&[
+        WORKER_FLAG.as_ref(),
+        "--no-replace".as_ref(),
+        src.as_os_str(),
+        dest.as_os_str(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let record = stdout(&output);
+    let (code, message) = io_dest(&record);
+    let system = std::io::Error::from_raw_os_error(code);
+    assert_eq!(
+        system.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "{record:?}"
+    );
+    assert_eq!(message, system.to_string());
+    assert_no_path(&record, &dest);
+}
+
+/// Run the worker with `args` under a file-size limit of one block (512 or
+/// 1024 bytes), with `SIGXFSZ` ignored: a write past the limit then fails
+/// with `EFBIG` instead of killing the process.
+#[cfg(unix)]
+fn serve_with_file_size_limit(args: &[&std::ffi::OsStr]) -> Output {
+    Command::new("sh")
+        .arg("-c")
+        .arg(r#"trap '' XFSZ; ulimit -f 1 && exec "$@""#)
+        .arg("sh")
+        .arg(WORKER)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+/// A 128x128 RGB PNG of pseudo-random noise: it does not compress, so any
+/// output is far larger than one block.
+#[cfg(unix)]
+fn noise_png() -> Vec<u8> {
+    let mut state = 0x2545_f491_u32;
+    let pixels: Vec<u8> = (0..128 * 128 * 3)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .collect();
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, 128, 128);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&pixels).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+#[cfg(unix)]
+#[test]
+fn a_write_that_fails_part_way_gives_an_io_record_with_the_os_code_and_no_path() {
+    // Through the temporary file's own writes, in both write modes.
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &noise_png());
+    // The control: without the limit the output is larger than the limit.
+    let unlimited = tmp.path().join("optimized/a.png");
+    let output = serve(&[WORKER_FLAG.as_ref(), src.as_os_str(), unlimited.as_os_str()]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(fs::metadata(&unlimited).unwrap().len() > 2048, "fixture");
+
+    let replace = tmp.path().join("optimized-a.png");
+    let no_replace = tmp.path().join("out").join("a.png");
+    let calls: [Vec<&std::ffi::OsStr>; 2] = [
+        vec![WORKER_FLAG.as_ref(), src.as_os_str(), replace.as_os_str()],
+        vec![
+            WORKER_FLAG.as_ref(),
+            "--no-replace".as_ref(),
+            src.as_os_str(),
+            no_replace.as_os_str(),
+        ],
+    ];
+    for (args, dest) in calls.iter().zip([&replace, &no_replace]) {
+        let output = serve_with_file_size_limit(args);
+
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let record = stdout(&output);
+        let (code, message) = io_dest(&record);
+        let system = std::io::Error::from_raw_os_error(code);
+        assert_eq!(
+            system.kind(),
+            std::io::ErrorKind::FileTooLarge,
+            "{record:?}"
+        );
+        assert_eq!(message, system.to_string());
+        assert_no_path(&record, dest);
+        assert!(!dest.exists());
+    }
+}
+
 #[test]
 fn refuses_a_call_without_the_flag_or_with_the_wrong_arguments_and_prints_no_record() {
     let tmp = TempDir::new().unwrap();

@@ -117,15 +117,13 @@ function waitingRow(row) {
 
 /**
  * A backend reason as it reads after a prefix such as "Will be skipped: ":
- * its first letter in lower case ("not a PNG, JPG, SVG or WebP file"). A
- * reason that starts with an acronym ("PNG …") keeps it.
+ * a first word that is a capitalised ordinary word (a capital followed by a
+ * lower-case letter) gets its first letter in lower case ("not a PNG, JPG,
+ * SVG or WebP file"). Anything else is kept: an acronym ("PNG …",
+ * "I/O error …"), a single letter ("A …") or a digit ("3 more …").
  */
 function afterPrefix(reason) {
-  const second = reason.charAt(1);
-  if (second !== second.toLowerCase()) {
-    return reason;
-  }
-  return reason.charAt(0).toLowerCase() + reason.slice(1);
+  return reason.replace(/^\p{Lu}(?=\p{Ll})/u, (first) => first.toLowerCase());
 }
 
 /** The run's settings from a `run-started` payload: a lossless run has no quality. */
@@ -569,6 +567,9 @@ export function rowView(row) {
         : { kind: 'skipped', name, text: `skipped: ${afterPrefix(row.skip)}` };
     case 'compressing':
       return { kind: 'compressing', name, size: sizeText(row.size), text: 'Compressing…' };
+    case 'skipped':
+      // The same reason text as the waiting row showed for it.
+      return { kind: 'skipped', name, text: `skipped: ${afterPrefix(row.reason)}` };
     default:
       return { kind: row.kind, name, text: `${row.kind}: ${row.reason}` };
   }

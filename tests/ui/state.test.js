@@ -379,7 +379,7 @@ test('rowView of a skipped row has the status word and reason as text, and no nu
   assert.deepEqual(view, {
     kind: 'skipped',
     name: 'notes.txt',
-    text: 'skipped: Not a PNG, JPG, SVG or WebP file',
+    text: 'skipped: not a PNG, JPG, SVG or WebP file',
   });
   assert.equal('before' in view, false);
 });
@@ -1363,4 +1363,44 @@ test('a_skip_reason_is_not_capitalised_and_a_lower_case_or_acronym_start_is_kept
   const running = reduce(ready, started(4));
   assert.doesNotMatch(rowView(running.rows[0]).text, /: Not /);
   assert.equal(rowView(running.rows[2]).text, 'skipped: PNG decoder refused it');
+});
+
+// Final review: the finished skipped row reads like the waiting one, and only
+// a capitalised ordinary word is lowered.
+
+test('a_finished_skipped_row_reads_like_the_waiting_row', () => {
+  const running = apply(initialState(), listed([entry('notes.txt', null, SKIP)]), started(1));
+  const waiting = rowView(running.rows[0]).text;
+  const finishedRow = reduce(running, skipped(0, 'notes.txt', SKIP));
+  const done = rowView(finishedRow.rows[0]);
+  assert.equal(done.kind, 'skipped');
+  assert.equal(done.text, 'skipped: not a PNG, JPG, SVG or WebP file');
+  assert.equal(done.text, waiting);
+});
+
+test('a_skip_reason_keeps_an_acronym_a_single_letter_and_a_digit_start', () => {
+  const kept = [
+    'I/O error while reading the file',
+    'PNG decoder refused it',
+    'A file that vanished',
+    '3 more files not optimised: over the 2000-file limit',
+  ];
+  const ready = reduce(
+    initialState(),
+    listed(kept.map((reason, index) => entry(`f${index}.png`, null, reason))),
+  );
+  ready.rows.forEach((row, index) => {
+    assert.equal(rowView(row).text, `Will be skipped: ${kept[index]}`);
+  });
+  const running = reduce(ready, started(kept.length));
+  running.rows.forEach((row, index) => {
+    assert.equal(rowView(row).text, `skipped: ${kept[index]}`);
+  });
+  const finishedRows = kept.reduce(
+    (state, reason, index) => reduce(state, skipped(index, `f${index}.png`, reason)),
+    running,
+  );
+  finishedRows.rows.forEach((row, index) => {
+    assert.equal(rowView(row).text, `skipped: ${kept[index]}`);
+  });
 });
