@@ -78,7 +78,8 @@ pub fn parse_settings(value: &Value) -> Result<Compression, CommandError> {
 
 /// The files the user has added, in the order they were added. Each entry is
 /// a path to a file, or to a folder that could not be read; a folder that
-/// can be read is replaced by its images.
+/// can be read is replaced by its images. An entry is never expanded later:
+/// see [`FileList::rows`].
 #[derive(Debug, Default)]
 pub struct FileList {
     entries: Vec<PathBuf>,
@@ -137,10 +138,42 @@ impl FileList {
         self.finished = false;
     }
 
-    /// The list planned now, into `out` or next to the originals: one job
-    /// per row, so a file deleted since it was added is a skip.
+    /// The list planned now, into `out` or next to the originals, so a file
+    /// deleted since it was added is a skip. An entry that is a folder now
+    /// (one that could not be read when it was added, or a path that did not
+    /// exist then) is one "Not a readable file" skip: nothing inside it is
+    /// planned, so a run never covers files the list did not show. An entry
+    /// that now resolves to the same file as an earlier one is planned once,
+    /// so the list has at most one row per entry.
     pub fn rows(&self, out: Option<&Path>) -> Vec<Job> {
-        plan_files_to(&self.entries, out)
+        let is_dir: Vec<bool> = self.entries.iter().map(|path| path.is_dir()).collect();
+        let files: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .zip(&is_dir)
+            .filter(|(_, dir)| !**dir)
+            .map(|(path, _)| path.clone())
+            .collect();
+        // A path that turns into a folder between the check above and the
+        // planner's own look is planned as a folder; its files are dropped
+        // here, so they never reach a run. That entry then has no row.
+        let listed: HashSet<&PathBuf> = files.iter().collect();
+        let mut planned = plan_files_to(&files, out)
+            .into_iter()
+            .filter(|job| listed.contains(job_src(job)))
+            .peekable();
+        let mut jobs = Vec::with_capacity(self.entries.len());
+        for (path, dir) in self.entries.iter().zip(is_dir) {
+            if dir {
+                jobs.push(Job::Skip {
+                    src: path.clone(),
+                    reason: Skip::NotAFile,
+                });
+            } else if let Some(job) = planned.next_if(|job| job_src(job) == path) {
+                jobs.push(job);
+            }
+        }
+        jobs
     }
 
     /// Whether a run over the list would compress at least one file.
@@ -151,6 +184,13 @@ impl FileList {
     /// A run over the list has ended: the next add first empties the list.
     pub fn mark_finished(&mut self) {
         self.finished = true;
+    }
+}
+
+/// The file `job` is about.
+fn job_src(job: &Job) -> &PathBuf {
+    match job {
+        Job::Optimize { src, .. } | Job::Skip { src, .. } => src,
     }
 }
 
@@ -196,12 +236,43 @@ pub fn list_rows(jobs: &[Job], size_of: impl Fn(&Path) -> Option<u64>) -> Vec<Li
 
 /// Whether a file can be created in `dir` now: one is created there under a
 /// fresh random name and removed again. Fails when `dir` is gone, is not a
-/// folder or cannot be written to.
+/// folder or cannot be written to, or when the check file cannot be removed
+/// again (a folder that keeps what is written but refuses deletes is not
+/// one to run into).
 fn can_write_in(dir: &Path) -> std::io::Result<()> {
     tempfile::Builder::new()
         .prefix(".lunaepix-check-")
-        .tempfile_in(dir)
-        .map(drop)
+        .tempfile_in(dir)?
+        .close()
+}
+
+/// Run `work(value)` on a thread that `spawn` starts. If no thread can be
+/// started, run it on this thread instead, so that `value` (a run, or a
+/// drop with its ticket) is never lost and the window never waits for
+/// events that cannot come.
+pub fn on_own_thread_or_here<T: Send + 'static>(
+    value: T,
+    work: impl FnOnce(T) + Clone + Send + 'static,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) {
+    // The value waits here until one side takes it: the new thread, or this
+    // one when the thread never started.
+    let slot = Arc::new(Mutex::new(Some(value)));
+    let on_thread = {
+        let slot = Arc::clone(&slot);
+        let work = work.clone();
+        move || {
+            if let Some(value) = lock(&slot).take() {
+                work(value);
+            }
+        }
+    };
+    if let Err(error) = spawn(Box::new(on_thread)) {
+        eprintln!("lunaepix: no thread could be started ({error}); working on this one");
+        if let Some(value) = lock(&slot).take() {
+            work(value);
+        }
+    }
 }
 
 /// A run that passed every check of `start_run`, holding its ticket.
@@ -371,12 +442,14 @@ impl Session {
     /// on the run thread.
     pub fn start_run(
         &self,
-        settings: &Value,
+        settings: Option<&Value>,
         emit: &mut impl FnMut(Event),
         start: impl FnOnce(PreparedRun),
     ) -> Result<(), CommandError> {
         // Every early return drops the ticket, which frees the guard.
         let ticket = claim_run(&self.guard, emit)?;
+        // A call without settings is refused like any badly shaped one.
+        let settings = settings.ok_or(CommandError::InvalidSettings)?;
         let compression = parse_settings(settings)?;
         let out = lock(&self.output).clone();
         if let Some(out) = &out {
@@ -1538,7 +1611,9 @@ mod tests {
         settings: &Value,
     ) -> (Result<(), CommandError>, Option<PreparedRun>) {
         let mut prepared = None;
-        let answer = session.start_run(settings, &mut window.emit(), |run| prepared = Some(run));
+        let answer = session.start_run(Some(settings), &mut window.emit(), |run| {
+            prepared = Some(run)
+        });
         (answer, prepared)
     }
 
@@ -2088,7 +2163,8 @@ mod tests {
             answers.push(session.clear_list(&mut busy.emit()));
             answers.push(session.choose_output_folder(&mut busy.emit(), |_| called.set(true)));
             answers.push(session.clear_output_folder(&mut busy.emit()));
-            answers.push(session.start_run(&lossless(), &mut busy.emit(), |_| called.set(true)));
+            answers
+                .push(session.start_run(Some(&lossless()), &mut busy.emit(), |_| called.set(true)));
             session.drop_paths(paths[1..].to_vec(), &mut busy.emit(), |_, _| {
                 called.set(true);
             });
@@ -2549,13 +2625,6 @@ mod tests {
         pick(&session, &window, &paths);
         choose_output(&session, &window, &out);
         let prepared = started(&session, &window, &lossy(40));
-        assert_eq!(
-            prepared.options(),
-            Options {
-                compression: Compression::Lossy(Quality::new(40).unwrap()),
-                write: WriteMode::NoReplace,
-            }
-        );
         session.run_with_worker(
             prepared,
             &recording_worker(&log),
@@ -2581,13 +2650,6 @@ mod tests {
         let window = Window::default();
         pick(&session, &window, &paths);
         let prepared = started(&session, &window, &lossless());
-        assert_eq!(
-            prepared.options(),
-            Options {
-                compression: Compression::Lossless,
-                write: WriteMode::Replace,
-            }
-        );
         session.run_with_worker(
             prepared,
             &recording_worker(&log),
@@ -2647,5 +2709,388 @@ mod tests {
         );
         assert!(session.guard.try_start().is_some());
         refused(&session, &window, &lossless(), CommandError::EmptyList);
+    }
+
+    // --- fix round 1 ----------------------------------------------------------
+
+    fn skip_row(src: &Path) -> Job {
+        Job::Skip {
+            src: src.to_path_buf(),
+            reason: Skip::NotAFile,
+        }
+    }
+
+    #[test]
+    fn a_missing_entry_that_becomes_a_folder_stays_one_skipped_row() {
+        let (dir, paths) = files(&[("a.png", b"png")]);
+        let later = dir.path().join("later");
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &[later.clone(), paths[0].clone()]);
+        fs::create_dir(&later).unwrap();
+        fs::write(later.join("b.png"), b"png").unwrap();
+        fs::write(later.join("notes.txt"), b"x").unwrap();
+        let prepared = started(&session, &window, &lossless());
+        assert_eq!(
+            prepared.jobs(),
+            [
+                skip_row(&later),
+                Job::Optimize {
+                    src: paths[0].clone(),
+                    dest: dir.path().join("optimized-a.png"),
+                },
+            ]
+        );
+        drop(prepared);
+        // The list shows the same row on its next change.
+        let (_more, more) = files(&[("c.png", b"png")]);
+        window.take();
+        pick(&session, &window, &more);
+        let events = window.take();
+        let list = last_list(&events);
+        assert_eq!(row_names(list), ["later", "a.png", "c.png"]);
+        assert_eq!(list.files[0].skip.as_deref(), Some("Not a readable file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_folder_that_becomes_readable_stays_one_skipped_row() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, paths) = files(&[("b.png", b"png")]);
+        let locked = dir.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("a.png"), b"png").unwrap();
+        fs::write(locked.join("notes.txt"), b"x").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&locked).is_ok() {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipped: the folder stays readable (running as root)");
+            return;
+        }
+        let session = Session::new();
+        let window = Window::default();
+        drop_on(&session, &window, &[locked.clone(), paths[0].clone()]);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let prepared = started(&session, &window, &lossless());
+        assert_eq!(
+            prepared.jobs(),
+            [
+                skip_row(&locked),
+                Job::Optimize {
+                    src: paths[0].clone(),
+                    dest: dir.path().join("optimized-b.png"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_folder_entry_plans_nothing_inside_it() {
+        let (dir, paths) = files(&[("x.png", b"png")]);
+        let later = dir.path().join("later");
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &[later.clone(), paths[0].clone()]);
+        fs::create_dir(&later).unwrap();
+        fs::write(later.join("a.png"), b"png").unwrap();
+        fs::write(later.join("notes.txt"), b"x").unwrap();
+        for settings in [lossless(), lossy(75)] {
+            let prepared = started(&session, &window, &settings);
+            let jobs = prepared.jobs().to_vec();
+            assert_eq!(jobs.len(), 2, "{jobs:?}");
+            for job in &jobs {
+                match job {
+                    Job::Optimize { src, dest } => {
+                        assert!(!src.starts_with(&later), "{job:?}");
+                        assert!(!dest.starts_with(later.join("optimized")), "{job:?}");
+                    }
+                    Job::Skip { src, .. } => assert_eq!(src, &later),
+                }
+            }
+            run_fake(&session, &window, prepared);
+        }
+        let events = window.take();
+        let names: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::FileDone(done) => Some(done.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!names.contains(&"notes.txt"), "{names:?}");
+        assert!(!names.contains(&"a.png"), "{names:?}");
+        assert!(!later.join("optimized").exists());
+    }
+
+    #[test]
+    fn start_run_without_settings_is_invalid_settings() {
+        let (_dir, paths) = files(&[("a.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths);
+        let called = Cell::new(false);
+        let answer = session.start_run(None, &mut window.emit(), |_| called.set(true));
+        assert_eq!(answer, Err(CommandError::InvalidSettings));
+        assert_eq!(
+            serde_json::to_value(answer.unwrap_err()).unwrap(),
+            json!("invalid-settings")
+        );
+        assert!(!called.get());
+        assert!(session.guard.try_start().is_some());
+        // A well-formed value still starts.
+        drop(started(&session, &window, &lossless()));
+    }
+
+    /// What `work` recorded: the value it got, and whether it ran on the
+    /// calling thread.
+    type Ran = Arc<Mutex<Vec<(u32, bool)>>>;
+
+    fn recording_work(ran: &Ran) -> impl FnOnce(u32) + Clone + Send + 'static {
+        let ran = Arc::clone(ran);
+        let caller = std::thread::current().id();
+        move |value| {
+            let here = std::thread::current().id() == caller;
+            ran.lock().unwrap().push((value, here));
+        }
+    }
+
+    #[test]
+    fn work_runs_once_on_the_started_thread() {
+        let ran: Ran = Arc::default();
+        on_own_thread_or_here(7, recording_work(&ran), |job| {
+            std::thread::spawn(job).join().unwrap();
+            Ok(())
+        });
+        assert_eq!(*ran.lock().unwrap(), [(7, false)]);
+    }
+
+    #[test]
+    fn work_runs_here_when_no_thread_can_start() {
+        let ran: Ran = Arc::default();
+        on_own_thread_or_here(7, recording_work(&ran), |job| {
+            drop(job);
+            Err(std::io::Error::other("no threads left"))
+        });
+        assert_eq!(*ran.lock().unwrap(), [(7, true)]);
+        // A run's ticket is not lost either: it is freed once the work is done.
+        let guard = RunGuard::new();
+        let freed = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&freed);
+        let check = guard.clone();
+        on_own_thread_or_here(
+            guard.try_start().unwrap(),
+            move |ticket: RunTicket| {
+                *seen.lock().unwrap() = Some(check.try_start().is_none());
+                drop(ticket);
+            },
+            |_| Err(std::io::Error::other("no threads left")),
+        );
+        assert_eq!(*freed.lock().unwrap(), Some(true));
+        assert!(guard.try_start().is_some());
+    }
+
+    #[test]
+    fn has_work_is_true_with_one_compressible_file() {
+        let (dir, paths) = files(&[("notes.txt", b"x"), ("a.png", b"png")]);
+        let mut list = FileList::new();
+        list.add(&paths);
+        assert!(list.has_work(None));
+        assert!(list.has_work(Some(&dir.path().join("exports"))));
+    }
+
+    #[test]
+    fn has_work_is_false_for_an_empty_or_all_skipped_list() {
+        let (dir, paths) = files(&[("notes.txt", b"x")]);
+        let mut list = FileList::new();
+        assert!(!list.has_work(None));
+        list.add(&[paths[0].clone(), dir.path().join("gone.png")]);
+        assert!(!list.has_work(None));
+        assert!(!list.has_work(Some(dir.path())));
+    }
+
+    #[test]
+    fn a_run_into_an_output_folder_replaces_nothing() {
+        let (dir, paths) = files(&[("a.png", b"png")]);
+        let out = dir.path().join("exports");
+        fs::create_dir(&out).unwrap();
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths);
+        choose_output(&session, &window, &out);
+        for (settings, compression) in [
+            (lossy(30), Compression::Lossy(Quality::new(30).unwrap())),
+            (lossless(), Compression::Lossless),
+        ] {
+            let prepared = started(&session, &window, &settings);
+            assert_eq!(
+                prepared.options(),
+                Options {
+                    compression,
+                    write: WriteMode::NoReplace,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_next_to_the_originals_replaces_an_earlier_output() {
+        let (dir, paths) = files(&[("a.png", b"png")]);
+        let out = dir.path().join("exports");
+        fs::create_dir(&out).unwrap();
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths);
+        let replace = |compression| Options {
+            compression,
+            write: WriteMode::Replace,
+        };
+        let prepared = started(&session, &window, &lossless());
+        assert_eq!(prepared.options(), replace(Compression::Lossless));
+        drop(prepared);
+        // Chosen and cleared again: back to replacing.
+        choose_output(&session, &window, &out);
+        assert_eq!(session.clear_output_folder(&mut window.emit()), Ok(()));
+        let prepared = started(&session, &window, &lossy(30));
+        assert_eq!(
+            prepared.options(),
+            replace(Compression::Lossy(Quality::new(30).unwrap()))
+        );
+    }
+
+    #[test]
+    fn a_missing_path_added_twice_is_listed_once() {
+        let dir = TempDir::new().unwrap();
+        let gone = dir.path().join("gone.png");
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &[gone.clone(), gone.clone()]);
+        pick(&session, &window, std::slice::from_ref(&gone));
+        let events = window.take();
+        let list = last_list(&events);
+        assert_eq!(row_names(list), ["gone.png"]);
+        assert_eq!(list.files[0].skip.as_deref(), Some("Not a readable file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_that_became_the_same_file_as_another_is_planned_once() {
+        let (dir, paths) = files(&[("a.png", b"png")]);
+        let link = dir.path().join("link.png");
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &[paths[0].clone(), link.clone()]);
+        std::os::unix::fs::symlink(&paths[0], &link).unwrap();
+        let prepared = started(&session, &window, &lossless());
+        assert_eq!(sources(prepared.jobs()), [paths[0].clone()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_in_the_list_is_not_a_readable_file() {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("s.png");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, std::slice::from_ref(&socket));
+        assert_eq!(
+            value(&window.take()[0]),
+            json!({ "files": [
+                { "name": "s.png", "size": null, "skip": "Not a readable file" }
+            ], "notice": null })
+        );
+    }
+
+    #[test]
+    fn a_file_over_the_size_limit_is_a_skipped_row() {
+        let dir = TempDir::new().unwrap();
+        let big = dir.path().join("big.png");
+        fs::File::create(&big)
+            .unwrap()
+            .set_len(lunaepix_core::MAX_FILE_BYTES + 1)
+            .unwrap();
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, std::slice::from_ref(&big));
+        assert_eq!(
+            value(&window.take()[0]),
+            json!({ "files": [
+                { "name": "big.png", "size": null, "skip": "File is too large" }
+            ], "notice": null })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_whose_output_name_links_back_to_it_is_a_skipped_row() {
+        let (dir, paths) = files(&[("a.png", b"png")]);
+        std::os::unix::fs::symlink(&paths[0], dir.path().join("optimized-a.png")).unwrap();
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths);
+        assert_eq!(
+            value(&window.take()[0]),
+            json!({ "files": [
+                { "name": "a.png", "size": null, "skip": "Its output would overwrite the file itself" }
+            ], "notice": null })
+        );
+    }
+
+    #[test]
+    fn a_taken_name_in_the_output_folder_is_planned_with_a_number() {
+        let (dir, first) = files(&[("a.png", b"png")]);
+        let (_other, second) = files(&[("a.png", b"png")]);
+        let out = dir.path().join("exports");
+        fs::create_dir(&out).unwrap();
+        fs::write(out.join("a.png"), b"keep").unwrap();
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &[first[0].clone(), second[0].clone()]);
+        choose_output(&session, &window, &out);
+        let prepared = started(&session, &window, &lossy(75));
+        assert_eq!(
+            prepared.jobs(),
+            [
+                Job::Optimize {
+                    src: first[0].clone(),
+                    dest: out.join("a-2.png"),
+                },
+                Job::Optimize {
+                    src: second[0].clone(),
+                    dest: out.join("a-3.png"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_list_planned_against_a_deleted_output_folder_still_lists_its_files() {
+        let (dir, paths) = files(&[("a.png", b"png")]);
+        let out = dir.path().join("exports");
+        fs::create_dir(&out).unwrap();
+        let session = Session::new();
+        let window = Window::default();
+        choose_output(&session, &window, &out);
+        fs::remove_dir(&out).unwrap();
+        window.take();
+        pick(&session, &window, &paths);
+        assert_eq!(
+            value(&window.take()[0]),
+            json!({ "files": [
+                { "name": "a.png", "size": 3, "skip": null }
+            ], "notice": null })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_a_dropped_folder_is_not_listed() {
+        let (dir, _) = files(&[("a.png", b"png")]);
+        let (_elsewhere, outside) = files(&[("b.png", b"png")]);
+        std::os::unix::fs::symlink(&outside[0], dir.path().join("link.png")).unwrap();
+        let session = Session::new();
+        let window = Window::default();
+        drop_on(&session, &window, &[dir.path().to_path_buf()]);
+        assert_eq!(row_names(last_list(&window.take())), ["a.png"]);
     }
 }

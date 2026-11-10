@@ -55,16 +55,15 @@ fn session(app: &AppHandle) -> &Session {
     &app.state::<AppState>().inner().session
 }
 
-/// Run `work` on a thread of its own: reading folders and running files
-/// never block the main thread. If the thread cannot be started, `work` is
-/// dropped unrun, and with it any ticket it holds, so the guard is free.
-fn on_own_thread(work: impl FnOnce() + Send + 'static) {
-    let spawned = std::thread::Builder::new()
+/// Start `job` on a thread of its own, so that reading folders and running
+/// files never block the main thread. Used through
+/// [`session::on_own_thread_or_here`], which does the work on the calling
+/// thread when this fails, so a run or a drop is never lost.
+fn spawn_work_thread(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    std::thread::Builder::new()
         .name("lunaepix-run".to_owned())
-        .spawn(work);
-    if let Err(error) = spawned {
-        eprintln!("lunaepix: could not start a thread: {error}");
-    }
+        .spawn(job)
+        .map(drop)
 }
 
 /// Dialog paths as plain paths. On desktop every entry is a path.
@@ -135,18 +134,23 @@ fn clear_output_folder(app: AppHandle) -> Result<(), CommandError> {
 /// progress arrives as events. Not on the main thread (`async`): planning
 /// the list reads every file's metadata.
 #[tauri::command(async)]
-fn start_run(app: AppHandle, settings: serde_json::Value) -> Result<(), CommandError> {
-    session(&app).start_run(&settings, &mut |event| emit(&app, event), |prepared| {
-        let app = app.clone();
-        on_own_thread(move || {
-            let state = app.state::<AppState>();
-            state
-                .session
-                .run_with_worker(prepared, &state.worker, &state.stop, &mut |event| {
-                    emit(&app, event)
-                });
-        });
-    })
+fn start_run(app: AppHandle, settings: Option<serde_json::Value>) -> Result<(), CommandError> {
+    session(&app).start_run(
+        settings.as_ref(),
+        &mut |event| emit(&app, event),
+        |prepared| {
+            let app = app.clone();
+            let run = move |prepared| {
+                let state = app.state::<AppState>();
+                state
+                    .session
+                    .run_with_worker(prepared, &state.worker, &state.stop, &mut |event| {
+                        emit(&app, event)
+                    });
+            };
+            session::on_own_thread_or_here(prepared, run, spawn_work_thread);
+        },
+    )
 }
 
 /// Open the output folder of the last completed run in the file manager.
@@ -198,9 +202,10 @@ fn on_window_event(window: &Window, event: &WindowEvent) {
         .drop_paths(paths, &mut |event| emit(app, event), |ticket, paths| {
             // Adding reads folders, so it runs off the main thread.
             let app = app.clone();
-            on_own_thread(move || {
+            let add = move |(ticket, paths)| {
                 session(&app).add_paths(ticket, Some(paths), &mut |event| emit(&app, event));
-            });
+            };
+            session::on_own_thread_or_here((ticket, paths), add, spawn_work_thread);
         });
 }
 

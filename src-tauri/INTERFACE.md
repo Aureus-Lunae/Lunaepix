@@ -46,7 +46,8 @@ await invoke('start_run', { settings: { mode: 'lossy', quality: 75 } });
 
 - `"busy"`: a run is active, or a dialog for one is open. A `run-busy` event
   goes out as well. Every command but `open_output_folder` can be busy.
-- `"invalid-settings"`: `settings` is not exactly an object with the two
+- `"invalid-settings"`: `settings` is missing or `null`, or is not exactly
+  an object with the two
   keys `mode` (`"lossless"` or `"lossy"`) and `quality` (a whole JSON number
   from 0 to 100). A float (also `75.0`), a string (`"75"`), `null`, a
   missing or an extra key, or another mode word is refused. Send `quality`
@@ -62,7 +63,10 @@ await invoke('start_run', { settings: { mode: 'lossy', quality: 75 } });
 `start_run` checks, in this order: busy, the settings, the output folder,
 then the list. The list is planned again at that moment, so a file deleted
 since it was added runs as a skipped row ("Not a readable file") and the
-rest still runs. Nothing runs when it rejects.
+rest still runs. A row that is a folder by then (a dropped folder that
+could not be read, or a path that did not exist when it was added) stays
+one "Not a readable file" row: the run never looks inside it. To add its
+images, drop the folder again. Nothing runs when it rejects.
 
 A dialog closed without a choice changes nothing and sends `run-cancelled`.
 
@@ -96,7 +100,8 @@ full list each time, in display order.
 - `skip`: why the row will be skipped, a sentence for the user; `null` for a
   row that will be compressed.
 - `notice`: a sentence for the status line, or `null`. It says why an add
-  changed nothing: a dropped or picked folder with no images directly in it.
+  changed nothing: a dropped folder with no images directly in it. (The
+  file dialog picks files only, so a folder arrives by a drop.)
 
 ```json
 { "files": [
@@ -121,8 +126,17 @@ A dropped folder with no images, onto an empty list:
 A run compresses at most 2000 files. The files over that limit do not get a
 row each: after every other row comes one row named `(over the limit)` with
 `size: null`, whose `skip` counts them ("1 more file not optimised: over the
-2000-file limit", or "3 more files ..."). The run's rows match the list's
-rows one for one, the over-limit row included.
+2000-file limit", or "3 more files ..."). The run ends with the same kind
+of row.
+
+The run plans the list again when Run is pressed, so its rows are the
+list's rows in the same order, each as things stand at that moment. While
+nothing on disk changed since the last `list-changed`, they are the same
+rows. Otherwise a row can differ: a file deleted since becomes "Not a
+readable file", a file that appeared at a missing path is compressed, and a
+row whose file is now the same file as an earlier row's (through a link
+made since) has no run row of its own. The run never has a row the list
+did not show, and never runs a file inside a folder row.
 
 ### `output-changed`
 
