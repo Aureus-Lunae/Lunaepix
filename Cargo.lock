@@ -2518,7 +2518,6 @@ dependencies = [
  "image",
  "libc",
  "libwebp-sys",
- "miniz_oxide 0.8.9",
  "mozjpeg-sys",
  "oxipng",
  "oxvg_ast",

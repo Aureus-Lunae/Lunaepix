@@ -19,7 +19,10 @@ path = "src/bin/lunaepix-worker.rs"
 [dependencies]
 thiserror = { workspace = true }
 # Same settings as the Step 2 evaluation: today's `oxipng -o 4 --strip safe`.
-oxipng = { version = "=10.2.1", default-features = false, features = ["parallel"] }
+# Pinned with `=`: the lossy PNG path also gates on oxipng's doc-hidden
+# `internal_tests::PngData::from_slice` (png::lossy::check_with_oxipng).
+# Re-check that call before any upgrade.
+oxipng ={ version = "=10.2.1", default-features = false, features = ["parallel"] }
 tempfile = "3.27.0"
 # A jpegtran-style coefficient transcode (the lossless path, as in the Step 2
 # evaluation) and a pixel re-encode (the lossy path). `nasm_simd` builds
@@ -48,15 +51,6 @@ roxmltree = "=0.21.2"
 # The tests also use `png` to encode their fixtures.
 png = "0.17.16"
 quantizr = "=1.4.3"
-# Chunk CRCs: the lossy PNG path checks them before decoding, as oxipng
-# does, and the tests make valid ones for hand-made hostile PNGs. Already in
-# the tree via `png`.
-crc32fast = "1.5.4"
-# The lossy PNG path inflates the image data once before decoding, in a small
-# window, to refuse a stream longer than its IHDR as oxipng does
-# (png::lossy::check_image_data_size). Already in the tree via `png`, at this
-# version.
-miniz_oxide = "0.8.9"
 # The lossy WebP path (src/webp/codec.rs, the only libwebp FFI): libwebp
 # decodes the source to RGBA and encodes it again with its simple lossy
 # encoder. Failures come back as return codes, so nothing unwinds through C.
@@ -79,6 +73,9 @@ windows-sys = { version = "0.61.2", features = ["Win32_System_Diagnostics_Debug"
 windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
+# Chunk CRCs: the tests make valid ones for hand-made hostile PNGs. Already in
+# the tree via `png`.
+crc32fast = "1.5.4"
 # Test fixtures: `image` decodes for the pixel comparison and encodes the
 # baseline JPEG fixtures (standard Huffman tables, so there is something to
 # optimise). Its `webp` feature gives the lossless WebP fixtures, from a
