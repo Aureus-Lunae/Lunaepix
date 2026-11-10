@@ -222,8 +222,14 @@ fn check_with_oxipng(bytes: &[u8]) -> Result<(), String> {
 
 /// Decode the source to 8-bit RGBA: palette and `tRNS` expanded, greyscale
 /// expanded to RGB, 16-bit samples reduced to 8.
+///
+/// It runs after [`check_with_oxipng`], so a decoder error here is a file
+/// the lossless path accepts but the `png` decoder refuses (for example a
+/// second tRNS chunk, where oxipng keeps the last). Its reason says so: "could
+/// not decode the PNG for lossy: …".
 fn decode(bytes: &[u8]) -> Result<Rgba, String> {
-    let unreadable = |error: ::png::DecodingError| format!("could not read the PNG data: {error}");
+    let unreadable =
+        |error: ::png::DecodingError| format!("could not decode the PNG for lossy: {error}");
     // The pixel count is already checked from IHDR. The limit covers the
     // decoder's own buffers, of which a row is the largest: at most
     // 8 bytes per pixel of the widest image within MAX_PIXELS.
@@ -1903,5 +1909,39 @@ mod tests {
         let png = big_gradient_split(255);
         let err = optimize_lossy_with(&png, q(75), never).unwrap_err();
         assert_eq!(err, crate::png::optimize(&png).unwrap_err());
+    }
+
+    // --- what oxipng accepts and the decoder refuses -------------------------
+
+    /// A 16x16 all-black greyscale PNG with the given tRNS chunks (each a
+    /// grey sample of 0 or 1) before its image data.
+    fn grey_with_trns(samples: &[u8]) -> Vec<u8> {
+        let mut chunks = vec![ihdr(16, 16, 8, 0)];
+        chunks.extend(samples.iter().map(|&sample| chunk(b"tRNS", &[0, sample])));
+        chunks.push(chunk(b"IDAT", &zlib_stored(&[0; 272])));
+        file(&chunks)
+    }
+
+    #[test]
+    fn a_png_oxipng_accepts_but_the_decoder_refuses_fails_with_the_lossy_decode_reason() {
+        // Two tRNS chunks, both with valid CRCs: oxipng keeps the last one,
+        // the `png` decoder refuses the second.
+        let png = grey_with_trns(&[0, 1]);
+        assert!(crate::png::optimize(&png).is_ok(), "lossless accepts it");
+        // `never` panics if the quantiser is reached.
+        let err = optimize_lossy_with(&png, q(75), never).unwrap_err();
+        assert!(
+            err.starts_with("could not decode the PNG for lossy: "),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_same_png_with_one_trns_chunk_is_quantised() {
+        let image = quantised_image(&grey_with_trns(&[0])).expect("quantised");
+        let image = image.expect("the quantiser was called");
+        assert_eq!((image.width, image.height), (16, 16));
+        // Black is the tRNS grey sample 0: every pixel is fully transparent.
+        assert!(image.pixels.chunks(4).all(|pixel| pixel == [0, 0, 0, 0]));
     }
 }
