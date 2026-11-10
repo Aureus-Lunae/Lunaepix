@@ -42,6 +42,12 @@ oxvg_ast = { version = "=0.0.9", features = ["roxmltree"] }
 # its limit of 255 nested references inside one reference, which the
 # `roxmltree_*` tests in svg.rs check. Re-run them before any upgrade.
 roxmltree = "=0.21.2"
+# The lossy PNG path: `png` decodes the source to RGBA (palette, tRNS and
+# greyscale expanded, 16-bit reduced) and writes the indexed result; quantizr
+# reduces the colours to a palette with alpha, with dithering. Both pure Rust.
+# The tests also use `png` to encode their fixtures.
+png = "0.17.16"
+quantizr = "=1.4.3"
 
 # The worker's start-up calls (see src/platform.rs). Both versions are the ones
 # already in Cargo.lock, so no new package.
@@ -57,11 +63,11 @@ windows-sys = { version = "0.61.2", features = ["Win32_System_Diagnostics_Debug"
 windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
-# Test fixtures: `png` encodes (low compression, redundant chunk), `image`
-# decodes for the pixel comparison and encodes the baseline JPEG fixtures
-# (standard Huffman tables, so there is something to optimise). Its `webp`
-# feature gives the lossless WebP fixtures, from a pure-Rust encoder.
-png = "0.17.16"
+# Test fixtures: `image` decodes for the pixel comparison and encodes the
+# baseline JPEG fixtures (standard Huffman tables, so there is something to
+# optimise). Its `webp` feature gives the lossless WebP fixtures, from a
+# pure-Rust encoder. (`png`, which encodes the PNG fixtures, is a normal
+# dependency now.)
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 # Lossy and lossy-with-alpha WebP fixtures, through libwebp's simple
 # `WebPEncodeRGBA` (the `image` crate only encodes lossless WebP). Tests only:

@@ -161,6 +161,17 @@ pub(crate) fn kept_lossless(bytes: Vec<u8>, note: Note) -> Lossy {
     }
 }
 
+/// A zeroed pixel buffer of `len` bytes, or an error when that memory cannot
+/// be had (instead of aborting the process).
+pub(crate) fn reserve_pixels(len: usize) -> Result<Vec<u8>, String> {
+    let mut pixels = Vec::new();
+    pixels
+        .try_reserve_exact(len)
+        .map_err(|_| "not enough memory for the pixels".to_owned())?;
+    pixels.resize(len, 0);
+    Ok(pixels)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +334,15 @@ mod tests {
             assert_eq!(lossy.bytes, original);
             assert_eq!(lossy.note, Some(Note::OriginalKept));
         }
+    }
+
+    // --- pixel buffers ----------------------------------------------------------
+
+    #[test]
+    fn reserving_an_impossible_pixel_buffer_fails_with_a_reason() {
+        let err = reserve_pixels(usize::MAX).unwrap_err();
+        assert_eq!(err, "not enough memory for the pixels");
+        assert_eq!(reserve_pixels(12).unwrap(), vec![0; 12]);
     }
 
     #[test]
