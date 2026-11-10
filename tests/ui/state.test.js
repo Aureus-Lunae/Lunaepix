@@ -1218,14 +1218,47 @@ test('settings_view_hides_choose_output_while_running', () => {
   assert.equal(settingsView(apply(readyList(), outputChanged('exports'), started(3))).showChooseOutput, false);
 });
 
-test('settings_view_shows_next_to_the_originals_with_a_folder_while_not_running', () => {
+test('settings_view_shows_clear_output_with_a_folder_while_not_running', () => {
   assert.equal(settingsView(reduce(readyList(), outputChanged('exports'))).showClearOutput, true);
   assert.equal(settingsView(reduce(readyList(), outputChanged(''))).showClearOutput, true);
 });
 
-test('settings_view_hides_next_to_the_originals_without_a_folder_or_while_running', () => {
+test('settings_view_hides_clear_output_without_a_folder_or_while_running', () => {
   assert.equal(settingsView(readyList()).showClearOutput, false);
   assert.equal(settingsView(apply(readyList(), outputChanged('exports'), started(3))).showClearOutput, false);
+});
+
+test('settings_view_shows_quality_while_lossy_and_ready', () => {
+  assert.equal(settingsView(reduce(readyList(), setMode('lossy'))).showQuality, true);
+});
+
+test('settings_view_shows_quality_while_lossy_and_running', () => {
+  const lossyRunning = apply(readyList(), setMode('lossy'), started(3, 'lossy', 75));
+  assert.equal(lossyRunning.phase, 'running');
+  assert.equal(settingsView(lossyRunning).showQuality, true);
+});
+
+test('settings_view_hides_quality_while_lossless_and_ready', () => {
+  assert.equal(readyList().mode, 'lossless');
+  assert.equal(settingsView(readyList()).showQuality, false);
+});
+
+test('settings_view_hides_quality_while_lossless_and_running', () => {
+  const losslessRunning = reduce(readyList(), started(3));
+  assert.equal(losslessRunning.phase, 'running');
+  assert.equal(settingsView(losslessRunning).showQuality, false);
+});
+
+test('settings_view_shows_quality_after_switching_to_lossy', () => {
+  assert.equal(settingsView(readyList()).showQuality, false);
+  assert.equal(settingsView(apply(readyList(), setMode('lossy'))).showQuality, true);
+});
+
+test('settings_view_hides_quality_again_after_switching_back_to_lossless', () => {
+  const back = apply(readyList(), setMode('lossy'), setQuality('40'), setMode('lossless'));
+  assert.equal(settingsView(back).showQuality, false);
+  // The last valid quality is still what comes back with Lossy.
+  assert.equal(apply(back, setMode('lossy')).qualityText, '40');
 });
 
 // the panel: which blocks show

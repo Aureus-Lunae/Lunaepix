@@ -48,6 +48,7 @@ const summaryText = document.getElementById('summaryText');
 const openFolder = document.getElementById('openFolder');
 const settings = document.getElementById('settings');
 const modeRadios = [document.getElementById('modeLossless'), document.getElementById('modeLossy')];
+const qualityRow = document.getElementById('qualityRow');
 const qualityRange = document.getElementById('qualityRange');
 const qualityNumber = document.getElementById('qualityNumber');
 const qualityError = document.getElementById('qualityError');
@@ -74,6 +75,9 @@ function renderSettings() {
     radio.checked = radio.value === state.mode;
     radio.disabled = view.radiosDisabled;
   }
+  // The row hides only while Lossless is picked, so focus (on a radio) is
+  // never inside it; the checked Lossless radio is the fallback all the same.
+  hideKeepingFocus(document, qualityRow, !view.showQuality, modeRadios[0]);
   qualityRange.value = String(state.quality);
   qualityRange.disabled = view.qualityDisabled;
   syncNumber(qualityNumber, state.qualityText);

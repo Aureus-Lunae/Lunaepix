@@ -64,9 +64,10 @@ One run handles at most 2000 files, and each file has its own limits (100 MiB,
    the PNG, JPG, SVG and WebP files directly inside it (not its subfolders).
    Adding files does not start anything: they appear in a list, and a file
    that cannot be compressed is listed with "Will be skipped" and its reason.
-2. Choose **Lossless** or **Lossy**. With Lossy, set the quality with the
-   slider or type a whole number from 0 to 100 (it starts at 75). Under "Save
-   to", leave "Next to the originals" or press "Choose output folder".
+2. Choose **Lossless** or **Lossy**. The quality appears when Lossy is
+   picked: set it with the slider or type a whole number from 0 to 100 (it
+   starts at 75). Under "Save to", leave "Next to the originals" or press
+   "Choose folder"; "Clear" then goes back to next to the originals.
 3. Press **Run**. Each file shows "Waiting", "Compressing…" and then its
    result: sizes, saving, time, and a note where a file was kept as it was. The
    heading shows the progress, for example "Compressing 2 of 3 · Lossy 75".
