@@ -475,6 +475,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_hostile_out_folder_name_or_error_text_reaches_no_terminal() {
+        for name in HOSTILE {
+            for cause_text in HOSTILE {
+                let mut err = Vec::new();
+                let cause = std::io::Error::other(cause_text);
+                report_cannot_create_out(Path::new(name), &cause, &mut err);
+                assert_no_control_bytes(&String::from_utf8(err).unwrap(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn the_out_folder_error_names_the_cause_and_the_folder() {
+        let mut err = Vec::new();
+        let cause = std::io::Error::other("Not a directory");
+        report_cannot_create_out(Path::new("pics/out"), &cause, &mut err);
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "lunaepix: failed (cannot create the output folder: Not a directory): pics/out\n"
+        );
+    }
+
     /// A writer whose pipe is closed.
     struct Closed;
 

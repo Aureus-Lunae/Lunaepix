@@ -182,6 +182,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_quality_value_that_is_not_valid_utf8_is_a_usage_error() {
+        use std::os::unix::ffi::OsStringExt;
+        // The same bytes as a number would be, with one invalid byte.
+        let bad = OsString::from_vec(vec![b'5', 0xff]);
+        let args = ["--lossy".into(), "--quality".into(), bad, "a.png".into()];
+        assert_eq!(parse(args), Err(UsageError));
+        // The valid spelling of the same option parses, so the byte decides.
+        assert_eq!(
+            parse_args(&["--lossy", "--quality", "5", "a.png"])
+                .unwrap()
+                .compression,
+            lossy(5)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn keeps_a_file_name_that_is_not_valid_utf8() {
         use std::os::unix::ffi::OsStringExt;
         let name = OsString::from_vec(vec![b'a', 0xff, b'.', b'p', b'n', b'g']);

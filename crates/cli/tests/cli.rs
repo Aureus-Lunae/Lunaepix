@@ -992,3 +992,43 @@ fn an_out_that_is_a_file_fails_with_exit_1_and_writes_nothing() {
     assert_eq!(listing(tmp.path()), names(&["a.png", "out"]));
     assert_eq!(fs::read(&out_file).unwrap(), b"not a folder");
 }
+
+#[test]
+fn without_out_a_rerun_replaces_the_earlier_output() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &gradient_png());
+    let earlier = write(tmp.path(), "optimized-a.png", b"an earlier result");
+
+    let output = run_on(tmp.path(), &[&src]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), "");
+    // The earlier output now holds the real result, and no numbered name
+    // was made beside it.
+    assert_eq!(
+        fs::read(&earlier).unwrap(),
+        core_bytes(&src, Compression::Lossless)
+    );
+    assert_eq!(listing(tmp.path()), names(&["a.png", "optimized-a.png"]));
+}
+
+#[test]
+fn without_out_a_dir_rerun_replaces_the_earlier_output_in_optimized() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("pics");
+    fs::create_dir(&dir).unwrap();
+    let src = write(&dir, "a.png", &gradient_png());
+    let out_dir = dir.join("optimized");
+    fs::create_dir(&out_dir).unwrap();
+    let earlier = write(&out_dir, "a.png", b"an earlier result");
+
+    let output = run_args(tmp.path(), &[OsStr::new("--dir"), dir.as_os_str()]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), "");
+    assert_eq!(
+        fs::read(&earlier).unwrap(),
+        core_bytes(&src, Compression::Lossless)
+    );
+    assert_eq!(listing(&out_dir), names(&["a.png"]));
+}
