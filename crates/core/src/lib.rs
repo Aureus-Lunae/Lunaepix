@@ -8,8 +8,9 @@
 //! in its own worker process ([`worker`]), so a library that crashes the
 //! process fails only that file.
 //!
-//! `unsafe` code is denied everywhere but in `jpg`, the libjpeg FFI, and in
-//! `platform`, the worker's two start-up system calls.
+//! `unsafe` code is denied everywhere but in `jpg`, the libjpeg FFI, in
+//! `platform`, the worker's two start-up system calls, and in `webp::codec`,
+//! the libwebp FFI.
 
 #![deny(unsafe_code)]
 
