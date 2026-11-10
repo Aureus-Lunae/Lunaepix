@@ -72,7 +72,7 @@ fn the_app_binary_optimises_one_file_in_worker_mode_without_a_window() {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(stdout.lines().count(), 1, "{stdout:?}");
-    assert!(stdout.starts_with("lunaepix-worker 1 ok "), "{stdout:?}");
+    assert!(stdout.starts_with("lunaepix-worker 2 ok "), "{stdout:?}");
     let written = fs::read(&dest).unwrap();
     assert!(written.len() < original.len());
     assert_eq!(fs::read(&src).unwrap(), original);
@@ -91,7 +91,7 @@ fn the_app_binary_reports_a_corrupt_file_in_worker_mode_and_writes_nothing() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(stdout.lines().count(), 1, "{stdout:?}");
     assert!(
-        stdout.starts_with("lunaepix-worker 1 invalid src "),
+        stdout.starts_with("lunaepix-worker 2 invalid src "),
         "{stdout:?}"
     );
     assert!(!dest.exists());

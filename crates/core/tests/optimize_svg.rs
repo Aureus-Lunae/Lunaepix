@@ -9,9 +9,15 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use lunaepix_core::{OptimizeError, optimize_file};
+use lunaepix_core::{Compression, OptimizeError, Options, Quality, WriteMode, optimize_file};
 use resvg::{tiny_skia, usvg};
 use tempfile::TempDir;
+
+/// Today's run: lossless, replacing an earlier output.
+const LOSSLESS: Options = Options {
+    compression: Compression::Lossless,
+    write: WriteMode::Replace,
+};
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -332,7 +338,7 @@ fn optimizes_a_cruft_laden_svg_to_a_smaller_svg_that_renders_alike() {
     let src = write(tmp.path(), "badge.svg", &original);
     let dest = tmp.path().join("optimized-badge.svg");
 
-    let outcome = optimize_file(&src, &dest).unwrap();
+    let outcome = optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     let optimized = fs::read(&dest).unwrap();
     assert!(
@@ -360,7 +366,7 @@ fn rejects_an_svg_that_is_not_well_formed_xml_and_leaves_no_output_or_temp_file(
     let dest = tmp.path().join("optimized-a.svg");
     let before = listing(tmp.path());
 
-    let err = optimize_file(&src, &dest).unwrap_err();
+    let err = optimize_file(&src, &dest, &LOSSLESS).unwrap_err();
 
     assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
     assert!(err.to_string().contains("not well-formed XML"), "{err}");
@@ -376,7 +382,7 @@ fn rejects_well_formed_xml_whose_root_is_not_svg_and_writes_nothing() {
     let dest = tmp.path().join("optimized-page.svg");
     let before = listing(tmp.path());
 
-    let err = optimize_file(&src, &dest).unwrap_err();
+    let err = optimize_file(&src, &dest, &LOSSLESS).unwrap_err();
 
     assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
     assert!(err.to_string().contains("not an SVG file"), "{err}");
@@ -389,7 +395,7 @@ fn rejects_well_formed_xml_whose_root_is_not_svg_and_writes_nothing() {
 fn keeps_the_source_bytes_unchanged_after_a_successful_run() {
     let tmp = TempDir::new().unwrap();
     let src = write(tmp.path(), "a.svg", &drawing());
-    optimize_file(&src, &tmp.path().join("optimized-a.svg")).unwrap();
+    optimize_file(&src, &tmp.path().join("optimized-a.svg"), &LOSSLESS).unwrap();
     assert_eq!(fs::read(&src).unwrap(), drawing());
 }
 
@@ -397,7 +403,7 @@ fn keeps_the_source_bytes_unchanged_after_a_successful_run() {
 fn keeps_the_source_unchanged_when_the_run_fails() {
     let tmp = TempDir::new().unwrap();
     let src = write(tmp.path(), "a.svg", &broken_xml());
-    let err = optimize_file(&src, &tmp.path().join("optimized-a.svg")).unwrap_err();
+    let err = optimize_file(&src, &tmp.path().join("optimized-a.svg"), &LOSSLESS).unwrap_err();
     assert!(err.to_string().contains("not well-formed XML"), "{err}");
     assert_eq!(fs::read(&src).unwrap(), broken_xml());
 }
@@ -409,10 +415,10 @@ fn writes_an_already_optimised_svg_as_an_equal_size_copy() {
     let tmp = TempDir::new().unwrap();
     let first = write(tmp.path(), "a.svg", &drawing());
     let once = tmp.path().join("once.svg");
-    optimize_file(&first, &once).unwrap();
+    optimize_file(&first, &once, &LOSSLESS).unwrap();
     let twice = tmp.path().join("twice.svg");
 
-    let outcome = optimize_file(&once, &twice).unwrap();
+    let outcome = optimize_file(&once, &twice, &LOSSLESS).unwrap();
 
     assert_eq!(outcome.before, outcome.after);
     assert_eq!(fs::read(&once).unwrap(), fs::read(&twice).unwrap());
@@ -429,7 +435,7 @@ fn keeps_the_original_bytes_when_the_optimised_svg_is_not_smaller() {
     let src = write(tmp.path(), "a.svg", minimal);
     let dest = tmp.path().join("optimized-a.svg");
 
-    let outcome = optimize_file(&src, &dest).unwrap();
+    let outcome = optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     assert_eq!(fs::read(&dest).unwrap(), minimal);
     assert_eq!(outcome.after, minimal.len() as u64);
@@ -443,7 +449,7 @@ fn accepts_svg_bytes_named_with_an_uppercase_svg_extension() {
     let src = write(tmp.path(), "BADGE.SVG", &drawing());
     let dest = tmp.path().join("optimized-BADGE.SVG");
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     let optimized = fs::read(&dest).unwrap();
     assert!(optimized.len() < drawing().len());
@@ -456,7 +462,7 @@ fn rejects_png_bytes_named_svg_and_writes_nothing() {
     let src = write(tmp.path(), "picture.svg", &png_bytes());
     let dest = tmp.path().join("optimized-picture.svg");
 
-    let err = optimize_file(&src, &dest).unwrap_err();
+    let err = optimize_file(&src, &dest, &LOSSLESS).unwrap_err();
 
     assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
     assert!(err.to_string().contains("not an SVG file"), "{err}");
@@ -476,7 +482,7 @@ fn replaces_an_existing_optimized_svg() {
         b"stale output from an earlier run",
     );
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     let written = fs::read(&dest).unwrap();
     assert_parses_as_svg(&written);
@@ -499,7 +505,7 @@ fn keeps_an_existing_optimized_svg_and_leaves_nothing_when_the_new_run_fails() {
     );
     let before = listing(tmp.path());
 
-    let err = optimize_file(&src, &dest).unwrap_err();
+    let err = optimize_file(&src, &dest, &LOSSLESS).unwrap_err();
 
     assert!(err.to_string().contains("not well-formed XML"), "{err}");
     assert_eq!(fs::read(&dest).unwrap(), b"output of an earlier good run");
@@ -512,7 +518,7 @@ fn writes_an_svg_into_the_optimized_folder() {
     let src = write(tmp.path(), "a.svg", &drawing());
     let dest = tmp.path().join("optimized").join("a.svg");
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     assert_eq!(
         listing(&tmp.path().join("optimized")),
@@ -526,8 +532,33 @@ fn does_not_create_the_destination_folder_when_the_svg_is_rejected() {
     let src = write(tmp.path(), "a.svg", &broken_xml());
     let dest = tmp.path().join("optimized").join("a.svg");
 
-    let err = optimize_file(&src, &dest).unwrap_err();
+    let err = optimize_file(&src, &dest, &LOSSLESS).unwrap_err();
 
     assert!(err.to_string().contains("not well-formed XML"), "{err}");
     assert!(!tmp.path().join("optimized").exists());
+}
+
+// --- a lossy run -----------------------------------------------------------------
+
+#[test]
+fn an_svg_in_a_lossy_run_gets_the_lossless_output_without_note() {
+    for quality in [0, 75, 100] {
+        let tmp = TempDir::new().unwrap();
+        let original = drawing();
+        let src = write(tmp.path(), "a.svg", &original);
+        let dest = tmp.path().join("optimized-a.svg");
+        let reference = tmp.path().join("optimized").join("a.svg");
+        let lossy = Options {
+            compression: Compression::Lossy(Quality::new(quality).unwrap()),
+            write: WriteMode::Replace,
+        };
+
+        let outcome = optimize_file(&src, &dest, &lossy).unwrap();
+        optimize_file(&src, &reference, &LOSSLESS).unwrap();
+
+        assert_eq!(outcome.note, None, "{quality}");
+        assert_eq!(fs::read(&dest).unwrap(), fs::read(&reference).unwrap());
+        assert!(outcome.after < outcome.before, "{quality}");
+        assert_eq!(fs::read(&src).unwrap(), original);
+    }
 }

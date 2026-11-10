@@ -52,12 +52,12 @@ fn exits_0_with_an_ok_record_when_the_file_is_optimised() {
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let record = stdout(&output);
-    assert!(record.starts_with("lunaepix-worker 1 ok "), "{record:?}");
+    assert!(record.starts_with("lunaepix-worker 2 ok "), "{record:?}");
     assert_eq!(record.lines().count(), 1, "{record:?}");
     let before = fs::metadata(&src).unwrap().len();
     let after = fs::metadata(&dest).unwrap().len();
     assert!(
-        record.starts_with(&format!("lunaepix-worker 1 ok {before} {after} ")),
+        record.starts_with(&format!("lunaepix-worker 2 ok {before} {after} ")),
         "{record:?}"
     );
 }
@@ -73,7 +73,7 @@ fn exits_1_with_an_error_record_when_the_file_cannot_be_optimised() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let record = stdout(&output);
     assert!(
-        record.starts_with("lunaepix-worker 1 invalid src "),
+        record.starts_with("lunaepix-worker 2 invalid src "),
         "{record:?}"
     );
     assert!(!dest.exists());
@@ -90,7 +90,7 @@ fn exits_1_with_an_io_record_when_the_source_is_missing() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let record = stdout(&output);
     assert!(
-        record.starts_with("lunaepix-worker 1 io src "),
+        record.starts_with("lunaepix-worker 2 io src "),
         "{record:?}"
     );
 }
@@ -115,6 +115,121 @@ fn refuses_a_call_without_the_flag_or_with_the_wrong_arguments_and_prints_no_rec
         assert!(output.stdout.is_empty(), "{args:?}");
         assert!(!dest.exists(), "{args:?}");
     }
+}
+
+/// A 64x64 RGBA gradient with noise: thousands of colours, so a lossless run
+/// keeps it a true-colour PNG and only a lossy run makes it indexed.
+fn gradient_png() -> Vec<u8> {
+    let (w, h) = (64u32, 64u32);
+    let mut pixels = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let noise = ((x * 31 + y * 17) % 13) as u8;
+            pixels.extend_from_slice(&[
+                (x * 4) as u8 ^ noise,
+                (y * 4) as u8,
+                ((x + y) * 2) as u8 ^ noise,
+                255,
+            ]);
+        }
+    }
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, w, h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&pixels).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+/// The colour type in a PNG's IHDR: 3 is indexed.
+fn colour_type(png: &[u8]) -> u8 {
+    assert_eq!(&png[12..16], b"IHDR");
+    png[25]
+}
+
+#[test]
+fn the_worker_accepts_lossy_0_75_and_100() {
+    let tmp = TempDir::new().unwrap();
+    let original = gradient_png();
+    let src = write(tmp.path(), "a.png", &original);
+    // The control: the same file in a lossless run stays true colour.
+    let lossless = tmp.path().join("optimized/a.png");
+    let output = serve(&[WORKER_FLAG.as_ref(), src.as_os_str(), lossless.as_os_str()]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_ne!(colour_type(&fs::read(&lossless).unwrap()), 3);
+
+    for quality in ["0", "75", "100"] {
+        let dest = tmp.path().join(format!("optimized-{quality}.png"));
+
+        let output = serve(&[
+            WORKER_FLAG.as_ref(),
+            "--lossy".as_ref(),
+            quality.as_ref(),
+            src.as_os_str(),
+            dest.as_os_str(),
+        ]);
+
+        assert_eq!(output.status.code(), Some(0), "{quality}: {output:?}");
+        let record = stdout(&output);
+        let after = fs::metadata(&dest).unwrap().len();
+        assert!(
+            record.starts_with(&format!("lunaepix-worker 2 ok {} {after} ", original.len())),
+            "{quality}: {record:?}"
+        );
+        assert!(record.ends_with(" -\n"), "{quality}: {record:?}");
+        let written = fs::read(&dest).unwrap();
+        assert_eq!(
+            colour_type(&written),
+            3,
+            "{quality}: lossy output is indexed"
+        );
+        let decoded = image::load_from_memory(&written).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (64, 64), "{quality}");
+    }
+    assert_eq!(fs::read(&src).unwrap(), original);
+}
+
+#[test]
+fn the_worker_refuses_a_missing_quality_minus_1_101_75_5_abc_an_unknown_option_and_a_repeat() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &gradient_png());
+    let dest = tmp.path().join("optimized-a.png");
+
+    let calls: [&[&str]; 9] = [
+        &["--lossy"],
+        &["--lossy", "-1"],
+        &["--lossy", "101"],
+        &["--lossy", "75.5"],
+        &["--lossy", "abc"],
+        &["--fast"],
+        &["--lossy", "75", "--lossy", "75"],
+        &["--no-replace", "--no-replace"],
+        &["--no-replace", "--lossy", "75"],
+    ];
+    for flags in calls {
+        let mut args: Vec<&std::ffi::OsStr> = vec![WORKER_FLAG.as_ref()];
+        args.extend(flags.iter().map(std::ffi::OsStr::new));
+        args.extend([src.as_os_str(), dest.as_os_str()]);
+
+        let output = serve(&args);
+
+        assert_eq!(output.status.code(), Some(2), "{flags:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{flags:?}");
+        assert!(!dest.exists(), "{flags:?}");
+    }
+    assert_eq!(listing_names(tmp.path()), ["a.png"]);
+}
+
+fn listing_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }
 
 /// Start `program`, which blocks opening the FIFO `fifo`, and read its OOM

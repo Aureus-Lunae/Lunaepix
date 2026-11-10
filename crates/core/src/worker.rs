@@ -2,23 +2,34 @@
 //! stdout.
 //!
 //! The batch runner ([`crate::run`]) starts a binary once per file as
-//! `<exe> --lunaepix-worker <src> <dest>`, so that a library that crashes the
-//! process (a stack overflow aborts, and cannot be caught) takes down only
-//! that one file. The CLI and the app call [`serve_if_requested`] first thing
-//! in `main`, so both binaries answer the worker mode.
+//! `<exe> --lunaepix-worker [--lossy <0-100>] [--no-replace] <src> <dest>`,
+//! so that a library that crashes the process (a stack overflow aborts, and
+//! cannot be caught) takes down only that one file. The CLI and the app call
+//! [`serve_if_requested`] first thing in `main`, so both binaries answer the
+//! worker mode.
+//!
+//! # The arguments
+//!
+//! The last two arguments are always the source and the destination, so a
+//! path that looks like an option is still a path. Before them come the run's
+//! options ([`Options`]), in this order and each at most once: `--lossy`
+//! with a quality that [`Quality::parse`] accepts, then `--no-replace`.
+//! Anything else is a usage error: exit code 2, no record, nothing written.
 //!
 //! # The result record
 //!
 //! The worker writes exactly one line of UTF-8 to stdout, and nothing else:
 //!
 //! ```text
-//! lunaepix-worker 1 ok <before> <after> <millis>
-//! lunaepix-worker 1 unsupported <role>
-//! lunaepix-worker 1 invalid <role> <message>
-//! lunaepix-worker 1 io <role> <os-error-code or -> <message>
+//! lunaepix-worker 2 ok <before> <after> <millis> <note-code or ->
+//! lunaepix-worker 2 unsupported <role>
+//! lunaepix-worker 2 invalid <role> <message>
+//! lunaepix-worker 2 io <role> <os-error-code or -> <message>
 //! ```
 //!
-//! `1` is the format version. The numbers are plain decimal digits. `<role>`
+//! `2` is the format version; the runner refuses any other, so a stale
+//! worker counts as crashed. The note code is [`Note::code`], or `-` for no
+//! note. The numbers are plain decimal digits. `<role>`
 //! is `src` or `dest`: which of the two paths the error is about. Paths are
 //! never written, because the parent already has them (exactly, even when
 //! they are not UTF-8). In `<message>` a backslash is written `\\`, a line
@@ -40,13 +51,22 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
 
-use crate::{MAX_WORKER_MESSAGE_BYTES, OptimizeError, Outcome, optimize_file, platform};
+use crate::{
+    Compression, MAX_WORKER_MESSAGE_BYTES, Note, OptimizeError, Options, Outcome, Quality,
+    WriteMode, optimize_file, platform,
+};
 
 /// The hidden first argument that starts a binary in worker mode.
 pub const WORKER_FLAG: &str = "--lunaepix-worker";
 
 /// Start of every record: a magic word and the format version.
-const RECORD_PREFIX: &str = "lunaepix-worker 1 ";
+const RECORD_PREFIX: &str = "lunaepix-worker 2 ";
+
+/// The option that makes a run lossy; the quality follows it.
+const LOSSY_OPTION: &str = "--lossy";
+
+/// The option that makes a run write without replacing anything.
+const NO_REPLACE_OPTION: &str = "--no-replace";
 
 const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
@@ -73,7 +93,8 @@ pub fn serve_if_requested() -> Option<ExitCode> {
 }
 
 /// Optimise one file and write the result record to stdout. `args` are the
-/// arguments after the flag, which must be exactly `<src> <dest>`.
+/// arguments after the flag: the options, then `<src> <dest>` (see the
+/// module documentation).
 ///
 /// First the worker sets itself up for its parent: on Linux it asks to be
 /// killed when the thread that started it ends (so closing the window stops
@@ -88,7 +109,7 @@ pub fn serve(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     platform::suppress_crash_dialogs();
     serve_with(
         args,
-        |src: &Path, dest: &Path| optimize_file(src, dest),
+        |src: &Path, dest: &Path, options: Options| optimize_file(src, dest, &options),
         &mut io::stdout().lock(),
     )
 }
@@ -102,18 +123,18 @@ pub(crate) fn serve_with<F>(
     out: &mut dyn Write,
 ) -> ExitCode
 where
-    F: FnOnce(&Path, &Path) -> Result<Outcome, OptimizeError> + Send + 'static,
+    F: FnOnce(&Path, &Path, Options) -> Result<Outcome, OptimizeError> + Send + 'static,
 {
-    let mut args = args.into_iter();
-    let (Some(src), Some(dest), None) = (args.next(), args.next(), args.next()) else {
-        eprintln!("usage: <program> {WORKER_FLAG} <source> <destination>");
+    let Some((options, src, dest)) = parse_args(args.into_iter().collect()) else {
+        eprintln!(
+            "usage: <program> {WORKER_FLAG} [{LOSSY_OPTION} <0-100>] [{NO_REPLACE_OPTION}] <source> <destination>"
+        );
         return ExitCode::from(EXIT_USAGE);
     };
-    let (src, dest) = (PathBuf::from(src), PathBuf::from(dest));
 
     let job = {
         let (src, dest) = (src.clone(), dest.clone());
-        move || optimise(&src, &dest)
+        move || optimise(&src, &dest, options)
     };
     let spawned = thread::Builder::new()
         .name("optimize".to_owned())
@@ -138,6 +159,44 @@ where
         Ok(_) => ExitCode::SUCCESS,
         Err(_) => ExitCode::from(EXIT_FAILED),
     }
+}
+
+/// The options and the two paths of a worker call, or `None` for anything
+/// but `[--lossy <quality>] [--no-replace] <src> <dest>`.
+fn parse_args(mut args: Vec<OsString>) -> Option<(Options, PathBuf, PathBuf)> {
+    let dest = PathBuf::from(args.pop()?);
+    let src = PathBuf::from(args.pop()?);
+    let mut flags = args.iter().map(|arg| arg.to_str());
+    let mut next = flags.next();
+    let mut options = Options {
+        compression: Compression::Lossless,
+        write: WriteMode::Replace,
+    };
+    if next == Some(Some(LOSSY_OPTION)) {
+        let quality = Quality::parse(flags.next()??)?;
+        options.compression = Compression::Lossy(quality);
+        next = flags.next();
+    }
+    if next == Some(Some(NO_REPLACE_OPTION)) {
+        options.write = WriteMode::NoReplace;
+        next = flags.next();
+    }
+    // Nothing may follow, and nothing else may stand where an option was.
+    next.is_none().then_some((options, src, dest))
+}
+
+/// The arguments that carry `options` to a worker, in the order
+/// [`parse_args`] reads them.
+pub(crate) fn option_args(options: &Options) -> Vec<OsString> {
+    let mut args = Vec::new();
+    if let Compression::Lossy(quality) = options.compression {
+        args.push(LOSSY_OPTION.into());
+        args.push(quality.get().to_string().into());
+    }
+    if options.write == WriteMode::NoReplace {
+        args.push(NO_REPLACE_OPTION.into());
+    }
+    args
 }
 
 /// Ask the kernel to pick this process first when memory runs out. Best
@@ -166,7 +225,13 @@ pub(crate) fn format_record(
         }
     };
     let body = match result {
-        Ok(outcome) => format!("ok {} {} {}", outcome.before, outcome.after, outcome.millis),
+        Ok(outcome) => format!(
+            "ok {} {} {} {}",
+            outcome.before,
+            outcome.after,
+            outcome.millis,
+            outcome.note.map_or("-", Note::code)
+        ),
         Err(OptimizeError::UnsupportedType { path }) => format!("unsupported {}", role(path)),
         Err(OptimizeError::Invalid { path, message }) => {
             format!("invalid {} {}", role(path), escape(message))
@@ -209,7 +274,10 @@ pub(crate) fn parse_record(
                 before: number(fields.next()?)?,
                 after: number(fields.next()?)?,
                 millis: number(fields.next()?)?,
-                note: None,
+                note: match fields.next()? {
+                    "-" => None,
+                    code => Some(Note::from_code(code)?),
+                },
             };
             if fields.next().is_some() {
                 return None;
@@ -328,7 +396,7 @@ mod tests {
         };
         assert_eq!(
             format_record(&Ok(outcome), &src, &dest),
-            "lunaepix-worker 1 ok 2048 1024 7\n"
+            "lunaepix-worker 2 ok 2048 1024 7 -\n"
         );
     }
 
@@ -466,7 +534,7 @@ mod tests {
         let mut out = Vec::new();
         let code = serve_with(
             worker_args(),
-            |_: &Path, _: &Path| -> Result<Outcome, OptimizeError> {
+            |_: &Path, _: &Path, _: Options| -> Result<Outcome, OptimizeError> {
                 panic!("the optimiser hit a bug")
             },
             &mut out,
@@ -487,11 +555,11 @@ mod tests {
         let mut out = Vec::new();
         let code = serve_with(
             worker_args(),
-            move |_: &Path, _: &Path| Ok(outcome),
+            move |_: &Path, _: &Path, _: Options| Ok(outcome),
             &mut out,
         );
         assert_eq!(code, ExitCode::SUCCESS);
-        assert_eq!(out, b"lunaepix-worker 1 ok 10 4 2\n");
+        assert_eq!(out, b"lunaepix-worker 2 ok 10 4 2 -\n");
     }
 
     #[test]
@@ -499,7 +567,7 @@ mod tests {
         let mut out = Vec::new();
         let code = serve_with(
             worker_args(),
-            |src: &Path, _: &Path| {
+            |src: &Path, _: &Path, _: Options| {
                 Err(OptimizeError::UnsupportedType {
                     path: src.to_path_buf(),
                 })
@@ -507,7 +575,7 @@ mod tests {
             &mut out,
         );
         assert_eq!(code, ExitCode::from(1));
-        assert_eq!(out, b"lunaepix-worker 1 unsupported src\n");
+        assert_eq!(out, b"lunaepix-worker 2 unsupported src\n");
     }
 
     #[test]
@@ -523,7 +591,7 @@ mod tests {
         }
         let code = serve_with(
             worker_args(),
-            |_: &Path, _: &Path| {
+            |_: &Path, _: &Path, _: Options| {
                 Ok(Outcome {
                     before: 1,
                     after: 1,
@@ -539,7 +607,7 @@ mod tests {
     #[test]
     fn rejects_anything_that_is_not_exactly_one_well_formed_record() {
         let (src, dest) = paths();
-        let ok = "lunaepix-worker 1 ok 10 5 3\n";
+        let ok = "lunaepix-worker 2 ok 10 5 3 -\n";
         assert!(
             parse_record(ok.as_bytes(), &src, &dest).is_some(),
             "control"
@@ -549,31 +617,31 @@ mod tests {
             b"",
             b"\n",
             b"garbage\n",
-            b"lunaepix-worker 1 ok 10 5 3", // no newline
-            b"lunaepix-worker 1 ok 10 5 3\n\n",
-            b"lunaepix-worker 1 ok 10 5 3\nlunaepix-worker 1 ok 10 5 3\n",
-            b"hello\nlunaepix-worker 1 ok 10 5 3\n",
-            b"lunaepix-worker 2 ok 10 5 3\n", // other version
-            b"lunaepix-worker 1 ok 10 5\n",
-            b"lunaepix-worker 1 ok 10 5 3 4\n",
-            b"lunaepix-worker 1 ok +10 5 3\n",
-            b"lunaepix-worker 1 ok -10 5 3\n",
-            b"lunaepix-worker 1 ok 10  5 3\n",
-            b"lunaepix-worker 1 ok 1e3 5 3\n",
-            b"lunaepix-worker 1 ok 18446744073709551616 5 3\n", // u64::MAX + 1
-            b"lunaepix-worker 1 ok 10 5 3\r\n",
-            b"lunaepix-worker 1 maybe 10 5 3\n",
-            b"lunaepix-worker 1 unsupported\n",
-            b"lunaepix-worker 1 unsupported elsewhere\n",
-            b"lunaepix-worker 1 unsupported src extra\n",
-            b"lunaepix-worker 1 invalid\n",
-            b"lunaepix-worker 1 invalid nowhere oops\n",
-            b"lunaepix-worker 1 invalid src bad \\x escape\n",
-            b"lunaepix-worker 1 invalid src trailing backslash \\\n",
-            b"lunaepix-worker 1 io src\n",
-            b"lunaepix-worker 1 io src 13\n",
-            b"lunaepix-worker 1 io src x13 denied\n",
-            b"lunaepix-worker 1 invalid src \xff\xfe not UTF-8\n",
+            b"lunaepix-worker 2 ok 10 5 3 -", // no newline
+            b"lunaepix-worker 2 ok 10 5 3 -\n\n",
+            b"lunaepix-worker 2 ok 10 5 3 -\nlunaepix-worker 2 ok 10 5 3 -\n",
+            b"hello\nlunaepix-worker 2 ok 10 5 3 -\n",
+            b"lunaepix-worker 3 ok 10 5 3 -\n", // other version
+            b"lunaepix-worker 2 ok 10 5 -\n",
+            b"lunaepix-worker 2 ok 10 5 3 - 4\n",
+            b"lunaepix-worker 2 ok +10 5 3 -\n",
+            b"lunaepix-worker 2 ok -10 5 3 -\n",
+            b"lunaepix-worker 2 ok 10  5 3 -\n",
+            b"lunaepix-worker 2 ok 1e3 5 3 -\n",
+            b"lunaepix-worker 2 ok 18446744073709551616 5 3 -\n", // u64::MAX + 1
+            b"lunaepix-worker 2 ok 10 5 3 -\r\n",
+            b"lunaepix-worker 2 maybe 10 5 3 -\n",
+            b"lunaepix-worker 2 unsupported\n",
+            b"lunaepix-worker 2 unsupported elsewhere\n",
+            b"lunaepix-worker 2 unsupported src extra\n",
+            b"lunaepix-worker 2 invalid\n",
+            b"lunaepix-worker 2 invalid nowhere oops\n",
+            b"lunaepix-worker 2 invalid src bad \\x escape\n",
+            b"lunaepix-worker 2 invalid src trailing backslash \\\n",
+            b"lunaepix-worker 2 io src\n",
+            b"lunaepix-worker 2 io src 13\n",
+            b"lunaepix-worker 2 io src x13 denied\n",
+            b"lunaepix-worker 2 invalid src \xff\xfe not UTF-8\n",
         ];
         for bytes in bad {
             assert!(
@@ -582,5 +650,265 @@ mod tests {
                 String::from_utf8_lossy(bytes)
             );
         }
+    }
+
+    // --- record version 2: the note ---------------------------------------------
+
+    use crate::Note;
+
+    const NOTES: [Note; 4] = [
+        Note::KeptLosslessAnimatedPng,
+        Note::KeptLosslessCmyk,
+        Note::KeptLosslessAnimationTooLarge,
+        Note::OriginalKept,
+    ];
+
+    #[test]
+    fn a_v2_ok_record_with_a_note_round_trips() {
+        let (src, dest) = paths();
+        let outcome = Outcome {
+            before: 2048,
+            after: 2048,
+            millis: 7,
+            note: Some(Note::OriginalKept),
+        };
+        assert_eq!(
+            format_record(&Ok(outcome), &src, &dest),
+            "lunaepix-worker 2 ok 2048 2048 7 original-kept\n"
+        );
+        for note in NOTES.map(Some).into_iter().chain([None]) {
+            let outcome = Outcome {
+                before: 300,
+                after: 200,
+                millis: 9,
+                note,
+            };
+            let (record, parsed) = round_trip(Ok(outcome));
+            assert_eq!(parsed.unwrap(), outcome, "{record:?}");
+            let code = note.map_or("-", Note::code);
+            assert_eq!(record, format!("lunaepix-worker 2 ok 300 200 9 {code}\n"));
+        }
+    }
+
+    #[test]
+    fn a_v1_record_is_refused() {
+        let (src, dest) = paths();
+        for record in [
+            &b"lunaepix-worker 1 ok 10 5 3\n"[..],
+            b"lunaepix-worker 1 ok 10 5 3 -\n",
+            b"lunaepix-worker 1 ok 10 5 3 original-kept\n",
+            b"lunaepix-worker 1 unsupported src\n",
+            b"lunaepix-worker 1 invalid src nope\n",
+            b"lunaepix-worker 1 io src - gone\n",
+        ] {
+            assert!(
+                parse_record(record, &src, &dest).is_none(),
+                "accepted {:?}",
+                String::from_utf8_lossy(record)
+            );
+        }
+        // The same records in version 2 are taken.
+        for record in [
+            &b"lunaepix-worker 2 ok 10 5 3 -\n"[..],
+            b"lunaepix-worker 2 unsupported src\n",
+            b"lunaepix-worker 2 invalid src nope\n",
+            b"lunaepix-worker 2 io src - gone\n",
+        ] {
+            assert!(
+                parse_record(record, &src, &dest).is_some(),
+                "refused {:?}",
+                String::from_utf8_lossy(record)
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_note_code_is_refused() {
+        let (src, dest) = paths();
+        for record in [
+            &b"lunaepix-worker 2 ok 10 5 3 bogus\n"[..],
+            b"lunaepix-worker 2 ok 10 5 3 APNG\n",
+            b"lunaepix-worker 2 ok 10 5 3 original kept\n",
+            b"lunaepix-worker 2 ok 10 5 3 --\n",
+            b"lunaepix-worker 2 ok 10 5 3 \n",
+            // The note field is not optional.
+            b"lunaepix-worker 2 ok 10 5 3\n",
+        ] {
+            assert!(
+                parse_record(record, &src, &dest).is_none(),
+                "accepted {:?}",
+                String::from_utf8_lossy(record)
+            );
+        }
+        for note in NOTES {
+            let record = format!("lunaepix-worker 2 ok 10 5 3 {}\n", note.code());
+            let parsed = parse_record(record.as_bytes(), &src, &dest).unwrap();
+            assert_eq!(parsed.unwrap().note, Some(note));
+        }
+    }
+
+    // --- the worker's arguments ---------------------------------------------------
+
+    use std::sync::{Arc, Mutex};
+
+    use crate::{Compression, Quality, WriteMode};
+
+    /// What the optimiser double was handed.
+    type Handed = (PathBuf, PathBuf, Options);
+
+    /// Run the worker with `args` and an optimiser double; the exit code, the
+    /// record and what the double was handed.
+    fn serve_recorded(args: &[&str]) -> (ExitCode, Vec<u8>, Vec<Handed>) {
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&handed);
+        let mut out = Vec::new();
+        let code = serve_with(
+            args.iter().map(OsString::from),
+            move |src: &Path, dest: &Path, options: Options| {
+                recorder
+                    .lock()
+                    .unwrap()
+                    .push((src.to_path_buf(), dest.to_path_buf(), options));
+                Ok(Outcome {
+                    before: 10,
+                    after: 4,
+                    millis: 2,
+                    note: None,
+                })
+            },
+            &mut out,
+        );
+        let handed = handed.lock().unwrap().clone();
+        (code, out, handed)
+    }
+
+    fn options(quality: Option<u8>, no_replace: bool) -> Options {
+        Options {
+            compression: match quality {
+                Some(value) => Compression::Lossy(Quality::new(value).unwrap()),
+                None => Compression::Lossless,
+            },
+            write: if no_replace {
+                WriteMode::NoReplace
+            } else {
+                WriteMode::Replace
+            },
+        }
+    }
+
+    #[test]
+    fn the_worker_hands_the_parsed_options_to_the_optimiser() {
+        let cases: [(&[&str], Options); 7] = [
+            (&[], options(None, false)),
+            (&["--lossy", "0"], options(Some(0), false)),
+            (&["--lossy", "75"], options(Some(75), false)),
+            (&["--lossy", "100"], options(Some(100), false)),
+            (&["--no-replace"], options(None, true)),
+            (&["--lossy", "40", "--no-replace"], options(Some(40), true)),
+            (&["--lossy", "075"], options(Some(75), false)),
+        ];
+        for (flags, expected) in cases {
+            let mut args = flags.to_vec();
+            args.extend(["/photos/a.png", "/photos/optimized-a.png"]);
+
+            let (code, out, handed) = serve_recorded(&args);
+
+            assert_eq!(code, ExitCode::SUCCESS, "{flags:?}");
+            assert_eq!(out, b"lunaepix-worker 2 ok 10 4 2 -\n", "{flags:?}");
+            assert_eq!(
+                handed,
+                [(
+                    PathBuf::from("/photos/a.png"),
+                    PathBuf::from("/photos/optimized-a.png"),
+                    expected
+                )],
+                "{flags:?}"
+            );
+        }
+        // The last two arguments are the paths, even when they look like
+        // options.
+        let (code, _, handed) = serve_recorded(&["--lossy", "50", "--no-replace", "--lossy"]);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(
+            handed,
+            [(
+                PathBuf::from("--no-replace"),
+                PathBuf::from("--lossy"),
+                options(Some(50), false)
+            )]
+        );
+    }
+
+    #[test]
+    fn the_worker_refuses_options_out_of_order_and_never_calls_the_optimiser() {
+        let calls: [&[&str]; 13] = [
+            &["--no-replace", "--lossy", "75"],
+            &["--lossy"],
+            &["--lossy", "-1"],
+            &["--lossy", "101"],
+            &["--lossy", "75.5"],
+            &["--lossy", "abc"],
+            &["--lossy", ""],
+            &["--quality", "75"],
+            &["--lossy", "75", "--lossy", "75"],
+            &["--no-replace", "--no-replace"],
+            &["--lossy=75"],
+            &["--lossy", "75", "--fast"],
+            &["--fast"],
+        ];
+        for flags in calls {
+            let mut args = flags.to_vec();
+            args.extend(["/photos/a.png", "/photos/optimized-a.png"]);
+
+            let (code, out, handed) = serve_recorded(&args);
+
+            assert_eq!(code, ExitCode::from(EXIT_USAGE), "{flags:?}");
+            assert!(out.is_empty(), "{flags:?}");
+            assert!(handed.is_empty(), "{flags:?}");
+        }
+        // Fewer than two paths.
+        for args in [
+            &[][..],
+            &["/photos/a.png"],
+            &["--lossy", "75", "/photos/a.png"],
+        ] {
+            let (code, out, handed) = serve_recorded(args);
+            assert_eq!(code, ExitCode::from(EXIT_USAGE), "{args:?}");
+            assert!(out.is_empty() && handed.is_empty(), "{args:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_worker_refuses_a_quality_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let calls = Arc::new(Mutex::new(0));
+        let recorder = Arc::clone(&calls);
+        let mut out = Vec::new();
+        let args = vec![
+            OsString::from("--lossy"),
+            OsString::from_vec(b"7\xff".to_vec()),
+            OsString::from("/photos/a.png"),
+            OsString::from("/photos/optimized-a.png"),
+        ];
+        let code = serve_with(
+            args,
+            move |_: &Path, _: &Path, _: Options| {
+                *recorder.lock().unwrap() += 1;
+                Err(OptimizeError::UnsupportedType {
+                    path: PathBuf::new(),
+                })
+            },
+            &mut out,
+        );
+        assert_eq!(code, ExitCode::from(EXIT_USAGE));
+        assert!(out.is_empty());
+        assert_eq!(*calls.lock().unwrap(), 0);
+        // The same call with a UTF-8 quality reaches the optimiser.
+        let (code, _, handed) =
+            serve_recorded(&["--lossy", "7", "/photos/a.png", "/photos/optimized-a.png"]);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(handed.len(), 1);
     }
 }

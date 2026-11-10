@@ -17,10 +17,10 @@
 //! quantised palette has any) from the quantised grey levels, and keeps its
 //! profile.
 //!
-//! Every chunk's CRC is checked before decoding. The decoder would skip an
-//! ancillary chunk with a bad CRC, but the chunk would then be carried over
-//! and oxipng would refuse it after the whole decode; the lossless path
-//! refuses such a file at once, with the reason given here too.
+//! Before decoding, oxipng's own parser reads the source
+//! ([`check_with_oxipng`]): whatever the lossless path refuses (a bad CRC,
+//! image data longer or shorter than the IHDR declares, corrupt data) is
+//! refused here too, with the same reason, before anything is quantised.
 //!
 //! An animated PNG (with an `acTL` chunk) gets the lossless treatment with
 //! [`Note::KeptLosslessAnimatedPng`].
@@ -30,7 +30,7 @@
 use std::io::Cursor;
 
 use super::{
-    MAX_DECOMPRESSED_BYTES, SIGNATURE, check_chunks, chunk_headers, first_bad_crc, oxipng_reason,
+    MAX_DECOMPRESSED_BYTES, SIGNATURE, check_chunks, chunk_headers, oxipng_options, oxipng_reason,
     run_oxipng,
 };
 use crate::lossy::{
@@ -63,10 +63,6 @@ struct Quantised {
 /// The result is never larger than the source (see [`finish`]); an animated
 /// PNG gets the lossless treatment with [`Note::KeptLosslessAnimatedPng`].
 /// The error is a message for the user, as for the lossless path.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into the run by a later task")
-)]
 pub(crate) fn optimize_lossy(bytes: &[u8], quality: Quality) -> Result<Lossy, String> {
     optimize_lossy_with(bytes, quality, quantise)
 }
@@ -88,10 +84,7 @@ fn optimize_lossy_with(
             Note::KeptLosslessAnimatedPng,
         ));
     }
-    // A bad CRC fails here, with oxipng's reason, as the lossless path does.
-    if let Some(kind) = first_bad_crc(bytes) {
-        return Err(oxipng_reason(oxipng::PngError::CRCMismatch(kind)));
-    }
+    check_with_oxipng(bytes)?;
     let image = decode(bytes)?;
     let (width, height) = (image.width, image.height);
     let quantised = quantise(&image, quality)?;
@@ -205,10 +198,38 @@ fn check_quantised(quantised: &Quantised, width: u32, height: u32) -> Result<(),
     Ok(())
 }
 
+/// The gate before decoding: oxipng's own parser reads the source, and
+/// whatever it refuses is refused here with its reason, word for word what
+/// the lossless path ([`super::optimize`]) gives. That covers every chunk's
+/// CRC, image data that inflates past or falls short of what the IHDR
+/// declares, and corrupt data. The `png` decoder is more lenient: it would
+/// skip an ancillary chunk with a bad CRC (which would then be carried over)
+/// and discards image data past the last row.
+///
+/// The parsed value holds the whole inflated image, so it is dropped before
+/// the decoder runs and the two never share the memory.
+fn check_with_oxipng(bytes: &[u8]) -> Result<(), String> {
+    // `oxipng::internal_tests` is doc-hidden and not part of oxipng's public
+    // API. oxipng is pinned at `=10.2.1` in Cargo.toml for this reason: an
+    // upgrade must re-check that `PngData::from_slice` still exists and
+    // still refuses what `optimize_from_memory` refuses (the tests that
+    // compare the lossy reason with `png::optimize`'s show it).
+    let parsed = oxipng::internal_tests::PngData::from_slice(bytes, &oxipng_options())
+        .map_err(oxipng_reason)?;
+    drop(parsed);
+    Ok(())
+}
+
 /// Decode the source to 8-bit RGBA: palette and `tRNS` expanded, greyscale
 /// expanded to RGB, 16-bit samples reduced to 8.
+///
+/// It runs after [`check_with_oxipng`], so a decoder error here is a file
+/// the lossless path accepts but the `png` decoder refuses (for example a
+/// second tRNS chunk, where oxipng keeps the last). Its reason says so: "could
+/// not decode the PNG for lossy: …".
 fn decode(bytes: &[u8]) -> Result<Rgba, String> {
-    let unreadable = |error: ::png::DecodingError| format!("could not read the PNG data: {error}");
+    let unreadable =
+        |error: ::png::DecodingError| format!("could not decode the PNG for lossy: {error}");
     // The pixel count is already checked from IHDR. The limit covers the
     // decoder's own buffers, of which a row is the largest: at most
     // 8 bytes per pixel of the widest image within MAX_PIXELS.
@@ -1627,5 +1648,300 @@ mod tests {
             assert!(err.contains("could not read the PNG data"), "{err}");
             assert!(start.elapsed() < Duration::from_secs(5));
         }
+    }
+
+    // --- image data past the IHDR's size -------------------------------------
+
+    /// An IHDR chunk like [`ihdr`], with Adam7 interlacing.
+    fn interlaced_ihdr(w: u32, h: u32, depth: u8, colour: u8) -> Vec<u8> {
+        let mut data = w.to_be_bytes().to_vec();
+        data.extend_from_slice(&h.to_be_bytes());
+        data.extend_from_slice(&[depth, colour, 0, 0, 1]);
+        chunk(b"IHDR", &data)
+    }
+
+    /// `stream` cut into `parts` IDAT chunks of about the same length.
+    fn idat_chunks(stream: &[u8], parts: usize) -> Vec<Vec<u8>> {
+        stream
+            .chunks(stream.len().div_ceil(parts))
+            .map(|part| chunk(b"IDAT", part))
+            .collect()
+    }
+
+    /// The image data of a 512x512 all-black greyscale image (256 KiB raw,
+    /// a few hundred bytes compressed) under a 16x16 IHDR, which holds
+    /// 272 bytes: in one IDAT chunk and split over three.
+    fn pngs_with_more_image_data_than_their_ihdr() -> Vec<Vec<u8>> {
+        let big = encode(
+            512,
+            512,
+            ::png::ColorType::Grayscale,
+            ::png::BitDepth::Eight,
+            &vec![0; 512 * 512],
+            |_| {},
+            &[],
+        );
+        let stream = chunk_data(&big, b"IDAT").unwrap();
+        let mut split = vec![ihdr(16, 16, 8, 0)];
+        split.extend(idat_chunks(&stream, 3));
+        vec![
+            file(&[ihdr(16, 16, 8, 0), chunk(b"IDAT", &stream)]),
+            file(&split),
+        ]
+    }
+
+    #[test]
+    fn a_png_with_more_image_data_than_its_ihdr_is_refused_before_quantising() {
+        for png in pngs_with_more_image_data_than_their_ihdr() {
+            let err = optimize_lossy_with(&png, q(75), never).unwrap_err();
+            // The lossless path's reason, word for word.
+            assert_eq!(err, crate::png::optimize(&png).unwrap_err());
+            assert_eq!(
+                err,
+                "could not read the PNG data: Inflated data would exceed the maximum size (272 bytes)"
+            );
+        }
+    }
+
+    /// Run the lossy path with a quantiser double that records the image it
+    /// gets and then fails, so nothing is written.
+    fn quantised_image(png: &[u8]) -> Result<Option<Rgba>, String> {
+        let seen = RefCell::new(None);
+        match optimize_lossy_with(png, q(75), |image, _| {
+            *seen.borrow_mut() = Some(image.clone());
+            Err("recorded".to_owned())
+        }) {
+            Err(reason) if reason == "recorded" => Ok(seen.into_inner()),
+            Err(reason) => Err(reason),
+            Ok(_) => panic!("the double fails, so the run cannot succeed"),
+        }
+    }
+
+    #[test]
+    fn a_png_whose_image_data_fits_its_ihdr_is_quantised_also_when_split_over_several_idat_chunks()
+    {
+        let whole = gradient_png();
+        let stream = chunk_data(&whole, b"IDAT").unwrap();
+        let mut split = vec![chunk(b"IHDR", &chunk_data(&whole, b"IHDR").unwrap())];
+        split.extend(idat_chunks(&stream, 4));
+        let split = file(&split);
+        assert_eq!(
+            chunk_types(&split)
+                .iter()
+                .filter(|kind| *kind == b"IDAT")
+                .count(),
+            4
+        );
+        let expected = Rgba {
+            width: GW,
+            height: GH,
+            pixels: gradient_pixels(GW, GH),
+        };
+        for png in [whole, split] {
+            assert_eq!(quantised_image(&png), Ok(Some(expected.clone())));
+        }
+    }
+
+    #[test]
+    fn image_data_of_exactly_the_ihdr_size_is_quantised_and_one_byte_more_is_refused() {
+        let palette = chunk(b"PLTE", &[0, 0, 0]);
+        // (what, header chunks, the IHDR's raw size: rows of bytes, each
+        // with its filter byte)
+        let cases: Vec<(&str, Vec<Vec<u8>>, usize)> = vec![
+            ("16x16 grey 8-bit", vec![ihdr(16, 16, 8, 0)], 16 * (1 + 16)),
+            ("10x3 grey 1-bit", vec![ihdr(10, 3, 1, 0)], 3 * (1 + 2)),
+            ("3x2 RGB 8-bit", vec![ihdr(3, 2, 8, 2)], 2 * (1 + 9)),
+            (
+                "3x3 palette 4-bit",
+                vec![ihdr(3, 3, 4, 3), palette],
+                3 * (1 + 2),
+            ),
+            ("2x2 grey-alpha 8-bit", vec![ihdr(2, 2, 8, 4)], 2 * (1 + 4)),
+            ("5x2 RGBA 16-bit", vec![ihdr(5, 2, 16, 6)], 2 * (1 + 40)),
+            // Adam7: seven passes of 2x2, 2x2, 4x2, 4x4, 8x4, 8x8 and 16x8
+            // pixels, 30 rows in all.
+            (
+                "16x16 grey 8-bit interlaced",
+                vec![interlaced_ihdr(16, 16, 8, 0)],
+                256 + 30,
+            ),
+        ];
+        for (what, header, size) in cases {
+            let with = |length: usize| {
+                let mut chunks = header.clone();
+                chunks.push(chunk(b"IDAT", &zlib_stored(&vec![0; length])));
+                file(&chunks)
+            };
+            let image = quantised_image(&with(size)).unwrap_or_else(|err| panic!("{what}: {err}"));
+            assert!(image.is_some(), "{what}");
+
+            let over = with(size + 1);
+            let err = optimize_lossy_with(&over, q(75), never).unwrap_err();
+            assert_eq!(err, crate::png::optimize(&over).unwrap_err(), "{what}");
+            assert!(
+                err.ends_with(&format!(
+                    "Inflated data would exceed the maximum size ({size} bytes)"
+                )),
+                "{what}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_corrupt_or_short_stream_is_refused_like_lossless() {
+        // 16x16 grey holds 272 bytes. A stream one byte short, and one whose
+        // zlib header is broken (with a valid chunk CRC).
+        let mut broken = zlib_stored(&[0; 272]);
+        broken[0] = 0x00;
+        for stream in [zlib_stored(&[0; 271]), broken] {
+            let png = file(&[ihdr(16, 16, 8, 0), chunk(b"IDAT", &stream)]);
+            let err = optimize_lossy_with(&png, q(75), never).unwrap_err();
+            assert_eq!(err, crate::png::optimize(&png).unwrap_err());
+        }
+    }
+
+    // --- oxipng's parser as the gate -----------------------------------------
+
+    /// A zlib stream of stored blocks of zeros, of the given lengths (each at
+    /// most 65535), the last one final, with its Adler-32.
+    fn zlib_stored_blocks(lengths: &[usize]) -> Vec<u8> {
+        let mut out = vec![0x78, 0x01];
+        for (i, &length) in lengths.iter().enumerate() {
+            let len = u16::try_from(length).unwrap();
+            out.push(u8::from(i + 1 == lengths.len()));
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.resize(out.len() + length, 0);
+        }
+        // Adler-32 of zeros: a stays 1, b adds 1 per byte.
+        let total: usize = lengths.iter().sum();
+        let b = (total % 65_521) as u32;
+        out.extend_from_slice(&((b << 16) | 1).to_be_bytes());
+        out
+    }
+
+    /// The reviewer's stream for a 256x256 greyscale IHDR (65,792 raw
+    /// bytes): a stored block of 65,535 bytes and one of 1 byte, so 64 KiB
+    /// out, then about 1 MiB more. Returned with the offset where the 1-byte
+    /// block ends, which is where the first IDAT chunk ends.
+    fn window_aligned_stream() -> (Vec<u8>, usize) {
+        let mut lengths = vec![65_535, 1];
+        lengths.extend([65_535; 16]);
+        let boundary = 2 + (5 + 65_535) + (5 + 1);
+        (zlib_stored_blocks(&lengths), boundary)
+    }
+
+    fn grey_256_split_at(stream: &[u8], at: usize) -> Vec<u8> {
+        file(&[
+            ihdr(256, 256, 8, 0),
+            chunk(b"IDAT", &stream[..at]),
+            chunk(b"IDAT", &stream[at..]),
+        ])
+    }
+
+    #[test]
+    fn the_window_aligned_idat_split_is_refused_like_lossless() {
+        let (stream, boundary) = window_aligned_stream();
+        let png = grey_256_split_at(&stream, boundary);
+        // `never` panics if the quantiser is reached.
+        let err = optimize_lossy_with(&png, q(75), never).unwrap_err();
+        assert_eq!(err, crate::png::optimize(&png).unwrap_err());
+    }
+
+    #[test]
+    fn the_same_stream_split_off_the_window_boundary_is_refused_like_lossless_too() {
+        let (stream, boundary) = window_aligned_stream();
+        for at in [boundary - 100, boundary + 100] {
+            let png = grey_256_split_at(&stream, at);
+            let err = optimize_lossy_with(&png, q(75), never).unwrap_err();
+            assert_eq!(
+                err,
+                crate::png::optimize(&png).unwrap_err(),
+                "split at {at}"
+            );
+        }
+    }
+
+    /// All IDAT payloads of a whole PNG, joined.
+    fn idat_stream(png: &[u8]) -> Vec<u8> {
+        let mut stream = Vec::new();
+        let mut at = 8;
+        while at + 8 <= png.len() {
+            let len = u32::from_be_bytes(png[at..at + 4].try_into().unwrap()) as usize;
+            if &png[at + 4..at + 8] == b"IDAT" {
+                stream.extend_from_slice(&png[at + 8..at + 8 + len]);
+            }
+            at += 12 + len;
+        }
+        stream
+    }
+
+    /// A 256x256 RGBA gradient (262,400 raw bytes, four 64 KiB windows and
+    /// more) with its image data in five IDAT chunks, under an IHDR of
+    /// `height` rows.
+    fn big_gradient_split(height: u32) -> Vec<u8> {
+        let source = rgba_png(256, 256, &gradient_pixels(256, 256), &[]);
+        let mut chunks = vec![ihdr(256, height, 8, 6)];
+        chunks.extend(idat_chunks(&idat_stream(&source), 5));
+        file(&chunks)
+    }
+
+    #[test]
+    fn a_valid_png_over_64_kib_of_image_data_split_over_several_idats_is_quantised() {
+        let png = big_gradient_split(256);
+        assert_eq!(
+            chunk_types(&png)
+                .iter()
+                .filter(|kind| *kind == b"IDAT")
+                .count(),
+            5
+        );
+        let expected = Rgba {
+            width: 256,
+            height: 256,
+            pixels: gradient_pixels(256, 256),
+        };
+        assert_eq!(quantised_image(&png), Ok(Some(expected)));
+    }
+
+    #[test]
+    fn the_same_image_data_under_an_ihdr_one_row_shorter_is_refused_like_lossless() {
+        let png = big_gradient_split(255);
+        let err = optimize_lossy_with(&png, q(75), never).unwrap_err();
+        assert_eq!(err, crate::png::optimize(&png).unwrap_err());
+    }
+
+    // --- what oxipng accepts and the decoder refuses -------------------------
+
+    /// A 16x16 all-black greyscale PNG with the given tRNS chunks (each a
+    /// grey sample of 0 or 1) before its image data.
+    fn grey_with_trns(samples: &[u8]) -> Vec<u8> {
+        let mut chunks = vec![ihdr(16, 16, 8, 0)];
+        chunks.extend(samples.iter().map(|&sample| chunk(b"tRNS", &[0, sample])));
+        chunks.push(chunk(b"IDAT", &zlib_stored(&[0; 272])));
+        file(&chunks)
+    }
+
+    #[test]
+    fn a_png_oxipng_accepts_but_the_decoder_refuses_fails_with_the_lossy_decode_reason() {
+        // Two tRNS chunks, both with valid CRCs: oxipng keeps the last one,
+        // the `png` decoder refuses the second.
+        let png = grey_with_trns(&[0, 1]);
+        assert!(crate::png::optimize(&png).is_ok(), "lossless accepts it");
+        // `never` panics if the quantiser is reached.
+        let err = optimize_lossy_with(&png, q(75), never).unwrap_err();
+        assert!(
+            err.starts_with("could not decode the PNG for lossy: "),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_same_png_with_one_trns_chunk_is_quantised() {
+        let image = quantised_image(&grey_with_trns(&[0])).expect("quantised");
+        let image = image.expect("the quantiser was called");
+        assert_eq!((image.width, image.height), (16, 16));
+        // Black is the tRNS grey sample 0: every pixel is fully transparent.
+        assert!(image.pixels.chunks(4).all(|pixel| pixel == [0, 0, 0, 0]));
     }
 }

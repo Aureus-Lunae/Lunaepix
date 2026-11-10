@@ -6,8 +6,16 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use lunaepix_core::{OptimizeError, optimize_file};
+use lunaepix_core::{
+    Compression, Note, OptimizeError, Options, Outcome, Quality, WriteMode, optimize_file,
+};
 use tempfile::TempDir;
+
+/// Today's run: lossless, replacing an earlier output.
+const LOSSLESS: Options = Options {
+    compression: Compression::Lossless,
+    write: WriteMode::Replace,
+};
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -200,7 +208,7 @@ fn optimizes_a_jpeg_to_a_smaller_file_with_identical_pixels() {
     let src = write(tmp.path(), "a.jpg", &original);
     let dest = tmp.path().join("optimized-a.jpg");
 
-    let outcome = optimize_file(&src, &dest).unwrap();
+    let outcome = optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     let optimized = fs::read(&dest).unwrap();
     assert!(
@@ -239,7 +247,7 @@ fn rejects_a_jpeg_truncated_mid_scan_and_leaves_no_output_or_temp_file() {
     let dest = tmp.path().join("optimized-a.jpg");
     let before = listing(tmp.path());
 
-    let err = optimize_file(&src, &dest).unwrap_err();
+    let err = optimize_file(&src, &dest, &LOSSLESS).unwrap_err();
 
     assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
     assert!(!dest.exists());
@@ -253,7 +261,7 @@ fn keeps_the_source_bytes_unchanged_after_a_successful_run() {
     let tmp = TempDir::new().unwrap();
     let original = photo_jpeg();
     let src = write(tmp.path(), "a.jpg", &original);
-    optimize_file(&src, &tmp.path().join("optimized-a.jpg")).unwrap();
+    optimize_file(&src, &tmp.path().join("optimized-a.jpg"), &LOSSLESS).unwrap();
     assert_eq!(fs::read(&src).unwrap(), original);
 }
 
@@ -263,7 +271,7 @@ fn keeps_the_source_unchanged_when_the_run_fails() {
     let corrupt = truncated_jpeg();
     let src = write(tmp.path(), "a.jpg", &corrupt);
 
-    assert!(optimize_file(&src, &tmp.path().join("optimized-a.jpg")).is_err());
+    assert!(optimize_file(&src, &tmp.path().join("optimized-a.jpg"), &LOSSLESS).is_err());
 
     assert_eq!(fs::read(&src).unwrap(), corrupt);
 }
@@ -278,7 +286,7 @@ fn writes_a_baseline_input_that_progressive_coding_shrinks_as_progressive() {
     let src = write(tmp.path(), "a.jpg", &original);
     let dest = tmp.path().join("optimized-a.jpg");
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     assert_eq!(frame_marker(&fs::read(&dest).unwrap()), 0xC2);
 }
@@ -292,7 +300,7 @@ fn keeps_a_tiny_baseline_input_baseline_when_progressive_coding_does_not_pay() {
     let src = write(tmp.path(), "a.jpg", &original);
     let dest = tmp.path().join("optimized-a.jpg");
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     let optimized = fs::read(&dest).unwrap();
     assert_eq!(frame_marker(&optimized), 0xC0);
@@ -305,10 +313,10 @@ fn writes_an_already_optimal_jpeg_as_a_byte_identical_copy_of_equal_size() {
     let tmp = TempDir::new().unwrap();
     let first = write(tmp.path(), "a.jpg", &photo_jpeg());
     let once = tmp.path().join("once.jpg");
-    optimize_file(&first, &once).unwrap();
+    optimize_file(&first, &once, &LOSSLESS).unwrap();
     let twice = tmp.path().join("twice.jpg");
 
-    let outcome = optimize_file(&once, &twice).unwrap();
+    let outcome = optimize_file(&once, &twice, &LOSSLESS).unwrap();
 
     assert_eq!(outcome.before, outcome.after);
     assert_eq!(fs::read(&once).unwrap(), fs::read(&twice).unwrap());
@@ -322,7 +330,7 @@ fn rejects_png_bytes_named_jpg_and_writes_nothing() {
     let src = write(tmp.path(), "picture.jpg", &png_bytes());
     let dest = tmp.path().join("optimized-picture.jpg");
 
-    let err = optimize_file(&src, &dest).unwrap_err();
+    let err = optimize_file(&src, &dest, &LOSSLESS).unwrap_err();
 
     assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
     assert!(err.to_string().contains("not a JPEG"), "{err}");
@@ -337,7 +345,7 @@ fn accepts_real_jpeg_bytes_named_with_an_uppercase_jpeg_extension() {
     let src = write(tmp.path(), "A.JPEG", &original);
     let dest = tmp.path().join("optimized-A.JPEG");
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     let optimized = fs::read(&dest).unwrap();
     assert!(optimized.len() < original.len());
@@ -350,7 +358,7 @@ fn rejects_an_empty_jpg_file() {
     let src = write(tmp.path(), "empty.jpg", b"");
     let dest = tmp.path().join("optimized-empty.jpg");
     assert!(matches!(
-        optimize_file(&src, &dest),
+        optimize_file(&src, &dest, &LOSSLESS),
         Err(OptimizeError::Invalid { .. })
     ));
     assert!(!dest.exists());
@@ -366,7 +374,7 @@ fn rejects_a_jpeg_start_marker_followed_by_garbage_through_the_warning_hook() {
     let src = write(tmp.path(), "a.jpg", &bytes);
     let dest = tmp.path().join("optimized-a.jpg");
 
-    let err = optimize_file(&src, &dest).unwrap_err();
+    let err = optimize_file(&src, &dest, &LOSSLESS).unwrap_err();
 
     assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
     assert!(err.to_string().contains("damaged"), "{err}");
@@ -394,7 +402,7 @@ fn rejects_a_jpeg_with_an_unsupported_sample_precision_through_error_exit() {
     let dest = tmp.path().join("optimized-a.jpg");
     let before = listing(tmp.path());
 
-    let err = optimize_file(&src, &dest).unwrap_err();
+    let err = optimize_file(&src, &dest, &LOSSLESS).unwrap_err();
 
     let message = err.to_string();
     assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
@@ -415,7 +423,7 @@ fn the_same_header_with_8_bit_precision_gets_past_the_precision_check() {
     let tmp = TempDir::new().unwrap();
     let src = write(tmp.path(), "a.jpg", &jpeg_with_precision(8));
 
-    let err = optimize_file(&src, &tmp.path().join("optimized-a.jpg")).unwrap_err();
+    let err = optimize_file(&src, &tmp.path().join("optimized-a.jpg"), &LOSSLESS).unwrap_err();
 
     assert!(!err.to_string().contains("precision"), "{err}");
 }
@@ -432,7 +440,7 @@ fn keeps_the_exif_and_icc_markers() {
     let src = write(tmp.path(), "a.jpg", &original);
     let dest = tmp.path().join("optimized-a.jpg");
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     let optimized = fs::read(&dest).unwrap();
     let kept = segments(&optimized);
@@ -449,7 +457,7 @@ fn does_not_add_a_jfif_header_to_a_source_without_one() {
     let src = write(tmp.path(), "a.jpg", &original);
     let dest = tmp.path().join("optimized-a.jpg");
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     let optimized = fs::read(&dest).unwrap();
     assert!(!has_jfif(&optimized));
@@ -464,7 +472,7 @@ fn keeps_the_jfif_header_of_a_source_that_has_one() {
     let src = write(tmp.path(), "a.jpg", &original);
     let dest = tmp.path().join("optimized-a.jpg");
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     assert!(has_jfif(&fs::read(&dest).unwrap()));
 }
@@ -495,7 +503,7 @@ fn replaces_an_existing_optimized_jpeg() {
         b"stale output from an earlier run",
     );
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     let written = fs::read(&dest).unwrap();
     assert_ne!(written, b"stale output from an earlier run");
@@ -518,7 +526,7 @@ fn keeps_an_existing_optimized_jpeg_and_leaves_nothing_when_the_new_run_fails() 
     );
     let before = listing(tmp.path());
 
-    assert!(optimize_file(&src, &dest).is_err());
+    assert!(optimize_file(&src, &dest, &LOSSLESS).is_err());
 
     assert_eq!(fs::read(&dest).unwrap(), b"output of an earlier good run");
     assert_eq!(listing(tmp.path()), before);
@@ -530,7 +538,7 @@ fn does_not_create_the_destination_folder_when_the_jpeg_is_rejected() {
     let src = write(tmp.path(), "a.jpg", &truncated_jpeg());
     let dest = tmp.path().join("optimized").join("a.jpg");
 
-    assert!(optimize_file(&src, &dest).is_err());
+    assert!(optimize_file(&src, &dest, &LOSSLESS).is_err());
 
     assert!(!tmp.path().join("optimized").exists());
 }
@@ -541,7 +549,7 @@ fn writes_a_jpeg_into_the_optimized_folder() {
     let src = write(tmp.path(), "a.jpeg", &photo_jpeg());
     let dest = tmp.path().join("optimized").join("a.jpeg");
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     assert_eq!(
         listing(&tmp.path().join("optimized")),
@@ -555,7 +563,7 @@ fn refuses_to_optimize_a_jpeg_onto_itself_and_keeps_it_byte_identical() {
     let original = photo_jpeg();
     let src = write(tmp.path(), "a.jpg", &original);
 
-    let err = optimize_file(&src, &src).unwrap_err();
+    let err = optimize_file(&src, &src, &LOSSLESS).unwrap_err();
 
     assert!(err.to_string().contains("same file"), "{err}");
     assert_eq!(fs::read(&src).unwrap(), original);
@@ -570,10 +578,144 @@ fn gives_the_jpeg_output_the_permissions_of_the_source() {
         let src = write(tmp.path(), "a.jpg", &photo_jpeg());
         fs::set_permissions(&src, fs::Permissions::from_mode(mode)).unwrap();
         let dest = tmp.path().join("optimized-a.jpg");
-        optimize_file(&src, &dest).unwrap();
+        optimize_file(&src, &dest, &LOSSLESS).unwrap();
         assert_eq!(
             fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
             mode
         );
     }
+}
+
+// --- a lossy run -----------------------------------------------------------------
+
+fn lossy(quality: u8) -> Options {
+    Options {
+        compression: Compression::Lossy(Quality::new(quality).unwrap()),
+        write: WriteMode::Replace,
+    }
+}
+
+/// Optimise `bytes` as `name` twice, lossy at `quality` and lossless: the
+/// outcome and output of the lossy run, and the output of the lossless one.
+/// The source must be unchanged by both.
+fn lossy_and_lossless(name: &str, bytes: &[u8], quality: u8) -> (Outcome, Vec<u8>, Vec<u8>) {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), name, bytes);
+    let dest = tmp.path().join(format!("optimized-{name}"));
+    let reference = tmp.path().join("optimized").join(name);
+
+    let outcome = optimize_file(&src, &dest, &lossy(quality)).unwrap();
+    optimize_file(&src, &reference, &LOSSLESS).unwrap();
+
+    assert_eq!(fs::read(&src).unwrap(), bytes, "the source is untouched");
+    (
+        outcome,
+        fs::read(&dest).unwrap(),
+        fs::read(&reference).unwrap(),
+    )
+}
+
+#[test]
+fn a_lossy_run_writes_a_smaller_jpg_of_the_same_size() {
+    let original = photo_jpeg();
+
+    let (outcome, written, lossless) = lossy_and_lossless("a.jpg", &original, 75);
+
+    assert_eq!(outcome.note, None);
+    assert!(
+        written.len() < original.len(),
+        "{} !< {}",
+        written.len(),
+        original.len()
+    );
+    assert_eq!(outcome.before, original.len() as u64);
+    assert_eq!(outcome.after, written.len() as u64);
+    let (w, h, _) = decode(&written);
+    assert_eq!((w, h), (256, 192));
+    // Encoded lossy: not the lossless output.
+    assert_ne!(written, lossless);
+}
+
+/// A photo already saved at a low quality: re-encoding it at 100 is larger.
+fn small_jpeg() -> Vec<u8> {
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 20)
+        .encode(
+            &photo_pixels(256, 192),
+            256,
+            192,
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+    out
+}
+
+#[test]
+fn a_lossy_jpg_that_is_not_smaller_keeps_the_original_bytes_with_the_note() {
+    let original = small_jpeg();
+
+    let (outcome, written, _) = lossy_and_lossless("a.jpg", &original, 100);
+
+    assert_eq!(outcome.note, Some(Note::OriginalKept));
+    assert_eq!(
+        outcome.note.unwrap().to_string(),
+        "original kept: lossy was not smaller"
+    );
+    assert_eq!(written, original);
+    assert_eq!(outcome.after, outcome.before);
+}
+
+/// A 16x16 CMYK baseline JPEG, put together by hand (the `image` crate
+/// cannot write CMYK): an Adobe APP14 marker with transform 0, four
+/// components at 1x1, and a scan in which every block is flat. Two
+/// one-code Huffman tables make each block two bits: DC difference 0, then
+/// end of block.
+fn cmyk_jpeg() -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xD8];
+    // APP14 "Adobe": version 100, flags 0 and 0, transform 0 (no transform).
+    bytes.extend_from_slice(&[0xFF, 0xEE, 0x00, 0x0E]);
+    bytes.extend_from_slice(b"Adobe");
+    bytes.extend_from_slice(&[0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    // DQT: table 0, 8-bit, all ones.
+    bytes.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
+    bytes.extend_from_slice(&[1; 64]);
+    // SOF0: precision 8, 16x16, four components (ids 1-4, 1x1, table 0).
+    bytes.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x14, 0x08, 0x00, 0x10, 0x00, 0x10, 0x04]);
+    for id in 1..=4 {
+        bytes.extend_from_slice(&[id, 0x11, 0x00]);
+    }
+    // DHT: DC table 0 and AC table 0, each one code of one bit for symbol 0.
+    for class in [0x00, 0x10] {
+        bytes.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x14, class, 1]);
+        bytes.extend_from_slice(&[0; 15]);
+        bytes.push(0);
+    }
+    // SOS: four components, tables 0/0, full spectrum.
+    bytes.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x0E, 0x04]);
+    for id in 1..=4 {
+        bytes.extend_from_slice(&[id, 0x00]);
+    }
+    bytes.extend_from_slice(&[0x00, 0x3F, 0x00]);
+    // Four MCUs of four blocks, two zero bits per block.
+    bytes.extend_from_slice(&[0x00; 4]);
+    bytes.extend_from_slice(&[0xFF, 0xD9]);
+    bytes
+}
+
+#[test]
+fn a_cmyk_jpg_in_a_lossy_run_gets_the_lossless_output_with_the_note() {
+    let original = cmyk_jpeg();
+    // The fixture says what the test relies on: four components.
+    let (_, sof) = segments(&original)
+        .into_iter()
+        .find(|(marker, _)| *marker == 0xC0)
+        .unwrap();
+    assert_eq!(sof[5], 4, "components");
+
+    let (outcome, written, lossless) = lossy_and_lossless("a.jpg", &original, 75);
+
+    assert_eq!(outcome.note, Some(Note::KeptLosslessCmyk));
+    assert_eq!(outcome.note.unwrap().to_string(), "kept lossless: CMYK JPG");
+    assert_eq!(written, lossless);
+    assert_eq!(outcome.after, lossless.len() as u64);
 }

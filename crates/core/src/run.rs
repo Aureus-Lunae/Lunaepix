@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::worker::{WORKER_FLAG, parse_record};
-use crate::{Job, MAX_WORKER_OUTPUT_BYTES, OptimizeError, Outcome, Skip, WORKER_TIMEOUT};
+use crate::worker::{WORKER_FLAG, option_args, parse_record};
+use crate::{Job, MAX_WORKER_OUTPUT_BYTES, OptimizeError, Options, Outcome, Skip, WORKER_TIMEOUT};
 
 /// Longest pause between two checks on a running worker. The pause starts at
 /// 1 ms and doubles, so a quick file costs a millisecond or two of waiting.
@@ -50,6 +50,16 @@ impl Worker {
             args: vec![WORKER_FLAG.into()],
             timeout: WORKER_TIMEOUT,
         }
+    }
+
+    /// This worker with the arguments that carry `options` to it appended:
+    /// `--lossy <quality>` for a lossy run, then `--no-replace` for a run
+    /// that replaces nothing. A lossless run that replaces adds nothing, so
+    /// its worker is called exactly as before.
+    pub fn with_options(&self, options: &Options) -> Worker {
+        let mut worker = self.clone();
+        worker.args.extend(option_args(options));
+        worker
     }
 
     /// The running binary in worker mode. Its `main` must call
@@ -199,6 +209,20 @@ pub fn run_until_stopped(
     jobs: &[Job],
     worker: &Worker,
     stop: &StopHandle,
+    on_progress: impl FnMut(usize, &Path, &FileResult),
+) -> Vec<FileResult> {
+    run_observed(jobs, worker, stop, |_| {}, on_progress)
+}
+
+/// [`run_until_stopped`], with `on_start(index)` called right before each
+/// [`Job::Optimize`]'s worker starts (so a window can show the file as in
+/// progress), and never for a [`Job::Skip`]. `on_progress` follows as
+/// before, once the job is done.
+pub fn run_observed(
+    jobs: &[Job],
+    worker: &Worker,
+    stop: &StopHandle,
+    mut on_start: impl FnMut(usize),
     mut on_progress: impl FnMut(usize, &Path, &FileResult),
 ) -> Vec<FileResult> {
     let mut results = Vec::with_capacity(jobs.len());
@@ -208,13 +232,16 @@ pub fn run_until_stopped(
         }
         let (src, result) = match job {
             Job::Skip { src, reason } => (src, FileResult::Skipped(*reason)),
-            Job::Optimize { src, dest } => (
-                src,
-                match run_worker(worker, src, dest, stop) {
-                    Ok(outcome) => FileResult::Optimized(outcome),
-                    Err(error) => FileResult::Failed(error),
-                },
-            ),
+            Job::Optimize { src, dest } => {
+                on_start(index);
+                (
+                    src,
+                    match run_worker(worker, src, dest, stop) {
+                        Ok(outcome) => FileResult::Optimized(outcome),
+                        Err(error) => FileResult::Failed(error),
+                    },
+                )
+            }
         };
         on_progress(index, src, &result);
         results.push(result);
