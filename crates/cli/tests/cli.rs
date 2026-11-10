@@ -534,3 +534,461 @@ fn an_existing_empty_dir_exits_0_with_no_output() {
     // No `optimized/` folder is made for nothing.
     assert_eq!(listing(&dir), names(&[]));
 }
+
+// --- --lossy, --quality and --out -------------------------------------------
+
+use std::ffi::OsStr;
+
+use lunaepix_core::{Compression, Options, Quality, WriteMode, optimize_file};
+
+/// A noisy gradient: far larger than it needs to be, so a lossy run saves a
+/// lot, and a different quality gives different bytes.
+fn gradient_png() -> Vec<u8> {
+    let (w, h) = (96u32, 96u32);
+    let mut pixels = Vec::new();
+    let mut seed = 12345u32;
+    for y in 0..h {
+        for x in 0..w {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let noise = (seed >> 24) % 24;
+            pixels.push(((x * 255 / w) + noise).min(255) as u8);
+            pixels.push(((y * 255 / h) + noise).min(255) as u8);
+            pixels.push((((x + y) * 255 / (w + h)) + noise).min(255) as u8);
+        }
+    }
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, w, h);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&pixels).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+/// A two-frame animated PNG: a lossy run keeps it lossless, with a note.
+fn apng_bytes() -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, 8, 8);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_animated(2, 0).unwrap();
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&[10; 8 * 8 * 3]).unwrap();
+    writer.write_image_data(&[200; 8 * 8 * 3]).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+const APNG_NOTE: &str = "kept lossless: animated PNG";
+
+fn lossy_at(quality: u8) -> Compression {
+    Compression::Lossy(Quality::new(quality).unwrap())
+}
+
+/// What the core itself writes for `src` with this compression, from a
+/// separate folder: the independent reference for what the binary wrote.
+fn core_bytes(src: &Path, compression: Compression) -> Vec<u8> {
+    let tmp = TempDir::new().unwrap();
+    let dest = tmp.path().join("reference");
+    let options = Options {
+        compression,
+        write: WriteMode::NoReplace,
+    };
+    optimize_file(src, &dest, &options).unwrap();
+    fs::read(dest).unwrap()
+}
+
+/// Run with a mix of options and paths.
+fn run_args(cwd: &Path, args: &[&OsStr]) -> Output {
+    let args: Vec<OsString> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    lunaepix(cwd, &args.iter().collect::<Vec<_>>())
+}
+
+/// The stdout with the milliseconds of every "Done in" line replaced.
+fn without_ms(stdout: &str) -> String {
+    stdout
+        .split('\n')
+        .map(|line| {
+            if line.starts_with("Done in ") && line.ends_with(" ms!") {
+                "Done in <ms> ms!"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The text of one block, with a note line after its sizes line if given.
+fn block_text(block: &[String; 4], note: Option<&str>) -> String {
+    let mut lines = vec![block[0].clone(), block[1].clone(), block[2].clone()];
+    lines.extend(note.map(str::to_owned));
+    lines.push(String::new());
+    lines.join("\n") + "\n"
+}
+
+#[test]
+fn lossy_alone_uses_75() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &gradient_png());
+
+    let output = run_args(tmp.path(), &[OsStr::new("--lossy"), src.as_os_str()]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), "");
+    let stdout = text(&output.stdout);
+    assert!(stdout.starts_with("Lossy, quality 75\n"), "{stdout:?}");
+    // The worker was told 75: the file is what the core writes at 75.
+    let written = fs::read(tmp.path().join("optimized-a.png")).unwrap();
+    assert_eq!(written, core_bytes(&src, lossy_at(75)));
+    assert!(written.len() < fs::metadata(&src).unwrap().len() as usize);
+}
+
+#[test]
+fn a_given_quality_reaches_the_worker() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &gradient_png());
+
+    let output = run_args(
+        tmp.path(),
+        &[
+            OsStr::new("--lossy"),
+            OsStr::new("--quality"),
+            OsStr::new("30"),
+            src.as_os_str(),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert!(text(&output.stdout).starts_with("Lossy, quality 30\n"));
+    let written = fs::read(tmp.path().join("optimized-a.png")).unwrap();
+    assert_eq!(written, core_bytes(&src, lossy_at(30)));
+    // And not what 75 would have written.
+    assert_ne!(written, core_bytes(&src, lossy_at(75)));
+}
+
+#[test]
+fn without_lossy_the_output_is_byte_identical_to_todays() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &gradient_png());
+
+    let output = run_on(tmp.path(), &[&src]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), "");
+    let stdout = text(&output.stdout);
+    // Nothing before the first block, and nothing but blocks.
+    assert!(stdout.starts_with("a.png:\n"), "{stdout:?}");
+    assert_eq!(
+        blocks(&stdout),
+        vec![expected_block(
+            "a.png",
+            &src,
+            &tmp.path().join("optimized-a.png")
+        )]
+    );
+    let written = fs::read(tmp.path().join("optimized-a.png")).unwrap();
+    assert_eq!(written, core_bytes(&src, Compression::Lossless));
+    assert_ne!(written, core_bytes(&src, lossy_at(75)));
+}
+
+#[test]
+fn out_creates_a_missing_folder_with_parents_and_writes_original_names() {
+    let tmp = TempDir::new().unwrap();
+    let png = write(tmp.path(), "a.png", &png_bytes());
+    let svg = write(tmp.path(), "b.svg", svg_text().as_bytes());
+    let out_dir = tmp.path().join("x").join("y").join("z");
+
+    let output = run_args(
+        tmp.path(),
+        &[
+            OsStr::new("--out"),
+            out_dir.as_os_str(),
+            png.as_os_str(),
+            svg.as_os_str(),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), "");
+    assert_eq!(
+        blocks(&text(&output.stdout)),
+        vec![
+            expected_block("a.png", &png, &out_dir.join("a.png")),
+            expected_block("b.svg", &svg, &out_dir.join("b.svg")),
+        ]
+    );
+    assert_eq!(listing(&out_dir), names(&["a.png", "b.svg"]));
+    // Nothing is written beside the originals, and they are not touched.
+    assert_eq!(listing(tmp.path()), names(&["a.png", "b.svg", "x"]));
+    assert_eq!(fs::read(&png).unwrap(), png_bytes());
+}
+
+#[test]
+fn out_never_overwrites_an_existing_file() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &png_bytes());
+    let out_dir = tmp.path().join("out");
+    fs::create_dir(&out_dir).unwrap();
+    write(&out_dir, "a.png", b"an earlier result");
+
+    let output = run_args(
+        tmp.path(),
+        &[OsStr::new("--out"), out_dir.as_os_str(), src.as_os_str()],
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), "");
+    // The earlier file is as it was; the result took the next free name.
+    assert_eq!(
+        fs::read(out_dir.join("a.png")).unwrap(),
+        b"an earlier result"
+    );
+    assert_eq!(listing(&out_dir), names(&["a-2.png", "a.png"]));
+    assert_eq!(
+        blocks(&text(&output.stdout)),
+        vec![expected_block("a.png", &src, &out_dir.join("a-2.png"))]
+    );
+}
+
+#[test]
+fn dir_without_out_writes_to_dir_optimized() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("pics");
+    fs::create_dir(&dir).unwrap();
+    let png = write(&dir, "a.png", &gradient_png());
+    let svg = write(&dir, "b.svg", svg_text().as_bytes());
+
+    let output = run_args(
+        tmp.path(),
+        &[OsStr::new("--lossy"), OsStr::new("--dir"), dir.as_os_str()],
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), "");
+    let out_dir = dir.join("optimized");
+    let stdout = text(&output.stdout);
+    let blocks_text = stdout
+        .strip_prefix("Lossy, quality 75\n")
+        .expect("mode line");
+    assert_eq!(
+        blocks(blocks_text),
+        vec![
+            expected_block("a.png", &png, &out_dir.join("a.png")),
+            expected_block("b.svg", &svg, &out_dir.join("b.svg")),
+        ]
+    );
+    assert_eq!(listing(&dir), names(&["a.png", "b.svg", "optimized"]));
+    assert_eq!(listing(&out_dir), names(&["a.png", "b.svg"]));
+    assert_eq!(
+        fs::read(out_dir.join("a.png")).unwrap(),
+        core_bytes(&png, lossy_at(75))
+    );
+}
+
+#[test]
+fn dir_with_out_writes_nothing_to_dir_optimized() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("pics");
+    fs::create_dir(&dir).unwrap();
+    let png = write(&dir, "a.png", &png_bytes());
+    let svg = write(&dir, "b.svg", svg_text().as_bytes());
+    let out_dir = tmp.path().join("elsewhere");
+
+    let output = run_args(
+        tmp.path(),
+        &[
+            OsStr::new("--out"),
+            out_dir.as_os_str(),
+            OsStr::new("--dir"),
+            dir.as_os_str(),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), "");
+    assert_eq!(
+        blocks(&text(&output.stdout)),
+        vec![
+            expected_block("a.png", &png, &out_dir.join("a.png")),
+            expected_block("b.svg", &svg, &out_dir.join("b.svg")),
+        ]
+    );
+    assert_eq!(listing(&out_dir), names(&["a.png", "b.svg"]));
+    // The folder of the originals is as it was: no `optimized/` in it.
+    assert_eq!(listing(&dir), names(&["a.png", "b.svg"]));
+}
+
+#[test]
+fn a_lossy_run_prints_the_mode_once_and_notes_after_their_row() {
+    let tmp = TempDir::new().unwrap();
+    let first = write(tmp.path(), "a.png", &apng_bytes());
+    let svg = write(tmp.path(), "b.svg", svg_text().as_bytes());
+    let last = write(tmp.path(), "c.png", &apng_bytes());
+
+    let output = run_args(
+        tmp.path(),
+        &[
+            OsStr::new("--lossy"),
+            first.as_os_str(),
+            svg.as_os_str(),
+            last.as_os_str(),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), "");
+    let stdout = text(&output.stdout);
+    // The mode once, then each block; the note under the sizes of the two
+    // rows that have one, and nothing under the SVG's (no note for an SVG).
+    let expected = format!(
+        "Lossy, quality 75\n{}{}{}",
+        block_text(
+            &expected_block("a.png", &first, &tmp.path().join("optimized-a.png")),
+            Some(APNG_NOTE)
+        ),
+        block_text(
+            &expected_block("b.svg", &svg, &tmp.path().join("optimized-b.svg")),
+            None
+        ),
+        block_text(
+            &expected_block("c.png", &last, &tmp.path().join("optimized-c.png")),
+            Some(APNG_NOTE)
+        ),
+    );
+    assert_eq!(without_ms(&stdout), expected);
+    assert_eq!(stdout.matches("Lossy, quality").count(), 1);
+}
+
+#[test]
+fn a_lossless_run_prints_no_mode_line_and_no_note() {
+    let tmp = TempDir::new().unwrap();
+    let first = write(tmp.path(), "a.png", &apng_bytes());
+    let svg = write(tmp.path(), "b.svg", svg_text().as_bytes());
+
+    let output = run_on(tmp.path(), &[&first, &svg]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), "");
+    let stdout = text(&output.stdout);
+    assert!(
+        !stdout.contains("Lossy") && !stdout.contains(APNG_NOTE),
+        "{stdout:?}"
+    );
+    assert_eq!(
+        blocks(&stdout),
+        vec![
+            expected_block("a.png", &first, &tmp.path().join("optimized-a.png")),
+            expected_block("b.svg", &svg, &tmp.path().join("optimized-b.svg")),
+        ]
+    );
+}
+
+#[test]
+fn a_lossy_run_reports_a_failed_file_on_stderr_and_exits_1() {
+    let tmp = TempDir::new().unwrap();
+    let bad = write(tmp.path(), "bad.png", b"this is not a png");
+    let good = write(tmp.path(), "a.png", &gradient_png());
+
+    let output = run_args(
+        tmp.path(),
+        &[OsStr::new("--lossy"), bad.as_os_str(), good.as_os_str()],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with("lunaepix: failed (")
+            && stderr.ends_with(&format!("): {}\n", bad.display())),
+        "{stderr:?}"
+    );
+    assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
+    // The mode, then the good file's block only.
+    let stdout = text(&output.stdout);
+    let blocks_text = stdout
+        .strip_prefix("Lossy, quality 75\n")
+        .expect("mode line");
+    assert_eq!(
+        blocks(blocks_text),
+        vec![expected_block(
+            "a.png",
+            &good,
+            &tmp.path().join("optimized-a.png")
+        )]
+    );
+}
+
+#[test]
+fn a_quality_without_lossy_prints_the_usage_and_exits_2() {
+    let tmp = TempDir::new().unwrap();
+    write(tmp.path(), "a.png", &png_bytes());
+
+    let output = run_with(tmp.path(), &["--quality", "50", "a.png"]);
+
+    assert_usage_error(&output, tmp.path(), &["a.png"]);
+    // Both forms are in the usage text.
+    assert_eq!(
+        text(&output.stderr),
+        "usage: lunaepix [--lossy [--quality <0-100>]] [--out <folder>] [--] <file>...\n       lunaepix [--lossy [--quality <0-100>]] [--out <folder>] --dir <dir>\n"
+    );
+}
+
+#[test]
+fn usage_error_with_out_creates_no_out_folder() {
+    let tmp = TempDir::new().unwrap();
+    write(tmp.path(), "a.png", &png_bytes());
+
+    let output = run_with(tmp.path(), &["--out", "new", "--quality", "50", "a.png"]);
+
+    assert_usage_error(&output, tmp.path(), &["a.png"]);
+}
+
+#[test]
+fn a_dir_that_is_not_a_folder_creates_no_out_folder() {
+    let tmp = TempDir::new().unwrap();
+    let missing = tmp.path().join("none");
+    let out_dir = tmp.path().join("out");
+
+    let output = run_args(
+        tmp.path(),
+        &[
+            OsStr::new("--out"),
+            out_dir.as_os_str(),
+            OsStr::new("--dir"),
+            missing.as_os_str(),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(
+        text(&output.stderr),
+        format!("lunaepix: failed (not a folder): {}\n", missing.display())
+    );
+    assert_eq!(listing(tmp.path()), names(&[]));
+}
+
+#[test]
+fn an_out_that_is_a_file_fails_with_exit_1_and_writes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &png_bytes());
+    let out_file = write(tmp.path(), "out", b"not a folder");
+
+    let output = run_args(
+        tmp.path(),
+        &[OsStr::new("--out"), out_file.as_os_str(), src.as_os_str()],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(text(&output.stdout), "");
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with("lunaepix: failed (cannot create the output folder: ")
+            && stderr.ends_with(&format!("): {}\n", out_file.display())),
+        "{stderr:?}"
+    );
+    assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
+    assert_eq!(listing(tmp.path()), names(&["a.png", "out"]));
+    assert_eq!(fs::read(&out_file).unwrap(), b"not a folder");
+}
