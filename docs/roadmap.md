@@ -7,7 +7,7 @@ plan (in `docs/pending-approval/` until approved) when it starts.
 | Item | Status |
 |---|---|
 | Image lossless compression | Done |
-| Lossy image compression | Plan approved; execution next |
+| Lossy image compression | Built; being tested by hand |
 | Preview single image compression before compressing (before/after slider) | Not started |
 | Apple support: a brew formula, and a plain download with one awkward step | Not started |
 | Choose how much it can get compressed (quality, like JPEG 70%) on lossy | Part of lossy compression |
