@@ -112,6 +112,12 @@ body {
   background: var(--over);
 }
 
+/* A run is going: the drop area cannot be used (Choose files says so with
+   aria-disabled, and a drop is refused with a message). */
+.lunaepixDrop.-busy {
+  border-color: var(--rowLine);
+}
+
 .lunaepixDrop__title {
   margin: 0;
   font-size: 1.25rem;
@@ -135,7 +141,10 @@ body {
    (it stays focusable, and the click handler ignores it). */
 
 .lunaepixDrop__button,
-.lunaepixSummary__button {
+.lunaepixSummary__button,
+.lunaepixPanel__button,
+.lunaepixPanel__run,
+.lunaepixSettings__button {
   min-width: 2.75rem;
   min-height: 2.75rem;
   padding: 0.5rem 1.25rem;
@@ -149,8 +158,19 @@ body {
   transition: background-color 0.15s ease, color 0.15s ease;
 }
 
+/* The secondary buttons (Clear, the output folder): outlined, so Run stays
+   the one filled button in the panel. */
+.lunaepixPanel__button,
+.lunaepixSettings__button {
+  background: var(--surface);
+  color: var(--accent);
+}
+
 .lunaepixDrop__button[aria-disabled="true"],
-.lunaepixSummary__button[aria-disabled="true"] {
+.lunaepixSummary__button[aria-disabled="true"],
+.lunaepixPanel__button[aria-disabled="true"],
+.lunaepixPanel__run[aria-disabled="true"],
+.lunaepixSettings__button[aria-disabled="true"] {
   border-style: dashed;
   border-color: var(--border);
   background: transparent;
@@ -158,9 +178,8 @@ body {
   cursor: not-allowed;
 }
 
-/* Progress and status */
+/* Status */
 
-.lunaepixProgress,
 .lunaepixStatus {
   margin: 1rem 0 0;
   color: var(--muted);
@@ -172,19 +191,52 @@ body {
   margin: 0;
 }
 
-/* The results table */
+/* The panel: the heading with Clear, the table, the settings and Run (or,
+   once a run is finished, the summary). Hidden while the list is empty. */
+
+.lunaepixPanel {
+  margin-top: 1rem;
+  padding: 0.75rem 1rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface);
+}
+
+.lunaepixPanel__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.lunaepixPanel__heading {
+  margin: 0;
+  font-size: 1.125rem;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.lunaepixPanel__foot {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 1rem;
+}
+
+/* The table */
 
 .lunaepixResults {
   width: 100%;
-  margin-top: 1rem;
-  border: 1px solid var(--border);
+  margin-top: 0.75rem;
   border-collapse: collapse;
   background: var(--surface);
   font-variant-numeric: tabular-nums;
 }
 
 /* Visually hidden, still read by screen readers. */
-.lunaepixResults__caption {
+.lunaepixResults__caption,
+.lunaepixResults__hiddenText,
+.lunaepixSettings__hiddenText {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -218,10 +270,23 @@ body {
   font-weight: 400;
 }
 
-/* A skipped or failed row says so in words in its reason cell; the colour
-   only supports the words. */
+/* How a file was handled differently from the run's mode, under its name. */
+.lunaepixResults__note {
+  display: block;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+/* Every row state says so in words ("Waiting", "Compressing…", "skipped: …",
+   "failed: …"); the colour and weight only support the words. */
+.lunaepixResults__row.-waiting .lunaepixResults__cell,
 .lunaepixResults__row.-skipped .lunaepixResults__cell {
   color: var(--muted);
+}
+
+.lunaepixResults__row.-busy .lunaepixResults__cell {
+  color: var(--accent);
+  font-weight: 600;
 }
 
 .lunaepixResults__row.-failed .lunaepixResults__cell {
@@ -241,6 +306,107 @@ body {
 
 .lunaepixSummary__text {
   margin: 0;
+}
+
+/* The settings: one row each for Compression, Quality and Save to, the
+   label on the left. */
+
+.lunaepixSettings {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--rowLine);
+}
+
+.lunaepixSettings__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+/* A floated legend takes part in the row like the other labels. */
+.lunaepixSettings__label {
+  float: left;
+  min-width: 6.5rem;
+  padding: 0;
+  font-weight: 600;
+}
+
+.lunaepixSettings__choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-height: 2.75rem;
+  cursor: pointer;
+}
+
+.lunaepixSettings__radio {
+  width: 1.25rem;
+  height: 1.25rem;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.lunaepixSettings__range {
+  flex: 1 1 8rem;
+  max-width: 14rem;
+  min-height: 2.75rem;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.lunaepixSettings__number {
+  width: 4.5rem;
+  min-height: 2.75rem;
+  padding: 0.25rem 0.5rem;
+  border: 2px solid var(--border);
+  border-radius: 0.375rem;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.lunaepixSettings__number[aria-invalid="true"] {
+  border-color: var(--danger);
+  border-style: dashed;
+}
+
+/* Lossless picked, or a run going: the quality fields are disabled. */
+.lunaepixSettings__range:disabled,
+.lunaepixSettings__number:disabled,
+.lunaepixSettings__radio:disabled {
+  cursor: not-allowed;
+}
+
+.lunaepixSettings__number:disabled {
+  border-style: dashed;
+  color: var(--muted);
+}
+
+/* Says what is wrong in words, under the field; tied to it by
+   aria-describedby. */
+.lunaepixSettings__error {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--danger);
+  font-size: 0.875rem;
+}
+
+.lunaepixSettings__value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* A run is going: the settings are fixed. */
+.lunaepixSettings.-busy {
+  color: var(--muted);
 }
 
 /* Narrow windows: tighter cells, no horizontal scroll at 320 px. Long names
@@ -267,14 +433,26 @@ body {
     padding: 1rem 0.5rem;
   }
 
+  .lunaepixPanel {
+    padding: 0.5rem;
+  }
+
   .lunaepixResults__headCell,
   .lunaepixResults__cell {
     padding: 0.25rem;
   }
 
   .lunaepixDrop__button,
-  .lunaepixSummary__button {
+  .lunaepixSummary__button,
+  .lunaepixPanel__button,
+  .lunaepixPanel__run,
+  .lunaepixSettings__button {
     padding-inline: 0.75rem;
+  }
+
+  /* The label goes above its controls. */
+  .lunaepixSettings__label {
+    flex-basis: 100%;
   }
 }
 
@@ -282,7 +460,10 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .lunaepixDrop,
   .lunaepixDrop__button,
-  .lunaepixSummary__button {
+  .lunaepixSummary__button,
+  .lunaepixPanel__button,
+  .lunaepixPanel__run,
+  .lunaepixSettings__button {
     transition: none;
   }
 }
@@ -291,7 +472,8 @@ body {
    borders, and keep the states visible without colour. */
 @media (forced-colors: active) {
   .lunaepixDrop,
-  .lunaepixResults {
+  .lunaepixPanel,
+  .lunaepixSettings__number {
     border-color: CanvasText;
   }
 
@@ -301,22 +483,36 @@ body {
   }
 
   .lunaepixDrop__button,
-  .lunaepixSummary__button {
+  .lunaepixSummary__button,
+  .lunaepixPanel__button,
+  .lunaepixPanel__run,
+  .lunaepixSettings__button {
     border-color: ButtonText;
     background: ButtonFace;
     color: ButtonText;
   }
 
   .lunaepixDrop__button[aria-disabled="true"],
-  .lunaepixSummary__button[aria-disabled="true"] {
+  .lunaepixSummary__button[aria-disabled="true"],
+  .lunaepixPanel__button[aria-disabled="true"],
+  .lunaepixPanel__run[aria-disabled="true"],
+  .lunaepixSettings__button[aria-disabled="true"] {
     border-color: GrayText;
     background: ButtonFace;
     color: GrayText;
   }
 
+  .lunaepixResults__row.-waiting .lunaepixResults__cell,
+  .lunaepixResults__row.-busy .lunaepixResults__cell,
   .lunaepixResults__row.-skipped .lunaepixResults__cell,
-  .lunaepixResults__row.-failed .lunaepixResults__cell {
+  .lunaepixResults__row.-failed .lunaepixResults__cell,
+  .lunaepixResults__note,
+  .lunaepixSettings__error {
     color: CanvasText;
+  }
+
+  .lunaepixSettings__number[aria-invalid="true"] {
+    border-color: Highlight;
   }
 
   :focus-visible {

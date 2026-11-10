@@ -5,10 +5,15 @@ import {
   MESSAGES,
   canChoose,
   canOpenFolder,
+  canRun,
   classifyRejection,
+  dropTitleText,
+  headingLine,
   initialState,
   reduce,
   rowView,
+  runSettings,
+  saveToText,
   settledFailures,
   summaryLine,
 } from '../../ui/state.js';
@@ -17,7 +22,10 @@ function apply(state, ...actions) {
   return actions.reduce((current, action) => reduce(current, action), state);
 }
 
-const started = (total) => ({ type: 'run-started', payload: { total } });
+const started = (total, mode = 'lossless', quality = null) => ({
+  type: 'run-started',
+  payload: { total, mode, quality },
+});
 const done = (index, name = 'a.png', before = 1000, after = 800, millis = 12) => ({
   type: 'file-done',
   payload: { index, name, status: 'done', before, after, millis },
@@ -39,7 +47,7 @@ const finished = (optimised, savedBytes, hasOutput) => ({
 
 test('the initial state is the empty state: nothing running, no rows, no summary', () => {
   const state = initialState();
-  assert.equal(state.running, false);
+  assert.equal(state.phase, 'empty');
   assert.deepEqual(state.rows, []);
   assert.equal(state.summary, null);
   assert.equal(state.hasOutput, false);
@@ -51,7 +59,7 @@ test('the initial state is the empty state: nothing running, no rows, no summary
 
 test('run-started begins a run with the announced total', () => {
   const state = reduce(initialState(), started(3));
-  assert.equal(state.running, true);
+  assert.equal(state.phase, 'running');
   assert.equal(state.total, 3);
 });
 
@@ -179,7 +187,7 @@ test('file-done with a missing reason says why in words', () => {
 
 test('run-finished sets the summary and the announcement', () => {
   const state = apply(initialState(), started(2), done(0), done(1), finished(2, 341210, true));
-  assert.equal(state.running, false);
+  assert.equal(state.phase, 'finished');
   assert.deepEqual(state.summary, { optimised: 2, savedBytes: 341210 });
   assert.equal(state.message, 'Optimised 2 files, saved 333.2 KiB');
 });
@@ -247,7 +255,7 @@ test('run-busy sets the busy message and leaves a running run alone', () => {
   const running = apply(initialState(), started(4), done(0));
   const state = reduce(running, { type: 'run-busy', payload: null });
   assert.equal(state.message, "Already optimising; try again when it's done.");
-  assert.equal(state.running, true);
+  assert.equal(state.phase, 'running');
   assert.equal(state.rows.length, 1);
 });
 
@@ -414,7 +422,7 @@ test('canOpenFolder is false while a new run is active, even after an earlier ru
   const earlier = apply(initialState(), started(1), finished(1, 5, true));
   assert.equal(canOpenFolder(reduce(earlier, started(3))), false);
   // Also when a state claims both (the gate does not rely on the reducer).
-  assert.equal(canOpenFolder({ ...earlier, running: true }), false);
+  assert.equal(canOpenFolder({ ...earlier, phase: 'running' }), false);
 });
 
 // classifyRejection: what the page does with a rejected command
@@ -448,4 +456,518 @@ test('settledFailures lists the reasons of rejected results, in order', () => {
 test('settledFailures is empty when every result is fulfilled', () => {
   assert.deepEqual(settledFailures([{ status: 'fulfilled', value: 1 }, { status: 'fulfilled', value: 2 }]), []);
   assert.deepEqual(settledFailures([]), []);
+});
+
+// ---------------------------------------------------------------------
+// The one-panel window: the file list, the settings and Run (Task 11).
+// ---------------------------------------------------------------------
+
+const SKIP = 'Not a PNG, JPG, SVG or WebP file';
+const NO_IMAGES = 'No PNG, JPG, SVG or WebP files directly in this folder (subfolders are not included)';
+const entry = (name, size = 1000, skip = null) => ({ name, size, skip });
+const listed = (files, notice = null) => ({ type: 'list-changed', payload: { files, notice } });
+const threeFiles = () =>
+  listed([entry('holiday.jpg', 2400000), entry('logo.png', 88000), entry('banner.webp', 410000)]);
+const fileStarted = (index) => ({ type: 'file-started', payload: { index } });
+const setMode = (mode) => ({ type: 'set-mode', payload: mode });
+const setQuality = (text) => ({ type: 'set-quality-text', payload: text });
+const outputChanged = (folder) => ({ type: 'output-changed', payload: { folder } });
+const doneWithNote = (index, name, note) => ({
+  type: 'file-done',
+  payload: { index, name, status: 'done', before: 512000, after: 498000, millis: 380, note },
+});
+const busy = { type: 'run-busy', payload: null };
+
+// launch
+
+test('launch_state_is_lossless_75_no_folder_empty', () => {
+  const state = initialState();
+  assert.equal(state.phase, 'empty');
+  assert.equal(state.mode, 'lossless');
+  assert.equal(state.quality, 75);
+  assert.equal(state.qualityText, '75');
+  assert.equal(state.folder, null);
+  assert.equal(state.current, null);
+  assert.deepEqual(state.rows, []);
+  assert.equal(saveToText(state), 'Next to the originals');
+  assert.deepEqual(runSettings(state), { mode: 'lossless', quality: 75 });
+});
+
+test('quality_cannot_change_while_lossless', () => {
+  const ready = reduce(initialState(), threeFiles());
+  const state = reduce(ready, setQuality('40'));
+  assert.equal(state.quality, 75);
+  assert.equal(state.qualityText, '75');
+  assert.deepEqual(runSettings(state), { mode: 'lossless', quality: 75 });
+  // The same action does change it once Lossy is picked.
+  assert.equal(apply(ready, setMode('lossy'), setQuality('40')).quality, 40);
+});
+
+// the list
+
+test('list_changed_fills_rows_and_writes_a_notice_to_the_status', () => {
+  const state = apply(
+    initialState(),
+    listed([entry('holiday.jpg', 2400000), entry('notes.txt', null, SKIP)]),
+    // A dropped folder without images onto a list that has rows: the same
+    // list again, with a notice.
+    listed([entry('holiday.jpg', 2400000), entry('notes.txt', null, SKIP)], NO_IMAGES),
+  );
+  assert.equal(state.phase, 'ready');
+  assert.deepEqual(state.rows, [
+    { kind: 'listed', name: 'holiday.jpg', size: 2400000, skip: null },
+    { kind: 'listed', name: 'notes.txt', size: null, skip: SKIP },
+  ]);
+  assert.equal(state.message, NO_IMAGES);
+  // Only the row that will be compressed counts.
+  assert.equal(headingLine(state), '1 file ready');
+  assert.deepEqual(rowView(state.rows[0]), { kind: 'listed', name: 'holiday.jpg', size: '2.3 MiB', text: '' });
+  assert.deepEqual(rowView(state.rows[1]), {
+    kind: 'listed',
+    name: 'notes.txt',
+    size: '',
+    text: `Will be skipped: ${SKIP}`,
+  });
+});
+
+test('an_empty_list_hides_the_panel_and_notice_null_leaves_the_status', () => {
+  const withMessage = apply(initialState(), threeFiles(), busy);
+  const state = reduce(withMessage, listed([], null));
+  assert.equal(state.phase, 'empty');
+  assert.deepEqual(state.rows, []);
+  assert.equal(headingLine(state), '');
+  assert.equal(state.message, MESSAGES.busy);
+  assert.equal(state.messageSeq, withMessage.messageSeq);
+});
+
+test('list_changed_with_a_bad_payload_changes_nothing', () => {
+  const ready = reduce(initialState(), threeFiles());
+  for (const payload of [null, 'files', {}, { files: 'a.png' }, { files: null }]) {
+    assert.equal(reduce(ready, { type: 'list-changed', payload }), ready, JSON.stringify(payload));
+  }
+  // Control: a well-formed list does replace the rows.
+  assert.deepEqual(reduce(ready, listed([entry('x.png')])).rows.map((row) => row.name), ['x.png']);
+});
+
+test('list_changed_reads_bad_fields_as_no_name_no_size_no_skip', () => {
+  const state = reduce(
+    initialState(),
+    listed([{ name: 42, size: -1, skip: '' }, { name: 'a.png', size: '5', skip: 3 }, null]),
+  );
+  assert.deepEqual(state.rows, [
+    { kind: 'listed', name: '', size: null, skip: null },
+    { kind: 'listed', name: 'a.png', size: null, skip: null },
+    { kind: 'listed', name: '', size: null, skip: null },
+  ]);
+  assert.equal(rowView(state.rows[0]).name, '(no name)');
+});
+
+// Run
+
+test('can_run_with_one_compressible_row', () => {
+  const state = reduce(initialState(), listed([entry('notes.txt', null, SKIP), entry('logo.png')]));
+  assert.equal(canRun(state), true);
+  assert.equal(canRun(reduce(state, setMode('lossy'))), true);
+});
+
+test('cannot_run_empty_only_skipped_or_running', () => {
+  assert.equal(canRun(initialState()), false);
+  assert.equal(canRun(reduce(initialState(), listed([entry('notes.txt', null, SKIP)]))), false);
+  const running = apply(initialState(), threeFiles(), started(3));
+  assert.equal(canRun(running), false);
+  const finishedRun = apply(running, done(0), done(1), done(2), finished(3, 10, true));
+  assert.equal(canRun(finishedRun), false);
+});
+
+// running rows
+
+test('file_started_marks_compressing_and_later_rows_waiting', () => {
+  const state = apply(
+    initialState(),
+    threeFiles(),
+    started(3, 'lossy', 75),
+    fileStarted(0),
+    done(0, 'holiday.jpg', 2400000, 610000, 1210),
+    fileStarted(1),
+  );
+  assert.equal(state.current, 1);
+  assert.equal(rowView(state.rows[0]).kind, 'done');
+  assert.deepEqual(rowView(state.rows[1]), {
+    kind: 'compressing',
+    name: 'logo.png',
+    size: '85.9 KiB',
+    text: 'Compressing…',
+  });
+  assert.deepEqual(rowView(state.rows[2]), {
+    kind: 'waiting',
+    name: 'banner.webp',
+    size: '400.4 KiB',
+    text: 'Waiting',
+  });
+});
+
+test('a_done_row_never_returns_to_compressing', () => {
+  const afterFirst = apply(initialState(), threeFiles(), started(3), fileStarted(0), done(0, 'holiday.jpg'));
+  const doneRow = afterFirst.rows[0];
+  const state = reduce(afterFirst, fileStarted(0));
+  assert.equal(state.rows[0], doneRow);
+  assert.equal(rowView(state.rows[0]).kind, 'done');
+  assert.equal(state.current, null);
+  // A skipped or failed result stays as well.
+  const withSkip = apply(afterFirst, skipped(1, 'logo.png'), fileStarted(1));
+  assert.equal(rowView(withSkip.rows[1]).kind, 'skipped');
+});
+
+test('run_started_shows_the_list_rows_as_waiting_and_the_skips_as_skipped', () => {
+  const state = apply(
+    initialState(),
+    listed([entry('holiday.jpg', 2400000), entry('notes.txt', null, SKIP)]),
+    started(2, 'lossy', 75),
+  );
+  assert.equal(state.phase, 'running');
+  assert.deepEqual(rowView(state.rows[0]), { kind: 'waiting', name: 'holiday.jpg', size: '2.3 MiB', text: 'Waiting' });
+  assert.deepEqual(rowView(state.rows[1]), { kind: 'skipped', name: 'notes.txt', text: `skipped: ${SKIP}` });
+});
+
+test('run_started_with_fewer_rows_than_the_list_shows_only_the_run_rows', () => {
+  const state = apply(initialState(), threeFiles(), started(2));
+  assert.deepEqual(
+    state.rows.map((row) => row.name),
+    ['holiday.jpg', 'logo.png'],
+  );
+});
+
+test('file_done_outside_a_run_or_past_its_rows_is_ignored', () => {
+  const ready = reduce(initialState(), threeFiles());
+  assert.equal(reduce(ready, done(0, 'x.png')), ready);
+  const running = apply(initialState(), threeFiles(), started(3));
+  const rowsBefore = JSON.stringify(running.rows);
+  for (const index of [5, -1, '1', 1.5, null]) {
+    assert.equal(reduce(running, done(index, 'x.png')), running, String(index));
+  }
+  assert.equal(JSON.stringify(running.rows), rowsBefore);
+});
+
+test('file_started_announces_the_progress_in_the_status_line', () => {
+  const runningState = apply(initialState(), threeFiles(), started(3, 'lossy', 75));
+  const state = reduce(runningState, fileStarted(0));
+  assert.equal(state.message, 'Compressing 1 of 3 · Lossy 75');
+  assert.notEqual(state.messageSeq, runningState.messageSeq);
+});
+
+test('a_file_started_for_a_finished_or_missing_row_announces_nothing', () => {
+  const afterFirst = apply(initialState(), threeFiles(), started(3), fileStarted(0), done(0, 'holiday.jpg'));
+  for (const index of [0, 9, -1, '1']) {
+    assert.equal(reduce(afterFirst, fileStarted(index)), afterFirst, String(index));
+  }
+  const ready = reduce(initialState(), threeFiles());
+  assert.equal(reduce(ready, fileStarted(0)), ready);
+  // Control: the next waiting row is announced.
+  assert.notEqual(reduce(afterFirst, fileStarted(1)).messageSeq, afterFirst.messageSeq);
+});
+
+test('a_run_that_broke_off_marks_its_unfinished_rows', () => {
+  const state = apply(
+    initialState(),
+    threeFiles(),
+    started(3),
+    fileStarted(0),
+    done(0, 'holiday.jpg'),
+    fileStarted(1),
+    finished(1, 10, true),
+  );
+  assert.equal(state.phase, 'finished');
+  assert.equal(state.current, null);
+  assert.equal(rowView(state.rows[0]).kind, 'done');
+  for (const index of [1, 2]) {
+    assert.deepEqual(rowView(state.rows[index]), {
+      kind: 'failed',
+      name: ['holiday.jpg', 'logo.png', 'banner.webp'][index],
+      text: 'failed: The run ended before this file was done',
+    });
+  }
+});
+
+test('a_complete_run_keeps_its_rows_as_they_arrived', () => {
+  const lastRow = apply(
+    initialState(),
+    threeFiles(),
+    started(3),
+    fileStarted(0),
+    done(0, 'holiday.jpg'),
+    skipped(1, 'logo.png'),
+    fileStarted(2),
+    failed(2, 'banner.webp'),
+  );
+  const rows = lastRow.rows;
+  const kept = [...rows];
+  const state = reduce(lastRow, finished(1, 10, true));
+  assert.equal(state.phase, 'finished');
+  assert.equal(state.rows, rows);
+  assert.deepEqual(state.rows, kept);
+  assert.deepEqual(state.rows.map((row) => row.kind), ['done', 'skipped', 'failed']);
+});
+
+// settings
+
+test('run_settings_sends_mode_and_integer_quality', () => {
+  const ready = apply(initialState(), threeFiles(), setMode('lossy'));
+  for (const [text, quality] of [['40', 40], ['0', 0], ['100', 100], ['075', 75]]) {
+    const settings = runSettings(reduce(ready, setQuality(text)));
+    assert.deepEqual(settings, { mode: 'lossy', quality }, text);
+    assert.deepEqual(Object.keys(settings), ['mode', 'quality']);
+    assert.equal(Number.isInteger(settings.quality), true);
+    assert.equal(canRun(reduce(ready, setQuality(text))), true, text);
+  }
+});
+
+test('text_fraction_or_out_of_range_blocks_run_and_sends_nothing', () => {
+  const ready = apply(initialState(), threeFiles(), setMode('lossy'));
+  for (const text of ['', 'abc', '7.5', '101', '-1', '1e2', ' 50', '50 ', '0x10', '1000', '٧٥']) {
+    const state = reduce(ready, setQuality(text));
+    assert.equal(runSettings(state), null, JSON.stringify(text));
+    assert.equal(canRun(state), false, JSON.stringify(text));
+  }
+});
+
+test('range_and_number_follow_each_other', () => {
+  const lossy = apply(initialState(), threeFiles(), setMode('lossy'));
+  // The range sends its value; the number field shows it.
+  const fromRange = reduce(lossy, setQuality('30'));
+  assert.equal(fromRange.quality, 30);
+  assert.equal(fromRange.qualityText, '30');
+  // The number field sends its text; the range moves to it.
+  const fromNumber = reduce(fromRange, setQuality('45'));
+  assert.equal(fromNumber.quality, 45);
+  assert.equal(fromNumber.qualityText, '45');
+});
+
+test('an_invalid_number_does_not_move_the_range', () => {
+  const at45 = apply(initialState(), threeFiles(), setMode('lossy'), setQuality('45'));
+  for (const text of ['7.5', '101', '', 'abc']) {
+    const state = reduce(at45, setQuality(text));
+    assert.equal(state.quality, 45, text);
+    assert.equal(state.qualityText, text);
+  }
+});
+
+test('set_mode_switches_to_lossy_and_back', () => {
+  const lossy = apply(initialState(), threeFiles(), setMode('lossy'));
+  assert.equal(lossy.mode, 'lossy');
+  assert.deepEqual(runSettings(lossy), { mode: 'lossy', quality: 75 });
+  assert.equal(reduce(lossy, setMode('lossless')).mode, 'lossless');
+});
+
+test('set_mode_with_an_unknown_word_or_while_running_changes_nothing', () => {
+  const ready = reduce(initialState(), threeFiles());
+  for (const word of ['Lossy', 'lossy ', 'fast', null, 1]) {
+    assert.equal(reduce(ready, setMode(word)), ready, String(word));
+  }
+  // Control: the right word, while not running, does switch.
+  assert.equal(reduce(ready, setMode('lossy')).mode, 'lossy');
+  const running = apply(initialState(), threeFiles(), started(3));
+  assert.equal(reduce(running, setMode('lossy')), running);
+  const runningLossy = apply(initialState(), threeFiles(), setMode('lossy'), started(3, 'lossy', 75));
+  assert.equal(reduce(runningLossy, setQuality('20')), runningLossy);
+});
+
+test('switching_to_lossless_puts_back_the_last_valid_quality', () => {
+  const state = apply(initialState(), threeFiles(), setMode('lossy'), setQuality('60'), setQuality('7.5'), setMode('lossless'));
+  assert.equal(state.qualityText, '60');
+  assert.equal(state.quality, 60);
+  assert.deepEqual(runSettings(state), { mode: 'lossless', quality: 60 });
+  assert.equal(canRun(state), true);
+});
+
+test('switching_to_lossless_keeps_a_valid_quality_text_as_typed', () => {
+  const state = apply(initialState(), threeFiles(), setMode('lossy'), setQuality('075'), setMode('lossless'));
+  assert.equal(state.qualityText, '075');
+  assert.equal(state.quality, 75);
+});
+
+// the output folder
+
+test('output_changed_shows_the_folder_name_in_save_to', () => {
+  const chosen = reduce(initialState(), outputChanged('exports'));
+  assert.equal(chosen.folder, 'exports');
+  assert.equal(saveToText(chosen), 'exports');
+  // A folder without a name, such as a drive root.
+  assert.equal(saveToText(reduce(initialState(), outputChanged(''))), '(no name)');
+  // A name with markup is kept as text data.
+  assert.equal(saveToText(reduce(initialState(), outputChanged('<b>x</b>'))), '<b>x</b>');
+  const back = reduce(chosen, outputChanged(null));
+  assert.equal(back.folder, null);
+  assert.equal(saveToText(back), 'Next to the originals');
+});
+
+test('output_changed_with_a_bad_payload_keeps_the_output', () => {
+  const chosen = reduce(initialState(), outputChanged('exports'));
+  assert.equal(chosen.folder, 'exports');
+  for (const payload of [null, 'exports', {}, { folder: 42 }, { folder: ['a'] }]) {
+    assert.equal(reduce(chosen, { type: 'output-changed', payload }), chosen, JSON.stringify(payload));
+  }
+});
+
+// the heading
+
+test('heading_reads_compressing_2_of_3_lossy_75_then_done_lossy_75_and_lossless_without_number', () => {
+  const second = apply(
+    initialState(),
+    threeFiles(),
+    setMode('lossy'),
+    started(3, 'lossy', 75),
+    fileStarted(0),
+    done(0, 'holiday.jpg'),
+    fileStarted(1),
+  );
+  assert.equal(headingLine(second), 'Compressing 2 of 3 · Lossy 75');
+  const lossyDone = apply(second, done(1, 'logo.png'), fileStarted(2), done(2, 'banner.webp'), finished(3, 10, true));
+  assert.equal(headingLine(lossyDone), 'Done · Lossy 75');
+
+  const lossless = apply(initialState(), threeFiles(), started(3, 'lossless', null), fileStarted(0));
+  assert.equal(headingLine(lossless), 'Compressing 1 of 3 · Lossless');
+  const losslessDone = apply(lossless, done(0), fileStarted(1), done(1), fileStarted(2), done(2), finished(3, 1, true));
+  assert.equal(headingLine(losslessDone), 'Done · Lossless');
+});
+
+test('a_lossless_run_never_shows_a_quality', () => {
+  // Even when a quality comes with a lossless run, it is not shown.
+  const running = apply(initialState(), threeFiles(), started(3, 'lossless', 75), fileStarted(0));
+  assert.equal(headingLine(running), 'Compressing 1 of 3 · Lossless');
+  assert.doesNotMatch(headingLine(running), /75/);
+  const finishedRun = apply(running, done(0), skipped(1), skipped(2), finished(1, 1, true));
+  assert.equal(headingLine(finishedRun), 'Done · Lossless');
+  assert.doesNotMatch(headingLine(finishedRun), /\d/);
+});
+
+// notes
+
+test('a_note_shows_on_its_row', () => {
+  const state = apply(
+    initialState(),
+    listed([entry('anim.png', 512000)]),
+    started(1, 'lossy', 75),
+    fileStarted(0),
+    doneWithNote(0, 'anim.png', 'kept lossless: animated PNG'),
+  );
+  assert.equal(state.rows[0].note, 'kept lossless: animated PNG');
+  assert.equal(rowView(state.rows[0]).note, 'kept lossless: animated PNG');
+});
+
+test('no_note_no_text', () => {
+  const plain = apply(initialState(), listed([entry('a.png')]), started(1), fileStarted(0), done(0, 'a.png'));
+  assert.equal('note' in plain.rows[0], false);
+  assert.equal('note' in rowView(plain.rows[0]), false);
+  for (const note of ['', 42, null]) {
+    const state = apply(initialState(), listed([entry('a.png')]), started(1), fileStarted(0), doneWithNote(0, 'a.png', note));
+    assert.equal('note' in rowView(state.rows[0]), false, String(note));
+  }
+  // Control: in the same run, a real note does show on its own row only.
+  const mixed = apply(
+    initialState(),
+    listed([entry('a.png'), entry('cmyk.jpg')]),
+    started(2, 'lossy', 75),
+    fileStarted(0),
+    done(0, 'a.png'),
+    fileStarted(1),
+    doneWithNote(1, 'cmyk.jpg', 'kept lossless: CMYK JPG'),
+  );
+  assert.equal('note' in rowView(mixed.rows[0]), false);
+  assert.equal(rowView(mixed.rows[1]).note, 'kept lossless: CMYK JPG');
+});
+
+// a fresh list
+
+test('a_list_changed_after_run_finished_replaces_the_rows', () => {
+  const finishedRun = apply(
+    initialState(),
+    threeFiles(),
+    started(3),
+    fileStarted(0),
+    done(0, 'holiday.jpg'),
+    fileStarted(1),
+    done(1, 'logo.png'),
+    fileStarted(2),
+    done(2, 'banner.webp'),
+    finished(3, 10, true),
+  );
+  const state = reduce(finishedRun, listed([entry('new.png', 2048)]));
+  assert.equal(state.phase, 'ready');
+  assert.deepEqual(state.rows, [{ kind: 'listed', name: 'new.png', size: 2048, skip: null }]);
+  assert.equal(state.summary, null);
+  assert.equal(headingLine(state), '1 file ready');
+  assert.equal(canRun(state), true);
+});
+
+test('an_add_before_run_finished_is_busy_and_keeps_the_rows', () => {
+  const running = apply(initialState(), threeFiles(), started(3), fileStarted(0), done(0, 'holiday.jpg'));
+  const rows = running.rows;
+  const kept = JSON.stringify(rows);
+  const refused = reduce(running, busy);
+  assert.equal(refused.message, MESSAGES.busy);
+  assert.equal(refused.phase, 'running');
+  assert.equal(refused.rows, rows);
+  assert.equal(JSON.stringify(refused.rows), kept);
+  // A list arriving during a run does not replace the run's rows either.
+  assert.equal(reduce(running, listed([entry('new.png')])), running);
+  assert.equal(JSON.stringify(running.rows), kept);
+});
+
+// the run's rejections
+
+test('the_run_rejections_get_their_own_message', () => {
+  for (const [reason, message] of [
+    ['invalid-settings', MESSAGES.invalidSettings],
+    ['empty-list', MESSAGES.emptyList],
+    ['output-missing', MESSAGES.outputMissing],
+  ]) {
+    assert.equal(typeof message, 'string', reason);
+    assert.notEqual(message, MESSAGES.unknown, reason);
+    assert.equal(classifyRejection(reason), 'known', reason);
+    assert.equal(reduce(initialState(), { type: 'command-rejected', payload: reason }).message, message);
+  }
+  assert.equal(MESSAGES.outputMissing, 'The output folder is gone or cannot be written to. Choose it again, or save next to the originals.');
+});
+
+test('a_run_rejection_spelled_differently_stays_unknown', () => {
+  for (const reason of ['Empty-list', 'output_missing', 'invalid settings', 'empty-list ']) {
+    assert.equal(classifyRejection(reason), 'unknown', reason);
+    assert.equal(reduce(initialState(), { type: 'command-rejected', payload: reason }).message, MESSAGES.unknown);
+  }
+  // Control: the exact spelling is known.
+  assert.equal(classifyRejection('empty-list'), 'known');
+});
+
+// the drop area
+
+test('the_drop_title_asks_for_more_while_the_list_has_rows', () => {
+  const ready = reduce(initialState(), threeFiles());
+  assert.equal(dropTitleText(ready), 'Drop more images or a folder here');
+  assert.equal(dropTitleText(reduce(ready, started(3))), 'Drop more images or a folder here');
+});
+
+test('the_drop_title_has_no_more_when_empty_or_finished', () => {
+  assert.equal(dropTitleText(initialState()), 'Drop images or a folder here');
+  const finishedRun = apply(initialState(), threeFiles(), started(1), done(0), finished(1, 1, true));
+  // The next add starts a fresh list.
+  assert.equal(dropTitleText(finishedRun), 'Drop images or a folder here');
+});
+
+// purity of the new actions
+
+test('the_new_actions_change_a_new_state_and_leave_the_given_one_as_it_was', () => {
+  const ready = apply(initialState(), threeFiles(), setMode('lossy'));
+  const snapshot = JSON.stringify(ready);
+  for (const [action, key, value] of [
+    [listed([entry('x.png')]), 'phase', 'ready'],
+    [outputChanged('exports'), 'folder', 'exports'],
+    [setMode('lossless'), 'mode', 'lossless'],
+    [setQuality('20'), 'quality', 20],
+    [started(3, 'lossy', 75), 'phase', 'running'],
+  ]) {
+    const next = reduce(ready, action);
+    assert.equal(next[key], value, action.type);
+    assert.notEqual(next, ready, action.type);
+    assert.equal(JSON.stringify(ready), snapshot, action.type);
+  }
 });
