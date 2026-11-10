@@ -11,7 +11,7 @@ Lunaepix makes PNG, JPG, SVG and WebP images smaller. You choose how:
 - **Lossy** allows a small change in pixels that the eye should not notice, for
   a much smaller file, and takes a **quality from 0 to 100** (75 to start
   with). A lower quality gives a smaller file and a bigger change. It applies
-  to JPG, PNG and WebP, still and animated.
+  to JPG, PNG and WebP (an animated WebP too; an animated PNG stays lossless).
 
 It never touches the original.
 
@@ -55,7 +55,7 @@ lossy run. Run lossy on your originals, not on earlier lossy outputs.
 - A file that is already as small as it gets is copied as it is, so the output
   is never larger than the input.
 
-One run handles at most 2000 files, and each file has its own limits (100 MB,
+One run handles at most 2000 files, and each file has its own limits (100 MiB,
 100 megapixels, 10 minutes).
 
 ## The window
