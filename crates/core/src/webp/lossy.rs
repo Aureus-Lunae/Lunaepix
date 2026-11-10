@@ -70,7 +70,9 @@ fn optimize_lossy_with(
 ///
 /// The result must have the source's canvas and total duration; it may
 /// have fewer frames, because libwebp merges a frame that matches the one
-/// before it into that frame.
+/// before it into that frame. When every frame merged into one and libwebp
+/// wrote a still file, it is made an animation of that one frame again
+/// ([`riff::still_as_animation`]), so an animation stays an animation.
 fn optimize_animated_lossy(
     bytes: &[u8],
     file: &riff::WebpFile<'_>,
@@ -92,8 +94,19 @@ fn optimize_animated_lossy(
         duration_ms: Some(header.duration_ms),
     };
     let (info, mut frames) = codec.decode_animation(bytes)?;
-    let encoded = codec.encode_animation(&info, &mut frames, quality)?;
+    let mut encoded = codec.encode_animation(&info, &mut frames, quality)?;
     drop(frames);
+    // libwebp writes an animation whose frames all merged into one as a
+    // still file when that is smaller; the result stays an animation. Bytes
+    // that do not parse are left for `with_metadata` to refuse.
+    if riff::parse(&encoded).is_ok_and(|result| result.kind != Kind::Animated) {
+        encoded = riff::still_as_animation(
+            &encoded,
+            info.loop_count,
+            info.background,
+            header.duration_ms,
+        )?;
+    }
     let result = riff::with_metadata(&encoded, file)?;
     drop(encoded);
     check_shape(expected, shape_of(&result)?)?;
@@ -128,6 +141,7 @@ fn shape_of(result: &[u8]) -> Result<Shape, String> {
 mod tests {
     use std::cell::RefCell;
     use std::panic;
+    use std::rc::Rc;
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -909,6 +923,91 @@ mod tests {
         assert_eq!(fx::decode_frames(&lossy.bytes).len(), 2);
     }
 
+    /// `source` in a lossy run, where libwebp's encoder on its own gives a
+    /// still image: the result is still an animation of one lossy frame on
+    /// the canvas, with the source's loop count, background and total
+    /// duration, that libwebp's animation decoder opens.
+    fn assert_stays_a_one_frame_animation(source: &[u8], duration_ms: u32) {
+        let (info, frames) = real_decode_animation(source).unwrap();
+        let alone = real_encode_animation(&info, frames, q(75)).unwrap();
+        assert_ne!(
+            riff::parse(&alone).unwrap().kind,
+            Kind::Animated,
+            "fixture: libwebp's encoder gives a still image"
+        );
+
+        let out = lossy_animation_bytes(source);
+
+        let file = riff::parse(&out).unwrap();
+        assert_eq!(file.kind, Kind::Animated);
+        assert_eq!(
+            riff::animation_header(&file).unwrap(),
+            riff::AnimationHeader {
+                width: AW,
+                height: AH,
+                frames: 1,
+                duration_ms: u64::from(duration_ms),
+            }
+        );
+        assert_eq!(flags(&out) & fx::FLAG_ANIMATION, fx::FLAG_ANIMATION);
+        assert_eq!(
+            payloads(&out, b"ANIM"),
+            [fx::anim_payload(LOOPS, BACKGROUND)]
+        );
+        let (info, frames) = LibWebp.decode_animation(&out).unwrap();
+        assert_eq!(
+            info,
+            AnimationInfo {
+                width: AW,
+                height: AH,
+                loop_count: u32::from(LOOPS),
+                background: BACKGROUND,
+                duration_ms,
+            }
+        );
+        let frames: Vec<Frame> = frames.collect::<Result<_, _>>().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].rgba.len(), (AW * AH * 4) as usize);
+    }
+
+    #[test]
+    fn a_single_frame_animation_stays_an_animation_with_its_loop_count_background_and_duration() {
+        let source = animation_of(&[anim_frame(0)], &[300]);
+        assert_stays_a_one_frame_animation(&source, 300);
+    }
+
+    #[test]
+    fn identical_frames_merge_into_one_frame_and_stay_an_animation() {
+        let same = anim_frame(1);
+        let source = animation_of(&[same.clone(), same.clone(), same], &[100, 250, 70]);
+        assert_stays_a_one_frame_animation(&source, 420);
+    }
+
+    #[test]
+    fn distinct_frames_are_not_wrapped_and_keep_the_encoders_frames() {
+        let written = Rc::new(RefCell::new(Vec::new()));
+        let record = Rc::clone(&written);
+        let codec = animation_double(real_decode_animation, move |info, frames, quality| {
+            let bytes = real_encode_animation(info, frames, quality)?;
+            record.borrow_mut().clone_from(&bytes);
+            Ok(bytes)
+        });
+
+        let lossy = optimize_lossy_with(&animation(), q(75), &codec).unwrap();
+
+        assert_eq!(lossy.note, None);
+        let written = written.borrow();
+        assert_eq!(
+            riff::parse(&written).unwrap().kind,
+            Kind::Animated,
+            "fixture"
+        );
+        let frames = payloads(&lossy.bytes, b"ANMF");
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames, payloads(&written, b"ANMF"));
+        assert_eq!(payloads(&lossy.bytes, b"ANIM"), payloads(&written, b"ANIM"));
+    }
+
     #[test]
     fn iccp_kept_and_xmp_dropped_on_an_animation() {
         let source = fx::with_chunks(&animation(), &[(*b"ICCP", ICC), (*b"XMP ", &[b'x'; 400])]);
@@ -1101,14 +1200,57 @@ mod tests {
     }
 
     #[test]
-    fn an_encode_double_returning_a_still_image_fails() {
+    fn an_encode_double_returning_a_still_image_is_wrapped_into_one_frame() {
         let still = fx::lossy(&anim_frame(0), AW, AH, 30.0);
+        let codec = animation_encoding_to(Ok(still.clone()));
+        let lossy = optimize_lossy_with(&animation(), q(75), &codec).unwrap();
+        assert_eq!(lossy.note, None);
+        let out = &lossy.bytes;
+        assert_eq!(riff::parse(out).unwrap().kind, Kind::Animated);
+        assert_eq!(fx::chunk_names(out), ["VP8X", "ANIM", "ANMF"]);
+        assert_eq!(
+            payloads(out, b"ANIM"),
+            [fx::anim_payload(LOOPS, BACKGROUND)]
+        );
+        // The whole source's 420 ms, and the double's image byte for byte.
+        assert_eq!(fx::anmf_durations(out), [420]);
+        let anmf = &payloads(out, b"ANMF")[0];
+        assert_eq!(&anmf[16..], &still[12..]);
+    }
+
+    #[test]
+    fn an_encode_double_returning_a_still_image_of_another_size_fails() {
+        let still = fx::lossy(&fx::photo_rgba(48, 32, false), 48, 32, 30.0);
         let codec = animation_encoding_to(Ok(still));
         let err = optimize_lossy_with(&animation(), q(75), &codec).unwrap_err();
         assert_eq!(
             err,
-            "the lossy result is not an animation, but the source is an animation"
+            "the lossy result has a different size (48×32, expected 96×64)"
         );
+    }
+
+    #[test]
+    fn a_still_image_that_one_frame_cannot_hold_fails_with_the_reason() {
+        let still = fx::lossy(&anim_frame(0), AW, AH, 30.0);
+        // One frame holds at most 0xFFFFFF ms; this source lasts one more.
+        let long = animation_of(&[anim_frame(0), anim_frame(1)], &[0xFF_FFFF, 1]);
+        let codec = animation_encoding_to(Ok(still.clone()));
+        let err = optimize_lossy_with(&long, q(75), &codec).unwrap_err();
+        assert_eq!(
+            err,
+            "the animation is too long for one WebP frame (16777216 ms)"
+        );
+        // A loop count the decoder gave that an ANIM chunk cannot hold.
+        let codec = animation_double(
+            |bytes| {
+                let (mut info, frames) = real_decode_animation(bytes)?;
+                info.loop_count = 0x1_0000;
+                Ok((info, frames))
+            },
+            move |_, _, _| Ok(still.clone()),
+        );
+        let err = optimize_lossy_with(&animation(), q(75), &codec).unwrap_err();
+        assert_eq!(err, "the loop count is too large for a WebP file (65536)");
     }
 
     #[test]

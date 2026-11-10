@@ -205,8 +205,19 @@ struct Metadata<'s> {
     icc_flag: u8,
 }
 
-/// The chunks of a still result with the metadata, after `WEBP`.
-fn still_body(result: &WebpFile<'_>, metadata: &Metadata<'_>) -> Result<Vec<u8>, String> {
+/// The image of a still result: its `ALPH` chunk (for a `VP8 ` image that
+/// has one), the image chunk, its size and whether it has alpha.
+struct StillImage<'r> {
+    alph: Option<&'r Chunk<'r>>,
+    image: &'r Chunk<'r>,
+    width: u32,
+    height: u32,
+    alpha: bool,
+}
+
+/// The image of a still result. Refuses one without an image chunk and one
+/// that declares a zero width or height.
+fn still_image<'r>(result: &'r WebpFile<'r>) -> Result<StillImage<'r>, String> {
     // A file that is not an animation has a still image chunk (`kind_of`).
     let image = result
         .chunks
@@ -224,6 +235,33 @@ fn still_body(result: &WebpFile<'_>, metadata: &Metadata<'_>) -> Result<Vec<u8>,
         ));
     }
     let alpha = alph.is_some() || (&image.fourcc == b"VP8L" && vp8l_uses_alpha(image.data));
+    Ok(StillImage {
+        alph,
+        image,
+        width,
+        height,
+        alpha,
+    })
+}
+
+/// A `VP8X` payload: `flags`, the 3 reserved bytes (zero) and the canvas,
+/// each side stored minus one in 24 bits. Both sides are at least 1.
+fn vp8x_payload(flags: u8, width: u32, height: u32) -> Vec<u8> {
+    let mut vp8x = vec![flags, 0, 0, 0];
+    vp8x.extend_from_slice(&(width - 1).to_le_bytes()[..3]);
+    vp8x.extend_from_slice(&(height - 1).to_le_bytes()[..3]);
+    vp8x
+}
+
+/// The chunks of a still result with the metadata, after `WEBP`.
+fn still_body(result: &WebpFile<'_>, metadata: &Metadata<'_>) -> Result<Vec<u8>, String> {
+    let StillImage {
+        alph,
+        image,
+        width,
+        height,
+        alpha,
+    } = still_image(result)?;
 
     let mut body = b"WEBP".to_vec();
     if alpha || !metadata.profiles.is_empty() || metadata.rotation.is_some() {
@@ -234,10 +272,7 @@ fn still_body(result: &WebpFile<'_>, metadata: &Metadata<'_>) -> Result<Vec<u8>,
         if metadata.rotation.is_some() {
             flags |= FLAG_EXIF;
         }
-        let mut vp8x = vec![flags, 0, 0, 0];
-        vp8x.extend_from_slice(&(width - 1).to_le_bytes()[..3]);
-        vp8x.extend_from_slice(&(height - 1).to_le_bytes()[..3]);
-        push_chunk(&mut body, b"VP8X", &vp8x);
+        push_chunk(&mut body, b"VP8X", &vp8x_payload(flags, width, height));
     }
     for chunk in metadata
         .profiles
@@ -283,6 +318,79 @@ fn animation_body(result: &WebpFile<'_>, metadata: &Metadata<'_>) -> Result<Vec<
         push_chunk(&mut body, &chunk.fourcc, chunk.data);
     }
     Ok(body)
+}
+
+/// The longest one `ANMF` frame can be shown: its duration has 24 bits.
+const MAX_FRAME_DURATION_MS: u64 = 0xFF_FFFF;
+
+/// The `ANMF` flags byte of [`still_as_animation`]'s frame: bit 1 set (do
+/// not blend), bit 0 clear (do not dispose).
+const ANMF_NO_BLEND_NO_DISPOSE: u8 = 0x02;
+
+/// A still lossy result written back as an animation of one frame, for an
+/// animated source whose frames libwebp's encoder merged into one image and
+/// then wrote as a still file (it does that when the still is smaller).
+///
+/// The file is `VP8X`, `ANIM`, `ANMF`. The `VP8X` has the animation flag,
+/// the alpha flag when the image has alpha (an `ALPH` chunk, or a `VP8L`
+/// that says so), no other flag, and the image's size as its canvas. The
+/// `ANIM` holds `background` and `loop_count`. The one `ANMF` sits at 0,0,
+/// covers the whole canvas, lasts `duration_ms` and holds the still's image
+/// chunks byte for byte (`ALPH` if there is one, then `VP8 ` or `VP8L`).
+/// Its flags are "do not blend" and "do not dispose": a frame that covers
+/// the canvas replaces every pixel, alpha included, exactly as the still
+/// shows it, and as the only frame nothing is drawn after it, so it is
+/// never disposed of.
+///
+/// Refuses bytes that are not a readable WebP file, an animation, a still
+/// image of zero width or height, a loop count over 16 bits (what `ANIM`
+/// holds) and a duration over 24 bits (what one `ANMF` holds).
+pub(crate) fn still_as_animation(
+    still: &[u8],
+    loop_count: u32,
+    background: u32,
+    duration_ms: u64,
+) -> Result<Vec<u8>, String> {
+    let file = parse(still)
+        .map_err(|reason| format!("the lossy result is not a readable WebP file ({reason})"))?;
+    if file.kind == Kind::Animated {
+        return Err("the lossy result is already an animation".to_owned());
+    }
+    let StillImage {
+        alph,
+        image,
+        width,
+        height,
+        alpha,
+    } = still_image(&file)?;
+    let loop_count = u16::try_from(loop_count)
+        .map_err(|_| format!("the loop count is too large for a WebP file ({loop_count})"))?;
+    if duration_ms > MAX_FRAME_DURATION_MS {
+        return Err(format!(
+            "the animation is too long for one WebP frame ({duration_ms} ms)"
+        ));
+    }
+
+    let mut anim = background.to_le_bytes().to_vec();
+    anim.extend_from_slice(&loop_count.to_le_bytes());
+    // X and Y offsets of zero, then the frame's size (stored minus one, as
+    // in `VP8X`), the duration and the flags.
+    let mut frame = vec![0; 6];
+    frame.extend_from_slice(&vp8x_payload(0, width, height)[4..]);
+    frame.extend_from_slice(&duration_ms.to_le_bytes()[..3]);
+    frame.push(ANMF_NO_BLEND_NO_DISPOSE);
+    for chunk in alph.into_iter().chain([image]) {
+        push_chunk(&mut frame, &chunk.fourcc, chunk.data);
+    }
+
+    let flags = FLAG_ANIMATION | if alpha { FLAG_ALPHA } else { 0 };
+    let mut body = b"WEBP".to_vec();
+    push_chunk(&mut body, b"VP8X", &vp8x_payload(flags, width, height));
+    push_chunk(&mut body, b"ANIM", &anim);
+    push_chunk(&mut body, b"ANMF", &frame);
+    let size = u32::try_from(body.len())
+        .map_err(|_| "the lossy result is too large for a WebP file".to_owned())?;
+    Ok(riff_file(&body, size))
 }
 
 /// The length of an `ANMF` frame header: X and Y offsets, width and height,
@@ -1889,5 +1997,147 @@ pub(super) mod tests {
 
         let out = with_metadata_of(&opaque, &source).unwrap();
         assert_eq!(flags(&out), fx::FLAG_ICC);
+    }
+
+    // --- still_as_animation: a still result as a one-frame animation ------------------
+
+    const BACKGROUND: u32 = 0x8040_2010;
+
+    /// The chunks inside an `ANMF` payload, after its 16-byte frame header.
+    fn frame_chunks(anmf: &[u8]) -> Vec<fx::RawChunk> {
+        let mut inner = b"RIFF".to_vec();
+        inner.extend_from_slice(&(anmf.len() as u32 - 12).to_le_bytes());
+        inner.extend_from_slice(b"WEBP");
+        inner.extend_from_slice(&anmf[ANMF_HEADER_LEN..]);
+        fx::chunks_of(&inner)
+    }
+
+    /// The image chunks of a still file, in order.
+    fn image_chunks(still: &[u8]) -> Vec<fx::RawChunk> {
+        fx::chunks_of(still)
+            .into_iter()
+            .filter(|(name, _)| matches!(name, b"ALPH" | b"VP8 " | b"VP8L"))
+            .collect()
+    }
+
+    #[test]
+    fn still_as_animation_puts_the_still_in_one_full_canvas_frame() {
+        let still = encoded(true);
+        assert_eq!(fx::chunk_names(&still), ["VP8X", "ALPH", "VP8 "], "fixture");
+
+        let out = still_as_animation(&still, 3, BACKGROUND, 420).unwrap();
+
+        assert_well_formed(&out);
+        assert_eq!(parse(&out).unwrap().kind, Kind::Animated);
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "ANIM", "ANMF"]);
+        assert_eq!(
+            fx::chunk_payload(&out, b"VP8X"),
+            Some(fx::vp8x_payload(
+                fx::FLAG_ANIMATION | fx::FLAG_ALPHA,
+                SIZE,
+                SIZE
+            ))
+        );
+        assert_eq!(
+            fx::chunk_payload(&out, b"ANIM"),
+            Some(fx::anim_payload(3, BACKGROUND))
+        );
+        let anmf = fx::chunk_payload(&out, b"ANMF").unwrap();
+        // At 0,0; 16x16 (stored minus one); 420 ms (0x1A4); no blending, no
+        // disposal.
+        assert_eq!(
+            anmf[..ANMF_HEADER_LEN],
+            [0, 0, 0, 0, 0, 0, 15, 0, 0, 15, 0, 0, 0xA4, 0x01, 0, 0x02]
+        );
+        assert_eq!(frame_chunks(&anmf), image_chunks(&still));
+        // An independent decoder sees one frame of the still's pixels.
+        let frames = fx::decode_frames(&out);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, fx::decode_rgba(&still).2);
+        assert_eq!(frames[0].1, (420, 1));
+    }
+
+    #[test]
+    fn still_as_animation_sets_the_alpha_flag_only_for_an_image_with_alpha() {
+        let opaque = encoded(false);
+        assert_eq!(fx::chunk_names(&opaque), ["VP8 "], "fixture");
+        let out = still_as_animation(&opaque, 0, 0, 100).unwrap();
+        assert_eq!(flags(&out), fx::FLAG_ANIMATION);
+        let anmf = fx::chunk_payload(&out, b"ANMF").unwrap();
+        assert_eq!(frame_chunks(&anmf), image_chunks(&opaque));
+
+        // A VP8L image that says it uses alpha.
+        let lossless = lossless_file(true);
+        let out = still_as_animation(&lossless, 0, 0, 100).unwrap();
+        assert_eq!(flags(&out), fx::FLAG_ANIMATION | fx::FLAG_ALPHA);
+        let anmf = fx::chunk_payload(&out, b"ANMF").unwrap();
+        assert_eq!(frame_chunks(&anmf), image_chunks(&lossless));
+    }
+
+    #[test]
+    fn still_as_animation_takes_the_largest_loop_count_and_frame_duration() {
+        let out = still_as_animation(&encoded(false), 0xFFFF, BACKGROUND, 0xFF_FFFF).unwrap();
+        assert_eq!(
+            fx::chunk_payload(&out, b"ANIM"),
+            Some(fx::anim_payload(0xFFFF, BACKGROUND))
+        );
+        assert_eq!(fx::anmf_durations(&out), [0xFF_FFFF]);
+        // And the smallest: forever, a zero duration.
+        let out = still_as_animation(&encoded(false), 0, 0, 0).unwrap();
+        assert_eq!(
+            fx::chunk_payload(&out, b"ANIM"),
+            Some(fx::anim_payload(0, 0))
+        );
+        assert_eq!(fx::anmf_durations(&out), [0]);
+    }
+
+    #[test]
+    fn still_as_animation_refuses_an_animation_other_data_an_empty_image_and_numbers_too_large() {
+        let still = encoded(false);
+        let cases: [(&[u8], u32, u64, &str); 6] = [
+            (
+                &animated_result(SIZE),
+                0,
+                100,
+                "the lossy result is already an animation",
+            ),
+            (
+                b"not webp data",
+                0,
+                100,
+                "the lossy result is not a readable WebP file \
+                 (not a WebP file (the content is not WebP data))",
+            ),
+            (
+                &riff(&[vp8(0, 16)]),
+                0,
+                100,
+                "the lossy result has an empty image (0×16)",
+            ),
+            (
+                &still,
+                0x1_0000,
+                100,
+                "the loop count is too large for a WebP file (65536)",
+            ),
+            (
+                &still,
+                0,
+                0x100_0000,
+                "the animation is too long for one WebP frame (16777216 ms)",
+            ),
+            (
+                &still,
+                u32::MAX,
+                u64::MAX,
+                "the loop count is too large for a WebP file (4294967295)",
+            ),
+        ];
+        for (input, loop_count, duration_ms, error) in cases {
+            assert_eq!(
+                still_as_animation(input, loop_count, BACKGROUND, duration_ms).unwrap_err(),
+                error
+            );
+        }
     }
 }
