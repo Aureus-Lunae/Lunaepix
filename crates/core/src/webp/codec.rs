@@ -68,6 +68,12 @@ pub(super) type Frames<'a> = Box<dyn Iterator<Item = Result<Frame, String>> + 'a
 /// milliseconds: its timestamps are C ints.
 pub(super) const MAX_TIMESTAMP_MS: u64 = i32::MAX as u64;
 
+/// The largest width or height libwebp's lossy encoder takes, in pixels:
+/// libwebp's `WEBP_MAX_DIMENSION` (`encode.h`). A WebP can declare 16384 (a
+/// lossless header has 14 bits for the size minus one), but the encoder
+/// refuses it.
+pub(super) const MAX_DIMENSION: u32 = libwebp_sys::WEBP_MAX_DIMENSION;
+
 /// What the lossy path needs from a WebP codec. [`LibWebp`] is the real one;
 /// the tests pass doubles.
 pub(super) trait Codec {
