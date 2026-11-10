@@ -54,7 +54,9 @@ await invoke('start_run', { settings: { mode: 'lossy', quality: 75 } });
   also for a lossless run (the current value, 75 unless changed); it is
   ignored there.
 - `"output-missing"`: the chosen output folder is gone, is no longer a
-  folder, or cannot be written to. It is not created again.
+  folder, or cannot be written to. `start_run` does not create it again.
+  A folder deleted once the run has started is created again by the next
+  file written into it.
 - `"empty-list"`: no file in the list can be compressed (the list is
   empty, or every row is skipped).
 - `"no-output"`: no completed run wrote anything yet. `"open-failed"`: the

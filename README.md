@@ -29,7 +29,7 @@ again; Lunaepix never converts between formats.
 |---|---|
 | JPG | Decoded and encoded again at the quality (mozjpeg). A photo's rotation and its colour profile are kept. |
 | PNG | Reduced to a palette of at most 256 colours, with dithering and transparency kept. The quality sets how many colours: 256 at 100, fewer below. A transparent PNG stays transparent. |
-| WebP | Encoded again as lossy WebP at the quality, with transparency kept. An animated WebP keeps its frame timing and loop count. |
+| WebP | Encoded again as lossy WebP at the quality, with transparency kept. An animated WebP keeps its loop count and total duration, but not always each frame's timing: a frame that (nearly) matches the one before it is merged into it, and the merged frame lasts as long as both did. |
 | SVG | Has no lossy mode: it gets the lossless treatment. |
 
 A few files are kept as they are, and the result says why:
