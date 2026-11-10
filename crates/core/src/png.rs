@@ -173,7 +173,7 @@ fn oxipng_reason(error: oxipng::PngError) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A signature and an IHDR chunk (CRC not checked here) for `w`x`h`.
@@ -197,7 +197,7 @@ mod tests {
         out
     }
 
-    pub(super) fn ihdr(w: u32, h: u32, depth: u8, colour: u8) -> Vec<u8> {
+    pub(crate) fn ihdr(w: u32, h: u32, depth: u8, colour: u8) -> Vec<u8> {
         let mut data = w.to_be_bytes().to_vec();
         data.extend_from_slice(&h.to_be_bytes());
         data.extend_from_slice(&[depth, colour, 0, 0, 0]);
@@ -210,7 +210,7 @@ mod tests {
     ];
 
     /// Signature, the given chunks, IEND.
-    pub(super) fn file(chunks: &[Vec<u8>]) -> Vec<u8> {
+    pub(crate) fn file(chunks: &[Vec<u8>]) -> Vec<u8> {
         let mut bytes = SIGNATURE.to_vec();
         for c in chunks {
             bytes.extend_from_slice(c);

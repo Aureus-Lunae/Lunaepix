@@ -45,7 +45,7 @@ pub(crate) struct Chunk<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WebpFile<'a> {
     pub chunks: Vec<Chunk<'a>>,
-    /// Read by the tests only; nothing in a run needs it.
+    /// Read by the lossy path, which a run calls from a later task on.
     #[cfg_attr(not(test), allow(dead_code))]
     pub kind: Kind,
 }
@@ -61,6 +61,7 @@ const KEPT: [&[u8; 4]; 7] = [
 
 /// `VP8X` flag bits: the chunks a file says it holds.
 const FLAG_ICC: u8 = 0x20;
+const FLAG_ALPHA: u8 = 0x10;
 const FLAG_EXIF: u8 = 0x08;
 const FLAG_XMP: u8 = 0x04;
 
@@ -78,50 +79,158 @@ impl WebpFile<'_> {
     /// no `VP8X` stays without one. The RIFF size is written to match, so
     /// bytes the source had after its own RIFF size are not in the result.
     pub(crate) fn stripped(&self) -> Vec<u8> {
-        // A reader uses the first EXIF chunk; it stays when it turns the
-        // picture, and every other EXIF chunk goes.
-        let rotated_exif = self
-            .chunks
-            .iter()
-            .position(|chunk| &chunk.fourcc == b"EXIF")
-            .filter(|&at| exif::is_rotated(self.chunks[at].data));
-        let kept: Vec<&Chunk<'_>> = self
+        let rotated_exif = self.rotated_exif();
+        let kept = self
             .chunks
             .iter()
             .enumerate()
             .filter(|&(at, chunk)| KEPT.contains(&&chunk.fourcc) || Some(at) == rotated_exif)
-            .map(|(_, chunk)| chunk)
-            .collect();
-        let has_icc = kept.iter().any(|chunk| &chunk.fourcc == b"ICCP");
+            .map(|(_, chunk)| chunk);
 
         let mut body = b"WEBP".to_vec();
         for chunk in kept {
-            body.extend_from_slice(&chunk.fourcc);
-            // The sizes come from a file of at most `MAX_FILE_BYTES`.
-            body.extend_from_slice(&(chunk.data.len() as u32).to_le_bytes());
-            let payload_at = body.len();
-            body.extend_from_slice(chunk.data);
+            let payload_at = push_chunk(&mut body, &chunk.fourcc, chunk.data);
             if &chunk.fourcc == b"VP8X" {
                 // `parse` refuses a VP8X shorter than its 10 bytes.
                 let flags = &mut body[payload_at];
-                let source_icc = *flags & FLAG_ICC;
                 *flags &= !(FLAG_ICC | FLAG_EXIF | FLAG_XMP);
-                if has_icc {
-                    *flags |= source_icc;
-                }
+                *flags |= self.kept_icc_flag();
                 if rotated_exif.is_some() {
                     *flags |= FLAG_EXIF;
                 }
             }
-            if chunk.data.len() % 2 == 1 {
-                body.push(0);
-            }
         }
-        let mut out = b"RIFF".to_vec();
-        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        out.extend_from_slice(&body);
-        out
+        // The sizes come from a file of at most `MAX_FILE_BYTES`.
+        riff_file(&body, body.len() as u32)
     }
+
+    /// Where the `EXIF` chunk the stripped file keeps is: the first `EXIF`
+    /// chunk, when it turns the picture. A reader uses the first one, so
+    /// every other `EXIF` chunk goes.
+    fn rotated_exif(&self) -> Option<usize> {
+        self.chunks
+            .iter()
+            .position(|chunk| &chunk.fourcc == b"EXIF")
+            .filter(|&at| exif::is_rotated(self.chunks[at].data))
+    }
+
+    /// The ICC flag a file written from this one carries: the source's own
+    /// `VP8X` ICC bit, set or clear, when it has an `ICCP` chunk (every one
+    /// is kept), so colour management is exactly as before; clear without
+    /// one, and clear for a source without `VP8X`.
+    fn kept_icc_flag(&self) -> u8 {
+        let has_icc = self.chunks.iter().any(|chunk| &chunk.fourcc == b"ICCP");
+        match self.chunks.first() {
+            Some(first) if has_icc && &first.fourcc == b"VP8X" => first.data[0] & FLAG_ICC,
+            _ => 0,
+        }
+    }
+}
+
+/// Append one chunk to `body`: FourCC, size, payload and the pad byte an odd
+/// size needs. Returns where the payload starts. `data` is a chunk of a
+/// parsed file, so its length fits the 32-bit size field.
+fn push_chunk(body: &mut Vec<u8>, fourcc: &[u8; 4], data: &[u8]) -> usize {
+    body.extend_from_slice(fourcc);
+    body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    let payload_at = body.len();
+    body.extend_from_slice(data);
+    if data.len() % 2 == 1 {
+        body.push(0);
+    }
+    payload_at
+}
+
+/// `RIFF`, the size, then `body` (which starts with `WEBP`).
+fn riff_file(body: &[u8], size: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + body.len());
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+/// A lossy result (libwebp's simple `VP8 ` file, or its `VP8X`, `ALPH`,
+/// `VP8 ` file) with the source's metadata, under exactly the rules of
+/// [`WebpFile::stripped`]: every `ICCP` chunk of the source, byte for byte;
+/// its first `EXIF` chunk only when that turns the picture; never `XMP ` or
+/// an unknown chunk.
+///
+/// The file is written as `VP8X`, `ICCP`…, `ALPH`, the image, `EXIF`, every
+/// odd chunk padded and the RIFF size rewritten. A `VP8X` is written when
+/// there is a profile, a rotation or alpha, and none otherwise, so a result
+/// with nothing to add comes back as it is. Its canvas is the image's own
+/// size, its reserved bits are zero, and its flags match the chunks written:
+/// alpha for an `ALPH` chunk (or a `VP8L` image that uses alpha), EXIF for
+/// the `EXIF` chunk, never XMP or animation, and the ICC flag by the source's
+/// rule ([`WebpFile::kept_icc_flag`]).
+///
+/// Refuses a result that is not a readable WebP file, that is not a still
+/// image, or whose image declares a zero width or height.
+pub(crate) fn with_metadata(encoded: &[u8], source: &WebpFile<'_>) -> Result<Vec<u8>, String> {
+    let result = parse(encoded)
+        .map_err(|reason| format!("the lossy result is not a readable WebP file ({reason})"))?;
+    // A file that is not an animation has a still image chunk (`kind_of`).
+    let image = (result.kind != Kind::Animated)
+        .then(|| {
+            result
+                .chunks
+                .iter()
+                .find(|chunk| matches!(&chunk.fourcc, b"VP8 " | b"VP8L"))
+        })
+        .flatten()
+        .ok_or_else(|| "the lossy result is not a still WebP image".to_owned())?;
+    let alph = (&image.fourcc == b"VP8 ")
+        .then(|| result.chunks.iter().find(|chunk| &chunk.fourcc == b"ALPH"))
+        .flatten();
+    // `parse` read this header already, so it is there and well-formed.
+    let (width, height) = declared_size(image).ok().flatten().unwrap_or_default();
+    if width == 0 || height == 0 {
+        return Err(format!(
+            "the lossy result has an empty image ({width}×{height})"
+        ));
+    }
+    let alpha = alph.is_some() || (&image.fourcc == b"VP8L" && vp8l_uses_alpha(image.data));
+    let profiles: Vec<&Chunk<'_>> = source
+        .chunks
+        .iter()
+        .filter(|chunk| &chunk.fourcc == b"ICCP")
+        .collect();
+    let rotation = source.rotated_exif().map(|at| &source.chunks[at]);
+
+    let mut body = b"WEBP".to_vec();
+    if alpha || !profiles.is_empty() || rotation.is_some() {
+        let mut flags = source.kept_icc_flag();
+        if alpha {
+            flags |= FLAG_ALPHA;
+        }
+        if rotation.is_some() {
+            flags |= FLAG_EXIF;
+        }
+        let mut vp8x = vec![flags, 0, 0, 0];
+        vp8x.extend_from_slice(&(width - 1).to_le_bytes()[..3]);
+        vp8x.extend_from_slice(&(height - 1).to_le_bytes()[..3]);
+        push_chunk(&mut body, b"VP8X", &vp8x);
+    }
+    for chunk in profiles
+        .into_iter()
+        .chain(alph)
+        .chain([image])
+        .chain(rotation)
+    {
+        push_chunk(&mut body, &chunk.fourcc, chunk.data);
+    }
+    let size = u32::try_from(body.len())
+        .map_err(|_| "the lossy result is too large for a WebP file".to_owned())?;
+    Ok(riff_file(&body, size))
+}
+
+/// Whether a `VP8L` image says it uses alpha: bit 28 of its header, after
+/// the signature byte. `parse` checked the header is there.
+fn vp8l_uses_alpha(data: &[u8]) -> bool {
+    data.get(1..5)
+        .and_then(|bits| bits.try_into().ok())
+        .is_some_and(|bits: [u8; 4]| u32::from_le_bytes(bits) >> 28 & 1 == 1)
 }
 
 /// The error for a file whose RIFF container is broken.
@@ -286,7 +395,7 @@ fn kind_of(chunks: &[Chunk<'_>]) -> Result<Kind, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
@@ -300,7 +409,7 @@ mod tests {
     // --- fixtures -----------------------------------------------------------
 
     /// One chunk: FourCC, size, payload, and the zero pad byte of an odd size.
-    fn chunk(fourcc: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    pub(in crate::webp) fn chunk(fourcc: &[u8; 4], data: &[u8]) -> Vec<u8> {
         let mut out = raw_chunk(fourcc, data.len() as u32, data);
         if data.len() % 2 == 1 {
             out.push(0);
@@ -310,7 +419,7 @@ mod tests {
 
     /// A chunk header declaring `size`, followed by `data` as it is, with no
     /// padding: for chunks whose declared size is wrong on purpose.
-    fn raw_chunk(fourcc: &[u8; 4], size: u32, data: &[u8]) -> Vec<u8> {
+    pub(in crate::webp) fn raw_chunk(fourcc: &[u8; 4], size: u32, data: &[u8]) -> Vec<u8> {
         let mut out = fourcc.to_vec();
         out.extend_from_slice(&size.to_le_bytes());
         out.extend_from_slice(data);
@@ -323,7 +432,7 @@ mod tests {
     }
 
     /// A RIFF header with the given size field, `WEBP`, then `body`.
-    fn riff_declaring(size: u32, body: &[u8]) -> Vec<u8> {
+    pub(in crate::webp) fn riff_declaring(size: u32, body: &[u8]) -> Vec<u8> {
         let mut out = b"RIFF".to_vec();
         out.extend_from_slice(&size.to_le_bytes());
         out.extend_from_slice(b"WEBP");
@@ -331,13 +440,13 @@ mod tests {
         out
     }
 
-    fn riff(chunks: &[Vec<u8>]) -> Vec<u8> {
+    pub(in crate::webp) fn riff(chunks: &[Vec<u8>]) -> Vec<u8> {
         riff_of(&chunks.concat())
     }
 
     /// A `VP8X` chunk for a `w`x`h` canvas (stored as width-1 and height-1,
     /// 24 bits each).
-    fn vp8x(flags: u8, w: u32, h: u32) -> Vec<u8> {
+    pub(in crate::webp) fn vp8x(flags: u8, w: u32, h: u32) -> Vec<u8> {
         let mut data = vec![flags, 0, 0, 0];
         data.extend_from_slice(&(w - 1).to_le_bytes()[..3]);
         data.extend_from_slice(&(h - 1).to_le_bytes()[..3]);
@@ -346,7 +455,7 @@ mod tests {
 
     /// A `VP8L` payload that declares `w`x`h`, with a few bytes of "bitstream"
     /// behind the header (the walk never decodes it).
-    fn vp8l_payload(w: u32, h: u32) -> Vec<u8> {
+    pub(in crate::webp) fn vp8l_payload(w: u32, h: u32) -> Vec<u8> {
         let bits = (w - 1) | ((h - 1) << 14);
         let mut data = vec![0x2F];
         data.extend_from_slice(&bits.to_le_bytes());
@@ -354,13 +463,13 @@ mod tests {
         data
     }
 
-    fn vp8l(w: u32, h: u32) -> Vec<u8> {
+    pub(in crate::webp) fn vp8l(w: u32, h: u32) -> Vec<u8> {
         chunk(b"VP8L", &vp8l_payload(w, h))
     }
 
     /// A `VP8 ` payload that declares `w`x`h`: the key frame tag, the start
     /// code, the two sizes, and a few bytes of "bitstream".
-    fn vp8_payload(w: u16, h: u16) -> Vec<u8> {
+    pub(in crate::webp) fn vp8_payload(w: u16, h: u16) -> Vec<u8> {
         let mut data = vec![0x30, 0x01, 0x00, 0x9D, 0x01, 0x2A];
         data.extend_from_slice(&w.to_le_bytes());
         data.extend_from_slice(&h.to_le_bytes());
@@ -368,7 +477,7 @@ mod tests {
         data
     }
 
-    fn vp8(w: u16, h: u16) -> Vec<u8> {
+    pub(in crate::webp) fn vp8(w: u16, h: u16) -> Vec<u8> {
         chunk(b"VP8 ", &vp8_payload(w, h))
     }
 
@@ -1326,5 +1435,187 @@ mod tests {
             assert_eq!(declared + 8, out.len());
             assert_eq!(&out[8..12], b"WEBP");
         }
+    }
+
+    // --- with_metadata: a lossy result with the source's metadata --------------------
+
+    /// A lossy result as libwebp writes it: a simple `VP8 ` file, or with
+    /// `alpha` a `VP8X`, `ALPH`, `VP8 ` file.
+    fn encoded(alpha: bool) -> Vec<u8> {
+        fx::lossy(&pixels(alpha), SIZE, SIZE, 80.0)
+    }
+
+    fn rotated_exif() -> Vec<u8> {
+        fx::exif_with_orientation(6, false, true)
+    }
+
+    fn with_metadata_of(encoded: &[u8], source: &[u8]) -> Result<Vec<u8>, String> {
+        with_metadata(encoded, &parse(source).unwrap())
+    }
+
+    /// The canvas a `VP8X` payload declares.
+    fn canvas(file: &[u8]) -> (u32, u32) {
+        let payload = fx::chunk_payload(file, b"VP8X").unwrap();
+        let read =
+            |at: usize| u32::from_le_bytes([payload[at], payload[at + 1], payload[at + 2], 0]);
+        (read(4) + 1, read(7) + 1)
+    }
+
+    #[test]
+    fn with_metadata_adds_iccp_and_a_rotated_exif_to_a_simple_file() {
+        let result = encoded(false);
+        assert_eq!(fx::chunk_names(&result), ["VP8 "], "fixture");
+        let source = fx::with_chunks(
+            &lossless_file(false),
+            &[(*b"ICCP", ICC_EVEN), (*b"EXIF", &rotated_exif())],
+        );
+
+        let out = with_metadata_of(&result, &source).unwrap();
+
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "ICCP", "VP8 ", "EXIF"]);
+        assert_eq!(fx::chunk_payload(&out, b"ICCP").as_deref(), Some(ICC_EVEN));
+        assert_eq!(fx::chunk_payload(&out, b"EXIF"), Some(rotated_exif()));
+        assert_eq!(
+            fx::chunk_payload(&out, b"VP8 "),
+            fx::chunk_payload(&result, b"VP8 ")
+        );
+        assert_eq!(flags(&out), fx::FLAG_ICC | fx::FLAG_EXIF);
+        assert_eq!(canvas(&out), (SIZE, SIZE));
+        assert_eq!(&fx::chunk_payload(&out, b"VP8X").unwrap()[1..4], [0, 0, 0]);
+        assert_well_formed(&out);
+    }
+
+    #[test]
+    fn with_metadata_keeps_alph_before_the_image_and_sets_the_alpha_flag() {
+        let result = encoded(true);
+        assert_eq!(
+            fx::chunk_names(&result),
+            ["VP8X", "ALPH", "VP8 "],
+            "fixture"
+        );
+        let source = fx::with_chunks(&lossless_file(true), &[(*b"ICCP", ICC_ODD)]);
+
+        let out = with_metadata_of(&result, &source).unwrap();
+
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "ICCP", "ALPH", "VP8 "]);
+        assert_eq!(
+            fx::chunk_payload(&out, b"ALPH"),
+            fx::chunk_payload(&result, b"ALPH")
+        );
+        assert_eq!(flags(&out), fx::FLAG_ALPHA | fx::FLAG_ICC);
+        assert_well_formed(&out);
+
+        // With nothing to add, libwebp's own alpha file comes back as written.
+        let plain = with_metadata_of(&result, &lossless_file(true)).unwrap();
+        assert_eq!(plain, result);
+    }
+
+    #[test]
+    fn with_metadata_writes_no_vp8x_when_nothing_needs_one() {
+        let result = encoded(false);
+        // No metadata at all, and metadata the lossless path drops too.
+        let sources = [
+            lossless_file(false),
+            fx::with_chunks(
+                &lossless_file(false),
+                &[
+                    (*b"XMP ", b"<x:xmpmeta/>"),
+                    (*b"EXIF", &fx::exif_with_orientation(1, true, false)),
+                    (*b"ABCD", &[5; 9]),
+                ],
+            ),
+        ];
+        for source in sources {
+            let out = with_metadata_of(&result, &source).unwrap();
+            assert_eq!(out, result);
+            assert_eq!(fx::chunk_names(&out), ["VP8 "]);
+        }
+    }
+
+    #[test]
+    fn with_metadata_pads_odd_chunks_and_writes_the_riff_size() {
+        let result = encoded(false);
+        let image_len = fx::chunk_payload(&result, b"VP8 ").unwrap().len();
+        let mut odd_exif = rotated_exif();
+        odd_exif.push(0x99);
+        assert_eq!(odd_exif.len() % 2, 1, "fixture");
+        let source = fx::with_chunks(
+            &lossless_file(false),
+            &[(*b"ICCP", ICC_ODD), (*b"EXIF", &odd_exif)],
+        );
+
+        let out = with_metadata_of(&result, &source).unwrap();
+
+        assert_eq!(
+            out.len(),
+            12 + (8 + 10)
+                + (8 + ICC_ODD.len() + 1)
+                + (8 + image_len + image_len % 2)
+                + (8 + odd_exif.len() + 1)
+        );
+        assert_eq!(fx::chunk_payload(&out, b"ICCP").as_deref(), Some(ICC_ODD));
+        assert_eq!(fx::chunk_payload(&out, b"EXIF"), Some(odd_exif));
+        assert_well_formed(&out);
+    }
+
+    #[test]
+    fn with_metadata_refuses_bytes_that_are_not_webp() {
+        let source = lossless_file(false);
+        let whole = encoded(false);
+        for bytes in [&b"not a WebP"[..], b"", &whole[..whole.len() - 6]] {
+            let err = with_metadata_of(bytes, &source).unwrap_err();
+            assert!(
+                err.starts_with("the lossy result is not a readable WebP file ("),
+                "{err}"
+            );
+        }
+        assert!(with_metadata_of(&whole, &source).is_ok());
+    }
+
+    #[test]
+    fn with_metadata_refuses_an_animation_and_an_empty_image() {
+        let source = lossless_file(false);
+        let animation = fx::animated(&[lossless_file(false), lossless_file(true)], SIZE, SIZE);
+        assert_eq!(
+            with_metadata_of(&animation, &source).unwrap_err(),
+            "the lossy result is not a still WebP image"
+        );
+        assert_eq!(
+            with_metadata_of(&riff(&[vp8(0, 16)]), &source).unwrap_err(),
+            "the lossy result has an empty image (0×16)"
+        );
+        assert_eq!(
+            with_metadata_of(&riff(&[vp8(16, 0)]), &source).unwrap_err(),
+            "the lossy result has an empty image (16×0)"
+        );
+        // The same headers with a size are taken.
+        assert!(with_metadata_of(&riff(&[vp8(16, 16)]), &source).is_ok());
+    }
+
+    #[test]
+    fn with_metadata_sets_the_alpha_flag_for_a_vp8l_with_alpha() {
+        let source = fx::with_chunks(&lossless_file(false), &[(*b"ICCP", ICC_EVEN)]);
+        let with_alpha = lossless_file(true);
+        // `image`'s encoder sets the alpha bit on every file; clear it for an
+        // image that says it is opaque (the bit is only a hint to readers).
+        let mut opaque_chunks = fx::chunks_of(&lossless_file(false));
+        opaque_chunks[0].1[4] &= !0x10;
+        let opaque = fx::from_chunks(&opaque_chunks);
+        let alpha_bit = |file: &[u8]| {
+            let payload = fx::chunk_payload(file, b"VP8L").unwrap();
+            u32::from_le_bytes(payload[1..5].try_into().unwrap()) >> 28 & 1
+        };
+        assert_eq!(
+            (alpha_bit(&with_alpha), alpha_bit(&opaque)),
+            (1, 0),
+            "fixture"
+        );
+
+        let out = with_metadata_of(&with_alpha, &source).unwrap();
+        assert_eq!(fx::chunk_names(&out), ["VP8X", "ICCP", "VP8L"]);
+        assert_eq!(flags(&out), fx::FLAG_ALPHA | fx::FLAG_ICC);
+
+        let out = with_metadata_of(&opaque, &source).unwrap();
+        assert_eq!(flags(&out), fx::FLAG_ICC);
     }
 }
