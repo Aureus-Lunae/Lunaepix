@@ -39,7 +39,7 @@ takes an argument.
 | `readd_list` | none | After a run, puts the files that were in the list back: sends `list-changed` with the list as it was added, planned again now. It adds nothing and removes nothing; it only ends the "run has finished" state, so the next add appends. | `"busy"` |
 | `choose_output_folder` | none | Opens a native folder dialog; the folder picked becomes the output folder. Resolves as soon as the dialog is open. | `"busy"` |
 | `clear_output_folder` | none | Back to "next to the originals". | `"busy"` |
-| `start_run` | `{ "settings": { "mode": "lossy", "quality": 75 } }` | Runs the list with these settings and the output setting. It writes next to the originals or into the chosen folder, and never replaces an existing output: a taken name gets a number before the extension, from `-1` (`optimized-a-1.png`). Resolves once the run has started; its progress arrives as events. | `"busy"`, `"invalid-settings"`, `"empty-list"`, `"output-missing"` |
+| `start_run` | `{ "settings": { "mode": "lossy", "quality": 75 } }` | Runs the list with these settings and the output setting. It writes next to the originals (`optimized-a.png`) or into the chosen folder (`a.png`), and never replaces an existing output: a taken name gets a number before the extension, from `-1` (`optimized-a-1.png`, `a-1.png`), then `-2`, up to `-9999`; when all of those are taken the file fails ("no free name in the output folder"). Resolves once the run has started; its progress arrives as events. | `"busy"`, `"invalid-settings"`, `"empty-list"`, `"output-missing"` |
 | `open_output_folder` | none | Opens the output folder of the last completed run in the file manager: the chosen output folder, or, with none, the folder of the first file written. | `"no-output"`, `"open-failed"` |
 
 ```js
@@ -80,10 +80,11 @@ JPG, SVG and WebP files directly inside it (not its subfolders), earlier
 `optimized-*` outputs included. While a run is going, a drop is refused with
 `run-busy`.
 
-A file is listed once, however often it is added. The first add after a
-run has finished starts a fresh list: only the new files are in it, unless
-`readd_list` was called after the run. Until then, and after a `readd_list`,
-adds go to the end of the list.
+A file is listed once, however often it is added. When a run has finished,
+the list is marked finished: the first add after that starts a fresh list
+(only the new files are in it, and its thumbnails get a new list number).
+`readd_list` clears that mark, so the next add appends to the list instead.
+At any other time adds go to the end of the list.
 
 `readd_list` gives back the paths that were added, not the outputs the run
 wrote beside them (`optimized-*`): dropping the folder again after a run does
@@ -98,14 +99,11 @@ Every payload is JSON data. Show names, reasons, notes and notices with
 `textContent`, never with `innerHTML`. A file or folder name may contain any
 character.
 
-`run-busy`, `run-cancelled`, `drag-state` and `run-finished` are as before;
-`list-changed`, `output-changed` and `file-started` are new; `run-started`
-and `file-done` gained fields.
-
 ### `list-changed`
 
-Sent after every add, every Clear and every `readd_list`, and at the start of
-a fresh list: the full list each time, in display order.
+Sent after every add (the first add after a finished run starts a fresh
+list), every Clear and every `readd_list`: the full list each time, in
+display order.
 
 - `name`: the file name alone, never a path.
 - `size`: in bytes, or `null` for a skipped row.
