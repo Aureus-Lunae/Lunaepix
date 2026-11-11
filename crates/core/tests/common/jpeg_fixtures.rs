@@ -44,6 +44,25 @@ pub fn four_component_jpeg(transform: u8) -> Vec<u8> {
     bytes
 }
 
+/// `jpeg` with one marker segment (`marker` is the code after the 0xFF, for
+/// example 0xE1 for APP1) holding `payload`, put right after the SOI marker.
+/// The payload must fit the segment's 16-bit length (at most 65,533 bytes).
+pub fn with_segment(jpeg: &[u8], marker: u8, payload: &[u8]) -> Vec<u8> {
+    assert!(jpeg.starts_with(&[0xFF, 0xD8]), "not a JPEG");
+    let length = u16::try_from(payload.len() + 2).expect("the payload must fit a segment");
+    let mut out = jpeg[..2].to_vec();
+    out.extend_from_slice(&[0xFF, marker]);
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&jpeg[2..]);
+    out
+}
+
+/// [`with_segment`] for an APP1 segment.
+pub fn with_app1(jpeg: &[u8], payload: &[u8]) -> Vec<u8> {
+    with_segment(jpeg, 0xE1, payload)
+}
+
 /// A greyscale JPEG header of `w`x`h` with an empty scan: libjpeg reads the
 /// header, and there is no image data to decode.
 pub fn grey_header(w: u16, h: u16) -> Vec<u8> {

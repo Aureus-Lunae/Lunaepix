@@ -1,7 +1,8 @@
 //! JPG optimisation: a lossless coefficient transcode with mozjpeg, the
 //! jpegtran route chosen in the Step 2 evaluation, and (in the child module
 //! `lossy`) a lossy re-encode at a quality. The child module `decode` holds
-//! the scaled decode a thumbnail is made from.
+//! the scaled decode a thumbnail is made from, and the read of its EXIF
+//! segment.
 //!
 //! The quantised DCT coefficients are read from the source and written back
 //! unchanged; only the entropy coding (Huffman tables and scan layout) is
@@ -39,7 +40,7 @@ use mozjpeg_sys::{
 mod decode;
 mod lossy;
 
-pub(crate) use decode::{check_header, decode_scaled};
+pub(crate) use decode::{check_header, decode_scaled, exif_payload};
 pub(crate) use lossy::optimize_lossy;
 
 /// Every JPEG starts with the SOI marker, followed by the next marker's 0xFF.

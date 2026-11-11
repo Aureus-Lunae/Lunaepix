@@ -1,5 +1,6 @@
 //! Decoding a JPG, PNG or WebP to the RGBA pixels a thumbnail is made from,
-//! with the decoders the optimisers use and within their bounds.
+//! with the decoders the optimisers use and within their bounds, and finding
+//! the EXIF orientation the thumbnail is turned by.
 
 use crate::plan::Format;
 
@@ -83,6 +84,24 @@ pub(super) fn picture(format: Format, bytes: &[u8], side: u32) -> Result<Picture
         Format::Svg => return Err(NOT_DECODED.to_owned()),
     };
     Picture::new(width, height, rgba)
+}
+
+/// The EXIF Orientation of `bytes` as 1 to 8, which a thumbnail turns the
+/// picture by:
+/// - JPG: the first `Exif\0\0` APP1 segment ([`crate::jpg::exif_payload`]);
+/// - WebP: the first `EXIF` chunk ([`crate::webp::exif_orientation`]);
+/// - PNG and SVG: `None`, whatever the bytes hold.
+///
+/// `None` too when there is no EXIF block or it cannot be read: a damaged
+/// block is no error, the picture just stays as stored. The format, not the
+/// content, picks where to look; the content must still be what
+/// [`picture`] decoded.
+pub(super) fn orientation(format: Format, bytes: &[u8]) -> Option<u8> {
+    match format {
+        Format::Jpg => crate::webp::orientation(&crate::jpg::exif_payload(bytes)?),
+        Format::Webp => crate::webp::exif_orientation(bytes),
+        Format::Png | Format::Svg => None,
+    }
 }
 
 #[cfg(test)]
@@ -170,5 +189,49 @@ mod tests {
         assert!(Picture::new(3, 2, vec![0; 28]).is_err());
         assert!(Picture::new(0, 2, vec![]).is_err());
         assert!(Picture::new(u32::MAX, u32::MAX, vec![]).is_err());
+    }
+
+    // --- orientation ------------------------------------------------------------
+
+    use crate::jpeg_fixtures::with_app1;
+    use crate::webp::fixtures as fx;
+
+    fn jpg_of_orientation(value: u16) -> Vec<u8> {
+        let mut plain = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut plain, 90)
+            .encode(&[128; 16 * 16 * 3], 16, 16, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        with_app1(&plain, &fx::exif_with_orientation(value, false, true))
+    }
+
+    fn webp_of_orientation(value: u16) -> Vec<u8> {
+        let plain = fx::lossless(&fx::photo_rgba(16, 16, false), 16, 16);
+        fx::with_chunks(
+            &plain,
+            &[(*b"EXIF", &fx::exif_with_orientation(value, true, false))],
+        )
+    }
+
+    #[test]
+    fn orientation_reads_a_jpg_and_a_webp() {
+        assert_eq!(orientation(Format::Jpg, &jpg_of_orientation(6)), Some(6));
+        assert_eq!(orientation(Format::Jpg, &jpg_of_orientation(1)), Some(1));
+        assert_eq!(orientation(Format::Webp, &webp_of_orientation(8)), Some(8));
+        assert_eq!(orientation(Format::Webp, &webp_of_orientation(1)), Some(1));
+    }
+
+    #[test]
+    fn orientation_is_none_for_a_png_an_svg_and_the_wrong_content() {
+        let (jpg, webp) = (jpg_of_orientation(6), webp_of_orientation(6));
+        // The format decides where to look, not what the bytes hold.
+        for format in [Format::Png, Format::Svg] {
+            assert_eq!(orientation(format, &jpg), None, "{format:?}");
+            assert_eq!(orientation(format, &webp), None, "{format:?}");
+        }
+        assert_eq!(orientation(Format::Jpg, &webp), None);
+        assert_eq!(orientation(Format::Webp, &jpg), None);
+        // And without a rotation to find, nothing is made up.
+        assert_eq!(orientation(Format::Jpg, b""), None);
+        assert_eq!(orientation(Format::Webp, b""), None);
     }
 }

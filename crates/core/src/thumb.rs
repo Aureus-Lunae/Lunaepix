@@ -5,8 +5,9 @@
 //! written. The decoding is bounded as the optimisers bound it: the file's
 //! size ([`MAX_FILE_BYTES`], or [`MAX_SVG_THUMB_BYTES`] for an SVG) before
 //! it is read, and the declared size ([`crate::MAX_PIXELS`]) from the header
-//! before anything is decoded ([`decode`]). The picture is returned as
-//! stored: no EXIF orientation is applied.
+//! before anything is decoded ([`decode`]). A JPG's or WebP's EXIF
+//! orientation is applied last ([`orient`]), so the thumbnail shows the
+//! picture upright; a damaged EXIF block is no error, just no turn.
 
 use std::fs;
 use std::io::Cursor;
@@ -56,6 +57,11 @@ pub struct CannotShow(pub String);
 ///   animated WebP its first frame, its canvas checked against
 ///   [`crate::MAX_ANIMATION_CANVAS_PIXELS`] first. A CMYK or YCCK JPG
 ///   cannot be shown.
+/// - A JPG or WebP whose EXIF block ([`decode::orientation`]) holds an
+///   Orientation of 2 to 8 is turned to match ([`orient`]) after it is
+///   scaled, so for 5 to 8 the width and height swap. A PNG is never
+///   turned; no EXIF block, a damaged one or an Orientation outside 1 to
+///   8 leaves the picture as stored.
 /// - An SVG is returned as its own bytes when they are UTF-8 text whose
 ///   first character, after an optional byte order mark and whitespace, is
 ///   `<`. It is not parsed or rendered.
@@ -79,10 +85,12 @@ pub fn thumbnail(src: &Path) -> Result<Thumbnail, CannotShow> {
         };
     }
     let picture = decode::picture(format, &bytes, THUMB_SIDE).map_err(CannotShow)?;
+    let orientation = decode::orientation(format, &bytes);
     drop(bytes);
     let (width, height) = fit(picture.width(), picture.height(), THUMB_SIDE);
     let rgba = area_average(&picture, width, height);
     drop(picture);
+    let (rgba, width, height) = orient(rgba, width, height, orientation.unwrap_or(1));
     encode_png(width, height, &rgba)
         .map(Thumbnail::Png)
         .map_err(CannotShow)
@@ -189,6 +197,52 @@ fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
     writer.write_image_data(rgba).map_err(failed)?;
     writer.finish().map_err(failed)?;
     Ok(out)
+}
+
+/// `rgba` (`width`×`height` pixels of four bytes) turned the way the EXIF
+/// Orientation `orientation` says it is stored, so it shows upright; gives
+/// the pixels and the new width and height.
+///
+/// Where the stored top left pixel goes (EXIF's table): 1 stays, 2 top
+/// right (mirrored left-right), 3 bottom right (turned 180°), 4 bottom
+/// left (mirrored top-bottom), 5 stays top left (transposed), 6 top right
+/// (turned 90° clockwise), 7 bottom right (transversed), 8 bottom left
+/// (turned 90° counter-clockwise). From 5 on the sides swap.
+///
+/// A value outside 1 to 8, and a buffer that is not `width * height * 4`
+/// bytes, come back as they are.
+pub(crate) fn orient(
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    orientation: u8,
+) -> (Vec<u8>, u32, u32) {
+    let (w, h) = (width as usize, height as usize);
+    let pixels = rgba.as_chunks::<4>().0;
+    let sized = w.checked_mul(h) == Some(pixels.len()) && rgba.len() == pixels.len() * 4;
+    if orientation <= 1 || orientation > 8 || !sized {
+        return (rgba, width, height);
+    }
+    // The turned size, and where the stored pixel (x, y) lands in it.
+    let (out_w, out_h) = if orientation >= 5 { (h, w) } else { (w, h) };
+    let target = |x: usize, y: usize| match orientation {
+        2 => (w - 1 - x, y),
+        3 => (w - 1 - x, h - 1 - y),
+        4 => (x, h - 1 - y),
+        5 => (y, x),
+        6 => (h - 1 - y, x),
+        7 => (h - 1 - y, w - 1 - x),
+        _ => (y, w - 1 - x),
+    };
+    let mut out = vec![0u8; rgba.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let (tx, ty) = target(x, y);
+            let at = (ty * out_w + tx) * 4;
+            out[at..at + 4].copy_from_slice(&pixels[y * w + x]);
+        }
+    }
+    (out, out_w as u32, out_h as u32)
 }
 
 #[cfg(test)]
@@ -328,5 +382,97 @@ mod tests {
         assert!(!is_svg_text(b"\x89PNG\r\n\x1a\n"));
         // A second BOM is not whitespace.
         assert!(!is_svg_text(b"\xEF\xBB\xBF\xEF\xBB\xBF<svg/>"));
+    }
+
+    // --- orient -----------------------------------------------------------------
+
+    /// A picture with one distinct pixel per letter of `rows`.
+    fn grid(rows: &[&str]) -> (Vec<u8>, u32, u32) {
+        let height = rows.len() as u32;
+        let width = rows[0].len() as u32;
+        let rgba = rows
+            .iter()
+            .flat_map(|row| row.bytes())
+            .flat_map(|letter| [letter, letter ^ 0x55, 7, 255])
+            .collect();
+        (rgba, width, height)
+    }
+
+    #[test]
+    fn orient_puts_every_pixel_where_the_standard_says() {
+        // The result of each EXIF value on ABC / DEF, as rows of letters,
+        // written from the standard's description of the stored image:
+        // 2 mirrored left-right, 3 turned 180, 4 mirrored top-bottom,
+        // 5 transposed, 6 turned 90 clockwise, 7 transversed, 8 turned 90
+        // counter-clockwise.
+        let expected: [(u8, &[&str]); 8] = [
+            (1, &["ABC", "DEF"]),
+            (2, &["CBA", "FED"]),
+            (3, &["FED", "CBA"]),
+            (4, &["DEF", "ABC"]),
+            (5, &["AD", "BE", "CF"]),
+            (6, &["DA", "EB", "FC"]),
+            (7, &["FC", "EB", "DA"]),
+            (8, &["CF", "BE", "AD"]),
+        ];
+        let (rgba, width, height) = grid(&["ABC", "DEF"]);
+        for (value, rows) in expected {
+            let got = orient(rgba.clone(), width, height, value);
+            assert_eq!(got, grid(rows), "orientation {value}");
+        }
+    }
+
+    #[test]
+    fn orient_1_leaves_the_buffer_and_the_size_unchanged() {
+        let (rgba, width, height) = grid(&["ABC", "DEF"]);
+        assert_eq!(orient(rgba.clone(), width, height, 1), (rgba, 3, 2));
+    }
+
+    #[test]
+    fn orient_5_to_8_swap_the_sides_and_1_to_4_keep_them() {
+        for (width, height) in [(3, 2), (1, 5), (5, 1), (64, 63)] {
+            let rgba = vec![9; (width * height * 4) as usize];
+            for value in 1..=4 {
+                let (_, w, h) = orient(rgba.clone(), width, height, value);
+                assert_eq!((w, h), (width, height), "{value} on {width}x{height}");
+            }
+            for value in 5..=8 {
+                let (_, w, h) = orient(rgba.clone(), width, height, value);
+                assert_eq!((w, h), (height, width), "{value} on {width}x{height}");
+            }
+        }
+    }
+
+    #[test]
+    fn orient_gives_back_every_pixel_once() {
+        for (width, height) in [(1, 1), (3, 2), (1, 5), (5, 1), (64, 63)] {
+            let rgba: Vec<u8> = (0..width * height)
+                .flat_map(|i| [i as u8, (i >> 8) as u8, 1, 255])
+                .collect();
+            let sorted = |rgba: &[u8]| {
+                let mut pixels = rgba.as_chunks::<4>().0.to_vec();
+                pixels.sort();
+                pixels
+            };
+            for value in 1..=8 {
+                let (out, ..) = orient(rgba.clone(), width, height, value);
+                assert_eq!(sorted(&out), sorted(&rgba), "{value} on {width}x{height}");
+            }
+        }
+    }
+
+    #[test]
+    fn orient_leaves_a_buffer_of_the_wrong_length_and_other_values_unchanged() {
+        let (rgba, width, height) = grid(&["ABC", "DEF"]);
+        for value in [0, 9, 10, 255] {
+            let got = orient(rgba.clone(), width, height, value);
+            assert_eq!(got, (rgba.clone(), 3, 2), "orientation {value}");
+        }
+        // 3x2 pixels need 24 bytes.
+        for len in [0, 4, 20, 23, 25, 28] {
+            let wrong = vec![1u8; len];
+            let got = orient(wrong.clone(), width, height, 6);
+            assert_eq!(got, (wrong, 3, 2), "length {len}");
+        }
     }
 }

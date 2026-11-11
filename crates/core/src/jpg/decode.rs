@@ -1,19 +1,20 @@
 //! Scaled JPG decoding for thumbnails: libjpeg decodes at 1/2, 1/4 or 1/8
 //! of the size where the thumbnail allows, which skips most of the work for
-//! a large photo.
+//! a large photo, and the read of the EXIF segment that says how to turn it.
 //!
 //! A child of `jpg`, so it uses the same libjpeg guard ([`Decompress`]),
 //! error manager and [`run_libjpeg`]: a libjpeg error or warning (a damaged
 //! file) unwinds to `run_libjpeg` and becomes `Err`, and the guard destroys
 //! the decompressor on the way.
 
-use std::os::raw::c_ulong;
+use std::os::raw::{c_int, c_ulong};
 
 use mozjpeg_sys::{
-    J_COLOR_SPACE, jpeg_finish_decompress, jpeg_mem_src, jpeg_read_header, jpeg_start_decompress,
+    J_COLOR_SPACE, jpeg_finish_decompress, jpeg_mem_src, jpeg_read_header, jpeg_save_markers,
+    jpeg_start_decompress,
 };
 
-use super::lossy::read_shape;
+use super::lossy::{MARKER_LIMIT, read_shape, saved_markers};
 use super::{Decompress, check_start, fail, read_scanlines, run_libjpeg, source_len};
 use crate::plan::check_pixels;
 
@@ -94,6 +95,54 @@ unsafe fn read_scaled(
         jpeg_finish_decompress(source);
         Ok((source.output_width, source.output_height, pixels))
     }
+}
+
+/// The marker code of an APP1 segment, which holds EXIF (and XMP).
+const APP1: u8 = 0xE1;
+
+/// The EXIF segment of a JPEG: the payload of its first APP1 segment that
+/// starts with the `Exif\0\0` prefix, prefix included, for
+/// [`crate::webp::orientation`]. Only the header is read, through libjpeg
+/// as the lossy path reads its markers (`jpeg_save_markers`, then
+/// `saved_markers`); an APP1 is at most 65,533 bytes, so the copy is
+/// bounded.
+///
+/// `None` for bytes that are not a JPEG, a header libjpeg fails or warns
+/// on (the picture could not be decoded either), no APP1 segment, and an
+/// APP1 that is not EXIF (XMP, for one); an EXIF block that cannot be
+/// parsed is the caller's to ignore.
+pub(crate) fn exif_payload(bytes: &[u8]) -> Option<Vec<u8>> {
+    check_start(bytes).ok()?;
+    let len = source_len(bytes).ok()?;
+    // SAFETY: `read_exif` must run inside `run_libjpeg`, which it does here,
+    // and `len` is `bytes.len()`.
+    run_libjpeg(|| unsafe { read_exif(bytes, len) }).ok()?
+}
+
+/// # Safety
+///
+/// Must run inside [`run_libjpeg`]: libjpeg failures unwind out of it. `len`
+/// must be `bytes.len()`.
+unsafe fn read_exif(bytes: &[u8], len: c_ulong) -> Option<Vec<u8>> {
+    let mut decompress = Decompress::new();
+    let source = decompress.cinfo();
+    // SAFETY: the start of the standard libjpeg decompression sequence on a
+    // decompressor that `Decompress` created and will destroy. `bytes`
+    // outlives `decompress`, and libjpeg only reads through that pointer, at
+    // most `len` bytes. The saved markers live in the decompressor's pool
+    // and are copied out by `saved_markers` before it is dropped.
+    let markers = unsafe {
+        jpeg_mem_src(source, bytes.as_ptr(), len);
+        jpeg_save_markers(source, c_int::from(APP1), MARKER_LIMIT);
+        // With `require_image` set, a file without an image fails inside; a
+        // memory source never suspends, so the header is read when it returns.
+        jpeg_read_header(source, 1);
+        saved_markers(source)
+    };
+    markers
+        .into_iter()
+        .find(|marker| marker.code == APP1 && marker.data.starts_with(crate::webp::EXIF_PREFIX))
+        .map(|marker| marker.data)
 }
 
 /// The largest of 8, 4 and 2 at which libjpeg's output of a `width`×`height`
@@ -210,5 +259,64 @@ mod tests {
     fn decode_scaled_refuses_bytes_that_are_not_a_jpeg() {
         let err = decode_scaled(b"\x89PNG\r\n\x1a\n", 64).unwrap_err();
         assert!(err.contains("not a JPEG"), "{err}");
+    }
+
+    // --- the EXIF segment -------------------------------------------------------
+
+    use crate::jpeg_fixtures::{with_app1, with_segment};
+
+    #[test]
+    fn exif_payload_is_the_first_app1_that_starts_with_exif() {
+        let plain = jpg(32, 32);
+        let first = [b"Exif\0\0".as_slice(), b"first TIFF"].concat();
+        let second = [b"Exif\0\0".as_slice(), b"second TIFF"].concat();
+        // Inserted last, so it comes first in the file.
+        let both = with_app1(&with_app1(&plain, &second), &first);
+        assert_eq!(exif_payload(&both), Some(first.clone()));
+        assert_eq!(exif_payload(&with_app1(&plain, &first)), Some(first));
+        // A payload that is only the prefix is still the EXIF segment.
+        let bare = with_app1(&plain, b"Exif\0\0");
+        assert_eq!(exif_payload(&bare), Some(b"Exif\0\0".to_vec()));
+    }
+
+    #[test]
+    fn exif_payload_skips_an_app1_that_is_not_exif() {
+        let exif = [b"Exif\0\0".as_slice(), b"TIFF"].concat();
+        let xmp = b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta/>";
+        // The XMP segment comes first in the file, the EXIF one after it.
+        let jpeg = with_app1(&with_app1(&jpg(32, 32), &exif), xmp);
+        assert_eq!(exif_payload(&jpeg), Some(exif));
+    }
+
+    #[test]
+    fn exif_payload_is_none_without_an_exif_app1() {
+        let plain = jpg(32, 32);
+        assert_eq!(exif_payload(&plain), None);
+        let xmp = b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta/>";
+        assert_eq!(exif_payload(&with_app1(&plain, xmp)), None);
+        // Almost the prefix, and the prefix in another segment.
+        assert_eq!(exif_payload(&with_app1(&plain, b"Exif\0XTIFF")), None);
+        assert_eq!(exif_payload(&with_app1(&plain, b"Exif\0")), None);
+        assert_eq!(exif_payload(&with_app1(&plain, b"")), None);
+        let elsewhere = b"Exif\0\0TIFF";
+        assert_eq!(exif_payload(&with_segment(&plain, 0xE2, elsewhere)), None);
+        assert_eq!(exif_payload(&with_segment(&plain, 0xFE, elsewhere)), None);
+    }
+
+    #[test]
+    fn exif_payload_is_none_for_what_is_not_a_readable_jpeg() {
+        let exif = [b"Exif\0\0".as_slice(), b"TIFF"].concat();
+        let jpeg = with_app1(&jpg(32, 32), &exif);
+        assert_eq!(exif_payload(&jpeg), Some(exif));
+        assert_eq!(exif_payload(b""), None);
+        assert_eq!(exif_payload(b"\x89PNG\r\n\x1a\n"), None);
+        assert_eq!(exif_payload(&[0xFF, 0xD8, 0xFF]), None);
+        // Cut inside the EXIF segment, and before the image.
+        assert_eq!(exif_payload(&jpeg[..12]), None);
+        assert_eq!(exif_payload(&jpeg[..40]), None);
+        // A segment whose length runs past the end.
+        let mut lying = jpeg.clone();
+        lying[4..6].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(exif_payload(&lying[..200]), None);
     }
 }
