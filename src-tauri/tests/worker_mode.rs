@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const WORKER_FLAG: &str = "--lunaepix-worker";
+const THUMB_FLAG: &str = "--lunaepix-thumb";
 const TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A PNG with something to gain: flat, stored with fast compression.
@@ -113,4 +114,56 @@ fn the_app_binary_refuses_a_worker_call_without_a_destination() {
         .collect();
     names.sort();
     assert_eq!(names, ["a.png"]);
+}
+
+/// A 200 x 100 RGB gradient: scaled to 64 x 32 by the thumbnail mode.
+fn wide_png_bytes() -> Vec<u8> {
+    let (w, h) = (200u32, 100u32);
+    let pixels: Vec<u8> = (0..w * h)
+        .flat_map(|i| [(i % w) as u8, (i / w) as u8, 90])
+        .collect();
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, w, h);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&pixels).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+#[test]
+fn thumb_flag_answers_a_png_with_the_header_and_a_decodable_thumbnail() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("hero image.png");
+    fs::write(&src, wide_png_bytes()).unwrap();
+
+    let output = app(&[THUMB_FLAG.as_ref(), src.as_os_str()]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let header = b"lunaepix-thumb 1 png\n";
+    assert!(output.stdout.starts_with(header), "{:?}", output.stdout);
+    let mut reader = png::Decoder::new(&output.stdout[header.len()..])
+        .read_info()
+        .unwrap();
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut buffer).unwrap();
+    assert_eq!((frame.width, frame.height), (64, 32));
+}
+
+#[test]
+fn thumb_flag_exits_3_for_a_text_file_and_prints_nothing() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("notes.txt");
+    fs::write(&src, b"just some text").unwrap();
+
+    let output = app(&[THUMB_FLAG.as_ref(), src.as_os_str()]);
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
 }

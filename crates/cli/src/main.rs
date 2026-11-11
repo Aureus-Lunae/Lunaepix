@@ -35,8 +35,9 @@ use lunaepix_core::{Options, Worker, WriteMode, plan_files_to, plan_folder_to, r
 use args::{Args, Request, USAGE, UsageError};
 
 fn main() -> ExitCode {
-    // The runner starts this same binary as the worker for each file; without
-    // this first line every worker would start a run of its own.
+    // The runner starts this same binary as the worker for each file (and as
+    // the thumbnail worker for each thumbnail); without this first line every
+    // worker would start a run of its own.
     if let Some(code) = lunaepix_core::worker::serve_if_requested() {
         return code;
     }

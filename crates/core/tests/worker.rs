@@ -7,7 +7,7 @@ use std::process::{Command, Output, Stdio};
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
-use lunaepix_core::WORKER_FLAG;
+use lunaepix_core::{THUMB_FLAG, WORKER_FLAG};
 use tempfile::TempDir;
 
 const WORKER: &str = env!("CARGO_BIN_EXE_lunaepix-worker");
@@ -594,4 +594,148 @@ fn a_child_that_is_not_the_worker_outlives_the_process_that_started_it() {
     );
 
     assert!(survived, "cat should outlive the shell");
+}
+
+// --- the thumbnail mode ------------------------------------------------------
+
+/// A 200 x 100 RGB gradient: wider than a thumbnail, so it is scaled to 64 x 32.
+fn wide_png_bytes() -> Vec<u8> {
+    let (w, h) = (200u32, 100u32);
+    let pixels: Vec<u8> = (0..w * h)
+        .flat_map(|i| [(i % w) as u8, (i / w) as u8, 90])
+        .collect();
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, w, h);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&pixels).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+/// What `<worker> --lunaepix-thumb <src>` wrote: the header line and the bytes.
+fn split_thumb_answer(stdout: &[u8]) -> (String, Vec<u8>) {
+    let newline = stdout
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or_else(|| panic!("no header line in {} bytes", stdout.len()));
+    (
+        String::from_utf8(stdout[..newline].to_vec()).unwrap(),
+        stdout[newline + 1..].to_vec(),
+    )
+}
+
+/// The size of a PNG, decoded for real.
+fn decoded_size(bytes: &[u8]) -> (u32, u32) {
+    let mut reader = png::Decoder::new(bytes).read_info().unwrap();
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut buffer).unwrap();
+    (frame.width, frame.height)
+}
+
+fn thumb(src: &Path) -> Output {
+    serve(&[THUMB_FLAG.as_ref(), src.as_os_str()])
+}
+
+#[test]
+fn thumb_flag_answers_a_png_with_the_header_and_a_decodable_thumbnail() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &wide_png_bytes());
+
+    let output = thumb(&src);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let (header, bytes) = split_thumb_answer(&output.stdout);
+    assert_eq!(header, "lunaepix-thumb 1 png");
+    assert_eq!(decoded_size(&bytes), (64, 32));
+}
+
+#[test]
+fn thumb_flag_exits_3_for_a_text_file_and_prints_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "notes.txt", b"just some text");
+
+    let output = thumb(&src);
+
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(output.stdout.is_empty(), "{:?}", stdout(&output));
+}
+
+#[test]
+fn thumb_flag_answers_an_svg_with_its_own_bytes() {
+    let tmp = TempDir::new().unwrap();
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"/>"#;
+    let src = write(tmp.path(), "a.svg", svg);
+
+    let output = thumb(&src);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let (header, bytes) = split_thumb_answer(&output.stdout);
+    assert_eq!(header, "lunaepix-thumb 1 svg");
+    assert_eq!(bytes, svg);
+}
+
+#[test]
+fn thumb_flag_refuses_the_wrong_arguments_with_exit_2() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &wide_png_bytes());
+    let other = write(tmp.path(), "b.png", &wide_png_bytes());
+    let flag: &std::ffi::OsStr = THUMB_FLAG.as_ref();
+
+    let calls: [&[&std::ffi::OsStr]; 3] = [
+        &[flag],
+        &[flag, src.as_os_str(), other.as_os_str()],
+        &[flag, "--bogus".as_ref(), src.as_os_str()],
+    ];
+    for args in calls {
+        let output = serve(args);
+
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
+    // The same source on its own is answered.
+    assert_eq!(thumb(&src).status.code(), Some(0));
+}
+
+#[test]
+fn thumb_flag_works_for_a_name_with_spaces_and_accents() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "Mobilis Logo – zwart é.png", &wide_png_bytes());
+
+    let output = thumb(&src);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let (header, bytes) = split_thumb_answer(&output.stdout);
+    assert_eq!(header, "lunaepix-thumb 1 png");
+    assert_eq!(decoded_size(&bytes), (64, 32));
+}
+
+#[cfg(unix)]
+#[test]
+fn thumb_flag_works_for_a_name_that_is_not_utf8() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = TempDir::new().unwrap();
+    // Byte 0xE9 is Latin-1 `é`, which is not valid UTF-8 on its own.
+    let src = tmp.path().join(std::ffi::OsStr::from_bytes(b"caf\xE9.png"));
+    fs::write(&src, wide_png_bytes()).unwrap();
+    assert!(std::str::from_utf8(src.file_name().unwrap().as_bytes()).is_err());
+
+    let output = thumb(&src);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let (header, bytes) = split_thumb_answer(&output.stdout);
+    assert_eq!(header, "lunaepix-thumb 1 png");
+    assert_eq!(decoded_size(&bytes), (64, 32));
+}
+
+#[test]
+fn thumb_flag_exits_3_for_a_missing_file_with_such_a_name() {
+    let tmp = TempDir::new().unwrap();
+    let missing = tmp.path().join("Mobilis Logo – zwart é.png");
+
+    let output = thumb(&missing);
+
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(output.stdout.is_empty());
 }

@@ -4,9 +4,11 @@
 //! The batch runner ([`crate::run`]) starts a binary once per file as
 //! `<exe> --lunaepix-worker [--lossy <0-100>] [--no-replace] <src> <dest>`,
 //! so that a library that crashes the process (a stack overflow aborts, and
-//! cannot be caught) takes down only that one file. The CLI and the app call
-//! [`serve_if_requested`] first thing in `main`, so both binaries answer the
-//! worker mode.
+//! cannot be caught) takes down only that one file. The same binary also
+//! makes a thumbnail, as `<exe> --lunaepix-thumb <src>` (see "The thumbnail
+//! mode" below), for the same reason: the decoders run in a process that can
+//! die without the window. The CLI and the app call [`serve_if_requested`]
+//! first thing in `main`, so both binaries answer both modes.
 //!
 //! # The arguments
 //!
@@ -43,6 +45,25 @@
 //! optimiser panicked (no record; the panic message is on stderr). The runner
 //! accepts only 0 with `ok` and 1 with an error record: anything else counts
 //! as a crash.
+//!
+//! # The thumbnail mode
+//!
+//! `<exe> --lunaepix-thumb <src>` takes exactly one argument after the flag,
+//! the source, which is a path even when it looks like an option; anything
+//! else is a usage error (exit code 2, nothing on stdout). The worker sets
+//! itself up as the optimiser does, makes the thumbnail ([`thumbnail`]) and
+//! writes one of these answers to stdout, header line first and the bytes
+//! right after it, then exits 0:
+//!
+//! ```text
+//! lunaepix-thumb 1 png\n<the bytes of a PNG>
+//! lunaepix-thumb 1 svg\n<the bytes of an SVG file>
+//! ```
+//!
+//! If the file cannot be shown ([`CannotShow`]) it writes nothing and exits
+//! 3. The exit codes 101 (a panic) and 1 (the answer could not be written)
+//! are crashes to the runner ([`crate::run_thumb`]), which reads only exit 3
+//! as "cannot be shown" and only exit 0 with a valid answer as a thumbnail.
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -52,12 +73,29 @@ use std::process::ExitCode;
 use std::thread;
 
 use crate::{
-    Compression, MAX_WORKER_MESSAGE_BYTES, Note, OptimizeError, Options, Outcome, Quality,
-    WriteMode, optimize_file, platform,
+    CannotShow, Compression, MAX_WORKER_MESSAGE_BYTES, Note, OptimizeError, Options, Outcome,
+    Quality, Thumbnail, WriteMode, optimize_file, platform, thumbnail,
 };
 
 /// The hidden first argument that starts a binary in worker mode.
 pub const WORKER_FLAG: &str = "--lunaepix-worker";
+
+/// The hidden first argument that starts a binary in thumbnail mode.
+pub const THUMB_FLAG: &str = "--lunaepix-thumb";
+
+/// The line that starts a worker's answer when the thumbnail is a PNG.
+const THUMB_PNG_HEADER: &[u8] = b"lunaepix-thumb 1 png
+";
+
+/// The line that starts a worker's answer when the thumbnail is an SVG.
+const THUMB_SVG_HEADER: &[u8] = b"lunaepix-thumb 1 svg
+";
+
+/// The length of either header line, newline included.
+pub(crate) const THUMB_HEADER_LEN: usize = THUMB_PNG_HEADER.len();
+
+/// The first eight bytes of every PNG file.
+const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
 /// Start of every record: a magic word and the format version.
 const RECORD_PREFIX: &str = "lunaepix-worker 2 ";
@@ -71,6 +109,8 @@ const NO_REPLACE_OPTION: &str = "--no-replace";
 const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 const EXIT_NO_RECORD: u8 = 3;
+/// The thumbnail mode's own meaning of 3: the file cannot be shown.
+const EXIT_NO_THUMB: u8 = 3;
 /// What Rust itself exits with after a panic on the main thread.
 const EXIT_PANICKED: u8 = 101;
 
@@ -80,33 +120,68 @@ const EXIT_PANICKED: u8 = 101;
 /// worker sets the size itself and every system gets the same.
 const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
-/// If this process was started as `<exe> --lunaepix-worker ...`, run the
-/// worker and return its exit code; `main` returns it at once. Otherwise
-/// `None`, and `main` carries on as usual. The arguments are read with
-/// `args_os`, so paths that are not UTF-8 arrive intact.
+/// If this process was started as `<exe> --lunaepix-worker ...` or
+/// `<exe> --lunaepix-thumb <src>`, run that worker and return its exit code;
+/// `main` returns it at once. Otherwise `None`, and `main` carries on as
+/// usual. The arguments are read with `args_os`, so paths that are not UTF-8
+/// arrive intact.
 pub fn serve_if_requested() -> Option<ExitCode> {
     let mut args = env::args_os().skip(1);
-    if args.next().as_deref() != Some(OsStr::new(WORKER_FLAG)) {
-        return None;
+    let flag = args.next()?;
+    if flag == OsStr::new(WORKER_FLAG) {
+        Some(serve(args))
+    } else if flag == OsStr::new(THUMB_FLAG) {
+        Some(serve_thumb(args))
+    } else {
+        None
     }
-    Some(serve(args))
+}
+
+/// What every worker does before its job: the start-up for its parent. On
+/// Linux it asks to be killed when the thread that started it ends (so
+/// closing the window stops it), then raises its own OOM score, so that when
+/// memory runs out the kernel kills the worker rather than the window; on
+/// Windows it turns off the crash dialogs.
+fn start_up() {
+    // Before the OOM score: the tests read a score of 1000 as "ready".
+    platform::die_with_parent();
+    raise_oom_score();
+    platform::suppress_crash_dialogs();
+}
+
+/// Run `job` on a new thread with the fixed [`WORKER_STACK_BYTES`] stack and
+/// wait for it: `Err` if the thread could not be started, and `Ok(Err(_))`
+/// if the job panicked (the panic hook has already written the message to
+/// stderr).
+fn on_worker_stack<T: Send + 'static>(
+    name: &str,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> io::Result<thread::Result<T>> {
+    on_stack(name, WORKER_STACK_BYTES, job)
+}
+
+/// [`on_worker_stack`] with the stack size given: the thumbnail tests pass
+/// a size the OS refuses, so that the thread cannot start.
+fn on_stack<T: Send + 'static>(
+    name: &str,
+    stack_bytes: usize,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> io::Result<thread::Result<T>> {
+    thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(stack_bytes)
+        .spawn(job)
+        .map(thread::JoinHandle::join)
 }
 
 /// Optimise one file and write the result record to stdout. `args` are the
 /// arguments after the flag: the options, then `<src> <dest>` (see the
 /// module documentation).
 ///
-/// First the worker sets itself up for its parent: on Linux it asks to be
-/// killed when the thread that started it ends (so closing the window stops
-/// it), then raises its own OOM score, so that when memory runs out the
-/// kernel kills the worker rather than the window; on Windows it turns off
-/// the crash dialogs. The file is optimised on a thread with a fixed 8 MiB
-/// stack.
+/// First the worker sets itself up for its parent ([`start_up`]). The file
+/// is optimised on a thread with a fixed 8 MiB stack.
 pub fn serve(args: impl IntoIterator<Item = OsString>) -> ExitCode {
-    // Before the OOM score: the tests read a score of 1000 as "ready".
-    platform::die_with_parent();
-    raise_oom_score();
-    platform::suppress_crash_dialogs();
+    start_up();
     serve_with(
         args,
         |src: &Path, dest: &Path, options: Options| optimize_file(src, dest, &options),
@@ -136,11 +211,7 @@ where
         let (src, dest) = (src.clone(), dest.clone());
         move || optimise(&src, &dest, options)
     };
-    let spawned = thread::Builder::new()
-        .name("optimize".to_owned())
-        .stack_size(WORKER_STACK_BYTES)
-        .spawn(job);
-    let result = match spawned.map(thread::JoinHandle::join) {
+    let result = match on_worker_stack("optimize", job) {
         Ok(Ok(result)) => result,
         // The panic hook has already written the message to stderr.
         Ok(Err(_panic)) => return ExitCode::from(EXIT_PANICKED),
@@ -197,6 +268,94 @@ pub(crate) fn option_args(options: &Options) -> Vec<OsString> {
         args.push(NO_REPLACE_OPTION.into());
     }
     args
+}
+
+/// Make the thumbnail of one file and write the answer to stdout. `args` are
+/// the arguments after the flag: exactly one, the source (see the module
+/// documentation). Set up and bounded like [`serve`].
+pub fn serve_thumb(args: impl IntoIterator<Item = OsString>) -> ExitCode {
+    start_up();
+    serve_thumb_with(args, thumbnail, &mut io::stdout().lock())
+}
+
+/// [`serve_thumb`] without the start-up calls, with the thumbnailer and the
+/// output given, as [`serve_with`] is for the optimiser.
+///
+/// Exit codes: 0 with the answer written; [`EXIT_NO_THUMB`] (nothing
+/// written) when the file cannot be shown; 2 for anything but exactly one
+/// argument; 101 if the thumbnailer panicked; 1 if the thread could not be
+/// started or the answer could not be written. The last two must not be 3,
+/// which the runner reads as "cannot be shown".
+pub(crate) fn serve_thumb_with<F>(
+    args: impl IntoIterator<Item = OsString>,
+    make: F,
+    out: &mut dyn Write,
+) -> ExitCode
+where
+    F: FnOnce(&Path) -> Result<Thumbnail, CannotShow> + Send + 'static,
+{
+    serve_thumb_on_stack(args, make, out, WORKER_STACK_BYTES)
+}
+
+/// [`serve_thumb_with`] with the stack size of the thumbnail thread given,
+/// which production sets to [`WORKER_STACK_BYTES`]: a test passes a size the
+/// OS refuses to reach the exit code of a thread that cannot start.
+pub(crate) fn serve_thumb_on_stack<F>(
+    args: impl IntoIterator<Item = OsString>,
+    make: F,
+    out: &mut dyn Write,
+    stack_bytes: usize,
+) -> ExitCode
+where
+    F: FnOnce(&Path) -> Result<Thumbnail, CannotShow> + Send + 'static,
+{
+    let Ok([src]) = <[OsString; 1]>::try_from(args.into_iter().collect::<Vec<_>>()) else {
+        eprintln!("usage: <program> {THUMB_FLAG} <source>");
+        return ExitCode::from(EXIT_USAGE);
+    };
+    let src = PathBuf::from(src);
+
+    let thumbnail = match on_stack("thumbnail", stack_bytes, move || make(&src)) {
+        Ok(Ok(result)) => result,
+        // The panic hook has already written the message to stderr.
+        Ok(Err(_panic)) => return ExitCode::from(EXIT_PANICKED),
+        Err(error) => {
+            eprintln!("could not start the thumbnail thread: {error}");
+            return ExitCode::from(EXIT_FAILED);
+        }
+    };
+    let Ok(thumbnail) = thumbnail else {
+        return ExitCode::from(EXIT_NO_THUMB);
+    };
+
+    let (header, bytes) = match &thumbnail {
+        Thumbnail::Png(bytes) => (THUMB_PNG_HEADER, bytes),
+        Thumbnail::Svg(bytes) => (THUMB_SVG_HEADER, bytes),
+    };
+    let written = out
+        .write_all(header)
+        .and_then(|()| out.write_all(bytes))
+        .and_then(|()| out.flush());
+    if let Err(error) = written {
+        eprintln!("could not write the thumbnail: {error}");
+        return ExitCode::from(EXIT_FAILED);
+    }
+    ExitCode::SUCCESS
+}
+
+/// The thumbnail in a worker's answer, or `None` unless `answer` is exactly a
+/// header ([`THUMB_PNG_HEADER`] or [`THUMB_SVG_HEADER`]) and the bytes after
+/// it: for `png` the bytes must start with the PNG signature, for `svg`
+/// there must be some. Never panics, whatever the bytes.
+pub(crate) fn parse_thumb_answer(answer: &[u8]) -> Option<Thumbnail> {
+    let (header, bytes) = answer.split_at_checked(THUMB_HEADER_LEN)?;
+    if header == THUMB_PNG_HEADER && bytes.starts_with(&PNG_SIGNATURE) {
+        Some(Thumbnail::Png(bytes.to_vec()))
+    } else if header == THUMB_SVG_HEADER && !bytes.is_empty() {
+        Some(Thumbnail::Svg(bytes.to_vec()))
+    } else {
+        None
+    }
 }
 
 /// Ask the kernel to pick this process first when memory runs out. Best
@@ -910,5 +1069,235 @@ mod tests {
             serve_recorded(&["--lossy", "7", "/photos/a.png", "/photos/optimized-a.png"]);
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(handed.len(), 1);
+    }
+
+    // --- the thumbnail mode -----------------------------------------------------
+
+    const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+    /// A thumbnail that starts like a PNG (the worker does not look inside).
+    fn png_thumb() -> Vec<u8> {
+        let mut bytes = PNG_SIGNATURE.to_vec();
+        bytes.extend_from_slice(b"pretend pixels");
+        bytes
+    }
+
+    /// Run the thumbnail mode with `args` and a thumbnailer double that
+    /// answers `answer`; the exit code, what was written, and the paths the
+    /// double was handed.
+    fn serve_thumb_recorded(
+        args: Vec<OsString>,
+        answer: Result<Thumbnail, CannotShow>,
+    ) -> (ExitCode, Vec<u8>, Vec<PathBuf>) {
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&handed);
+        let mut out = Vec::new();
+        let code = serve_thumb_with(
+            args,
+            move |src: &Path| {
+                recorder.lock().unwrap().push(src.to_path_buf());
+                answer
+            },
+            &mut out,
+        );
+        let handed = handed.lock().unwrap().clone();
+        (code, out, handed)
+    }
+
+    fn one_source() -> Vec<OsString> {
+        vec![OsString::from("/photos/a b.png")]
+    }
+
+    #[test]
+    fn thumb_serves_a_png_as_the_png_header_and_the_bytes() {
+        let bytes = png_thumb();
+        let (code, out, _) = serve_thumb_recorded(one_source(), Ok(Thumbnail::Png(bytes.clone())));
+        assert_eq!(code, ExitCode::SUCCESS);
+        let mut expected = b"lunaepix-thumb 1 png\n".to_vec();
+        expected.extend_from_slice(&bytes);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn thumb_serves_an_svg_under_the_svg_header_not_the_png_one() {
+        let bytes = b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec();
+        let (code, out, _) = serve_thumb_recorded(one_source(), Ok(Thumbnail::Svg(bytes.clone())));
+        assert_eq!(code, ExitCode::SUCCESS);
+        let mut expected = b"lunaepix-thumb 1 svg\n".to_vec();
+        expected.extend_from_slice(&bytes);
+        assert_eq!(out, expected);
+        assert!(!out.starts_with(b"lunaepix-thumb 1 png"));
+    }
+
+    #[test]
+    fn thumb_exits_3_and_writes_nothing_when_the_file_cannot_be_shown() {
+        let (code, out, handed) =
+            serve_thumb_recorded(one_source(), Err(CannotShow("not a picture".to_owned())));
+        assert_eq!(code, ExitCode::from(3));
+        assert!(out.is_empty(), "{:?}", String::from_utf8_lossy(&out));
+        assert_eq!(handed.len(), 1, "it was asked, and said no");
+    }
+
+    #[test]
+    fn thumb_hands_the_one_argument_to_the_thumbnailer_exactly() {
+        let mut sources = vec![
+            OsString::from("--looks-like-an-option"),
+            OsString::from("/photos/Mobilis Logo – zwart é.png"),
+        ];
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            sources.push(OsString::from_vec(b"/photos/caf\xE9.png".to_vec()));
+        }
+        for source in sources {
+            let (code, _, handed) =
+                serve_thumb_recorded(vec![source.clone()], Ok(Thumbnail::Png(png_thumb())));
+            assert_eq!(code, ExitCode::SUCCESS, "{source:?}");
+            assert_eq!(handed, [PathBuf::from(&source)], "{source:?}");
+        }
+    }
+
+    #[test]
+    fn thumb_refuses_no_source_two_sources_and_an_option_before_the_source_with_exit_2() {
+        let calls: [Vec<OsString>; 3] = [
+            vec![],
+            vec![
+                OsString::from("/photos/a.png"),
+                OsString::from("/photos/b.png"),
+            ],
+            vec![OsString::from("--bogus"), OsString::from("/photos/a.png")],
+        ];
+        for args in calls {
+            let (code, out, handed) =
+                serve_thumb_recorded(args.clone(), Ok(Thumbnail::Png(png_thumb())));
+            assert_eq!(code, ExitCode::from(EXIT_USAGE), "{args:?}");
+            assert!(out.is_empty(), "{args:?}");
+            assert!(handed.is_empty(), "{args:?}: the thumbnailer must not run");
+        }
+    }
+
+    #[test]
+    fn thumb_exits_101_without_an_answer_when_the_thumbnailer_panics() {
+        let mut out = Vec::new();
+        let code = serve_thumb_with(
+            one_source(),
+            |_: &Path| -> Result<Thumbnail, CannotShow> { panic!("the decoder hit a bug") },
+            &mut out,
+        );
+        assert_eq!(code, ExitCode::from(EXIT_PANICKED));
+        assert!(out.is_empty(), "{:?}", String::from_utf8_lossy(&out));
+    }
+
+    /// A writer that fails on every write.
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn thumb_exits_1_not_3_when_the_answer_cannot_be_written() {
+        // Exit 3 means "cannot be shown" to the runner, so a failed write
+        // must not look like it.
+        let code = serve_thumb_with(
+            one_source(),
+            |_: &Path| Ok(Thumbnail::Png(png_thumb())),
+            &mut ClosedPipe,
+        );
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+        assert_ne!(code, ExitCode::from(3));
+    }
+
+    /// `usize::MAX` is a stack size Linux refuses (`EINVAL`), so the thread
+    /// cannot start; this is checked to give an `Err`, not a panic.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn thumb_exits_1_not_3_and_writes_nothing_when_its_thread_cannot_start() {
+        let calls = Arc::new(Mutex::new(0));
+        let recorder = Arc::clone(&calls);
+        let mut out = Vec::new();
+        let code = serve_thumb_on_stack(
+            one_source(),
+            move |_: &Path| {
+                *recorder.lock().unwrap() += 1;
+                Ok(Thumbnail::Png(png_thumb()))
+            },
+            &mut out,
+            usize::MAX,
+        );
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+        assert_ne!(code, ExitCode::from(3));
+        assert!(out.is_empty(), "{:?}", String::from_utf8_lossy(&out));
+        assert_eq!(*calls.lock().unwrap(), 0, "the thumbnailer must not run");
+
+        // The pair: the same call on the normal stack answers.
+        let mut out = Vec::new();
+        let code = serve_thumb_on_stack(
+            one_source(),
+            |_: &Path| Ok(Thumbnail::Png(png_thumb())),
+            &mut out,
+            WORKER_STACK_BYTES,
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(out.starts_with(b"lunaepix-thumb 1 png\n"));
+    }
+
+    #[test]
+    fn parses_a_png_answer_and_an_svg_answer() {
+        let png = png_thumb();
+        let mut answer = b"lunaepix-thumb 1 png\n".to_vec();
+        answer.extend_from_slice(&png);
+        assert_eq!(parse_thumb_answer(&answer), Some(Thumbnail::Png(png)));
+
+        let svg = b"<svg/>".to_vec();
+        let mut answer = b"lunaepix-thumb 1 svg\n".to_vec();
+        answer.extend_from_slice(&svg);
+        assert_eq!(parse_thumb_answer(&answer), Some(Thumbnail::Svg(svg)));
+    }
+
+    #[test]
+    fn rejects_a_wrong_version_no_header_an_unknown_kind_and_a_png_header_with_other_bytes() {
+        let png = png_thumb();
+        let with = |header: &[u8], bytes: &[u8]| [header, bytes].concat();
+        // Control: the right header and bytes parse.
+        assert!(parse_thumb_answer(&with(b"lunaepix-thumb 1 png\n", &png)).is_some());
+
+        let bad: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", vec![]),
+            ("no header", png.clone()),
+            ("version 2", with(b"lunaepix-thumb 2 png\n", &png)),
+            ("version 0", with(b"lunaepix-thumb 0 png\n", &png)),
+            ("unknown kind", with(b"lunaepix-thumb 1 gif\n", &png)),
+            ("upper-case kind", with(b"lunaepix-thumb 1 PNG\n", &png)),
+            ("no newline", with(b"lunaepix-thumb 1 png", &png)),
+            ("carriage return", with(b"lunaepix-thumb 1 png\r\n", &png)),
+            ("header only", b"lunaepix-thumb 1 png\n".to_vec()),
+            (
+                "png header, text bytes",
+                with(b"lunaepix-thumb 1 png\n", b"<svg/>"),
+            ),
+            (
+                "png header, a truncated signature",
+                with(b"lunaepix-thumb 1 png\n", &PNG_SIGNATURE[..7]),
+            ),
+            (
+                "svg header, nothing after it",
+                b"lunaepix-thumb 1 svg\n".to_vec(),
+            ),
+        ];
+        for (what, bytes) in bad {
+            assert_eq!(parse_thumb_answer(&bytes), None, "{what}");
+        }
+    }
+
+    #[test]
+    fn the_thumbnail_header_length_is_that_of_both_headers() {
+        assert_eq!(b"lunaepix-thumb 1 png\n".len(), THUMB_HEADER_LEN);
+        assert_eq!(b"lunaepix-thumb 1 svg\n".len(), THUMB_HEADER_LEN);
     }
 }

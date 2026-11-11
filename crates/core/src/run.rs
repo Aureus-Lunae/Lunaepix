@@ -4,6 +4,9 @@
 //! A worker that crashes, is killed (for example by the kernel when memory
 //! runs out), hangs past its timeout, or prints anything but one valid record
 //! fails only its own file; the run carries on with the next one.
+//!
+//! A thumbnail is made the same way, by [`run_thumb`]: one worker process per
+//! file, with its own timeout and cap on the answer.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -15,8 +18,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::worker::{WORKER_FLAG, option_args, parse_record};
-use crate::{Job, MAX_WORKER_OUTPUT_BYTES, OptimizeError, Options, Outcome, Skip, WORKER_TIMEOUT};
+use crate::worker::{
+    THUMB_FLAG, THUMB_HEADER_LEN, WORKER_FLAG, option_args, parse_record, parse_thumb_answer,
+};
+use crate::{
+    Job, MAX_WORKER_OUTPUT_BYTES, OptimizeError, Options, Outcome, Skip, Thumbnail, WORKER_TIMEOUT,
+};
 
 /// Longest pause between two checks on a running worker. The pause starts at
 /// 1 ms and doubles, so a quick file costs a millisecond or two of waiting.
@@ -292,6 +299,101 @@ impl StopHandle {
     }
 }
 
+/// How long one thumbnail worker may take.
+pub const THUMB_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most bytes of a thumbnail the runner accepts after the header line.
+/// The largest SVG the worker passes through ([`crate::MAX_SVG_THUMB_BYTES`])
+/// is exactly this long.
+pub const MAX_THUMB_ANSWER_BYTES: usize = 2 * 1024 * 1024;
+
+/// What a thumbnail worker answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThumbAnswer {
+    /// A PNG: the bytes start with the PNG signature.
+    Png(Vec<u8>),
+    /// An SVG file's own bytes.
+    Svg(Vec<u8>),
+    /// The worker said the file cannot be shown (exit code 3).
+    CannotShow,
+    /// Anything else: the worker could not be started, timed out, crashed,
+    /// exited with another code, wrote too much, or gave no valid answer.
+    Failed,
+}
+
+/// Make the thumbnail of `src` in a worker process: `program` started as
+/// `<program> --lunaepix-thumb <src>` (see [`crate::worker`]).
+///
+/// Started and waited for on the calling thread, with no shell and no stdin,
+/// and with [`THUMB_TIMEOUT`] and [`MAX_THUMB_ANSWER_BYTES`]: a worker that
+/// runs past the limit or writes more is killed and reaped. Only exit code 3
+/// is [`ThumbAnswer::CannotShow`]; every other way of not giving a valid
+/// answer is [`ThumbAnswer::Failed`].
+pub fn run_thumb(program: &Path, src: &Path) -> ThumbAnswer {
+    run_thumb_with(program, src, THUMB_TIMEOUT, MAX_THUMB_ANSWER_BYTES)
+}
+
+/// [`run_thumb`], with the timeout and the cap on the bytes after the header
+/// given: the tests shorten them.
+pub(crate) fn run_thumb_with(
+    program: &Path,
+    src: &Path,
+    timeout: Duration,
+    cap: usize,
+) -> ThumbAnswer {
+    let mut command = Command::new(program);
+    command.arg(THUMB_FLAG).arg(src);
+    run_thumb_command(&mut command, timeout, cap)
+}
+
+/// [`run_thumb_with`], with the whole command given: the tests put a shell
+/// script in the worker's place.
+pub(crate) fn run_thumb_command(
+    command: &mut Command,
+    timeout: Duration,
+    cap: usize,
+) -> ThumbAnswer {
+    // Nobody else holds this handle, so nothing stops the worker but its
+    // own end, the timeout, or an overflow.
+    let stop = StopHandle::new();
+    let started = start(command, cap + THUMB_HEADER_LEN, &mut stop.active());
+    let Ok(Started {
+        stdout,
+        stderr,
+        overflow,
+    }) = started
+    else {
+        return ThumbAnswer::Failed;
+    };
+
+    let ended = wait(&stop, timeout, &overflow);
+    // Reaped by now.
+    stop.active().take();
+    // A reader sets the overflow flag before it sends, so once both have
+    // been received the flag is final.
+    let stdout = stdout.recv_timeout(PIPE_GRACE).ok();
+    let _ = stderr.recv_timeout(PIPE_GRACE);
+
+    // A timeout, a failed wait and a stop (which cannot happen here) are all
+    // "no answer", like a crash.
+    let Ended::Exited(status) = ended else {
+        return ThumbAnswer::Failed;
+    };
+    if overflow.load(Ordering::SeqCst) {
+        return ThumbAnswer::Failed;
+    }
+    // A worker killed by a signal has no exit code.
+    match (status.code(), stdout) {
+        (Some(0), Some(answer)) => match parse_thumb_answer(&answer) {
+            Some(Thumbnail::Png(bytes)) => ThumbAnswer::Png(bytes),
+            Some(Thumbnail::Svg(bytes)) => ThumbAnswer::Svg(bytes),
+            None => ThumbAnswer::Failed,
+        },
+        (Some(3), _) => ThumbAnswer::CannotShow,
+        _ => ThumbAnswer::Failed,
+    }
+}
+
 /// Windows' `CREATE_NO_WINDOW` process creation flag.
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -329,7 +431,11 @@ fn run_worker(
     let stopped = || RunError::Stopped {
         path: src.to_path_buf(),
     };
-    let (pipes, overflow) = {
+    let Started {
+        stdout,
+        stderr,
+        overflow,
+    } = {
         // The flag is checked, and the worker started and stored, under the
         // lock that `stop` takes after setting the flag: either `stop` sees
         // the worker, or the worker is never started.
@@ -338,30 +444,9 @@ fn run_worker(
             return Err(stopped());
         }
         let mut command = Command::new(&worker.program);
-        command
-            .args(&worker.args)
-            .arg(src)
-            .arg(dest)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = without_console_window(&mut command)
-            .spawn()
-            .map_err(spawn_error)?;
-        let overflow = Arc::new(AtomicBool::new(false));
-        let pipes = match (child.stdout.take(), child.stderr.take()) {
-            (Some(stdout), Some(stderr)) => read_capped(stdout, &overflow)
-                .and_then(|out| Ok((out, read_capped(stderr, &overflow)?))),
-            _ => Err(io::Error::other("the worker's output pipes are missing")),
-        };
-        if pipes.is_err() {
-            kill_and_reap(&mut child);
-        } else {
-            *active = Some(child);
-        }
-        (pipes, overflow)
+        command.args(&worker.args).arg(src).arg(dest);
+        start(&mut command, MAX_WORKER_OUTPUT_BYTES, &mut active).map_err(spawn_error)?
     };
-    let (stdout, stderr) = pipes.map_err(spawn_error)?;
 
     let ended = wait(stop, worker.timeout, &overflow);
     // Reaped by now; the next file starts with an empty slot.
@@ -404,6 +489,57 @@ fn run_worker(
         (Some(0 | 1), _) => Err(crashed(Crash::NoValidResult)),
         (Some(code), _) => Err(crashed(Crash::ExitCode(code))),
         (None, _) => Err(crashed(Crash::NoValidResult)),
+    }
+}
+
+/// A worker that has been started: the readers of its two pipes, and the
+/// flag they set when one of them goes past its limit.
+struct Started {
+    stdout: mpsc::Receiver<Vec<u8>>,
+    stderr: mpsc::Receiver<Vec<u8>>,
+    overflow: Arc<AtomicBool>,
+}
+
+/// Start `command` with no stdin and both output pipes read on their own
+/// threads (stdout up to `stdout_limit` bytes, stderr up to
+/// [`MAX_WORKER_OUTPUT_BYTES`]), and put the child in `active`. If the pipes
+/// cannot be set up, the child is killed and reaped and `active` stays as it
+/// was.
+fn start(
+    command: &mut Command,
+    stdout_limit: usize,
+    active: &mut Option<Child>,
+) -> io::Result<Started> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = without_console_window(command).spawn()?;
+    let overflow = Arc::new(AtomicBool::new(false));
+    let pipes = match (child.stdout.take(), child.stderr.take()) {
+        (Some(stdout), Some(stderr)) => {
+            read_capped(stdout, stdout_limit, &overflow).and_then(|out| {
+                Ok((
+                    out,
+                    read_capped(stderr, MAX_WORKER_OUTPUT_BYTES, &overflow)?,
+                ))
+            })
+        }
+        _ => Err(io::Error::other("the worker's output pipes are missing")),
+    };
+    match pipes {
+        Ok((stdout, stderr)) => {
+            *active = Some(child);
+            Ok(Started {
+                stdout,
+                stderr,
+                overflow,
+            })
+        }
+        Err(error) => {
+            kill_and_reap(&mut child);
+            Err(error)
+        }
     }
 }
 
@@ -477,11 +613,12 @@ fn kill_and_reap(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Read `pipe` to its end on a new thread, keeping at most
-/// [`MAX_WORKER_OUTPUT_BYTES`]. One byte more sets `overflow` and stops the
-/// reading; closing the pipe then makes the worker's next write fail.
+/// Read `pipe` to its end on a new thread, keeping at most `limit` bytes.
+/// One byte more sets `overflow` and stops the reading; closing the pipe
+/// then makes the worker's next write fail.
 fn read_capped(
     pipe: impl Read + Send + 'static,
+    limit: usize,
     overflow: &Arc<AtomicBool>,
 ) -> io::Result<mpsc::Receiver<Vec<u8>>> {
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -491,11 +628,9 @@ fn read_capped(
         .spawn(move || {
             let mut bytes = Vec::new();
             // A read error ends the output early; whatever came is kept.
-            let _ = pipe
-                .take(MAX_WORKER_OUTPUT_BYTES as u64 + 1)
-                .read_to_end(&mut bytes);
-            if bytes.len() > MAX_WORKER_OUTPUT_BYTES {
-                bytes.truncate(MAX_WORKER_OUTPUT_BYTES);
+            let _ = pipe.take(limit as u64 + 1).read_to_end(&mut bytes);
+            if bytes.len() > limit {
+                bytes.truncate(limit);
                 overflow.store(true, Ordering::SeqCst);
             }
             let _ = sender.send(bytes);
@@ -687,6 +822,188 @@ mod tests {
         fn a_wait_with_no_worker_in_the_slot_ends_unknown() {
             let ended = wait(&StopHandle::new(), LONG, &AtomicBool::new(false));
             assert!(matches!(ended, Ended::Unknown), "{ended:?}");
+        }
+    }
+
+    #[test]
+    fn the_thumbnail_limits_are_the_documented_ones() {
+        assert_eq!(THUMB_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(MAX_THUMB_ANSWER_BYTES, 2 * 1024 * 1024);
+        // The largest SVG the worker passes through must fit in an answer.
+        assert!(MAX_THUMB_ANSWER_BYTES as u64 >= crate::MAX_SVG_THUMB_BYTES);
+    }
+
+    /// The thumbnail runner against doubles: shell scripts that print what a
+    /// worker would, or misbehave.
+    #[cfg(unix)]
+    mod thumb {
+        use std::fs;
+
+        use tempfile::TempDir;
+
+        use super::*;
+
+        const LONG: Duration = Duration::from_secs(30);
+        /// A small cap, so the boundary tests stay small.
+        const CAP: usize = 100;
+        const PNG_HEADER: &str = "printf 'lunaepix-thumb 1 png\\n'";
+        /// The PNG signature, as `printf` octal escapes.
+        const PNG_SIGNATURE: &str = "printf '\\211PNG\\r\\n\\032\\n'";
+
+        fn answer_of(script: &str) -> ThumbAnswer {
+            answer_with(script, LONG, CAP)
+        }
+
+        fn answer_with(script: &str, timeout: Duration, cap: usize) -> ThumbAnswer {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", script]);
+            run_thumb_command(&mut command, timeout, cap)
+        }
+
+        /// A script that answers `png` with the signature and `extra` more
+        /// bytes of zero.
+        fn png_answer(extra: usize) -> String {
+            format!("{PNG_HEADER}; {PNG_SIGNATURE}; head -c {extra} /dev/zero")
+        }
+
+        fn png_bytes(extra: usize) -> Vec<u8> {
+            let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+            bytes.resize(8 + extra, 0);
+            bytes
+        }
+
+        #[test]
+        fn a_valid_png_answer_is_png() {
+            assert_eq!(answer_of(&png_answer(20)), ThumbAnswer::Png(png_bytes(20)));
+        }
+
+        #[test]
+        fn a_valid_svg_answer_is_svg() {
+            let script = "printf 'lunaepix-thumb 1 svg\\n<svg/>'";
+            assert_eq!(answer_of(script), ThumbAnswer::Svg(b"<svg/>".to_vec()));
+        }
+
+        #[test]
+        fn a_png_header_with_non_png_bytes_is_failed() {
+            let script = "printf 'lunaepix-thumb 1 png\\n<svg/>'";
+            assert_eq!(answer_of(script), ThumbAnswer::Failed);
+        }
+
+        #[test]
+        fn a_header_of_version_2_none_or_another_kind_is_failed() {
+            let sig = PNG_SIGNATURE;
+            for header in [
+                "printf 'lunaepix-thumb 2 png\\n'",
+                "printf 'lunaepix-thumb 1 gif\\n'",
+                "printf 'lunaepix-thumb 1 png'", // no newline
+                "true",                          // no header at all
+            ] {
+                let script = format!("{header}; {sig}; head -c 20 /dev/zero");
+                assert_eq!(answer_of(&script), ThumbAnswer::Failed, "{header}");
+            }
+        }
+
+        #[test]
+        fn exit_3_is_cannot_show() {
+            assert_eq!(answer_of("exit 3"), ThumbAnswer::CannotShow);
+        }
+
+        #[test]
+        fn exit_1_other_exit_codes_and_a_crash_by_signal_are_failed() {
+            // Each of these prints a valid answer first, so only the way the
+            // worker ended can make it `Failed`.
+            let valid = png_answer(20);
+            for ending in [
+                "exit 1",
+                "exit 2",
+                "exit 4",
+                "exit 101",
+                "kill -SEGV $$",
+                "kill -KILL $$",
+            ] {
+                let script = format!("{valid}; {ending}");
+                assert_eq!(answer_of(&script), ThumbAnswer::Failed, "{ending}");
+            }
+            // And with nothing printed.
+            for ending in ["exit 1", "exit 2", "exit 101", "kill -SEGV $$"] {
+                assert_eq!(answer_of(ending), ThumbAnswer::Failed, "{ending}");
+            }
+        }
+
+        #[test]
+        fn a_program_that_does_not_exist_is_failed() {
+            let missing = Path::new("/nonexistent/lunaepix-worker");
+            let src = Path::new("/photos/a.png");
+            assert_eq!(run_thumb_with(missing, src, LONG, CAP), ThumbAnswer::Failed);
+            assert_eq!(run_thumb(missing, src), ThumbAnswer::Failed);
+        }
+
+        #[test]
+        fn an_answer_of_exactly_the_cap_is_png() {
+            // The cap counts the bytes after the header: the signature and
+            // the rest make exactly `CAP`.
+            assert_eq!(
+                answer_with(&png_answer(CAP - 8), LONG, CAP),
+                ThumbAnswer::Png(png_bytes(CAP - 8))
+            );
+        }
+
+        #[test]
+        fn an_answer_one_byte_over_the_cap_is_failed() {
+            assert_eq!(
+                answer_with(&png_answer(CAP - 8 + 1), LONG, CAP),
+                ThumbAnswer::Failed
+            );
+        }
+
+        #[test]
+        fn a_worker_that_also_writes_to_stderr_still_answers() {
+            let script = format!("echo some noise >&2; {}", png_answer(20));
+            assert_eq!(answer_of(&script), ThumbAnswer::Png(png_bytes(20)));
+        }
+
+        #[test]
+        fn a_worker_whose_stderr_overflows_is_failed() {
+            let script = format!(
+                "head -c {} /dev/zero >&2; {}",
+                MAX_WORKER_OUTPUT_BYTES + 1,
+                png_answer(20)
+            );
+            assert_eq!(answer_of(&script), ThumbAnswer::Failed);
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_worker_past_the_timeout_is_failed_and_reaped() {
+            let tmp = TempDir::new().unwrap();
+            let pid_file = tmp.path().join("worker.pid");
+            // `exec` keeps the PID: the process that sleeps is the one started.
+            let script = format!("echo $$ > '{}'; exec sleep 60", pid_file.display());
+            let limit = Duration::from_millis(500);
+            let started = Instant::now();
+
+            let answer = answer_with(&script, limit, CAP);
+
+            let elapsed = started.elapsed();
+            assert_eq!(answer, ThumbAnswer::Failed);
+            assert!(elapsed >= limit, "{elapsed:?}");
+            assert!(elapsed < Duration::from_secs(20), "{elapsed:?}");
+            let pid = fs::read_to_string(&pid_file).unwrap();
+            // Gone from the process table: killed and reaped, no zombie.
+            assert!(
+                !Path::new("/proc").join(pid.trim()).exists(),
+                "process {} still exists",
+                pid.trim()
+            );
+        }
+
+        #[test]
+        fn a_slow_worker_within_the_timeout_is_not_stopped() {
+            let script = format!("sleep 1; {}", png_answer(20));
+            assert_eq!(
+                answer_with(&script, LONG, CAP),
+                ThumbAnswer::Png(png_bytes(20))
+            );
         }
     }
 
