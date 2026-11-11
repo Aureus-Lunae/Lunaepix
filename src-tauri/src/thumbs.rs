@@ -2,9 +2,9 @@
 //!
 //! Every `list-changed` gives each image row a key, `<list>-<index>`
 //! ([`Thumbs::snapshot`]). The window asks for `thumb://localhost/<key>`
-//! (`http://thumb.localhost/<key>` on Windows), and [`Thumbs::answer`] finds
-//! the row's file through the key alone: nothing else in the address is
-//! read. A worker process makes the thumbnail ([`serve`] with
+//! (`http://thumb.localhost/<key>` on Windows), and [`Thumbs::answer_request`]
+//! finds the row's file through the key alone: an address with a query is
+//! refused, and nothing else in it is read. A worker process makes the thumbnail ([`serve`] with
 //! [`lunaepix_core::run_thumb`]), at most [`MAX_THUMB_WORKERS`] at a time,
 //! and the answers of the current list are kept until a new list starts,
 //! up to [`MAX_THUMB_CACHE_BYTES`] of them.
@@ -21,7 +21,7 @@ use std::sync::{Condvar, Mutex, PoisonError};
 
 use lunaepix_core::{ThumbAnswer, run_thumb};
 use tauri::http::header::CONTENT_TYPE;
-use tauri::http::{Response, StatusCode};
+use tauri::http::{Request, Response, StatusCode};
 
 use crate::session::lock;
 
@@ -240,6 +240,24 @@ impl Thumbs {
         self.store(key, &path, made)
     }
 
+    /// The answer to a `thumb` request. A request with a query (`?x=1`, also
+    /// an empty `?`) is refused: `404`, and nothing is made. Otherwise the
+    /// path, as received, is looked up as by [`Thumbs::answer`]. Both
+    /// platform addresses (`thumb://localhost/…` and
+    /// `http://thumb.localhost/…`) have the same path. A fragment never
+    /// reaches here: the `http` crate's `Uri` drops it when it parses.
+    pub fn answer_request(
+        &self,
+        request: &Request<Vec<u8>>,
+        make: impl Fn(&Path) -> ThumbAnswer,
+    ) -> ThumbResponse {
+        let uri = request.uri();
+        if uri.query().is_some() {
+            return ThumbResponse::not_found();
+        }
+        self.answer(uri.path(), make)
+    }
+
     /// What the current list says about the key `(number, index)`.
     fn find(&self, (number, index): (u64, usize)) -> Found {
         let list = lock(&self.list);
@@ -339,11 +357,11 @@ impl Drop for Slot<'_> {
     }
 }
 
-/// What the `thumb` handler answers to `uri_path`: [`Thumbs::answer`], with
-/// each thumbnail made by `program` in a worker process that this thread
-/// starts and waits for ([`run_thumb`]).
-pub fn serve(thumbs: &Thumbs, program: &Path, uri_path: &str) -> ThumbResponse {
-    thumbs.answer(uri_path, |src| run_thumb(program, src))
+/// What the `thumb` handler answers to `request`: [`Thumbs::answer_request`],
+/// with each thumbnail made by `program` in a worker process that this
+/// thread starts and waits for ([`run_thumb`]).
+pub fn serve(thumbs: &Thumbs, program: &Path, request: &Request<Vec<u8>>) -> ThumbResponse {
+    thumbs.answer_request(request, |src| run_thumb(program, src))
 }
 
 #[cfg(test)]
@@ -797,6 +815,107 @@ mod tests {
         );
         assert_eq!(thumbs.answer(&uri(&old[0]), &make), not_found());
         assert_eq!(calls.taken(), [path("a.png"), path("a.png")]);
+    }
+
+    // --- the request ------------------------------------------------------------
+
+    /// A GET request for `address`, as the webview sends it.
+    fn request_for(address: &str) -> tauri::http::Request<Vec<u8>> {
+        tauri::http::Request::builder()
+            .uri(address)
+            .body(Vec::new())
+            .expect("a request")
+    }
+
+    /// A fresh list of two rows, and the key of the first.
+    fn two_rows() -> (Thumbs, String) {
+        let thumbs = Thumbs::new();
+        let keys = thumbs.snapshot(&[Some(path("a.png")), Some(path("b.png"))]);
+        let key = keys[0].clone().expect("a key");
+        (thumbs, key)
+    }
+
+    #[test]
+    fn a_request_for_a_current_key_is_answered_on_both_platform_addresses() {
+        let (thumbs, key) = two_rows();
+        let calls = Calls::default();
+        for host in ["thumb://localhost", "http://thumb.localhost"] {
+            let request = request_for(&format!("{host}/{key}"));
+            assert_eq!(
+                thumbs.answer_request(&request, calls.png()),
+                png_response(png_of(&path("a.png"))),
+                "{host}"
+            );
+        }
+        // The second was kept from the first.
+        assert_eq!(calls.taken(), [path("a.png")]);
+    }
+
+    #[test]
+    fn a_request_with_a_query_is_404_and_nothing_is_made() {
+        let (thumbs, key) = two_rows();
+        let calls = Calls::default();
+        for query in ["?x=1", "?", "?x=1&y=2", "?%2F"] {
+            for host in ["thumb://localhost", "http://thumb.localhost"] {
+                let address = format!("{host}/{key}{query}");
+                let request = request_for(&address);
+                assert_eq!(
+                    thumbs.answer_request(&request, calls.png()),
+                    not_found(),
+                    "{address}"
+                );
+            }
+        }
+        assert_eq!(calls.taken(), Vec::<PathBuf>::new());
+        // The key itself is current, and the refused requests kept nothing.
+        let plain = request_for(&format!("thumb://localhost/{key}"));
+        assert_eq!(
+            thumbs.answer_request(&plain, calls.png()),
+            png_response(png_of(&path("a.png")))
+        );
+        assert_eq!(calls.taken(), [path("a.png")]);
+    }
+
+    #[test]
+    fn a_fragment_never_reaches_the_key_check_because_the_uri_drops_it() {
+        let (thumbs, key) = two_rows();
+        let calls = Calls::default();
+        let request = request_for(&format!("thumb://localhost/{key}#frag"));
+        // If the `http` crate ever kept a fragment, the path would carry it
+        // (or the query would), and this test would fail.
+        assert_eq!(request.uri().path(), format!("/{key}"));
+        assert_eq!(request.uri().query(), None);
+        assert_eq!(
+            thumbs.answer_request(&request, calls.png()),
+            png_response(png_of(&path("a.png")))
+        );
+        // A fragment after a query does not make the query go away.
+        let both = request_for(&format!("thumb://localhost/{key}?x=1#frag"));
+        assert_eq!(thumbs.answer_request(&both, calls.png()), not_found());
+    }
+
+    #[test]
+    fn a_request_whose_path_is_not_exactly_a_key_is_404_and_nothing_is_made() {
+        let (thumbs, key) = two_rows();
+        let calls = Calls::default();
+        let (list, index) = key.split_once('-').unwrap();
+        for address in [
+            format!("thumb://localhost/{list}%2D{index}"),
+            format!("thumb://localhost/{key}/extra"),
+            format!("thumb://localhost//{key}"),
+            format!("thumb://localhost/{list}-x"),
+            "thumb://localhost/%2Fetc%2Fpasswd".to_owned(),
+            "thumb://localhost/../a.png".to_owned(),
+            "thumb://localhost".to_owned(),
+        ] {
+            let request = request_for(&address);
+            assert_eq!(
+                thumbs.answer_request(&request, calls.png()),
+                not_found(),
+                "{address}"
+            );
+        }
+        assert_eq!(calls.taken(), Vec::<PathBuf>::new());
     }
 
     // --- the byte budget of the kept answers ------------------------------------

@@ -270,8 +270,9 @@ anything else as `null`, so no other text reaches an image address.
   when re-planning would move a file into a row whose key was already sent
   (a row dropped from the middle of the list), the list number is raised
   too, and every row gets a new key.
-- **The answer:** the path must be exactly `/<list>-<index>` as received
-  (not percent-decoded), of the current list, for a row whose `thumb` is not
+- **The answer:** the address must have no query (not even an empty `?`),
+  and its path must be exactly `/<list>-<index>` as received (not
+  percent-decoded), of the current list, for a row whose `thumb` is not
   `null`. Then `200` with `Content-Type: image/png` and the thumbnail
   (longest side 64 px), or, for a row whose name ends in `.svg`,
   `200` with `Content-Type: image/svg+xml` and the file's own bytes. Anything
@@ -293,6 +294,7 @@ GET thumb://localhost/2-0     → 404 (list 2 is gone)
 GET thumb://localhost/3-2     → 404 (notes.txt is a skipped row)
 GET thumb://localhost/3%2D0   → 404 (encoded; not a key as received)
 GET thumb://localhost/3-x     → 404 (not a key)
+GET thumb://localhost/3-0?x=1 → 404 (a query)
 ```
 
 The scheme needs no permission: it is not a command.

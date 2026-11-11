@@ -172,9 +172,20 @@ fn thumb_flag_exits_3_for_a_text_file_and_prints_nothing() {
 
 use lunaepix_app_lib::thumbs::{self, Thumbs};
 
-/// The request path for `key`.
-fn uri(key: &Option<String>) -> String {
-    format!("/{}", key.as_deref().expect("a key"))
+/// A GET request for `address`, as the webview sends it.
+fn request_for(address: &str) -> tauri::http::Request<Vec<u8>> {
+    tauri::http::Request::builder()
+        .uri(address)
+        .body(Vec::new())
+        .expect("a request")
+}
+
+/// The request for `key`, on the Linux and macOS address.
+fn uri(key: &Option<String>) -> tauri::http::Request<Vec<u8>> {
+    request_for(&format!(
+        "thumb://localhost/{}",
+        key.as_deref().expect("a key")
+    ))
 }
 
 fn app_binary() -> &'static Path {
@@ -247,4 +258,34 @@ fn serve_with_a_program_that_is_not_there_is_404_and_tries_again() {
     let answer = thumbs::serve(&thumbs, app_binary(), &uri(&keys[0]));
     assert_eq!(answer.status, 200);
     assert_eq!(answer.content_type, Some("image/png"));
+}
+
+#[test]
+fn serve_with_the_app_binary_is_404_for_a_query_and_starts_no_worker() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("a.png");
+    fs::write(&src, wide_png_bytes()).unwrap();
+    let thumbs = Thumbs::new();
+    let keys = thumbs.snapshot(&[Some(src)]);
+    let key = keys[0].as_deref().expect("a key");
+
+    // The key is current (the plain request below is answered), so the
+    // query alone is the reason for the 404.
+    for address in [
+        format!("thumb://localhost/{key}?x=1"),
+        format!("http://thumb.localhost/{key}?"),
+    ] {
+        let answer = thumbs::serve(&thumbs, app_binary(), &request_for(&address));
+        assert_eq!(
+            (answer.status, answer.content_type, answer.body.len()),
+            (404, None, 0),
+            "{address}"
+        );
+    }
+    let answer = thumbs::serve(&thumbs, app_binary(), &uri(&keys[0]));
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.content_type, Some("image/png"));
+    // The Windows address answers the same key.
+    let windows = request_for(&format!("http://thumb.localhost/{key}"));
+    assert_eq!(thumbs::serve(&thumbs, app_binary(), &windows).status, 200);
 }

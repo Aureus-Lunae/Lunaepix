@@ -87,20 +87,20 @@ fn spawn_thumbnail_thread(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> 
 
 /// The `thumb` scheme: a request is answered by [`thumbs::serve`] on a
 /// thread of its own, which starts the thumbnail worker and waits for it,
-/// so the webview's thread never waits. Only the request's path goes along,
-/// as received. If no thread can be started, the request gets `404`.
+/// so the webview's thread never waits. The request goes along unchanged:
+/// [`thumbs::serve`] decides what of it counts (no query, the path as
+/// received). If no thread can be started, the request gets `404`.
 fn thumb_protocol(
     context: UriSchemeContext<'_, Wry>,
     request: tauri::http::Request<Vec<u8>>,
     responder: UriSchemeResponder,
 ) {
     let app = context.app_handle().clone();
-    let path = request.uri().path().to_owned();
     session::on_own_thread_or_else(
-        (app, path, responder),
-        |(app, path, responder)| {
+        (app, request, responder),
+        |(app, request, responder)| {
             let state = app.state::<AppState>();
-            let answer = thumbs::serve(state.session.thumbs(), &state.worker.program, &path);
+            let answer = thumbs::serve(state.session.thumbs(), &state.worker.program, &request);
             responder.respond(answer.into_http());
         },
         spawn_thumbnail_thread,
