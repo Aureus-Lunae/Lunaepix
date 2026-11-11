@@ -20,6 +20,7 @@ import {
   settledFailures,
   startRunArgs,
   summaryLine,
+  thumbKey,
 } from '../../ui/state.js';
 
 function apply(state, ...actions) {
@@ -94,14 +95,14 @@ test('run-started with a payload that has no usable total counts zero files', ()
 test('file-done adds a done row with the numbers', () => {
   const state = apply(initialState(), started(1), done(0, 'logo.svg', 21828, 9631, 22));
   assert.deepEqual(state.rows, [
-    { kind: 'done', name: 'logo.svg', before: 21828, after: 9631, millis: 22 },
+    { kind: 'done', name: 'logo.svg', before: 21828, after: 9631, millis: 22, thumb: null },
   ]);
 });
 
 test('file-done adds a skipped row with its reason and no numbers', () => {
   const state = apply(initialState(), started(1), skipped(0));
   assert.deepEqual(state.rows, [
-    { kind: 'skipped', name: 'notes.txt', reason: 'Not a PNG, JPG, SVG or WebP file' },
+    { kind: 'skipped', name: 'notes.txt', reason: 'Not a PNG, JPG, SVG or WebP file', thumb: null },
   ]);
   assert.equal('before' in state.rows[0], false);
 });
@@ -176,7 +177,7 @@ test('file-done with missing numbers on a done file shows zeros, not NaN', () =>
     type: 'file-done',
     payload: { index: 0, name: 'a.png', status: 'done' },
   });
-  assert.deepEqual(state.rows[0], { kind: 'done', name: 'a.png', before: 0, after: 0, millis: 0 });
+  assert.deepEqual(state.rows[0], { kind: 'done', name: 'a.png', before: 0, after: 0, millis: 0, thumb: null });
 });
 
 test('file-done with a missing reason says why in words', () => {
@@ -366,6 +367,7 @@ test('rowView of a done row has the formatted numbers', () => {
     after: '9.4 KiB',
     saved: '55.9%',
     time: '22 ms',
+    thumb: null,
   });
 });
 
@@ -380,6 +382,7 @@ test('rowView of a skipped row has the status word and reason as text, and no nu
     kind: 'skipped',
     name: 'notes.txt',
     text: 'skipped: not a PNG, JPG, SVG or WebP file',
+    thumb: null,
   });
   assert.equal('before' in view, false);
 });
@@ -521,18 +524,19 @@ test('list_changed_fills_rows_and_writes_a_notice_to_the_status', () => {
   );
   assert.equal(state.phase, 'ready');
   assert.deepEqual(state.rows, [
-    { kind: 'listed', name: 'holiday.jpg', size: 2400000, skip: null },
-    { kind: 'listed', name: 'notes.txt', size: null, skip: SKIP },
+    { kind: 'listed', name: 'holiday.jpg', size: 2400000, skip: null, thumb: null },
+    { kind: 'listed', name: 'notes.txt', size: null, skip: SKIP, thumb: null },
   ]);
   assert.equal(state.message, NO_IMAGES);
   // Only the row that will be compressed counts.
   assert.equal(headingLine(state), '1 file ready');
-  assert.deepEqual(rowView(state.rows[0]), { kind: 'listed', name: 'holiday.jpg', size: '2.3 MiB', text: '' });
+  assert.deepEqual(rowView(state.rows[0]), { kind: 'listed', name: 'holiday.jpg', size: '2.3 MiB', text: '', thumb: null });
   assert.deepEqual(rowView(state.rows[1]), {
     kind: 'listed',
     name: 'notes.txt',
     size: '',
     text: `Will be skipped: ${SKIP_LOWER}`,
+    thumb: null,
   });
 });
 
@@ -561,9 +565,9 @@ test('list_changed_reads_bad_fields_as_no_name_no_size_no_skip', () => {
     listed([{ name: 42, size: -1, skip: '' }, { name: 'a.png', size: '5', skip: 3 }, null]),
   );
   assert.deepEqual(state.rows, [
-    { kind: 'listed', name: '', size: null, skip: null },
-    { kind: 'listed', name: 'a.png', size: null, skip: null },
-    { kind: 'listed', name: '', size: null, skip: null },
+    { kind: 'listed', name: '', size: null, skip: null, thumb: null },
+    { kind: 'listed', name: 'a.png', size: null, skip: null, thumb: null },
+    { kind: 'listed', name: '', size: null, skip: null, thumb: null },
   ]);
   assert.equal(rowView(state.rows[0]).name, '(no name)');
 });
@@ -603,12 +607,14 @@ test('file_started_marks_compressing_and_later_rows_waiting', () => {
     name: 'logo.png',
     size: '85.9 KiB',
     text: 'Compressing…',
+    thumb: null,
   });
   assert.deepEqual(rowView(state.rows[2]), {
     kind: 'waiting',
     name: 'banner.webp',
     size: '400.4 KiB',
     text: 'Waiting',
+    thumb: null,
   });
 });
 
@@ -631,8 +637,8 @@ test('run_started_shows_the_list_rows_as_waiting_and_the_skips_as_skipped', () =
     started(2, 'lossy', 75),
   );
   assert.equal(state.phase, 'running');
-  assert.deepEqual(rowView(state.rows[0]), { kind: 'waiting', name: 'holiday.jpg', size: '2.3 MiB', text: 'Waiting' });
-  assert.deepEqual(rowView(state.rows[1]), { kind: 'skipped', name: 'notes.txt', text: `skipped: ${SKIP_LOWER}` });
+  assert.deepEqual(rowView(state.rows[0]), { kind: 'waiting', name: 'holiday.jpg', size: '2.3 MiB', text: 'Waiting', thumb: null });
+  assert.deepEqual(rowView(state.rows[1]), { kind: 'skipped', name: 'notes.txt', text: `skipped: ${SKIP_LOWER}`, thumb: null });
 });
 
 test('run_started_with_fewer_rows_than_the_list_shows_only_the_run_rows', () => {
@@ -690,6 +696,7 @@ test('a_run_that_broke_off_marks_its_unfinished_rows', () => {
       kind: 'failed',
       name: ['holiday.jpg', 'logo.png', 'banner.webp'][index],
       text: 'failed: The run ended before this file was done',
+      thumb: null,
     });
   }
 });
@@ -899,7 +906,7 @@ test('a_list_changed_after_run_finished_replaces_the_rows', () => {
   );
   const state = reduce(finishedRun, listed([entry('new.png', 2048)]));
   assert.equal(state.phase, 'ready');
-  assert.deepEqual(state.rows, [{ kind: 'listed', name: 'new.png', size: 2048, skip: null }]);
+  assert.deepEqual(state.rows, [{ kind: 'listed', name: 'new.png', size: 2048, skip: null, thumb: null }]);
   assert.equal(state.summary, null);
   assert.equal(headingLine(state), '1 file ready');
   assert.equal(canRun(state), true);
@@ -1350,6 +1357,7 @@ test('a_waiting_row_without_a_skip_becomes_the_broken_off_failure', () => {
     kind: 'failed',
     name: 'b.png',
     text: 'failed: The run ended before this file was done',
+    thumb: null,
   });
 });
 
@@ -1362,7 +1370,7 @@ test('a_waiting_row_with_a_skip_stays_skipped_with_its_own_reason_after_the_brea
     done(0, 'a.png'),
     finished(1, 1, true),
   );
-  assert.deepEqual(rowView(state.rows[1]), { kind: 'skipped', name: 'notes.txt', text: `skipped: ${SKIP_LOWER}` });
+  assert.deepEqual(rowView(state.rows[1]), { kind: 'skipped', name: 'notes.txt', text: `skipped: ${SKIP_LOWER}`, thumb: null });
 });
 
 // Minor 3: the reason after "Will be skipped: " and "skipped: " starts in lower case
@@ -1436,4 +1444,238 @@ test('a_skip_reason_keeps_an_acronym_a_single_letter_and_a_digit_start', () => {
   finishedRows.rows.forEach((row, index) => {
     assert.equal(rowView(row).text, `skipped: ${kept[index]}`);
   });
+});
+
+// ---------------------------------------------------------------------
+// Re-add: the button sits in the summary and `readd_list` brings the list
+// back as a `list-changed` (Task 2). These pin the state the button and the
+// reducer depend on.
+// ---------------------------------------------------------------------
+
+test('the_summary_with_readd_shows_only_when_finished', () => {
+  // "Re-add" is inside the summary, so it shows exactly when the summary does.
+  assert.equal(panelView(finishedRun()).showSummary, true);
+  assert.equal(canChoose(finishedRun()), true);
+  const others = [initialState(), readyList(), reduce(readyList(), started(3))];
+  for (const state of others) {
+    assert.equal(panelView(state).showSummary, false, state.phase);
+  }
+});
+
+test('settings_survive_a_readd', () => {
+  const lossyRun = apply(
+    initialState(),
+    threeFiles(),
+    setMode('lossy'),
+    setQuality('60'),
+    started(3, 'lossy', 60),
+    done(0, 'holiday.jpg'),
+    done(1, 'logo.png'),
+    done(2, 'banner.webp'),
+    finished(3, 10, true),
+  );
+  assert.equal(lossyRun.phase, 'finished');
+  const readded = reduce(lossyRun, threeFiles());
+  assert.equal(readded.phase, 'ready');
+  assert.equal(readded.mode, 'lossy');
+  assert.equal(readded.quality, 60);
+  assert.equal(readded.qualityText, '60');
+  assert.deepEqual(startRunArgs(readded), { settings: { mode: 'lossy', quality: 60 } });
+  assert.deepEqual(
+    readded.rows.map((row) => row.name),
+    ['holiday.jpg', 'logo.png', 'banner.webp'],
+  );
+  assert.equal(panelView(readded).showSummary, false);
+  assert.equal(panelView(readded).showSettings, true);
+});
+
+test('a_list_changed_during_a_run_changes_nothing', () => {
+  const running = reduce(readyList(), started(3, 'lossy', 60));
+  assert.equal(running.phase, 'running');
+  assert.equal(reduce(running, threeFiles()), running);
+});
+
+test('an_all_skipped_list_after_a_readd_is_ready_but_cannot_run', () => {
+  const finishedState = finishedRun();
+  const skippedOnly = reduce(finishedState, listed([entry('a.txt', null, SKIP), entry('b.txt', null, SKIP)]));
+  assert.equal(skippedOnly.phase, 'ready');
+  assert.equal(skippedOnly.rows.length, 2);
+  assert.equal(canRun(skippedOnly), false);
+  assert.equal(startRunArgs(skippedOnly), null);
+  // One compressible row among them can run.
+  const mixed = reduce(finishedState, listed([entry('a.txt', null, SKIP), entry('b.png')]));
+  assert.equal(canRun(mixed), true);
+});
+
+// thumbnails: the key
+
+test('thumb_key_keeps_a_list_number_and_a_row_index_joined_by_a_dash', () => {
+  assert.equal(thumbKey('3-0'), '3-0');
+  assert.equal(thumbKey('4294967295-1999'), '4294967295-1999');
+  assert.equal(thumbKey('0-0'), '0-0');
+  assert.equal(thumbKey('1234567890-9999'), '1234567890-9999');
+});
+
+test('thumb_key_rejects_everything_that_is_not_a_key', () => {
+  const notKeys = [
+    {},
+    ['3-0'],
+    3,
+    null,
+    undefined,
+    true,
+    '',
+    '3/0',
+    '3-0-1',
+    '../a',
+    '3-x',
+    '3-',
+    '-0',
+    '-1',
+    ' 3-0',
+    '3-0 ',
+    '3-0\n',
+    '3-12345',
+    '12345678901-0',
+    'thumb://localhost/3-0',
+    'http://thumb.localhost/3-0',
+    '3%2D0',
+    '3-0?x=1',
+    '\u0663-0',
+  ];
+  for (const value of notKeys) {
+    assert.equal(thumbKey(value), null, JSON.stringify(value) ?? 'undefined');
+  }
+});
+
+// thumbnails: the rows
+
+const thumbEntry = (name, thumb, skip = null) => ({ name, size: 1000, skip, thumb });
+const thumbList = () =>
+  listed([thumbEntry('holiday.jpg', '3-0'), thumbEntry('notes.txt', null, SKIP), thumbEntry('logo.png', '3-2')]);
+
+test('list_changed_keeps_the_thumb_key_of_each_row', () => {
+  const state = reduce(initialState(), thumbList());
+  assert.deepEqual(
+    state.rows.map((row) => row.thumb),
+    ['3-0', null, '3-2'],
+  );
+});
+
+test('list_changed_reads_a_thumb_that_is_not_a_key_as_none', () => {
+  const state = reduce(
+    initialState(),
+    listed([
+      thumbEntry('a.png', 'thumb://localhost/3-0'),
+      thumbEntry('b.png', '../a'),
+      thumbEntry('c.png', 7),
+      { name: 'd.png', size: 1, skip: null },
+      thumbEntry('e.png', '3-4'),
+    ]),
+  );
+  assert.deepEqual(
+    state.rows.map((row) => row.thumb),
+    [null, null, null, null, '3-4'],
+  );
+});
+
+test('run_started_gives_each_waiting_row_the_thumb_of_the_list_row', () => {
+  const state = apply(initialState(), thumbList(), started(3));
+  assert.deepEqual(
+    state.rows.map((row) => [row.kind, row.thumb]),
+    [
+      ['waiting', '3-0'],
+      ['waiting', null],
+      ['waiting', '3-2'],
+    ],
+  );
+});
+
+test('a_row_keeps_its_thumb_when_it_starts_and_when_it_is_done', () => {
+  const state = apply(initialState(), thumbList(), started(3), fileStarted(0));
+  assert.equal(state.rows[0].kind, 'compressing');
+  assert.equal(state.rows[0].thumb, '3-0');
+  const after = apply(state, done(0, 'holiday.jpg'));
+  assert.equal(after.rows[0].kind, 'done');
+  assert.equal(after.rows[0].thumb, '3-0');
+});
+
+test('a_skipped_or_failed_result_keeps_the_thumb_of_its_row', () => {
+  const state = apply(
+    initialState(),
+    listed([thumbEntry('a.png', '3-0'), thumbEntry('b.png', '3-1')]),
+    started(2),
+    skipped(0, 'a.png'),
+    failed(1, 'b.png'),
+  );
+  assert.equal(state.rows[0].kind, 'skipped');
+  assert.equal(state.rows[0].thumb, '3-0');
+  assert.equal(state.rows[1].kind, 'failed');
+  assert.equal(state.rows[1].thumb, '3-1');
+});
+
+test('a_row_without_a_thumb_has_none_all_through_the_run', () => {
+  const state = apply(
+    initialState(),
+    listed([thumbEntry('a.png', null), thumbEntry('b.png', null), thumbEntry('c.png', null), thumbEntry('d.png', null)]),
+    started(4),
+  );
+  assert.deepEqual(state.rows.map((row) => row.thumb), [null, null, null, null]);
+  const running = apply(state, fileStarted(0), done(0, 'a.png'), fileStarted(1), skipped(1, 'b.png'), fileStarted(2));
+  assert.deepEqual(running.rows.map((row) => [row.kind, row.thumb]), [
+    ['done', null],
+    ['skipped', null],
+    ['compressing', null],
+    ['waiting', null],
+  ]);
+  const ended = apply(running, failed(2, 'c.png'), finished(1, 1, true));
+  assert.deepEqual(ended.rows.map((row) => row.thumb), [null, null, null, null]);
+});
+
+test('a_file_done_cannot_give_its_row_another_thumb', () => {
+  const state = apply(initialState(), thumbList(), started(3), {
+    type: 'file-done',
+    payload: { index: 0, name: 'holiday.jpg', status: 'done', before: 1, after: 1, millis: 1, thumb: '9-9' },
+  });
+  assert.equal(state.rows[0].thumb, '3-0');
+  // A row past the end of the list has no key to keep.
+  const appended = apply(initialState(), started(1), {
+    type: 'file-done',
+    payload: { index: 0, name: 'x.png', status: 'done', before: 1, after: 1, millis: 1, thumb: '9-9' },
+  });
+  assert.equal(appended.rows[0].thumb, null);
+});
+
+test('a_run_that_broke_off_keeps_the_thumb_of_its_unfinished_rows', () => {
+  const state = apply(
+    initialState(),
+    listed([thumbEntry('a.png', '3-0'), thumbEntry('b.png', '3-1'), thumbEntry('c.png', '3-2')]),
+    started(3),
+    fileStarted(0),
+    done(0, 'a.png'),
+    fileStarted(1),
+    finished(1, 1, true),
+  );
+  assert.deepEqual(state.rows.map((row) => [row.kind, row.thumb]), [
+    ['done', '3-0'],
+    ['failed', '3-1'],
+    ['failed', '3-2'],
+  ]);
+});
+
+test('row_view_passes_the_thumb_on_for_every_kind_of_row', () => {
+  const kinds = [
+    { kind: 'listed', name: 'a', size: 1, skip: null },
+    { kind: 'waiting', name: 'a', size: 1, skip: null },
+    { kind: 'waiting', name: 'a', size: 1, skip: SKIP },
+    { kind: 'compressing', name: 'a', size: 1 },
+    { kind: 'done', name: 'a', before: 2, after: 1, millis: 1 },
+    { kind: 'skipped', name: 'a', reason: 'x' },
+    { kind: 'failed', name: 'a', reason: 'x' },
+  ];
+  for (const row of kinds) {
+    assert.equal(rowView({ ...row, thumb: '3-5' }).thumb, '3-5', `${row.kind} with a key`);
+    assert.equal(rowView({ ...row, thumb: null }).thumb, null, `${row.kind} with null`);
+    assert.equal(rowView(row).thumb, null, `${row.kind} without the field`);
+  }
 });

@@ -745,10 +745,10 @@ fn out_never_overwrites_an_existing_file() {
         fs::read(out_dir.join("a.png")).unwrap(),
         b"an earlier result"
     );
-    assert_eq!(listing(&out_dir), names(&["a-2.png", "a.png"]));
+    assert_eq!(listing(&out_dir), names(&["a-1.png", "a.png"]));
     assert_eq!(
         blocks(&text(&output.stdout)),
-        vec![expected_block("a.png", &src, &out_dir.join("a-2.png"))]
+        vec![expected_block("a.png", &src, &out_dir.join("a-1.png"))]
     );
 }
 
@@ -1013,6 +1013,30 @@ fn without_out_a_rerun_replaces_the_earlier_output() {
 }
 
 #[test]
+fn the_cli_without_out_still_replaces() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &gradient_png());
+
+    // The first run is lossy, the second lossless: the bytes tell them apart.
+    let first = run_with(
+        tmp.path(),
+        &["--lossy", "--quality", "30", src.to_str().unwrap()],
+    );
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first.stderr));
+    let after_first = fs::read(tmp.path().join("optimized-a.png")).unwrap();
+    assert_eq!(after_first, core_bytes(&src, lossy_at(30)));
+
+    let second = run_on(tmp.path(), &[&src]);
+
+    assert_eq!(second.status.code(), Some(0), "{}", text(&second.stderr));
+    assert_eq!(text(&second.stderr), "");
+    let after_second = fs::read(tmp.path().join("optimized-a.png")).unwrap();
+    assert_eq!(after_second, core_bytes(&src, Compression::Lossless));
+    assert_ne!(after_second, after_first);
+    assert_eq!(listing(tmp.path()), names(&["a.png", "optimized-a.png"]));
+}
+
+#[test]
 fn without_out_a_dir_rerun_replaces_the_earlier_output_in_optimized() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("pics");
@@ -1031,4 +1055,64 @@ fn without_out_a_dir_rerun_replaces_the_earlier_output_in_optimized() {
         core_bytes(&src, Compression::Lossless)
     );
     assert_eq!(listing(&out_dir), names(&["a.png"]));
+}
+
+// --- the thumbnail mode (the runner's thumbnail worker is this binary) --------
+
+const THUMB_FLAG: &str = "--lunaepix-thumb";
+
+/// A 200 x 100 RGB gradient: scaled to 64 x 32 by the thumbnail mode.
+fn wide_png_bytes() -> Vec<u8> {
+    let (w, h) = (200u32, 100u32);
+    let pixels: Vec<u8> = (0..w * h)
+        .flat_map(|i| [(i % w) as u8, (i / w) as u8, 90])
+        .collect();
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, w, h);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&pixels).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+fn thumb(cwd: &Path, src: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_lunaepix"))
+        .arg(THUMB_FLAG)
+        .arg(src)
+        .current_dir(cwd)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn thumb_flag_answers_a_png_with_the_header_and_a_decodable_thumbnail() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &wide_png_bytes());
+
+    let output = thumb(tmp.path(), &src);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let header = b"lunaepix-thumb 1 png\n";
+    assert!(output.stdout.starts_with(header), "{:?}", output.stdout);
+    let mut reader = png::Decoder::new(&output.stdout[header.len()..])
+        .read_info()
+        .unwrap();
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut buffer).unwrap();
+    assert_eq!((frame.width, frame.height), (64, 32));
+    // Nothing was optimised or written next to the source.
+    assert_eq!(listing(tmp.path()), names(&["a.png"]));
+}
+
+#[test]
+fn thumb_flag_exits_3_for_a_text_file_and_prints_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "notes.txt", b"just some text");
+
+    let output = thumb(tmp.path(), &src);
+
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
 }

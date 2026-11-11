@@ -6,7 +6,7 @@
 //! The `plan_*` functions never write to the filesystem; destination folders
 //! are created only when a job runs. [`run`] runs the planned jobs, each file
 //! in its own worker process ([`worker`]), so a library that crashes the
-//! process fails only that file.
+//! process fails only that file. [`run_thumb`] makes a thumbnail the same way.
 //!
 //! `unsafe` code is denied everywhere but in `jpg`, the libjpeg FFI, in
 //! `platform`, the worker's two start-up system calls, and in `webp::codec`,
@@ -31,8 +31,15 @@ mod platform;
 mod png;
 mod run;
 mod svg;
+mod thumb;
 mod webp;
 pub mod worker;
+
+/// The JPEG fixture helpers of the integration tests, shared with the unit
+/// tests (`jpg::decode`, `thumb::decode`).
+#[cfg(test)]
+#[path = "../tests/common/jpeg_fixtures.rs"]
+mod jpeg_fixtures;
 
 use lossy::Lossy;
 pub use lossy::{DEFAULT_QUALITY, Note, Quality};
@@ -43,9 +50,11 @@ pub use plan::{
     plan_folder, plan_folder_to,
 };
 pub use run::{
-    Crash, FileResult, RunError, StopHandle, Worker, run, run_observed, run_until_stopped,
+    Crash, FileResult, MAX_THUMB_ANSWER_BYTES, RunError, StopHandle, THUMB_TIMEOUT, ThumbAnswer,
+    Worker, run, run_observed, run_thumb, run_until_stopped,
 };
-pub use worker::WORKER_FLAG;
+pub use thumb::{CannotShow, MAX_SVG_THUMB_BYTES, THUMB_SIDE, Thumbnail, thumbnail};
+pub use worker::{THUMB_FLAG, WORKER_FLAG};
 
 /// How a run compresses its files: one setting for the whole run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,7 +182,7 @@ impl OptimizeError {
 /// [`WriteMode::NoReplace`] `dest` may be in any folder: the output is
 /// written as a new file and nothing existing is replaced. When `dest` is
 /// taken by then (a file appeared after planning), the first free numbered
-/// name beside it is used (`logo-2.png`, up to `logo-9999.png`), and past
+/// name beside it is used (`logo-1.png`, up to `logo-9999.png`), and past
 /// that the file fails with "no free name in the output folder". A source of
 /// more than [`MAX_FILE_BYTES`] when it is
 /// read (it grew after planning) is refused with the planner's size reason,
@@ -824,7 +833,7 @@ mod tests {
             let outcome = result.unwrap();
             assert_eq!(dest, existing);
             assert_eq!(fs::read(&dest).unwrap(), b"an earlier output");
-            let numbered = tmp.path().join("optimized-a-2.png");
+            let numbered = tmp.path().join("optimized-a-1.png");
             assert_eq!(fs::read(&numbered).unwrap(), expected, "{compression:?}");
             assert_eq!(outcome.after, expected.len() as u64);
             assert_eq!(fs::read(&src).unwrap(), original);
@@ -833,7 +842,7 @@ mod tests {
                 .map(|e| e.unwrap().file_name())
                 .collect();
             names.sort();
-            assert_eq!(names, ["a.png", "optimized-a-2.png", "optimized-a.png"]);
+            assert_eq!(names, ["a.png", "optimized-a-1.png", "optimized-a.png"]);
         }
     }
 

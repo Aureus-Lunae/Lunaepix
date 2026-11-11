@@ -22,9 +22,19 @@ import {
   startRunArgs,
   summaryLine,
 } from './state.js';
-import { hideKeepingFocus, markInvalid, setHeads, syncNumber, syncRows, syncStatus } from './table.js';
+import {
+  bindCommand,
+  hideKeepingFocus,
+  markInvalid,
+  setHeads,
+  swapSummaryAndSettings,
+  syncNumber,
+  syncRows,
+  syncStatus,
+  thumbSource,
+} from './table.js';
 
-const { invoke } = window.__TAURI__.core;
+const { convertFileSrc, invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 const drop = document.getElementById('drop');
@@ -45,6 +55,7 @@ const heads = {
 };
 const summary = document.getElementById('summary');
 const summaryText = document.getElementById('summaryText');
+const readdList = document.getElementById('readdList');
 const openFolder = document.getElementById('openFolder');
 const settings = document.getElementById('settings');
 const modeRadios = [document.getElementById('modeLossless'), document.getElementById('modeLossy')];
@@ -57,6 +68,9 @@ const chooseOutput = document.getElementById('chooseOutput');
 const clearOutput = document.getElementById('clearOutput');
 const runRow = document.getElementById('runRow');
 const run = document.getElementById('run');
+
+// The address of a row's thumbnail, from its key (see `thumbSource`).
+const thumbSrc = thumbSource(convertFileSrc);
 
 let state = initialState();
 // What is already on screen: the table's rows (see `syncRows`) and the
@@ -103,16 +117,17 @@ function render() {
   setDisabled(clearList, !canChoose(state));
 
   setHeads(document, heads, view.listing);
-  syncRows(document, resultsBody, shownRows, state.rows);
+  syncRows(document, resultsBody, shownRows, state.rows, thumbSrc);
   results.hidden = !view.showTable;
 
-  // Finished: the summary and Open folder take the place of the settings and
-  // Run. The summary shows first, so focus on Run can move to Open folder.
-  hideKeepingFocus(document, summary, !view.showSummary, chooseFiles);
+  // Finished: the summary (Re-add and Open folder) takes the place of the
+  // settings and Run, and the other way round when Re-add brings the list
+  // back. The block that comes up shows first, so focus has somewhere
+  // visible to go (see `swapSummaryAndSettings`).
+  swapSummaryAndSettings(document, { summary, settings, runRow, run, openFolder }, view.showSummary);
   summaryText.textContent = summaryLine(state);
+  setDisabled(readdList, !canChoose(state));
   setDisabled(openFolder, !canOpenFolder(state));
-  hideKeepingFocus(document, settings, !view.showSettings, openFolder);
-  hideKeepingFocus(document, runRow, !view.showSettings, openFolder);
   renderSettings();
   setDisabled(run, !canRun(state));
 
@@ -140,17 +155,14 @@ async function call(command, args) {
 }
 
 // A button that cannot be used right now stays focusable (aria-disabled), so
-// its click asks the same gate and does nothing.
+// its click asks the same gate and does nothing (see `bindCommand`).
 function onClick(button, gate, command) {
-  button.addEventListener('click', () => {
-    if (gate(state)) {
-      call(command);
-    }
-  });
+  bindCommand(button, () => state, gate, command, call);
 }
 
 onClick(chooseFiles, canChoose, 'choose_files');
 onClick(clearList, canChoose, 'clear_list');
+onClick(readdList, canChoose, 'readd_list');
 onClick(chooseOutput, canChoose, 'choose_output_folder');
 onClick(clearOutput, canChoose, 'clear_output_folder');
 onClick(openFolder, canOpenFolder, 'open_output_folder');

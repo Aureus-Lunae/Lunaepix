@@ -1,14 +1,17 @@
 //! JPG optimisation: a lossless coefficient transcode with mozjpeg, the
 //! jpegtran route chosen in the Step 2 evaluation, and (in the child module
-//! `lossy`) a lossy re-encode at a quality.
+//! `lossy`) a lossy re-encode at a quality. The child module `decode` holds
+//! the scaled decode a thumbnail is made from, and the read of its EXIF
+//! segment.
 //!
 //! The quantised DCT coefficients are read from the source and written back
 //! unchanged; only the entropy coding (Huffman tables and scan layout) is
 //! rebuilt. Nothing is re-quantised, so every decoder sees the same image.
 //!
-//! This module and its child `lossy` hold the libjpeg FFI, so `unsafe` code
-//! is allowed here (lib.rs names the other modules that allow it). Both use
-//! the same guards, error manager and [`run_libjpeg`]. libjpeg reports a
+//! This module and its children `lossy` and `decode` hold the libjpeg FFI,
+//! so `unsafe` code is allowed here (lib.rs names the other modules that
+//! allow it). All three use the same guards, error manager and
+//! [`run_libjpeg`]. libjpeg reports a
 //! fatal error by calling `error_exit`, which must not return. Ours unwinds
 //! with a [`LibjpegFailure`] payload through the C frames (`extern
 //! "C-unwind"`; mozjpeg-sys's `unwinding` feature compiles libjpeg with
@@ -30,11 +33,14 @@ use mozjpeg_sys::{
     jpeg_create_compress, jpeg_create_decompress, jpeg_decompress_struct, jpeg_destination_mgr,
     jpeg_destroy_compress, jpeg_destroy_decompress, jpeg_error_mgr, jpeg_finish_compress,
     jpeg_finish_decompress, jpeg_mem_src, jpeg_read_coefficients, jpeg_read_header,
-    jpeg_simple_progression, jpeg_std_error, jpeg_write_coefficients, jvirt_barray_control,
+    jpeg_read_scanlines, jpeg_simple_progression, jpeg_std_error, jpeg_write_coefficients,
+    jvirt_barray_control,
 };
 
+mod decode;
 mod lossy;
 
+pub(crate) use decode::{check_header, decode_scaled, exif_payload};
 pub(crate) use lossy::optimize_lossy;
 
 /// Every JPEG starts with the SOI marker, followed by the next marker's 0xFF.
@@ -335,6 +341,38 @@ unsafe extern "C-unwind" fn emit_message(cinfo: &mut jpeg_common_struct, level: 
 /// libjpeg's printing hook. Nothing calls it once the two hooks above are in
 /// place; it is replaced too, so that nothing can ever print to stderr.
 unsafe extern "C-unwind" fn output_message(_cinfo: &mut jpeg_common_struct) {}
+
+// --- reading decoded rows ---------------------------------------------------------
+
+/// Every output row of a decompressor that `jpeg_start_decompress` has
+/// started, `components` bytes per pixel, into a buffer of our own.
+///
+/// # Safety
+///
+/// Must run inside [`run_libjpeg`]: libjpeg failures unwind out of it, and
+/// so does a buffer that cannot be had. `source` must be started, with
+/// `components` the bytes per pixel of its `out_color_space`, and its
+/// output size checked against [`crate::MAX_PIXELS`] (so the buffer size
+/// cannot overflow).
+unsafe fn read_scanlines(source: &mut jpeg_decompress_struct, components: usize) -> Vec<u8> {
+    let height = source.output_height;
+    let row = source.output_width as usize * components;
+    let mut pixels =
+        crate::lossy::reserve_pixels(row * height as usize).unwrap_or_else(|message| fail(message));
+    while source.output_scanline < height {
+        let at = source.output_scanline as usize * row;
+        let mut rows = [pixels[at..at + row].as_mut_ptr()];
+        // SAFETY: the row pointer points at `row` bytes of `pixels`, one
+        // output row of `components` bytes per pixel (this function's
+        // contract), and libjpeg writes one row.
+        // A memory source never suspends, so libjpeg returns 0 rows only in a
+        // state it has already reported; refuse to loop forever.
+        if unsafe { jpeg_read_scanlines(source, rows.as_mut_ptr(), 1) } == 0 {
+            fail("could not read the JPEG data: libjpeg returned no rows".to_owned());
+        }
+    }
+    pixels
+}
 
 // --- owned libjpeg objects ------------------------------------------------------
 

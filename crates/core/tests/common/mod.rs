@@ -2,4 +2,5 @@
 //! `mod common;`; the ones it does not use are dead code in that file.
 #![allow(dead_code)]
 
+pub mod jpeg_fixtures;
 pub mod webp_fixtures;

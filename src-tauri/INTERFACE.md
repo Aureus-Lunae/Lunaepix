@@ -2,8 +2,9 @@
 
 The contract between the window (`ui/`, vanilla JS) and the Rust backend
 (`src-tauri/src/lib.rs`, with the logic in `session.rs` and the payloads in
-`events.rs`). The window never sends a path, and it never receives one: it
-gets file names, the output folder's name and numbers.
+`events.rs`; the thumbnails in `thumbs.rs`). The window never sends a path,
+and it never receives one: it gets file names, the output folder's name,
+numbers and thumbnail keys.
 
 Use the global API (`app.withGlobalTauri` is on):
 
@@ -35,9 +36,10 @@ takes an argument.
 |---|---|---|---|
 | `choose_files` | none | Opens a native multi-file dialog (PNG, JPG, SVG, WebP; "All files" as a second filter). The files picked are added to the list. Resolves as soon as the dialog is open; the outcome arrives as events. | `"busy"` |
 | `clear_list` | none | Empties the list. | `"busy"` |
+| `readd_list` | none | After a run, puts the files that were in the list back: sends `list-changed` with the list as it was added, planned again now. It adds nothing and removes nothing; it only ends the "run has finished" state, so the next add appends. | `"busy"` |
 | `choose_output_folder` | none | Opens a native folder dialog; the folder picked becomes the output folder. Resolves as soon as the dialog is open. | `"busy"` |
 | `clear_output_folder` | none | Back to "next to the originals". | `"busy"` |
-| `start_run` | `{ "settings": { "mode": "lossy", "quality": 75 } }` | Runs the list with these settings and the output setting. Resolves once the run has started; its progress arrives as events. | `"busy"`, `"invalid-settings"`, `"empty-list"`, `"output-missing"` |
+| `start_run` | `{ "settings": { "mode": "lossy", "quality": 75 } }` | Runs the list with these settings and the output setting. It writes next to the originals (`optimized-a.png`) or into the chosen folder (`a.png`), and never replaces an existing output: a taken name gets a number before the extension, from `-1` (`optimized-a-1.png`, `a-1.png`), then `-2`, up to `-9999`; when all of those are taken the file fails ("no free name in the output folder"). Resolves once the run has started; its progress arrives as events. | `"busy"`, `"invalid-settings"`, `"empty-list"`, `"output-missing"` |
 | `open_output_folder` | none | Opens the output folder of the last completed run in the file manager: the chosen output folder, or, with none, the folder of the first file written. | `"no-output"`, `"open-failed"` |
 
 ```js
@@ -78,9 +80,18 @@ JPG, SVG and WebP files directly inside it (not its subfolders), earlier
 `optimized-*` outputs included. While a run is going, a drop is refused with
 `run-busy`.
 
-A file is listed once, however often it is added. The first add after a
-run has finished starts a fresh list: only the new files are in it. Until
-then, adds go to the end of the list.
+A file is listed once, however often it is added. When a run has finished,
+the list is marked finished: the first add after that starts a fresh list
+(only the new files are in it, and its thumbnails get a new list number).
+`readd_list` clears that mark, so the next add appends to the list instead.
+At any other time adds go to the end of the list.
+
+`readd_list` gives back the paths that were added, not the outputs the run
+wrote beside them (`optimized-*`): dropping the folder again after a run does
+list those too, a re-add does not. The list is planned again at that moment,
+so a file deleted since the run is a skipped row ("Not a readable file"), as
+in `start_run`. Called with an empty list, it sends an empty list. The
+window's settings (mode, quality) and the output folder are not touched.
 
 ## Events
 
@@ -88,30 +99,32 @@ Every payload is JSON data. Show names, reasons, notes and notices with
 `textContent`, never with `innerHTML`. A file or folder name may contain any
 character.
 
-`run-busy`, `run-cancelled`, `drag-state` and `run-finished` are as before;
-`list-changed`, `output-changed` and `file-started` are new; `run-started`
-and `file-done` gained fields.
-
 ### `list-changed`
 
-Sent after every add and every Clear, and at the start of a fresh list: the
-full list each time, in display order.
+Sent after every add (the first add after a finished run starts a fresh
+list), every Clear and every `readd_list`: the full list each time, in
+display order.
 
 - `name`: the file name alone, never a path.
 - `size`: in bytes, or `null` for a skipped row.
 - `skip`: why the row will be skipped, a sentence for the user; `null` for a
   row that will be compressed.
+- `thumb`: the key of the row's thumbnail, `<list>-<index>` (for example
+  `"3-0"`), or `null` for a skipped row and for the over-the-limit row. See
+  [Thumbnails](#thumbnails-the-thumb-scheme).
 - `notice`: a sentence for the status line, or `null`. It says why an add
   changed nothing: a dropped folder with no images directly in it. (The
   file dialog picks files only, so a folder arrives by a drop.)
 
 ```json
 { "files": [
-  { "name": "holiday.jpg", "size": 2400000, "skip": null },
-  { "name": "logo.png", "size": 88000, "skip": null },
-  { "name": "notes.txt", "size": null, "skip": "Not a PNG, JPG, SVG or WebP file" }
+  { "name": "holiday.jpg", "size": 2400000, "skip": null, "thumb": "3-0" },
+  { "name": "logo.svg", "size": 4100, "skip": null, "thumb": "3-1" },
+  { "name": "notes.txt", "size": null, "skip": "Not a PNG, JPG, SVG or WebP file", "thumb": null }
 ], "notice": null }
 ```
+
+`thumb` is in every file row, always a string or `null`.
 
 After Clear:
 
@@ -241,6 +254,51 @@ its `list-changed`.
 { "over": true }
 ```
 
+## Thumbnails: the `thumb` scheme
+
+Each `list-changed` row with a `thumb` key has a thumbnail at an address of
+the custom URI scheme `thumb`. Build it with
+`window.__TAURI__.core.convertFileSrc(key, 'thumb')`: that gives
+`thumb://localhost/3-0` on Linux and macOS and `http://thumb.localhost/3-0`
+on Windows. Accept only a key matching `^\d{1,10}-\d{1,4}$` and treat
+anything else as `null`, so no other text reaches an image address.
+
+- **The key** is `<list>-<index>`: `index` is the row's place in that
+  `list-changed`; `list` is a number the backend raises when a new list
+  starts (Clear, and the first add after a finished run). Adds and
+  `readd_list` keep the earlier rows' keys. A key never names another file:
+  when re-planning would move a file into a row whose key was already sent
+  (a row dropped from the middle of the list), the list number is raised
+  too, and every row gets a new key.
+- **The answer:** the address must have no query (not even an empty `?`),
+  and its path must be exactly `/<list>-<index>` as received (not
+  percent-decoded), of the current list, for a row whose `thumb` is not
+  `null`. Then `200` with `Content-Type: image/png` and the thumbnail
+  (longest side 64 px), or, for a row whose name ends in `.svg`,
+  `200` with `Content-Type: image/svg+xml` and the file's own bytes. Anything
+  else, and a thumbnail that cannot be made (not an image, damaged, too
+  large, the worker failed or timed out), is `404` with an empty body. Show
+  an empty square then; nothing goes to the status line.
+- **How:** a worker process makes each thumbnail (the window process never
+  opens the file), at most two at a time; other requests wait their turn.
+  Thumbnails and "cannot be shown" are kept for the current list and dropped
+  when a new list starts. At most 64 MiB of thumbnails are kept per list: one
+  that does not fit is still sent, but made again when it is asked for
+  again ("cannot be shown" takes no room). A failure of any other kind is
+  tried again on the next request.
+
+```text
+GET thumb://localhost/3-0     → 200, image/png
+GET thumb://localhost/3-1     → 200, image/svg+xml
+GET thumb://localhost/2-0     → 404 (list 2 is gone)
+GET thumb://localhost/3-2     → 404 (notes.txt is a skipped row)
+GET thumb://localhost/3%2D0   → 404 (encoded; not a key as received)
+GET thumb://localhost/3-x     → 404 (not a key)
+GET thumb://localhost/3-0?x=1 → 404 (a query)
+```
+
+The scheme needs no permission: it is not a command.
+
 ## Rules for the window
 
 - **Runs never overlap, so events are strictly ordered.** Handle them in the
@@ -254,8 +312,8 @@ its `list-changed`.
   `tauri://drag-enter`, `tauri://drag-over` or `tauri://drag-drop`: Tauri
   puts the dropped paths in them, and they reach the page only when a
   listener asks for them. `drag-state` is the replacement.
-- **Permissions:** the six commands (`allow-choose-files`,
-  `allow-clear-list`, `allow-choose-output-folder`,
+- **Permissions:** the seven commands (`allow-choose-files`,
+  `allow-clear-list`, `allow-readd-list`, `allow-choose-output-folder`,
   `allow-clear-output-folder`, `allow-start-run`,
   `allow-open-output-folder`), `core:event:allow-listen` and
   `core:event:allow-unlisten`, nothing more (`capabilities/default.json`; a
@@ -263,12 +321,14 @@ its `list-changed`.
   `alert()` and `confirm()` do not work (the dialog plugin overrides them,
   and the window has no dialog permission). Show messages in the page.
 - **CSP** (`tauri.conf.json`): `default-src 'self'; script-src 'self';
-  style-src 'self'; img-src 'self'; font-src 'self'; connect-src ipc:
-  http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action
-  'none'; frame-src 'none'`. So: scripts and styles come from files in `ui/`
-  only. No inline `<script>`, no `on…=` attributes, no `style="…"`
-  attributes, no `eval` or `new Function`, nothing remote, no `data:`
-  images. Setting `element.style.foo` from JS is allowed; `setAttribute('style', …)`
+  style-src 'self'; img-src 'self' thumb: http://thumb.localhost; font-src
+  'self'; connect-src ipc: http://ipc.localhost; object-src 'none';
+  base-uri 'none'; form-action 'none'; frame-src 'none'`. So: scripts and
+  styles come from files in `ui/` only. No inline `<script>`, no `on…=`
+  attributes, no `style="…"` attributes, no `eval` or `new Function`,
+  nothing remote, no `data:` images; images come from `ui/` or from the
+  `thumb` scheme (`thumb:` on Linux and macOS, `http://thumb.localhost` on
+  Windows). Setting `element.style.foo` from JS is allowed; `setAttribute('style', …)`
   is not.
 - **Do not lock the buttons while a dialog is open** in the page's own state.
   The backend refuses a second request with `"busy"`, and the page can say

@@ -2,8 +2,9 @@
 //!
 //! The lossless path walks the container in safe Rust ([`riff`]); no image
 //! is decoded, so it cannot change a pixel. The lossy path ([`lossy`])
-//! decodes and encodes through libwebp, whose FFI is the one module here
-//! that may use `unsafe` ([`codec`]).
+//! decodes and encodes through libwebp, and so does a thumbnail
+//! ([`thumbnail_rgba`]); libwebp's FFI is the one module here that may use
+//! `unsafe` ([`codec`]).
 
 #[allow(unsafe_code)]
 mod codec;
@@ -11,7 +12,68 @@ mod exif;
 mod lossy;
 mod riff;
 
+pub(crate) use exif::{PREFIX as EXIF_PREFIX, orientation};
 pub(crate) use lossy::optimize_lossy;
+
+use codec::{Codec, LibWebp, Rgba};
+use riff::Kind;
+
+/// Check that `bytes` is WebP data with well-formed chunks whose declared
+/// size is within [`crate::MAX_PIXELS`] ([`riff::parse`]); nothing is
+/// decoded.
+pub(crate) fn check_header(bytes: &[u8]) -> Result<(), String> {
+    riff::parse(bytes).map(drop)
+}
+
+/// The pixels a thumbnail of `side` pixels is made from, as width, height
+/// and 8-bit RGBA, after the container check ([`riff::parse`]):
+/// - a still image, decoded by libwebp straight to the thumbnail's size
+///   ([`crate::thumb::fit`] of the size in its header);
+/// - an animation's first frame, at the canvas size ([`first_frame`]).
+///
+/// An animation's canvas is checked against
+/// [`crate::MAX_ANIMATION_CANVAS_PIXELS`] from its header first, as the
+/// optimiser does: libwebp's animation decoder holds two canvases, and
+/// the frame is a third. The frame-count cap does not apply here, because
+/// the frames are decoded one at a time and only the first is taken.
+pub(crate) fn thumbnail_rgba(bytes: &[u8], side: u32) -> Result<(u32, u32, Vec<u8>), String> {
+    let file = riff::parse(bytes)?;
+    let image = if file.kind == Kind::Animated {
+        let header = riff::animation_header(&file)?;
+        crate::plan::check_animation_canvas(header.width, header.height)?;
+        first_frame(bytes, &LibWebp)?
+    } else {
+        codec::decode_scaled(bytes, |width, height| {
+            crate::thumb::fit(width, height, side)
+        })?
+    };
+    Ok((image.width, image.height, image.pixels))
+}
+
+/// The EXIF Orientation of a WebP file as 1 to 8 ([`exif::orientation`]),
+/// from its first `EXIF` chunk, the one [`riff::WebpFile`] keeps when it
+/// strips a file. `None` when the container cannot be read, there is no
+/// such chunk, or its Orientation is missing, damaged or out of range; a
+/// later `EXIF` chunk is not looked at then.
+pub(crate) fn exif_orientation(bytes: &[u8]) -> Option<u8> {
+    let file = riff::parse(bytes).ok()?;
+    let chunk = file.chunks.iter().find(|chunk| &chunk.fourcc == b"EXIF")?;
+    orientation(chunk.data)
+}
+
+/// The first frame of an animated WebP, as a full canvas: the first that
+/// `codec`'s animation decoder gives. Only that frame is decoded.
+fn first_frame(bytes: &[u8], codec: &impl Codec) -> Result<Rgba, String> {
+    let (info, mut frames) = codec.decode_animation(bytes)?;
+    let frame = frames.next().unwrap_or_else(|| {
+        Err("could not read the WebP data: the animation has no frame".to_owned())
+    })?;
+    Ok(Rgba {
+        width: info.width,
+        height: info.height,
+        pixels: frame.rgba,
+    })
+}
 
 /// The fixture helpers of the integration tests, shared with the unit tests.
 /// They call libwebp's encoder themselves, hence the `unsafe`, so a fixture
@@ -19,7 +81,7 @@ pub(crate) use lossy::optimize_lossy;
 #[cfg(test)]
 #[path = "../tests/common/webp_fixtures.rs"]
 #[allow(unsafe_code)]
-mod fixtures;
+pub(crate) mod fixtures;
 
 /// Optimise WebP bytes losslessly: check the file, strip its metadata and
 /// return the smaller of the result and the source.
@@ -112,11 +174,181 @@ mod tests {
         assert_eq!(optimize(&input), Ok(input));
     }
 
+    // --- thumbnails ---------------------------------------------------------------
+
+    use std::cell::RefCell;
+
+    use codec::{AnimationInfo, Frame, Frames, LibWebp};
+
+    use crate::lossy::Quality;
+
+    /// A codec double for the first frame: it records the bytes it is
+    /// handed and opens an animation of `frames`. Nothing else is called.
+    struct FramesDouble {
+        given: RefCell<Vec<Vec<u8>>>,
+        frames: Vec<Result<Frame, String>>,
+    }
+
+    impl FramesDouble {
+        fn with(frames: Vec<Result<Frame, String>>) -> Self {
+            FramesDouble {
+                given: RefCell::new(Vec::new()),
+                frames,
+            }
+        }
+    }
+
+    impl Codec for FramesDouble {
+        fn decode_rgba(&self, _: &[u8]) -> Result<Rgba, String> {
+            panic!("not called")
+        }
+
+        fn encode_lossy(&self, _: &Rgba, _: Quality) -> Result<Vec<u8>, String> {
+            panic!("not called")
+        }
+
+        fn decode_animation<'a>(
+            &self,
+            bytes: &'a [u8],
+        ) -> Result<(AnimationInfo, Frames<'a>), String> {
+            self.given.borrow_mut().push(bytes.to_vec());
+            let info = AnimationInfo {
+                width: 2,
+                height: 1,
+                loop_count: 0,
+                background: 0,
+                duration_ms: 200,
+            };
+            Ok((info, Box::new(self.frames.clone().into_iter())))
+        }
+
+        fn encode_animation(
+            &self,
+            _: &AnimationInfo,
+            _: &mut dyn Iterator<Item = Result<Frame, String>>,
+            _: Quality,
+        ) -> Result<Vec<u8>, String> {
+            panic!("not called")
+        }
+    }
+
+    fn frame(rgba: [u8; 8]) -> Result<Frame, String> {
+        Ok(Frame {
+            rgba: rgba.to_vec(),
+            timestamp_ms: 0,
+        })
+    }
+
+    #[test]
+    fn the_first_frame_is_the_first_the_decoder_gives_at_the_canvas_size() {
+        let double = FramesDouble::with(vec![frame([1; 8]), frame([2; 8])]);
+        let first = first_frame(b"the animation", &double).unwrap();
+        assert_eq!(
+            first,
+            Rgba {
+                width: 2,
+                height: 1,
+                pixels: vec![1; 8]
+            }
+        );
+        assert_eq!(*double.given.borrow(), [b"the animation".to_vec()]);
+    }
+
+    #[test]
+    fn the_first_frame_fails_when_the_decoder_gives_no_frame_or_an_error() {
+        let none = FramesDouble::with(Vec::new());
+        assert!(first_frame(b"x", &none).is_err());
+        let broken = FramesDouble::with(vec![Err("frame 1 is broken".to_owned()), frame([2; 8])]);
+        assert_eq!(first_frame(b"x", &broken).unwrap_err(), "frame 1 is broken");
+    }
+
+    #[test]
+    fn the_real_first_frame_of_an_animation_is_its_first_canvas() {
+        let red = fx::lossless(&[255, 0, 0, 255].repeat(16), 4, 4);
+        let blue = fx::lossless(&[0, 0, 255, 255].repeat(16), 4, 4);
+        let animation = fx::animated(&[red, blue], 4, 4);
+        let first = first_frame(&animation, &LibWebp).unwrap();
+        assert_eq!((first.width, first.height), (4, 4));
+        assert_eq!(first.pixels, [255, 0, 0, 255].repeat(16));
+    }
+
+    #[test]
+    fn a_still_webp_thumbnail_is_decoded_scaled_to_fit() {
+        let still = fx::lossless(&fx::photo_rgba(400, 200, false), 400, 200);
+        let (w, h, rgba) = thumbnail_rgba(&still, 64).unwrap();
+        assert_eq!((w, h), (64, 32));
+        assert_eq!(rgba.len(), 64 * 32 * 4);
+    }
+
+    #[test]
+    fn an_animated_webp_thumbnail_is_its_first_frame_at_the_canvas_size() {
+        let frames = [
+            fx::lossless(&fx::photo_rgba(400, 200, false), 400, 200),
+            fx::lossless(&fx::photo_rgba(400, 200, true), 400, 200),
+        ];
+        let animation = fx::animated(&frames, 400, 200);
+        let (w, h, rgba) = thumbnail_rgba(&animation, 64).unwrap();
+        assert_eq!((w, h), (400, 200));
+        assert_eq!(rgba, fx::photo_rgba(400, 200, false));
+    }
+
+    #[test]
+    fn a_webp_thumbnail_refuses_what_the_container_check_refuses() {
+        assert_eq!(
+            thumbnail_rgba(b"RIFF", 64).unwrap_err(),
+            "not a WebP file (the content is not WebP data)"
+        );
+        assert_eq!(check_header(b"RIFF"), thumbnail_rgba(b"RIFF", 64).map(drop));
+        assert_eq!(check_header(&clean()), Ok(()));
+    }
+
     #[test]
     fn returns_the_file_without_its_trailing_bytes_when_that_is_all_there_is_to_save() {
         let clean = clean();
         let mut input = clean.clone();
         input.extend_from_slice(&[0xAB; 100]);
         assert_eq!(optimize(&input), Ok(clean));
+    }
+
+    // --- EXIF orientation ---------------------------------------------------------
+
+    fn exif(orientation: u16) -> Vec<u8> {
+        fx::exif_with_orientation(orientation, false, true)
+    }
+
+    #[test]
+    fn exif_orientation_reads_the_first_exif_chunk() {
+        let file = fx::with_chunks(&clean(), &[(*b"EXIF", &exif(6))]);
+        assert_eq!(exif_orientation(&file), Some(6));
+        // The first chunk decides, whichever comes second.
+        let (first_6, first_1) = (exif(6), exif(1));
+        let both = fx::with_chunks(&clean(), &[(*b"EXIF", &first_6), (*b"EXIF", &first_1)]);
+        assert_eq!(exif_orientation(&both), Some(6));
+        let both = fx::with_chunks(&clean(), &[(*b"EXIF", &first_1), (*b"EXIF", &first_6)]);
+        assert_eq!(exif_orientation(&both), Some(1));
+        // An animation holds it the same way.
+        let frames = [fx::lossless(&fx::photo_rgba(16, 16, false), 16, 16)];
+        let animation = fx::with_chunks(&fx::animated(&frames, 16, 16), &[(*b"EXIF", &exif(3))]);
+        assert_eq!(exif_orientation(&animation), Some(3));
+    }
+
+    #[test]
+    fn exif_orientation_is_none_without_a_usable_exif_chunk() {
+        assert_eq!(exif_orientation(&clean()), None);
+        let garbage = fx::with_chunks(&clean(), &[(*b"EXIF", &[9u8; 40])]);
+        assert_eq!(exif_orientation(&garbage), None);
+        // Another chunk's payload is not looked at.
+        let xmp = fx::with_chunks(&clean(), &[(*b"XMP ", &exif(6))]);
+        assert_eq!(exif_orientation(&xmp), None);
+        // Behind a garbage first EXIF chunk the second one is not used.
+        let (junk, six) = (vec![9u8; 40], exif(6));
+        let second = fx::with_chunks(&clean(), &[(*b"EXIF", &junk), (*b"EXIF", &six)]);
+        assert_eq!(exif_orientation(&second), None);
+        // Not a WebP, or cut off in a chunk.
+        assert_eq!(exif_orientation(b"RIFF"), None);
+        assert_eq!(exif_orientation(&[]), None);
+        let mut cut = fx::with_chunks(&clean(), &[(*b"EXIF", &exif(6))]);
+        cut.truncate(cut.len() - 3);
+        assert_eq!(exif_orientation(&cut), None);
     }
 }

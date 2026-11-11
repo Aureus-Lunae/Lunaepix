@@ -1,6 +1,7 @@
 //! Guards on the window's security settings, so a later change cannot widen
-//! them silently: the capability grants the six app commands and event
-//! listening only, and the content security policy stays strict.
+//! them silently: the capability grants the seven app commands and event
+//! listening only, and the content security policy stays strict (only
+//! `img-src` names the `thumb` scheme).
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -17,6 +18,7 @@ use serde_json::Value;
 const ALLOWED: &[&str] = &[
     "allow-choose-files",
     "allow-clear-list",
+    "allow-readd-list",
     "allow-choose-output-folder",
     "allow-clear-output-folder",
     "allow-start-run",
@@ -45,7 +47,8 @@ fn unexpected_permissions(capability: &Value) -> Vec<String> {
 
 /// What makes a content security policy weaker than we allow: inline code,
 /// `eval`, wildcards, `data:`/`blob:`, and any remote source. The only
-/// network origin allowed is Tauri's IPC endpoint on Windows. Also missing
+/// network origins allowed are Tauri's IPC endpoint on Windows, and the
+/// `thumb` scheme's origin on Windows in `img-src` only. Also missing
 /// `default-src 'self'` or `script-src 'self'`.
 fn csp_problems(csp: &str) -> Vec<String> {
     let mut problems = Vec::new();
@@ -55,8 +58,11 @@ fn csp_problems(csp: &str) -> Vec<String> {
         .filter(|tokens: &Vec<&str>| !tokens.is_empty())
         .collect();
     for tokens in &directives {
+        let img_src = tokens[0].eq_ignore_ascii_case("img-src");
         for source in &tokens[1..] {
             let lower = source.to_ascii_lowercase();
+            let allowed_origin =
+                lower == "http://ipc.localhost" || (img_src && lower == "http://thumb.localhost");
             let weak = lower.starts_with("'unsafe-")
                 || lower == "*"
                 || lower.contains("*.")
@@ -65,7 +71,7 @@ fn csp_problems(csp: &str) -> Vec<String> {
                 || lower == "http:"
                 || lower == "https:"
                 || ((lower.starts_with("http://") || lower.starts_with("https://"))
-                    && lower != "http://ipc.localhost");
+                    && !allowed_origin);
             if weak {
                 problems.push(format!("{} {source}", tokens[0]));
             }
@@ -82,6 +88,75 @@ fn csp_problems(csp: &str) -> Vec<String> {
     problems
 }
 
+/// The policy as it must be, directive by directive. Only `img-src` differs
+/// from the policy before thumbnails: the `thumb` scheme, as Linux and macOS
+/// name it (`thumb:`) and as Windows serves it (`http://thumb.localhost`).
+const EXPECTED_CSP: &[(&str, &[&str])] = &[
+    ("default-src", &["'self'"]),
+    ("script-src", &["'self'"]),
+    ("style-src", &["'self'"]),
+    ("img-src", &["'self'", "thumb:", "http://thumb.localhost"]),
+    ("font-src", &["'self'"]),
+    ("connect-src", &["ipc:", "http://ipc.localhost"]),
+    ("object-src", &["'none'"]),
+    ("base-uri", &["'none'"]),
+    ("form-action", &["'none'"]),
+    ("frame-src", &["'none'"]),
+];
+
+/// How a policy differs from [`EXPECTED_CSP`]: a directive missing, given
+/// twice, not expected, or with other sources. Names and sources are
+/// compared without case (as the browser reads them) and sources in any
+/// order.
+fn csp_shape_problems(csp: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let directives: Vec<(String, Vec<String>)> = csp
+        .split(';')
+        .map(|directive| directive.split_whitespace().collect::<Vec<_>>())
+        .filter(|tokens| !tokens.is_empty())
+        .map(|tokens| {
+            let mut sources: Vec<String> =
+                tokens[1..].iter().map(|s| s.to_ascii_lowercase()).collect();
+            sources.sort();
+            (tokens[0].to_ascii_lowercase(), sources)
+        })
+        .collect();
+    for (name, _) in &directives {
+        if !EXPECTED_CSP.iter().any(|(expected, _)| expected == name) {
+            problems.push(format!("unexpected directive {name}"));
+        }
+    }
+    for (name, expected) in EXPECTED_CSP {
+        let given: Vec<&Vec<String>> = directives
+            .iter()
+            .filter(|(directive, _)| directive == name)
+            .map(|(_, sources)| sources)
+            .collect();
+        let mut expected: Vec<String> = expected.iter().map(|s| s.to_ascii_lowercase()).collect();
+        expected.sort();
+        match given.as_slice() {
+            [] => problems.push(format!("missing {name}")),
+            [sources] if **sources == expected => {}
+            [sources] => problems.push(format!("{name} is {sources:?}, not {expected:?}")),
+            _ => problems.push(format!("{name} given more than once")),
+        }
+    }
+    problems
+}
+
+/// Every problem [`csp_problems`] and [`csp_shape_problems`] find.
+fn all_csp_problems(csp: &str) -> Vec<String> {
+    let mut problems = csp_problems(csp);
+    problems.extend(csp_shape_problems(csp));
+    problems
+}
+
+/// The policy the window must have, written out as a fixture.
+const GOOD_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
+    img-src 'self' thumb: http://thumb.localhost; font-src 'self'; \
+    connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; \
+    form-action 'none'; frame-src 'none'";
+
 /// The permissions a capability grants that are plain names, in order.
 fn granted(capability: &Value) -> Vec<&str> {
     capability["permissions"]
@@ -92,20 +167,74 @@ fn granted(capability: &Value) -> Vec<&str> {
         .collect()
 }
 
+/// What is wrong with a capability's permissions: one that is not in
+/// [`ALLOWED`], one of [`ALLOWED`] that is missing or given twice, and any
+/// count of `allow-` commands other than seven.
+fn capability_problems(capability: &Value) -> Vec<String> {
+    let mut problems: Vec<String> = unexpected_permissions(capability)
+        .into_iter()
+        .map(|permission| format!("unexpected {permission}"))
+        .collect();
+    let granted = granted(capability);
+    for allowed in ALLOWED {
+        match granted.iter().filter(|p| *p == allowed).count() {
+            1 => {}
+            0 => problems.push(format!("missing {allowed}")),
+            _ => problems.push(format!("{allowed} given more than once")),
+        }
+    }
+    let commands = granted.iter().filter(|p| p.starts_with("allow-")).count();
+    if commands != 7 {
+        problems.push(format!("{commands} app commands, not seven"));
+    }
+    problems
+}
+
 #[test]
-fn the_capability_grants_exactly_the_six_commands_and_event_listening() {
-    let capability = read_json("capabilities/default.json");
-    assert_eq!(unexpected_permissions(&capability), Vec::<String>::new());
-    let granted = granted(&capability);
-    // Each exactly once, nothing else.
-    let mut sorted = granted.clone();
-    sorted.sort_unstable();
-    let mut allowed = ALLOWED.to_vec();
-    allowed.sort_unstable();
-    assert_eq!(sorted, allowed);
+fn a_capability_with_six_or_eight_commands_is_flagged_in_a_fixture() {
+    let all: Vec<Value> = ALLOWED.iter().map(|p| Value::from(*p)).collect();
+    // The control: the full list has nothing to report.
     assert_eq!(
-        granted.iter().filter(|p| p.starts_with("allow-")).count(),
-        6
+        capability_problems(&serde_json::json!({ "permissions": all })),
+        Vec::<String>::new()
+    );
+    // Six: no `allow-readd-list`.
+    let six: Vec<Value> = all
+        .iter()
+        .filter(|p| p.as_str() != Some("allow-readd-list"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        capability_problems(&serde_json::json!({ "permissions": six })),
+        ["missing allow-readd-list", "6 app commands, not seven"]
+    );
+    // Eight: an extra command.
+    let mut eight = all.clone();
+    eight.push(Value::from("allow-delete-everything"));
+    assert_eq!(
+        capability_problems(&serde_json::json!({ "permissions": eight })),
+        [
+            r#"unexpected "allow-delete-everything""#,
+            "8 app commands, not seven"
+        ]
+    );
+    // A permission given twice.
+    let mut twice = all;
+    twice.push(Value::from("allow-readd-list"));
+    assert!(
+        capability_problems(&serde_json::json!({ "permissions": twice }))
+            .contains(&"allow-readd-list given more than once".to_owned())
+    );
+}
+
+#[test]
+fn the_capability_grants_exactly_the_seven_commands_and_event_listening() {
+    let capability = read_json("capabilities/default.json");
+    assert_eq!(capability_problems(&capability), Vec::<String>::new());
+    assert_eq!(
+        granted(&capability).len(),
+        ALLOWED.len(),
+        "nothing but the allowed permissions"
     );
     assert_eq!(capability["windows"], serde_json::json!(["main"]));
     // No `remote` block: no web page may use the capability.
@@ -146,10 +275,59 @@ fn the_content_security_policy_is_strict() {
         .as_str()
         .expect("the csp is set, as one string");
     assert_eq!(csp_problems(csp), Vec::<String>::new());
-    assert!(
-        csp.contains("connect-src ipc: http://ipc.localhost"),
-        "{csp}"
+    assert_eq!(csp_shape_problems(csp), Vec::<String>::new());
+}
+
+#[test]
+fn an_img_src_with_anything_more_or_another_changed_directive_is_flagged() {
+    // The control: the policy as it must be, also in another spelling.
+    assert_eq!(all_csp_problems(GOOD_CSP), Vec::<String>::new());
+    let respelled = GOOD_CSP.replace(
+        "img-src 'self' thumb: http://thumb.localhost",
+        "IMG-SRC http://THUMB.localhost 'SELF'  thumb:",
     );
+    assert_eq!(all_csp_problems(&respelled), Vec::<String>::new());
+
+    let img_src = "img-src 'self' thumb: http://thumb.localhost";
+    for extra in [
+        "data:",
+        "blob:",
+        "*",
+        "https:",
+        "http:",
+        "http://evil.localhost",
+        "http://*.localhost",
+        "https://thumb.localhost",
+        "thumbs:",
+        "'unsafe-inline'",
+    ] {
+        let widened = GOOD_CSP.replace(img_src, &format!("{img_src} {extra}"));
+        assert_ne!(widened, GOOD_CSP);
+        assert!(!all_csp_problems(&widened).is_empty(), "{extra}");
+    }
+    let changed = [
+        // The scheme anywhere but `img-src`.
+        GOOD_CSP.replace(
+            "script-src 'self'",
+            "script-src 'self' http://thumb.localhost",
+        ),
+        GOOD_CSP.replace("script-src 'self'", "script-src 'self' thumb:"),
+        GOOD_CSP.replace(
+            "connect-src ipc: http://ipc.localhost",
+            "connect-src ipc: http://ipc.localhost thumb:",
+        ),
+        // `img-src` narrowed, given twice, or dropped.
+        GOOD_CSP.replace(img_src, "img-src 'self' thumb:"),
+        GOOD_CSP.replace(img_src, &format!("{img_src}; img-src 'self'")),
+        GOOD_CSP.replace(&format!("{img_src}; "), ""),
+        // Another directive changed or added.
+        GOOD_CSP.replace("object-src 'none'", "object-src 'self'"),
+        format!("{GOOD_CSP}; worker-src 'self'"),
+    ];
+    for csp in &changed {
+        assert_ne!(csp, GOOD_CSP);
+        assert!(!all_csp_problems(csp).is_empty(), "{csp}");
+    }
 }
 
 #[test]
@@ -2586,8 +2764,8 @@ fn a_page_without_webp_in_its_text_does_not_say_it_in_a_fixture() {
 
 // ---------------------------------------------------------------------
 // The moon logo in the window header: one decorative image, loaded from the
-// window folder (the CSP allows `img-src 'self'` only), made from the same
-// SVG as the app icon.
+// window folder (the CSP allows images from the window folder and the
+// `thumb` scheme only), made from the same SVG as the app icon.
 // ---------------------------------------------------------------------
 
 /// Problems with the images in `html`. The page must hold exactly one `<img>`;
@@ -2735,4 +2913,178 @@ fn the_logo_svg_does_not_trip_the_text_scans() {
         .expect("ui/lunaepix-logo.svg is not among the scanned files");
     assert_eq!(js_lint_hits(svg), Vec::<&str>::new());
     assert_eq!(html_attribute_problems(svg), Vec::<String>::new());
+}
+
+// ---------------------------------------------------------------------
+// The summary row after a run: "Re-add" and then "Open folder", side by
+// side. Read as tokens, with the nesting walked, so a button outside
+// `#summary` or one spelled in a comment is not taken for the real one.
+// ---------------------------------------------------------------------
+
+/// Elements that have no end tag.
+const VOID_ELEMENTS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track",
+    "wbr",
+];
+
+/// A `<button>` as the checks need it.
+struct ButtonTag {
+    id: Option<String>,
+    kind: Option<String>,
+    class: Option<String>,
+    text: String,
+}
+
+/// The buttons inside the element whose id is `container`, in document
+/// order, with their text (whitespace collapsed).
+fn buttons_inside(html: &str, container: &str) -> Vec<ButtonTag> {
+    let mut buttons: Vec<ButtonTag> = Vec::new();
+    let mut depth = 0usize;
+    let mut open_button = false;
+    for piece in pieces(html) {
+        match piece {
+            Piece::Start(tag) => {
+                let void = VOID_ELEMENTS.contains(&tag.name.as_str());
+                if depth == 0 {
+                    if tag.attr("id") == Some(container) && !void {
+                        depth = 1;
+                    }
+                    continue;
+                }
+                if tag.name == "button" {
+                    buttons.push(ButtonTag {
+                        id: tag.attr("id").map(str::to_owned),
+                        kind: tag.attr("type").map(str::to_owned),
+                        class: tag.attr("class").map(str::to_owned),
+                        text: String::new(),
+                    });
+                    open_button = true;
+                }
+                if !void {
+                    depth += 1;
+                }
+            }
+            Piece::End(name) if depth > 0 => {
+                if name == "button" {
+                    open_button = false;
+                }
+                depth -= 1;
+            }
+            Piece::Text(text) if depth > 0 && open_button => {
+                let button = buttons.last_mut().expect("a button is open");
+                button.text.push_str(&text);
+            }
+            _ => {}
+        }
+    }
+    for button in &mut buttons {
+        button.text = button.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    }
+    buttons
+}
+
+/// Problems with the Re-add button: exactly one `#readdList` on the page; in
+/// `#summary`, directly before `#openFolder`; text "Re-add"; `type="button"`;
+/// the summary's button class.
+fn readd_button_problems(html: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let on_page = start_tags(html)
+        .iter()
+        .filter(|tag| tag.attr("id") == Some("readdList"))
+        .count();
+    if on_page != 1 {
+        problems.push(format!("{on_page} elements with id readdList, not one"));
+    }
+    let buttons = buttons_inside(html, "summary");
+    let ids: Vec<Option<&str>> = buttons.iter().map(|button| button.id.as_deref()).collect();
+    if ids != [Some("readdList"), Some("openFolder")] {
+        problems.push(format!(
+            "the summary's buttons are {ids:?}, not readdList then openFolder"
+        ));
+    }
+    if let Some(button) = buttons
+        .iter()
+        .find(|button| button.id.as_deref() == Some("readdList"))
+    {
+        if button.text != "Re-add" {
+            problems.push(format!("the text is {:?}, not \"Re-add\"", button.text));
+        }
+        if button.kind.as_deref() != Some("button") {
+            problems.push("the button has no type=\"button\"".to_owned());
+        }
+        let has_class = button.class.as_deref().is_some_and(|class| {
+            class
+                .split_whitespace()
+                .any(|name| name == "lunaepixSummary__button")
+        });
+        if !has_class {
+            problems.push("the button lacks the class lunaepixSummary__button".to_owned());
+        }
+    }
+    problems
+}
+
+#[test]
+fn the_summary_has_readd_before_open_folder() {
+    assert_eq!(readd_button_problems(&index_html()), Vec::<String>::new());
+}
+
+#[test]
+fn a_summary_without_readd_or_with_it_misplaced_is_flagged_in_a_fixture() {
+    let good = r#"<div id="summary"><p id="summaryText"></p>
+        <button class="lunaepixSummary__button" id="readdList" type="button">Re-add</button>
+        <button class="lunaepixSummary__button" id="openFolder" type="button">Open folder</button></div>"#;
+    assert_eq!(readd_button_problems(good), Vec::<String>::new());
+    // Line breaks inside the button do not matter.
+    let spread = good.replace(">Re-add<", ">\n  Re-add\n<");
+    assert_eq!(readd_button_problems(&spread), Vec::<String>::new());
+
+    let open = r#"<button class="lunaepixSummary__button" id="openFolder" type="button">Open folder</button>"#;
+    let readd =
+        r#"<button class="lunaepixSummary__button" id="readdList" type="button">Re-add</button>"#;
+    for (what, html) in [
+        ("missing", format!(r#"<div id="summary">{open}</div>"#)),
+        (
+            "after Open folder",
+            format!(r#"<div id="summary">{open}{readd}</div>"#),
+        ),
+        (
+            "outside the summary",
+            format!(r#"<div id="summary">{open}</div>{readd}"#),
+        ),
+        (
+            "before the summary",
+            format!(r#"{readd}<div id="summary">{open}</div>"#),
+        ),
+        ("other text", good.replace(">Re-add<", ">Reuse files<")),
+        (
+            "no type",
+            good.replace(r#"id="readdList" type="button""#, r#"id="readdList""#),
+        ),
+        (
+            "wrong type",
+            good.replace(
+                r#"id="readdList" type="button""#,
+                r#"id="readdList" type="submit""#,
+            ),
+        ),
+        (
+            "other class",
+            good.replacen("lunaepixSummary__button", "lunaepixPanel__button", 1),
+        ),
+        (
+            "twice",
+            good.replace(
+                r#"<button class="lunaepixSummary__button" id="openFolder""#,
+                &format!(r#"{readd}<button class="lunaepixSummary__button" id="openFolder""#),
+            ),
+        ),
+        // Only a real tag counts: a comment that spells one is not a button.
+        (
+            "only in a comment",
+            format!(r#"<!-- {readd} --><div id="summary">{open}</div>"#),
+        ),
+    ] {
+        assert!(!readd_button_problems(&html).is_empty(), "{what}: {html}");
+    }
 }

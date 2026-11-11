@@ -35,7 +35,8 @@ pub const MAX_ANIMATION_PIXELS: u64 = 1_000_000_000;
 /// megapixels). Set by the user from the Task 1 measurements: memory grows
 /// with the canvas, not the frame count (about 50 MB per megapixel with
 /// alpha, so about 2.5 GB here). Over it: the lossless treatment with the
-/// same note as over [`MAX_ANIMATION_PIXELS`].
+/// same note as over [`MAX_ANIMATION_PIXELS`]. A thumbnail of an animation
+/// over it cannot be shown.
 pub const MAX_ANIMATION_CANVAS_PIXELS: u64 = 50_000_000;
 
 /// Deepest element nesting an SVG may have: the root `<svg>` is level 1. oxvg
@@ -107,7 +108,7 @@ pub fn plan_folder(dir: &Path) -> Vec<Job> {
 
 /// [`plan_files`], or, with `Some(out)`, a run into the output folder `out`:
 /// every file (also those of a directory among the inputs) goes to
-/// `out/<original name>`. That name gets a number (`logo-2.png`, see
+/// `out/<original name>`. That name gets a number (`logo-1.png`, see
 /// `atomic::numbered`) when it clashes with an entry already in `out` or with
 /// an earlier job's destination in this plan. Names clash case-insensitively
 /// on every platform: they are compared after full Unicode lowercasing of
@@ -216,7 +217,7 @@ impl OutputFolder {
         if is_free(name) {
             return name.to_owned();
         }
-        (2..=MAX_NAME_NUMBER)
+        (1..=MAX_NAME_NUMBER)
             .map(|n| numbered(name, n))
             .find(|candidate| is_free(candidate))
             .unwrap_or_else(|| name.to_owned())
@@ -369,13 +370,28 @@ pub(crate) fn check_pixels(width: u32, height: u32) -> Result<(), String> {
     ))
 }
 
+/// Refuse an animation canvas of `width`×`height` over
+/// [`MAX_ANIMATION_CANVAS_PIXELS`]: the memory cap for decoding an
+/// animation, which holds whole canvases. The error is a message for the
+/// user.
+pub(crate) fn check_animation_canvas(width: u32, height: u32) -> Result<(), String> {
+    // Both factors fit in 32 bits, so the product cannot overflow 64.
+    if u64::from(width) * u64::from(height) <= MAX_ANIMATION_CANVAS_PIXELS {
+        return Ok(());
+    }
+    Err(format!(
+        "animation too large: {width}×{height} canvas exceeds {} megapixels",
+        MAX_ANIMATION_CANVAS_PIXELS / 1_000_000
+    ))
+}
+
 /// Whether an animation of `frames` frames on a `width`×`height` canvas is
 /// within both lossy animation caps: [`MAX_ANIMATION_CANVAS_PIXELS`] for the
 /// canvas and [`MAX_ANIMATION_PIXELS`] for frames times canvas.
 pub(crate) fn animation_within_caps(frames: u64, width: u32, height: u32) -> bool {
     // Both factors fit in 32 bits, so the canvas cannot overflow 64.
     let canvas = u64::from(width) * u64::from(height);
-    canvas <= MAX_ANIMATION_CANVAS_PIXELS
+    check_animation_canvas(width, height).is_ok()
         && frames
             .checked_mul(canvas)
             .is_some_and(|work| work <= MAX_ANIMATION_PIXELS)
@@ -412,6 +428,24 @@ mod tests {
     fn animation_caps_are_the_values_the_user_set() {
         assert_eq!(MAX_ANIMATION_PIXELS, 1_000_000_000);
         assert_eq!(MAX_ANIMATION_CANVAS_PIXELS, 50_000_000);
+    }
+
+    #[test]
+    fn accepts_an_animation_canvas_of_exactly_the_cap() {
+        assert_eq!(check_animation_canvas(10_000, 5000), Ok(()));
+        assert_eq!(check_animation_canvas(50_000_000, 1), Ok(()));
+        assert_eq!(check_animation_canvas(1, 1), Ok(()));
+    }
+
+    #[test]
+    fn refuses_an_animation_canvas_one_pixel_over_the_cap() {
+        assert_eq!(
+            check_animation_canvas(10_001, 5000),
+            Err("animation too large: 10001×5000 canvas exceeds 50 megapixels".to_owned())
+        );
+        assert!(check_animation_canvas(50_000_001, 1).is_err());
+        // No overflow at the largest sizes.
+        assert!(check_animation_canvas(u32::MAX, u32::MAX).is_err());
     }
 
     #[test]

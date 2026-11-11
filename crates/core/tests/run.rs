@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use lunaepix_core::{
-    Compression, FileResult, Job, Note, OptimizeError, Options, Outcome, Quality, RunError, Skip,
-    StopHandle, WORKER_FLAG, WORKER_TIMEOUT, Worker, WriteMode, plan_files, plan_folder, run,
-    run_observed, run_until_stopped,
+    Compression, FileResult, Job, MAX_SVG_THUMB_BYTES, Note, OptimizeError, Options, Outcome,
+    Quality, RunError, Skip, StopHandle, ThumbAnswer, WORKER_FLAG, WORKER_TIMEOUT, Worker,
+    WriteMode, plan_files, plan_folder, run, run_observed, run_thumb, run_until_stopped,
 };
 #[cfg(unix)]
 use lunaepix_core::{Crash, MAX_WORKER_OUTPUT_BYTES};
@@ -925,5 +925,70 @@ fn on_start_never_fires_for_a_skip() {
                 seen: Seen::Skipped(Skip::NotAFile)
             },
         ]
+    );
+}
+
+// --- thumbnails ----------------------------------------------------------------
+
+/// The size of a PNG, decoded for real.
+fn decoded_size(bytes: &[u8]) -> (u32, u32) {
+    let mut reader = png::Decoder::new(bytes).read_info().unwrap();
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut buffer).unwrap();
+    (frame.width, frame.height)
+}
+
+fn sidecar() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_lunaepix-worker"))
+}
+
+#[test]
+fn run_thumb_with_the_real_worker_gives_a_png_for_a_png() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "my phöto – ✓ 日本.png", &png_bytes());
+
+    let answer = run_thumb(&sidecar(), &src);
+
+    let ThumbAnswer::Png(bytes) = answer else {
+        panic!("expected a PNG, got {answer:?}");
+    };
+    assert_eq!(decoded_size(&bytes), (64, 64));
+    // Nothing was written next to the source.
+    assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn run_thumb_with_the_real_worker_gives_cannot_show_for_a_text_file() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "notes.txt", b"just some text");
+
+    assert_eq!(run_thumb(&sidecar(), &src), ThumbAnswer::CannotShow);
+}
+
+#[test]
+fn run_thumb_takes_the_largest_svg_the_worker_answers() {
+    let tmp = TempDir::new().unwrap();
+    // Exactly the largest SVG the worker passes through.
+    let head = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">"#;
+    let tail = b"</svg>";
+    let mut svg = head.to_vec();
+    svg.resize(MAX_SVG_THUMB_BYTES as usize - tail.len(), b' ');
+    svg.extend_from_slice(tail);
+    assert_eq!(svg.len() as u64, MAX_SVG_THUMB_BYTES);
+    let src = write(tmp.path(), "big.svg", &svg);
+
+    let answer = run_thumb(&sidecar(), &src);
+
+    assert_eq!(answer, ThumbAnswer::Svg(svg));
+}
+
+#[test]
+fn run_thumb_with_a_program_that_is_not_there_gives_failed() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &png_bytes());
+
+    assert_eq!(
+        run_thumb(&tmp.path().join("no-such-worker"), &src),
+        ThumbAnswer::Failed
     );
 }

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const WORKER_FLAG: &str = "--lunaepix-worker";
+const THUMB_FLAG: &str = "--lunaepix-thumb";
 const TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A PNG with something to gain: flat, stored with fast compression.
@@ -113,4 +114,178 @@ fn the_app_binary_refuses_a_worker_call_without_a_destination() {
         .collect();
     names.sort();
     assert_eq!(names, ["a.png"]);
+}
+
+/// A 200 x 100 RGB gradient: scaled to 64 x 32 by the thumbnail mode.
+fn wide_png_bytes() -> Vec<u8> {
+    let (w, h) = (200u32, 100u32);
+    let pixels: Vec<u8> = (0..w * h)
+        .flat_map(|i| [(i % w) as u8, (i / w) as u8, 90])
+        .collect();
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, w, h);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&pixels).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+#[test]
+fn thumb_flag_answers_a_png_with_the_header_and_a_decodable_thumbnail() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("hero image.png");
+    fs::write(&src, wide_png_bytes()).unwrap();
+
+    let output = app(&[THUMB_FLAG.as_ref(), src.as_os_str()]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let header = b"lunaepix-thumb 1 png\n";
+    assert!(output.stdout.starts_with(header), "{:?}", output.stdout);
+    let mut reader = png::Decoder::new(&output.stdout[header.len()..])
+        .read_info()
+        .unwrap();
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut buffer).unwrap();
+    assert_eq!((frame.width, frame.height), (64, 32));
+}
+
+#[test]
+fn thumb_flag_exits_3_for_a_text_file_and_prints_nothing() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("notes.txt");
+    fs::write(&src, b"just some text").unwrap();
+
+    let output = app(&[THUMB_FLAG.as_ref(), src.as_os_str()]);
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+}
+
+// --- the `thumb` handler's answer, with the app binary as the worker --------
+
+use lunaepix_app_lib::thumbs::{self, Thumbs};
+
+/// A GET request for `address`, as the webview sends it.
+fn request_for(address: &str) -> tauri::http::Request<Vec<u8>> {
+    tauri::http::Request::builder()
+        .uri(address)
+        .body(Vec::new())
+        .expect("a request")
+}
+
+/// The request for `key`, on the Linux and macOS address.
+fn uri(key: &Option<String>) -> tauri::http::Request<Vec<u8>> {
+    request_for(&format!(
+        "thumb://localhost/{}",
+        key.as_deref().expect("a key")
+    ))
+}
+
+fn app_binary() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_lunaepix-app"))
+}
+
+#[test]
+fn serve_with_the_app_binary_answers_a_png_and_an_svg() {
+    let dir = TempDir::new().unwrap();
+    let png = dir.path().join("hero image.png");
+    fs::write(&png, wide_png_bytes()).unwrap();
+    let svg = dir.path().join("logo.svg");
+    let svg_bytes = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>"#;
+    fs::write(&svg, svg_bytes).unwrap();
+    let thumbs = Thumbs::new();
+    let keys = thumbs.snapshot(&[Some(png), Some(svg)]);
+
+    let answer = thumbs::serve(&thumbs, app_binary(), &uri(&keys[0]));
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.content_type, Some("image/png"));
+    let mut reader = png::Decoder::new(answer.body.as_slice())
+        .read_info()
+        .unwrap();
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut buffer).unwrap();
+    assert_eq!((frame.width, frame.height), (64, 32));
+
+    let answer = thumbs::serve(&thumbs, app_binary(), &uri(&keys[1]));
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.content_type, Some("image/svg+xml"));
+    assert_eq!(answer.body, svg_bytes);
+}
+
+#[test]
+fn serve_with_the_app_binary_is_404_for_a_text_file_and_remembers_it() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("notes.png");
+    fs::write(&src, b"just some text").unwrap();
+    let thumbs = Thumbs::new();
+    let keys = thumbs.snapshot(&[Some(src.clone())]);
+
+    let answer = thumbs::serve(&thumbs, app_binary(), &uri(&keys[0]));
+    assert_eq!(
+        (answer.status, answer.content_type, answer.body.len()),
+        (404, None, 0)
+    );
+    // Remembered: even once the file is a picture, the key stays 404.
+    fs::write(&src, wide_png_bytes()).unwrap();
+    assert_eq!(
+        thumbs::serve(&thumbs, app_binary(), &uri(&keys[0])).status,
+        404
+    );
+}
+
+#[test]
+fn serve_with_a_program_that_is_not_there_is_404_and_tries_again() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("a.png");
+    fs::write(&src, wide_png_bytes()).unwrap();
+    let thumbs = Thumbs::new();
+    let keys = thumbs.snapshot(&[Some(src)]);
+
+    let missing = dir.path().join("no-such-worker");
+    let answer = thumbs::serve(&thumbs, &missing, &uri(&keys[0]));
+    assert_eq!(
+        (answer.status, answer.content_type, answer.body.len()),
+        (404, None, 0)
+    );
+    // Not remembered: with a worker that is there, the same key is made.
+    let answer = thumbs::serve(&thumbs, app_binary(), &uri(&keys[0]));
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.content_type, Some("image/png"));
+}
+
+#[test]
+fn serve_with_the_app_binary_is_404_for_a_query_and_starts_no_worker() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("a.png");
+    fs::write(&src, wide_png_bytes()).unwrap();
+    let thumbs = Thumbs::new();
+    let keys = thumbs.snapshot(&[Some(src)]);
+    let key = keys[0].as_deref().expect("a key");
+
+    // The key is current (the plain request below is answered), so the
+    // query alone is the reason for the 404.
+    for address in [
+        format!("thumb://localhost/{key}?x=1"),
+        format!("http://thumb.localhost/{key}?"),
+    ] {
+        let answer = thumbs::serve(&thumbs, app_binary(), &request_for(&address));
+        assert_eq!(
+            (answer.status, answer.content_type, answer.body.len()),
+            (404, None, 0),
+            "{address}"
+        );
+    }
+    let answer = thumbs::serve(&thumbs, app_binary(), &uri(&keys[0]));
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.content_type, Some("image/png"));
+    // The Windows address answers the same key.
+    let windows = request_for(&format!("http://thumb.localhost/{key}"));
+    assert_eq!(thumbs::serve(&thumbs, app_binary(), &windows).status, 200);
 }

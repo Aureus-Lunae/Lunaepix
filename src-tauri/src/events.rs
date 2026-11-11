@@ -61,6 +61,9 @@ pub struct ListRow {
     pub size: Option<u64>,
     /// Why the row will be skipped, a sentence for the user; `null` otherwise.
     pub skip: Option<String>,
+    /// The key of the row's thumbnail, `<list>-<index>` (see `thumbs`):
+    /// never a path. `null` for a skipped row and for the over-limit row.
+    pub thumb: Option<String>,
 }
 
 /// The whole file list, in display order.
@@ -464,19 +467,21 @@ mod tests {
                             name: "holiday.jpg".to_owned(),
                             size: Some(2400000),
                             skip: None,
+                            thumb: Some("3-0".to_owned()),
                         },
                         ListRow {
                             name: "notes.txt".to_owned(),
                             size: None,
                             skip: Some("Not a PNG, JPG, SVG or WebP file".to_owned()),
+                            thumb: None,
                         },
                     ],
                     notice: None,
                 }),
                 "list-changed",
                 r#"{ "files": [
-                    { "name": "holiday.jpg", "size": 2400000, "skip": null },
-                    { "name": "notes.txt", "size": null, "skip": "Not a PNG, JPG, SVG or WebP file" }
+                    { "name": "holiday.jpg", "size": 2400000, "skip": null, "thumb": "3-0" },
+                    { "name": "notes.txt", "size": null, "skip": "Not a PNG, JPG, SVG or WebP file", "thumb": null }
                 ], "notice": null }"#,
             ),
             (
