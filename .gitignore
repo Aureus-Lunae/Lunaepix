@@ -1,3 +1,6 @@
 samples/
 /target/
 .claude/worktrees/
+
+# Brainstorm mockups (visual companion)
+.superpowers/

@@ -1,5 +1,5 @@
 //! Guards on the window's security settings, so a later change cannot widen
-//! them silently: the capability grants the three app commands and event
+//! them silently: the capability grants the six app commands and event
 //! listening only, and the content security policy stays strict.
 
 use std::cell::RefCell;
@@ -16,7 +16,10 @@ use serde_json::Value;
 /// Every permission the window may have.
 const ALLOWED: &[&str] = &[
     "allow-choose-files",
-    "allow-choose-folder",
+    "allow-clear-list",
+    "allow-choose-output-folder",
+    "allow-clear-output-folder",
+    "allow-start-run",
     "allow-open-output-folder",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
@@ -79,22 +82,45 @@ fn csp_problems(csp: &str) -> Vec<String> {
     problems
 }
 
-#[test]
-fn the_capability_grants_the_three_commands_and_event_listening_only() {
-    let capability = read_json("capabilities/default.json");
-    assert_eq!(unexpected_permissions(&capability), Vec::<String>::new());
-    let granted: Vec<&str> = capability["permissions"]
+/// The permissions a capability grants that are plain names, in order.
+fn granted(capability: &Value) -> Vec<&str> {
+    capability["permissions"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(Value::as_str)
-        .collect();
-    for needed in ALLOWED {
-        assert!(granted.contains(needed), "missing {needed}");
-    }
+        .collect()
+}
+
+#[test]
+fn the_capability_grants_exactly_the_six_commands_and_event_listening() {
+    let capability = read_json("capabilities/default.json");
+    assert_eq!(unexpected_permissions(&capability), Vec::<String>::new());
+    let granted = granted(&capability);
+    // Each exactly once, nothing else.
+    let mut sorted = granted.clone();
+    sorted.sort_unstable();
+    let mut allowed = ALLOWED.to_vec();
+    allowed.sort_unstable();
+    assert_eq!(sorted, allowed);
+    assert_eq!(
+        granted.iter().filter(|p| p.starts_with("allow-")).count(),
+        6
+    );
     assert_eq!(capability["windows"], serde_json::json!(["main"]));
     // No `remote` block: no web page may use the capability.
     assert!(capability.get("remote").is_none());
+}
+
+#[test]
+fn a_capability_listing_choose_folder_is_flagged() {
+    let mut permissions: Vec<Value> = ALLOWED.iter().map(|p| Value::from(*p)).collect();
+    permissions.push(Value::from("allow-choose-folder"));
+    let capability = serde_json::json!({ "permissions": permissions });
+    assert_eq!(
+        unexpected_permissions(&capability),
+        [r#""allow-choose-folder""#]
+    );
 }
 
 #[test]
@@ -393,12 +419,13 @@ fn js_lint_hits(text: &str) -> Vec<&'static str> {
 // ---------------------------------------------------------------------
 
 /// What the tokenizer found, reduced to what the checks need: start tags with
-/// their attributes (names in lower case, values decoded), end tags, and text.
-/// Comments and doctypes are dropped.
+/// their attributes (names in lower case, values decoded), end tags, text and
+/// comments. Doctypes are dropped.
 enum Piece {
     Start(StartTag),
     End(String),
     Text(String),
+    Comment(String),
 }
 
 struct StartTag {
@@ -425,8 +452,14 @@ impl TokenSink for Collector {
 
     fn process_token(&self, token: Token, _line_number: u64) -> TokenSinkResult<()> {
         let Token::TagToken(tag) = token else {
-            if let Token::CharacterTokens(text) = token {
-                self.0.borrow_mut().push(Piece::Text(text.to_string()));
+            match token {
+                Token::CharacterTokens(text) => {
+                    self.0.borrow_mut().push(Piece::Text(text.to_string()));
+                }
+                Token::CommentToken(text) => {
+                    self.0.borrow_mut().push(Piece::Comment(text.to_string()));
+                }
+                _ => {}
             }
             return TokenSinkResult::Continue;
         };
@@ -473,6 +506,17 @@ fn start_tags(html: &str) -> Vec<StartTag> {
         .into_iter()
         .filter_map(|piece| match piece {
             Piece::Start(tag) => Some(tag),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The comments of `html`, in order.
+fn comments(html: &str) -> Vec<String> {
+    pieces(html)
+        .into_iter()
+        .filter_map(|piece| match piece {
+            Piece::Comment(text) => Some(text),
             _ => None,
         })
         .collect()
@@ -1024,6 +1068,386 @@ fn only_a_real_html_lang_and_real_column_headers_satisfy_the_structure() {
     );
 }
 
+// --- the run settings (Task 11) ---------------------------------------------
+
+/// Problems with the settings controls the accessibility rules need, read as
+/// tokens: the "Compression" choice is a `<fieldset>` whose `<legend>` says
+/// "Compression" and that holds two radio inputs, and the quality range and
+/// number inputs each have a `<label for>` and the bounds min 0, max 100,
+/// step 1.
+fn settings_problems(html: &str) -> Vec<String> {
+    let pieces = pieces(html);
+    let mut problems = Vec::new();
+
+    // Each fieldset as (its legend's text, the radio inputs inside it).
+    let mut fieldsets: Vec<(String, usize)> = Vec::new();
+    let mut open: Vec<(String, usize)> = Vec::new();
+    let mut in_legend = 0usize;
+    for piece in &pieces {
+        match piece {
+            Piece::Start(tag) if tag.name == "fieldset" => open.push((String::new(), 0)),
+            Piece::End(name) if name == "fieldset" => {
+                if let Some(closed) = open.pop() {
+                    fieldsets.push(closed);
+                }
+            }
+            Piece::Start(tag) if tag.name == "legend" && !open.is_empty() => in_legend += 1,
+            Piece::End(name) if name == "legend" => in_legend = in_legend.saturating_sub(1),
+            Piece::Text(text) if in_legend > 0 => {
+                if let Some(current) = open.last_mut() {
+                    current.0.push_str(text);
+                }
+            }
+            Piece::Start(tag)
+                if tag.name == "input"
+                    && tag
+                        .attr("type")
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("radio")) =>
+            {
+                if let Some(current) = open.last_mut() {
+                    current.1 += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    fieldsets.extend(open);
+    match fieldsets
+        .iter()
+        .find(|(legend, _)| one_line(legend) == "Compression")
+    {
+        None => problems.push("a fieldset with the legend \"Compression\"".to_owned()),
+        Some((_, radios)) if *radios != 2 => {
+            problems.push("two radio inputs in the Compression fieldset".to_owned());
+        }
+        Some(_) => {}
+    }
+
+    let tags: Vec<&StartTag> = pieces
+        .iter()
+        .filter_map(|piece| match piece {
+            Piece::Start(tag) => Some(tag),
+            _ => None,
+        })
+        .collect();
+    let labelled: HashSet<&str> = tags
+        .iter()
+        .filter(|tag| tag.name == "label")
+        .filter_map(|tag| tag.attr("for"))
+        .collect();
+    for kind in ["range", "number"] {
+        let inputs: Vec<&&StartTag> = tags
+            .iter()
+            .filter(|tag| {
+                tag.name == "input"
+                    && tag
+                        .attr("type")
+                        .is_some_and(|value| value.eq_ignore_ascii_case(kind))
+            })
+            .collect();
+        let [input] = inputs.as_slice() else {
+            problems.push(format!("one {kind} input"));
+            continue;
+        };
+        if !input.attr("id").is_some_and(|id| labelled.contains(id)) {
+            problems.push(format!("a <label for> on the {kind} input"));
+        }
+        for (name, value) in [("min", "0"), ("max", "100"), ("step", "1")] {
+            if input.attr(name) != Some(value) {
+                problems.push(format!("{name}=\"{value}\" on the {kind} input"));
+            }
+        }
+    }
+    problems
+}
+
+/// Settings markup with everything [`settings_problems`] asks for.
+const SETTINGS_FIXTURE: &str = "<fieldset><legend>Compression</legend>\
+     <label><input type=\"radio\" name=\"m\"> Lossless</label>\
+     <label><input type=\"radio\" name=\"m\"> Lossy</label></fieldset>\
+     <label for=\"r\">Quality</label>\
+     <input id=\"r\" type=\"range\" min=\"0\" max=\"100\" step=\"1\">\
+     <label for=\"n\">Quality number</label>\
+     <input id=\"n\" type=\"number\" min=\"0\" max=\"100\" step=\"1\">";
+
+#[test]
+fn the_settings_have_a_compression_fieldset_and_two_labelled_bounded_quality_inputs() {
+    assert_eq!(settings_problems(&index_html()), Vec::<String>::new());
+}
+
+#[test]
+fn a_settings_fixture_with_everything_passes_in_any_spelling() {
+    assert_eq!(settings_problems(SETTINGS_FIXTURE), Vec::<String>::new());
+    // Upper-case tags, attribute names and type values, other quotes, a
+    // wrapped legend: the same markup to a browser.
+    let spelled = SETTINGS_FIXTURE
+        .replace(
+            "<legend>Compression</legend>",
+            "<LEGEND>\n  Compression\n</LEGEND>",
+        )
+        .replace("type=\"radio\"", "TYPE='RADIO'")
+        .replace(
+            "<input id=\"r\" type=\"range\"",
+            "<INPUT ID='r' TYPE='Range'",
+        );
+    assert_eq!(settings_problems(&spelled), Vec::<String>::new());
+}
+
+#[test]
+fn a_settings_fixture_without_a_legend_a_label_or_a_bound_is_flagged() {
+    let cases: [(String, &str); 10] = [
+        (
+            SETTINGS_FIXTURE.replace("<legend>Compression</legend>", ""),
+            "a fieldset with the legend \"Compression\"",
+        ),
+        (
+            SETTINGS_FIXTURE.replace(
+                "<legend>Compression</legend>",
+                "<!-- <legend>Compression</legend> -->",
+            ),
+            "a fieldset with the legend \"Compression\"",
+        ),
+        (
+            SETTINGS_FIXTURE.replace("<legend>Compression</legend>", "<legend>Mode</legend>"),
+            "a fieldset with the legend \"Compression\"",
+        ),
+        (
+            SETTINGS_FIXTURE.replacen("type=\"radio\"", "type=\"checkbox\"", 1),
+            "two radio inputs in the Compression fieldset",
+        ),
+        (
+            SETTINGS_FIXTURE.replace("<label for=\"r\">Quality</label>", ""),
+            "a <label for> on the range input",
+        ),
+        (
+            SETTINGS_FIXTURE.replace("<label for=\"n\">", "<label for=\"x\">"),
+            "a <label for> on the number input",
+        ),
+        (
+            SETTINGS_FIXTURE.replace("<label for=\"n\">", "<label data-for=\"n\">"),
+            "a <label for> on the number input",
+        ),
+        (
+            SETTINGS_FIXTURE.replace(
+                "type=\"number\" min=\"0\" max=\"100\"",
+                "type=\"number\" min=\"0\" max=\"101\"",
+            ),
+            "max=\"100\" on the number input",
+        ),
+        (
+            SETTINGS_FIXTURE.replace(
+                "type=\"range\" min=\"0\" max=\"100\" step=\"1\"",
+                "type=\"range\" min=\"0\" max=\"100\"",
+            ),
+            "step=\"1\" on the range input",
+        ),
+        (
+            SETTINGS_FIXTURE.replace("type=\"range\" min=\"0\"", "type=\"range\" min=\"1\""),
+            "min=\"0\" on the range input",
+        ),
+    ];
+    for (html, problem) in cases {
+        assert_eq!(settings_problems(&html), vec![problem.to_owned()], "{html}");
+    }
+    // A quality input that is missing altogether.
+    let no_number = SETTINGS_FIXTURE.replace(
+        "<input id=\"n\" type=\"number\" min=\"0\" max=\"100\" step=\"1\">",
+        "",
+    );
+    assert_eq!(
+        settings_problems(&no_number),
+        vec!["one number input".to_owned()]
+    );
+}
+
+// --- the Save to buttons and the quality row (Task 13) ---------------------
+
+/// Problems with the Save to buttons and the quality row, read as tokens:
+/// `chooseOutput` says "Choose folder"; `clearOutput` says "Clear" and has the
+/// `aria-label` "Clear output folder" (the visible text is inside the
+/// accessible name); and an element with the id `qualityRow` holds the range
+/// input, the number input and the `qualityError` line, so one `hidden` on the
+/// row hides the whole Quality row.
+fn output_and_quality_problems(html: &str) -> Vec<String> {
+    const VOID: &[&str] = &["input", "br", "img", "hr", "meta", "link"];
+    const ROW: &str = "qualityRow";
+    let mut problems = Vec::new();
+
+    // Each button with an id, as (id, aria-label, text).
+    let mut buttons: Vec<(String, Option<String>, String)> = Vec::new();
+    let mut in_button = false;
+    // The open elements as (name, id), innermost last.
+    let mut open: Vec<(String, Option<String>)> = Vec::new();
+    let mut row_seen = false;
+    // Whether each range input, number input and `qualityError` is inside the row.
+    let (mut ranges, mut numbers, mut errors): (Vec<bool>, Vec<bool>, Vec<bool>) =
+        (Vec::new(), Vec::new(), Vec::new());
+    for piece in pieces(html) {
+        match piece {
+            Piece::Start(tag) => {
+                let inside = open.iter().any(|(_, id)| id.as_deref() == Some(ROW));
+                let id = tag.attr("id");
+                row_seen |= id == Some(ROW);
+                let kind = tag.attr("type").map(str::to_ascii_lowercase);
+                if tag.name == "input" && kind.as_deref() == Some("range") {
+                    ranges.push(inside);
+                } else if tag.name == "input" && kind.as_deref() == Some("number") {
+                    numbers.push(inside);
+                } else if id == Some("qualityError") {
+                    errors.push(inside);
+                }
+                if tag.name == "button"
+                    && let Some(id) = id
+                {
+                    buttons.push((
+                        id.to_owned(),
+                        tag.attr("aria-label").map(str::to_owned),
+                        String::new(),
+                    ));
+                    in_button = true;
+                }
+                if !VOID.contains(&tag.name.as_str()) {
+                    open.push((tag.name.clone(), id.map(str::to_owned)));
+                }
+            }
+            Piece::End(name) => {
+                if name == "button" {
+                    in_button = false;
+                }
+                // An end tag closes the nearest open element of its name
+                // and whatever was left open inside it.
+                if let Some(at) = open.iter().rposition(|(open_name, _)| *open_name == name) {
+                    open.truncate(at);
+                }
+            }
+            Piece::Text(text) if in_button => {
+                if let Some(last) = buttons.last_mut() {
+                    last.2.push_str(&text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (id, text, aria) in [
+        ("chooseOutput", "Choose folder", None),
+        ("clearOutput", "Clear", Some("Clear output folder")),
+    ] {
+        let Some((_, label, content)) = buttons.iter().find(|(button, _, _)| button == id) else {
+            problems.push(format!("a button with the id {id}"));
+            continue;
+        };
+        if one_line(content) != text {
+            problems.push(format!("{id} text \"{text}\""));
+        }
+        if let Some(aria) = aria
+            && label.as_deref() != Some(aria)
+        {
+            problems.push(format!("aria-label=\"{aria}\" on {id}"));
+        }
+    }
+    if !row_seen {
+        problems.push(format!("an element with the id {ROW}"));
+    }
+    for (what, found) in [
+        ("the range input", ranges),
+        ("the number input", numbers),
+        ("qualityError", errors),
+    ] {
+        if found.is_empty() || found.contains(&false) {
+            problems.push(format!("{what} inside {ROW}"));
+        }
+    }
+    problems
+}
+
+/// Markup with everything [`output_and_quality_problems`] asks for.
+const OUTPUT_FIXTURE: &str = "<div id=\"qualityRow\">\
+     <label for=\"r\">Quality</label><input id=\"r\" type=\"range\">\
+     <label for=\"n\">Quality number</label><input id=\"n\" type=\"number\">\
+     <p id=\"qualityError\" hidden>Enter a whole number.</p></div>\
+     <div><button id=\"chooseOutput\" type=\"button\">Choose folder</button>\
+     <button id=\"clearOutput\" type=\"button\" aria-label=\"Clear output folder\" hidden>Clear</button></div>";
+
+#[test]
+fn the_output_buttons_and_the_quality_row_match_the_rules() {
+    assert_eq!(
+        output_and_quality_problems(&index_html()),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn an_output_and_quality_fixture_with_everything_passes_in_any_spelling() {
+    assert_eq!(
+        output_and_quality_problems(OUTPUT_FIXTURE),
+        Vec::<String>::new()
+    );
+    // Upper-case tags and attribute names, other quotes, wrapped button text,
+    // and an input nested deeper inside the row: the same markup to a browser.
+    let spelled = OUTPUT_FIXTURE
+        .replace("<div id=\"qualityRow\">", "<DIV ID='qualityRow'>")
+        .replace(
+            "<input id=\"n\" type=\"number\">",
+            "<span><INPUT ID='n' TYPE='Number'></span>",
+        )
+        .replace(
+            "<button id=\"chooseOutput\" type=\"button\">Choose folder</button>",
+            "<BUTTON ID='chooseOutput'>\n  Choose\n  folder\n</BUTTON>",
+        )
+        .replace("aria-label=", "ARIA-LABEL=");
+    assert_eq!(output_and_quality_problems(&spelled), Vec::<String>::new());
+}
+
+#[test]
+fn an_output_and_quality_fixture_with_old_texts_no_label_or_a_misplaced_input_is_flagged() {
+    let moved_out = |input: &str| OUTPUT_FIXTURE.replace(input, "") + input;
+    let number = "<input id=\"n\" type=\"number\">";
+    let range = "<input id=\"r\" type=\"range\">";
+    let error = "<p id=\"qualityError\" hidden>Enter a whole number.</p>";
+    let cases: Vec<(String, Vec<&str>)> = vec![
+        (
+            OUTPUT_FIXTURE.replace(">Clear</button>", ">Next to the originals</button>"),
+            vec!["clearOutput text \"Clear\""],
+        ),
+        (
+            OUTPUT_FIXTURE.replace(">Choose folder<", ">Choose output folder<"),
+            vec!["chooseOutput text \"Choose folder\""],
+        ),
+        (
+            OUTPUT_FIXTURE.replace(" aria-label=\"Clear output folder\"", ""),
+            vec!["aria-label=\"Clear output folder\" on clearOutput"],
+        ),
+        (
+            OUTPUT_FIXTURE.replace("aria-label=\"Clear output folder\"", "aria-label=\"Clear\""),
+            vec!["aria-label=\"Clear output folder\" on clearOutput"],
+        ),
+        (
+            OUTPUT_FIXTURE.replace("<button id=\"clearOutput\"", "<div id=\"clearOutput\""),
+            vec!["a button with the id clearOutput"],
+        ),
+        (
+            moved_out(number),
+            vec!["the number input inside qualityRow"],
+        ),
+        (moved_out(range), vec!["the range input inside qualityRow"]),
+        (moved_out(error), vec!["qualityError inside qualityRow"]),
+        (
+            OUTPUT_FIXTURE.replace("<div id=\"qualityRow\">", "<div>"),
+            vec![
+                "an element with the id qualityRow",
+                "the range input inside qualityRow",
+                "the number input inside qualityRow",
+                "qualityError inside qualityRow",
+            ],
+        ),
+    ];
+    for (html, problems) in cases {
+        let expected: Vec<String> = problems.into_iter().map(str::to_owned).collect();
+        assert_eq!(output_and_quality_problems(&html), expected, "{html}");
+    }
+}
+
 // ---------------------------------------------------------------------
 // Third-party licences. `THIRD-PARTY-LICENSES.html` is generated by
 // cargo-about from `about.toml`; these checks keep copyleft out of the
@@ -1534,6 +1958,302 @@ fn a_text_without_the_ijg_wording_or_the_libdeflate_notice_is_caught_in_a_fixtur
     assert!(!has_libdeflate_notice("<pre>MIT License</pre>"));
     assert!(has_libdeflate_notice(
         "<pre>Copyright 2016 Eric Biggers\nCopyright 2024 Google LLC</pre>"
+    ));
+}
+
+// --- the licences of libwebp and quantizr ------------------------------------------
+
+/// SHA-256 of `vendor/COPYING` in libwebp-sys 0.14.4 (libwebp's BSD-3-Clause).
+const LIBWEBP_COPYING_SHA256: &str =
+    "5aec868f669e384a22372a4e8a1a6cd7d44c64cd451f960ca69cc170d1e13acf";
+/// SHA-256 of `vendor/PATENTS` in libwebp-sys 0.14.4 (Google's patent grant).
+const LIBWEBP_PATENTS_SHA256: &str =
+    "cc3273e0694ea5896145e0677699b53471b03ea43021ddc50e7923fbb9f5023c";
+/// SHA-256 of `LICENSE` in quantizr 1.4.3 (MIT).
+const QUANTIZR_LICENSE_SHA256: &str =
+    "407b2d167f73ef78da1fcbfb6c2f1051f195b1984b9bfeeac0a39b34c198a7fe";
+
+/// What `about.toml` must clarify, as `(crate, licence expression, file path,
+/// file checksum, file licence)`. libwebp-sys declares only MIT but vendors
+/// BSD-3-Clause C code; quantizr declares no licence in its manifest at all
+/// (`license-file` only), so cargo-about cannot guess it.
+const CLARIFICATIONS: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "libwebp-sys",
+        "MIT AND BSD-3-Clause",
+        "vendor/COPYING",
+        LIBWEBP_COPYING_SHA256,
+        "BSD-3-Clause",
+    ),
+    ("quantizr", "MIT", "LICENSE", QUANTIZR_LICENSE_SHA256, "MIT"),
+];
+
+/// What is missing or wrong in `about.toml`'s clarifications of libwebp-sys
+/// and quantizr: the table, the licence expression, and the licence file with
+/// its path, checksum and licence.
+fn clarification_problems(about_toml: &str) -> Vec<String> {
+    let table = match about_toml.parse::<toml::Table>() {
+        Ok(table) => table,
+        Err(error) => return vec![format!("about.toml does not parse: {error}")],
+    };
+    let mut problems = Vec::new();
+    for (name, expression, path, checksum, file_licence) in CLARIFICATIONS {
+        let Some(clarify) = table
+            .get(*name)
+            .and_then(toml::Value::as_table)
+            .and_then(|krate| krate.get("clarify"))
+            .and_then(toml::Value::as_table)
+        else {
+            problems.push(format!("{name}: no clarify table"));
+            continue;
+        };
+        if clarify.get("license").and_then(toml::Value::as_str) != Some(*expression) {
+            problems.push(format!("{name}: license is not {expression}"));
+        }
+        let listed = clarify
+            .get("files")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_table)
+            .any(|file| {
+                let field = |key: &str| file.get(key).and_then(toml::Value::as_str);
+                field("path") == Some(*path)
+                    && field("checksum") == Some(*checksum)
+                    && field("license") == Some(*file_licence)
+            });
+        if !listed {
+            problems.push(format!(
+                "{name}: no file {path} with checksum {checksum} and licence {file_licence}"
+            ));
+        }
+    }
+    problems
+}
+
+/// libwebp's BSD-3-Clause text (its copyright line and the clause that names
+/// Google), quantizr's MIT notice, Google's patent grant (its heading, the
+/// definition and the scope sentence) and the checksum of the `PATENTS` file
+/// in a comment beside it. Text in a comment, script or style does not count
+/// as shown; the checksum counts only as a comment.
+fn licence_page_problems(html: &str) -> Vec<String> {
+    let text = page_text(html);
+    let mut problems = Vec::new();
+    for (what, needle) in [
+        ("libwebp-sys in the list of users", "libwebp-sys"),
+        (
+            "libwebp's copyright line",
+            "Copyright (c) 2010, Google Inc.",
+        ),
+        (
+            "libwebp's BSD-3-Clause text",
+            "Neither the name of Google nor the names of its contributors",
+        ),
+        ("quantizr in the list of users", "quantizr"),
+        (
+            "quantizr's copyright line",
+            "Copyright (c) 2017 Sergey Alexandrovich",
+        ),
+        (
+            "the patent grant heading",
+            "Additional IP Rights Grant (Patents)",
+        ),
+        // Not the Apache-2.0 wording the page also holds: the grant's own words.
+        (
+            "the patent grant's definition",
+            "implement the WebM codecs distributed by Google as part of the WebM Project.",
+        ),
+        (
+            "the patent grant's scope",
+            "necessarily infringed by these implementations of WebM.",
+        ),
+    ] {
+        if !text.contains(needle) {
+            problems.push(format!("the page does not show {what}"));
+        }
+    }
+    if !comments(html)
+        .iter()
+        .any(|comment| comment.contains(LIBWEBP_PATENTS_SHA256))
+    {
+        problems.push("no comment gives the PATENTS checksum".to_owned());
+    }
+    problems
+}
+
+const LIBWEBP_FIXTURE: &str = "<li>libwebp-sys 0.14.4</li><pre>Copyright (c) 2010, Google Inc. \
+    All rights reserved. Neither the name of Google nor the names of its contributors may be used</pre>";
+const QUANTIZR_FIXTURE: &str =
+    "<li>quantizr 1.4.3</li><pre>MIT License Copyright (c) 2017 Sergey Alexandrovich</pre>";
+const PATENTS_TEXT_FIXTURE: &str = "<h3>libwebp: Additional IP Rights Grant (Patents)</h3><pre>\
+    \"These implementations\" means the copyrightable works that implement the WebM codecs distributed \
+    by Google as part of the WebM Project. ... necessarily infringed by these implementations of WebM. ...</pre>";
+const PATENTS_SUM_FIXTURE: &str = "<!-- vendor/PATENTS of libwebp-sys 0.14.4, sha256 cc3273e0694ea5896145e0677699b53471b03ea43021ddc50e7923fbb9f5023c -->";
+
+fn licence_fixture(parts: &[&str]) -> String {
+    format!("<main>{}</main>", parts.concat())
+}
+
+fn full_licence_fixture() -> String {
+    licence_fixture(&[
+        LIBWEBP_FIXTURE,
+        QUANTIZR_FIXTURE,
+        PATENTS_SUM_FIXTURE,
+        PATENTS_TEXT_FIXTURE,
+    ])
+}
+
+/// An `about.toml` fixture with the clarification of libwebp-sys and/or
+/// quantizr, each as the real file should have it.
+fn about_fixture(libwebp: bool, quantizr: bool) -> String {
+    let mut about = String::from("accepted = [\"MIT\", \"BSD-3-Clause\"]\n");
+    for (include, (name, expression, path, checksum, licence)) in
+        [libwebp, quantizr].into_iter().zip(CLARIFICATIONS)
+    {
+        if include {
+            about.push_str(&format!(
+                "[{name}.clarify]\nlicense = \"{expression}\"\n\
+                 [[{name}.clarify.files]]\npath = \"{path}\"\nchecksum = \"{checksum}\"\nlicense = \"{licence}\"\n"
+            ));
+        }
+    }
+    about
+}
+
+#[test]
+fn about_toml_clarifies_libwebp_sys_and_quantizr_with_checksums() {
+    let about = repo_file("about.toml");
+    assert_eq!(clarification_problems(&about), Vec::<String>::new());
+    // Not vacuous: the parse saw both entries, and the policy is still sound.
+    let table = about.parse::<toml::Table>().unwrap();
+    assert_eq!(
+        table["libwebp-sys"]["clarify"]["license"].as_str(),
+        Some("MIT AND BSD-3-Clause")
+    );
+    assert_eq!(
+        table["quantizr"]["clarify"]["license"].as_str(),
+        Some("MIT")
+    );
+    assert_eq!(about_problems(&about), Vec::<String>::new());
+}
+
+#[test]
+fn a_clarification_that_is_missing_or_wrong_is_caught_in_a_fixture() {
+    // The pair is right: nothing to flag (so each case below fails on its own).
+    assert_eq!(
+        clarification_problems(&about_fixture(true, true)),
+        Vec::<String>::new()
+    );
+    let no_quantizr = clarification_problems(&about_fixture(true, false));
+    assert!(
+        names(&no_quantizr, "quantizr: no clarify table"),
+        "{no_quantizr:?}"
+    );
+    assert!(!names(&no_quantizr, "libwebp-sys"), "{no_quantizr:?}");
+    let no_libwebp = clarification_problems(&about_fixture(false, true));
+    assert!(
+        names(&no_libwebp, "libwebp-sys: no clarify table"),
+        "{no_libwebp:?}"
+    );
+    assert!(!names(&no_libwebp, "quantizr"), "{no_libwebp:?}");
+    // A changed checksum is a changed file: flagged for that crate only.
+    let wrong_sum = about_fixture(true, true).replace(QUANTIZR_LICENSE_SHA256, "00");
+    let problems = clarification_problems(&wrong_sum);
+    assert!(
+        names(&problems, "quantizr: no file LICENSE"),
+        "{problems:?}"
+    );
+    assert!(!names(&problems, "libwebp-sys"), "{problems:?}");
+    // libwebp-sys left at MIT alone drops the BSD-3-Clause notice.
+    let mit_only = about_fixture(true, true).replace("MIT AND BSD-3-Clause", "MIT");
+    let problems = clarification_problems(&mit_only);
+    assert!(
+        names(
+            &problems,
+            "libwebp-sys: license is not MIT AND BSD-3-Clause"
+        ),
+        "{problems:?}"
+    );
+    // A file entry under another path is not the file.
+    let wrong_path = about_fixture(true, true).replace("vendor/COPYING", "COPYING");
+    let problems = clarification_problems(&wrong_path);
+    assert!(
+        names(&problems, "libwebp-sys: no file vendor/COPYING"),
+        "{problems:?}"
+    );
+    // A file that does not parse says so, instead of reading as "nothing wrong".
+    assert!(names(
+        &clarification_problems("accepted = ["),
+        "does not parse"
+    ));
+}
+
+#[test]
+fn the_licence_page_names_libwebp_quantizr_and_the_patents_grant() {
+    let html = repo_file(LICENCE_FILE);
+    assert_eq!(licence_page_problems(&html), Vec::<String>::new());
+}
+
+#[test]
+fn a_licence_page_without_libwebp_quantizr_or_the_patents_grant_is_caught_in_a_fixture() {
+    // The full fixture is right: nothing to flag (so each case below fails on its own).
+    assert_eq!(
+        licence_page_problems(&full_licence_fixture()),
+        Vec::<String>::new()
+    );
+    let without = |parts: &[&str]| licence_page_problems(&licence_fixture(parts));
+    let no_libwebp = without(&[QUANTIZR_FIXTURE, PATENTS_SUM_FIXTURE, PATENTS_TEXT_FIXTURE]);
+    assert!(
+        names(&no_libwebp, "libwebp's copyright line"),
+        "{no_libwebp:?}"
+    );
+    assert!(
+        names(&no_libwebp, "libwebp's BSD-3-Clause text"),
+        "{no_libwebp:?}"
+    );
+    assert!(!names(&no_libwebp, "quantizr"), "{no_libwebp:?}");
+    let no_quantizr = without(&[LIBWEBP_FIXTURE, PATENTS_SUM_FIXTURE, PATENTS_TEXT_FIXTURE]);
+    assert!(
+        names(&no_quantizr, "quantizr's copyright line"),
+        "{no_quantizr:?}"
+    );
+    assert!(!names(&no_quantizr, "libwebp"), "{no_quantizr:?}");
+    let no_patents = without(&[LIBWEBP_FIXTURE, QUANTIZR_FIXTURE, PATENTS_SUM_FIXTURE]);
+    assert!(names(&no_patents, "the patent grant"), "{no_patents:?}");
+    assert!(!names(&no_patents, "PATENTS checksum"), "{no_patents:?}");
+    // The patent text without the checksum comment: the file cannot be re-checked.
+    let no_sum = without(&[LIBWEBP_FIXTURE, QUANTIZR_FIXTURE, PATENTS_TEXT_FIXTURE]);
+    assert_eq!(
+        no_sum,
+        vec!["no comment gives the PATENTS checksum".to_owned()]
+    );
+    // The checksum as page text is not a comment, and another file's checksum is not it.
+    let sum_as_text = full_licence_fixture()
+        .replace("<!-- ", "<p>")
+        .replace(" -->", "</p>");
+    assert_eq!(
+        licence_page_problems(&sum_as_text),
+        vec!["no comment gives the PATENTS checksum".to_owned()]
+    );
+    let other_sum = full_licence_fixture().replace(LIBWEBP_PATENTS_SHA256, LIBWEBP_COPYING_SHA256);
+    assert_eq!(
+        licence_page_problems(&other_sum),
+        vec!["no comment gives the PATENTS checksum".to_owned()]
+    );
+    // A notice that stands only in a comment, a script or a style is not on the page.
+    let in_comment = format!(
+        "<!-- {LIBWEBP_FIXTURE} -->{QUANTIZR_FIXTURE}{PATENTS_SUM_FIXTURE}{PATENTS_TEXT_FIXTURE}"
+    );
+    assert!(names(
+        &licence_page_problems(&in_comment),
+        "libwebp's copyright line"
+    ));
+    let in_script = format!(
+        "<script>'{PATENTS_TEXT_FIXTURE}'</script>{LIBWEBP_FIXTURE}{QUANTIZR_FIXTURE}{PATENTS_SUM_FIXTURE}"
+    );
+    assert!(names(
+        &licence_page_problems(&in_script),
+        "the patent grant"
     ));
 }
 

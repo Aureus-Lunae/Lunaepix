@@ -5,7 +5,7 @@ use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::Path;
 
-use lunaepix_core::{FileResult, Outcome};
+use lunaepix_core::{Compression, FileResult, Outcome};
 
 /// The colour switched on before the saved percentage, and off after it.
 const GREEN: &str = "\x1b[32m";
@@ -17,6 +17,7 @@ const RESET: &str = "\x1b[0m";
 /// <name>:
 /// Done in <ms> ms!
 /// <before> KiB - <saved>% = <after> KiB
+/// <the note, only when a lossy run kept the file's bytes as they were>
 /// <blank line>
 /// ```
 ///
@@ -33,13 +34,28 @@ pub fn format_success(name: &OsStr, outcome: &Outcome, colour: bool) -> String {
     } else {
         0.0
     };
+    // A lossy run's note goes on the line under the sizes. Without one the
+    // block is exactly what it always was.
+    let note = outcome
+        .note
+        .map_or_else(String::new, |note| format!("{note}\n"));
     format!(
-        "{}:\nDone in {} ms!\n{:.3} KiB - {green}{saved:.1}%{reset} = {:.3} KiB\n\n",
+        "{}:\nDone in {} ms!\n{:.3} KiB - {green}{saved:.1}%{reset} = {:.3} KiB\n{note}\n",
         escape_control(&name.to_string_lossy()),
         outcome.millis,
         before / 1024.0,
         after / 1024.0,
     )
+}
+
+/// Print `Lossy, quality <q>` to `out`, once, for a lossy run. A lossless run
+/// prints nothing, so its output is what it always was. A write that fails (a
+/// closed pipe) is ignored, as everywhere in this module.
+pub fn report_mode(compression: Compression, out: &mut dyn Write) {
+    if let Compression::Lossy(quality) = compression {
+        let _ = writeln!(out, "Lossy, quality {}", quality.get());
+        let _ = out.flush();
+    }
 }
 
 /// `text` with every control character replaced by a visible escape, so that
@@ -72,6 +88,18 @@ pub fn report_not_a_folder(dir: &Path, err: &mut dyn Write) {
         err,
         "lunaepix: failed (not a folder): {}",
         display_path(dir)
+    );
+}
+
+/// Print `lunaepix: failed (cannot create the output folder: <cause>): <out>`
+/// to `err`: the `--out` folder could not be made (a file is in the way, or
+/// there is no permission). Nothing has been optimised then.
+pub fn report_cannot_create_out(out: &Path, cause: &io::Error, err: &mut dyn Write) {
+    let _ = writeln!(
+        err,
+        "lunaepix: failed (cannot create the output folder: {}): {}",
+        escape_control(&cause.to_string()),
+        display_path(out)
     );
 }
 
@@ -129,6 +157,7 @@ mod tests {
             before,
             after,
             millis,
+            note: None,
         }
     }
 
@@ -446,6 +475,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_hostile_out_folder_name_or_error_text_reaches_no_terminal() {
+        for name in HOSTILE {
+            for cause_text in HOSTILE {
+                let mut err = Vec::new();
+                let cause = std::io::Error::other(cause_text);
+                report_cannot_create_out(Path::new(name), &cause, &mut err);
+                assert_no_control_bytes(&String::from_utf8(err).unwrap(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn the_out_folder_error_names_the_cause_and_the_folder() {
+        let mut err = Vec::new();
+        let cause = std::io::Error::other("Not a directory");
+        report_cannot_create_out(Path::new("pics/out"), &cause, &mut err);
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "lunaepix: failed (cannot create the output folder: Not a directory): pics/out\n"
+        );
+    }
+
     /// A writer whose pipe is closed.
     struct Closed;
 
@@ -456,6 +508,93 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Err(std::io::ErrorKind::BrokenPipe.into())
         }
+    }
+
+    // --- the mode line and the notes (lossy runs) -----------------------------
+
+    use lunaepix_core::{Note, Quality};
+
+    const ALL_NOTES: [(Note, &str); 4] = [
+        (Note::KeptLosslessAnimatedPng, "kept lossless: animated PNG"),
+        (Note::KeptLosslessCmyk, "kept lossless: CMYK JPG"),
+        (
+            Note::KeptLosslessAnimationTooLarge,
+            "kept lossless: animation too large for lossy",
+        ),
+        (Note::OriginalKept, "original kept: lossy was not smaller"),
+    ];
+
+    fn noted(note: Option<Note>) -> Outcome {
+        Outcome {
+            before: 2048,
+            after: 1024,
+            millis: 7,
+            note,
+        }
+    }
+
+    fn mode_text(compression: Compression) -> String {
+        let mut out = Vec::new();
+        report_mode(compression, &mut out);
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn prints_the_note_after_the_sizes_line() {
+        for (note, text) in ALL_NOTES {
+            assert_eq!(
+                format_success(OsStr::new("my file.png"), &noted(Some(note)), false),
+                format!("my file.png:\nDone in 7 ms!\n2.000 KiB - 50.0% = 1.000 KiB\n{text}\n\n")
+            );
+            // And through the report, on stdout only.
+            let (failed, out, err) = run_report("a.png", &FileResult::Optimized(noted(Some(note))));
+            assert!(!failed);
+            assert!(out.contains(&format!("= 1.000 KiB\n{text}\n\n")), "{out:?}");
+            assert_eq!(err, "");
+        }
+    }
+
+    #[test]
+    fn a_block_without_a_note_is_unchanged() {
+        assert_eq!(
+            format_success(OsStr::new("my file.png"), &noted(None), false),
+            "my file.png:\nDone in 7 ms!\n2.000 KiB - 50.0% = 1.000 KiB\n\n"
+        );
+        // Not even an empty line for the missing note.
+        assert_eq!(
+            format_success(OsStr::new("a.png"), &noted(None), true)
+                .matches('\n')
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn the_mode_line_names_the_quality() {
+        for quality in [0, 75, 100] {
+            assert_eq!(
+                mode_text(Compression::Lossy(Quality::new(quality).unwrap())),
+                format!("Lossy, quality {quality}\n")
+            );
+        }
+    }
+
+    #[test]
+    fn a_lossless_run_has_no_mode_line() {
+        assert_eq!(mode_text(Compression::Lossless), "");
+    }
+
+    #[test]
+    fn a_closed_stdout_neither_panics_for_the_mode_line_or_a_note() {
+        report_mode(Compression::Lossy(Quality::new(75).unwrap()), &mut Closed);
+        let noted = FileResult::Optimized(noted(Some(Note::OriginalKept)));
+        assert!(!report_to(
+            Path::new("a.png"),
+            &noted,
+            false,
+            &mut Closed,
+            &mut Closed
+        ));
     }
 
     #[test]

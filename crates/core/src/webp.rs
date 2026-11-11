@@ -1,13 +1,21 @@
 //! WebP optimisation.
 //!
-//! The container is walked in safe Rust ([`riff`]); no image is decoded, so
-//! nothing here can change a pixel.
+//! The lossless path walks the container in safe Rust ([`riff`]); no image
+//! is decoded, so it cannot change a pixel. The lossy path ([`lossy`])
+//! decodes and encodes through libwebp, whose FFI is the one module here
+//! that may use `unsafe` ([`codec`]).
 
+#[allow(unsafe_code)]
+mod codec;
 mod exif;
+mod lossy;
 mod riff;
 
+pub(crate) use lossy::optimize_lossy;
+
 /// The fixture helpers of the integration tests, shared with the unit tests.
-/// They call libwebp's encoder, hence the `unsafe`; no product code does.
+/// They call libwebp's encoder themselves, hence the `unsafe`, so a fixture
+/// does not come from the code under test ([`codec`]).
 #[cfg(test)]
 #[path = "../tests/common/webp_fixtures.rs"]
 #[allow(unsafe_code)]

@@ -52,12 +52,12 @@ fn exits_0_with_an_ok_record_when_the_file_is_optimised() {
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let record = stdout(&output);
-    assert!(record.starts_with("lunaepix-worker 1 ok "), "{record:?}");
+    assert!(record.starts_with("lunaepix-worker 2 ok "), "{record:?}");
     assert_eq!(record.lines().count(), 1, "{record:?}");
     let before = fs::metadata(&src).unwrap().len();
     let after = fs::metadata(&dest).unwrap().len();
     assert!(
-        record.starts_with(&format!("lunaepix-worker 1 ok {before} {after} ")),
+        record.starts_with(&format!("lunaepix-worker 2 ok {before} {after} ")),
         "{record:?}"
     );
 }
@@ -73,7 +73,7 @@ fn exits_1_with_an_error_record_when_the_file_cannot_be_optimised() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let record = stdout(&output);
     assert!(
-        record.starts_with("lunaepix-worker 1 invalid src "),
+        record.starts_with("lunaepix-worker 2 invalid src "),
         "{record:?}"
     );
     assert!(!dest.exists());
@@ -90,9 +90,190 @@ fn exits_1_with_an_io_record_when_the_source_is_missing() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let record = stdout(&output);
     assert!(
-        record.starts_with("lunaepix-worker 1 io src "),
+        record.starts_with("lunaepix-worker 2 io src "),
         "{record:?}"
     );
+}
+
+// --- an output that cannot be written: the reason carries no path ----------
+
+/// The OS error code and the message of an `io dest` record.
+#[cfg(unix)]
+fn io_dest(record: &str) -> (i32, String) {
+    let body = record
+        .strip_prefix("lunaepix-worker 2 io dest ")
+        .and_then(|body| body.strip_suffix('\n'))
+        .unwrap_or_else(|| panic!("not an io dest record: {record:?}"));
+    let (code, message) = body.split_once(' ').unwrap();
+    let code = code
+        .parse()
+        .unwrap_or_else(|_| panic!("no OS error code: {record:?}"));
+    (code, message.to_owned())
+}
+
+/// `record` names no part of `path` and no temporary file: the reason a file
+/// failed reaches the window, which never receives a path.
+#[cfg(unix)]
+fn assert_no_path(record: &str, path: &Path) {
+    assert!(!record.contains("at path"), "{record:?}");
+    assert!(!record.contains(".tmp"), "{record:?}");
+    for part in path.components() {
+        if let std::path::Component::Normal(name) = part {
+            let name = name.to_string_lossy();
+            assert!(!record.contains(&*name), "{name:?} in {record:?}");
+        }
+    }
+}
+
+/// Make `folder` read-only. `false` when running as root, where it stays
+/// writable and the test has nothing to check.
+#[cfg(unix)]
+fn lock(folder: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(folder, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::write(folder.join("probe"), b"").is_ok() {
+        eprintln!("skipped: the folder stays writable (running as root)");
+        return false;
+    }
+    true
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_destination_folder_gives_an_io_record_with_the_os_code_and_no_path() {
+    // The default mode: the output goes beside the source.
+    let tmp = TempDir::new().unwrap();
+    let folder = tmp.path().join("locked-folder");
+    fs::create_dir(&folder).unwrap();
+    let src = write(&folder, "a.png", &png_bytes());
+    let dest = folder.join("optimized-a.png");
+    if !lock(&folder) {
+        return;
+    }
+
+    let output = serve(&[WORKER_FLAG.as_ref(), src.as_os_str(), dest.as_os_str()]);
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let record = stdout(&output);
+    let (code, message) = io_dest(&record);
+    let system = std::io::Error::from_raw_os_error(code);
+    assert_eq!(
+        system.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "{record:?}"
+    );
+    assert_eq!(message, system.to_string());
+    assert_no_path(&record, &dest);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_output_folder_with_no_replace_gives_an_io_record_with_the_os_code_and_no_path() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &png_bytes());
+    let folder = tmp.path().join("locked-folder");
+    fs::create_dir(&folder).unwrap();
+    let dest = folder.join("a.png");
+    if !lock(&folder) {
+        return;
+    }
+
+    let output = serve(&[
+        WORKER_FLAG.as_ref(),
+        "--no-replace".as_ref(),
+        src.as_os_str(),
+        dest.as_os_str(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let record = stdout(&output);
+    let (code, message) = io_dest(&record);
+    let system = std::io::Error::from_raw_os_error(code);
+    assert_eq!(
+        system.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "{record:?}"
+    );
+    assert_eq!(message, system.to_string());
+    assert_no_path(&record, &dest);
+}
+
+/// Run the worker with `args` under a file-size limit of one block (512 or
+/// 1024 bytes), with `SIGXFSZ` ignored: a write past the limit then fails
+/// with `EFBIG` instead of killing the process.
+#[cfg(unix)]
+fn serve_with_file_size_limit(args: &[&std::ffi::OsStr]) -> Output {
+    Command::new("sh")
+        .arg("-c")
+        .arg(r#"trap '' XFSZ; ulimit -f 1 && exec "$@""#)
+        .arg("sh")
+        .arg(WORKER)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+/// A 128x128 RGB PNG of pseudo-random noise: it does not compress, so any
+/// output is far larger than one block.
+#[cfg(unix)]
+fn noise_png() -> Vec<u8> {
+    let mut state = 0x2545_f491_u32;
+    let pixels: Vec<u8> = (0..128 * 128 * 3)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .collect();
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, 128, 128);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&pixels).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+#[cfg(unix)]
+#[test]
+fn a_write_that_fails_part_way_gives_an_io_record_with_the_os_code_and_no_path() {
+    // Through the temporary file's own writes, in both write modes.
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &noise_png());
+    // The control: without the limit the output is larger than the limit.
+    let unlimited = tmp.path().join("optimized/a.png");
+    let output = serve(&[WORKER_FLAG.as_ref(), src.as_os_str(), unlimited.as_os_str()]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(fs::metadata(&unlimited).unwrap().len() > 2048, "fixture");
+
+    let replace = tmp.path().join("optimized-a.png");
+    let no_replace = tmp.path().join("out").join("a.png");
+    let calls: [Vec<&std::ffi::OsStr>; 2] = [
+        vec![WORKER_FLAG.as_ref(), src.as_os_str(), replace.as_os_str()],
+        vec![
+            WORKER_FLAG.as_ref(),
+            "--no-replace".as_ref(),
+            src.as_os_str(),
+            no_replace.as_os_str(),
+        ],
+    ];
+    for (args, dest) in calls.iter().zip([&replace, &no_replace]) {
+        let output = serve_with_file_size_limit(args);
+
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let record = stdout(&output);
+        let (code, message) = io_dest(&record);
+        let system = std::io::Error::from_raw_os_error(code);
+        assert_eq!(
+            system.kind(),
+            std::io::ErrorKind::FileTooLarge,
+            "{record:?}"
+        );
+        assert_eq!(message, system.to_string());
+        assert_no_path(&record, dest);
+        assert!(!dest.exists());
+    }
 }
 
 #[test]
@@ -115,6 +296,121 @@ fn refuses_a_call_without_the_flag_or_with_the_wrong_arguments_and_prints_no_rec
         assert!(output.stdout.is_empty(), "{args:?}");
         assert!(!dest.exists(), "{args:?}");
     }
+}
+
+/// A 64x64 RGBA gradient with noise: thousands of colours, so a lossless run
+/// keeps it a true-colour PNG and only a lossy run makes it indexed.
+fn gradient_png() -> Vec<u8> {
+    let (w, h) = (64u32, 64u32);
+    let mut pixels = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let noise = ((x * 31 + y * 17) % 13) as u8;
+            pixels.extend_from_slice(&[
+                (x * 4) as u8 ^ noise,
+                (y * 4) as u8,
+                ((x + y) * 2) as u8 ^ noise,
+                255,
+            ]);
+        }
+    }
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, w, h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&pixels).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+/// The colour type in a PNG's IHDR: 3 is indexed.
+fn colour_type(png: &[u8]) -> u8 {
+    assert_eq!(&png[12..16], b"IHDR");
+    png[25]
+}
+
+#[test]
+fn the_worker_accepts_lossy_0_75_and_100() {
+    let tmp = TempDir::new().unwrap();
+    let original = gradient_png();
+    let src = write(tmp.path(), "a.png", &original);
+    // The control: the same file in a lossless run stays true colour.
+    let lossless = tmp.path().join("optimized/a.png");
+    let output = serve(&[WORKER_FLAG.as_ref(), src.as_os_str(), lossless.as_os_str()]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_ne!(colour_type(&fs::read(&lossless).unwrap()), 3);
+
+    for quality in ["0", "75", "100"] {
+        let dest = tmp.path().join(format!("optimized-{quality}.png"));
+
+        let output = serve(&[
+            WORKER_FLAG.as_ref(),
+            "--lossy".as_ref(),
+            quality.as_ref(),
+            src.as_os_str(),
+            dest.as_os_str(),
+        ]);
+
+        assert_eq!(output.status.code(), Some(0), "{quality}: {output:?}");
+        let record = stdout(&output);
+        let after = fs::metadata(&dest).unwrap().len();
+        assert!(
+            record.starts_with(&format!("lunaepix-worker 2 ok {} {after} ", original.len())),
+            "{quality}: {record:?}"
+        );
+        assert!(record.ends_with(" -\n"), "{quality}: {record:?}");
+        let written = fs::read(&dest).unwrap();
+        assert_eq!(
+            colour_type(&written),
+            3,
+            "{quality}: lossy output is indexed"
+        );
+        let decoded = image::load_from_memory(&written).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (64, 64), "{quality}");
+    }
+    assert_eq!(fs::read(&src).unwrap(), original);
+}
+
+#[test]
+fn the_worker_refuses_a_missing_quality_minus_1_101_75_5_abc_an_unknown_option_and_a_repeat() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &gradient_png());
+    let dest = tmp.path().join("optimized-a.png");
+
+    let calls: [&[&str]; 9] = [
+        &["--lossy"],
+        &["--lossy", "-1"],
+        &["--lossy", "101"],
+        &["--lossy", "75.5"],
+        &["--lossy", "abc"],
+        &["--fast"],
+        &["--lossy", "75", "--lossy", "75"],
+        &["--no-replace", "--no-replace"],
+        &["--no-replace", "--lossy", "75"],
+    ];
+    for flags in calls {
+        let mut args: Vec<&std::ffi::OsStr> = vec![WORKER_FLAG.as_ref()];
+        args.extend(flags.iter().map(std::ffi::OsStr::new));
+        args.extend([src.as_os_str(), dest.as_os_str()]);
+
+        let output = serve(&args);
+
+        assert_eq!(output.status.code(), Some(2), "{flags:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{flags:?}");
+        assert!(!dest.exists(), "{flags:?}");
+    }
+    assert_eq!(listing_names(tmp.path()), ["a.png"]);
+}
+
+fn listing_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }
 
 /// Start `program`, which blocks opening the FIFO `fifo`, and read its OOM

@@ -2,8 +2,9 @@
 //! It cannot be run here, and it builds the installer people download, so
 //! the rules that keep it safe are checked in a test: every action pinned to
 //! a commit, read-only permissions, no secrets, no way to start it from a
-//! pull request, and the test and build commands present. Each check has
-//! fixtures it must catch, so it is known to fail when it should.
+//! pull request, the test and build commands present, and NASM installed
+//! before cargo runs. Each check has fixtures it must catch, so it is known
+//! to fail when it should.
 //!
 //! The workflow is parsed as YAML 1.2 (so the key `on` is a name, not
 //! boolean true) and every check reads the parsed tree, so quoting, spacing
@@ -502,6 +503,69 @@ fn bundle_build_problems(text: &str) -> Vec<String> {
     })
 }
 
+// ---- NASM ----
+
+/// Whether the line of a script that runs `choco install nasm` carries a
+/// `--version=<x.y.z>` pin: the workflow pins every action by hash, so the
+/// build tool is pinned too.
+fn nasm_install_is_pinned(script: &str) -> bool {
+    script
+        .lines()
+        .filter(|line| line.contains("choco install nasm"))
+        .any(|line| {
+            line.split_whitespace().any(|word| {
+                word.strip_prefix("--version=")
+                    .is_some_and(|v| !v.is_empty())
+            })
+        })
+}
+
+/// Every job with a cargo step installs NASM in an earlier step, which also
+/// puts NASM's folder on the path through `GITHUB_PATH`: mozjpeg's SIMD code
+/// is assembled with it when lunaepix-core builds. The install step is found
+/// by `choco install nasm` outside shell comments; a cargo step is any step
+/// whose script has the word `cargo` outside shell comments. The install must
+/// also carry a `--version=` pin.
+fn nasm_problems(text: &str) -> Vec<String> {
+    on_tree(text, |doc| {
+        let mut problems = Vec::new();
+        for (name, job) in jobs(doc) {
+            let code = steps_of(job)
+                .into_iter()
+                .map(|step| scalar(&step["run"]).map_or_else(String::new, |s| without_comments(&s)))
+                .collect::<Vec<_>>();
+            let Some(cargo) = code
+                .iter()
+                .position(|script| script.split_whitespace().any(|word| word == "cargo"))
+            else {
+                continue;
+            };
+            let install = code
+                .iter()
+                .position(|script| script.contains("choco install nasm"));
+            match install {
+                None => problems.push(format!("job {name}: does not install nasm")),
+                Some(at) if at > cargo => problems.push(format!(
+                    "job {name}: installs nasm after its first cargo step"
+                )),
+                Some(at) => {
+                    if !code[at].contains("GITHUB_PATH") {
+                        problems.push(format!(
+                            "job {name}: the nasm step does not add NASM to GITHUB_PATH"
+                        ));
+                    }
+                    if !nasm_install_is_pinned(&code[at]) {
+                        problems.push(format!(
+                            "job {name}: the nasm install is not pinned with --version="
+                        ));
+                    }
+                }
+            }
+        }
+        problems
+    })
+}
+
 const REQUIRED_COMMANDS: &[&str] = &[
     "cargo fmt --all --check",
     "cargo clippy --workspace --all-targets -- -D warnings",
@@ -517,6 +581,12 @@ const PIN: &str = "11bd71901bbe5b1630ceea73d27597364c9af683";
 /// The build job's bundle step in `good()`.
 const BUILD_STEP: &str =
     "      - run: cargo tauri build --config src-tauri/tauri.bundle.conf.json\n";
+
+/// The NASM install step, in both jobs of `good()` before their cargo steps.
+const NASM_STEP: &str = r#"      - run: |
+          choco install nasm --version=2.16.3 --no-progress -y
+          echo 'C:\Program Files\NASM' >> "$GITHUB_PATH"
+"#;
 
 const UPLOAD_STEP: &str = "      - uses: actions/upload-artifact@PIN # v7
         with:
@@ -550,7 +620,7 @@ jobs:
         with:
           node-version: 22
       - uses: Swatinem/rust-cache@PIN # v2
-      - run: cargo fmt --all --check
+NASM      - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release
@@ -559,9 +629,11 @@ jobs:
     needs: test
     runs-on: windows-latest
     steps:
-      - run: cargo tauri build --config src-tauri/tauri.bundle.conf.json
+NASM      - run: cargo tauri build --config src-tauri/tauri.bundle.conf.json
 ";
-    format!("{base}{UPLOAD_STEP}").replace("PIN", PIN)
+    format!("{base}{UPLOAD_STEP}")
+        .replace("NASM", NASM_STEP)
+        .replace("PIN", PIN)
 }
 
 /// `good()` with the first `from` replaced by `to`. Fails when `from` is not
@@ -597,6 +669,7 @@ fn every_check(text: &str) -> Vec<(&'static str, Vec<String>)> {
         ("structure_problems", structure_problems(text)),
         ("setting_problems", setting_problems(text)),
         ("bundle_build_problems", bundle_build_problems(text)),
+        ("nasm_problems", nasm_problems(text)),
     ]
 }
 
@@ -1246,4 +1319,94 @@ fn a_bundle_build_without_the_config_file_is_caught_in_a_fixture() {
     assert_problem(&bundle_build_problems(&none), "the build job has no cargo tauri build", &none);
     let no_build = good().replacen("  build:\n", "  installer:\n", 1);
     assert_problem(&bundle_build_problems(&no_build), "no build job", &no_build);
+}
+
+// ---- NASM ----
+
+#[test]
+fn nasm_before_cargo_in_every_job_passes_a_fixture() {
+    assert_clean(nasm_problems(&good()));
+    // A job without a cargo step needs no NASM.
+    assert_clean(nasm_problems(&steps_doc("      - run: node --version")));
+    // The install and the path line may be separate lines of one script.
+    let one_line = "      - run: choco install nasm --version=2.16.3 --no-progress -y && echo x >> \"$GITHUB_PATH\"\n";
+    assert_clean(nasm_problems(&with(NASM_STEP, one_line)));
+}
+
+#[test]
+#[rustfmt::skip]
+fn a_job_without_nasm_or_with_nasm_after_cargo_is_caught_in_a_fixture() {
+    // Without it in the test job (the first one), in the build job, in both.
+    let test_job = with(NASM_STEP, "");
+    assert_eq!(nasm_problems(&test_job), ["job test: does not install nasm"]);
+    let neither = good().replace(NASM_STEP, "");
+    assert_eq!(
+        nasm_problems(&neither),
+        ["job test: does not install nasm", "job build: does not install nasm"]
+    );
+    let build_missing = {
+        let at = good().rfind(NASM_STEP).unwrap();
+        let mut text = good();
+        text.replace_range(at..at + NASM_STEP.len(), "");
+        text
+    };
+    assert_eq!(nasm_problems(&build_missing), ["job build: does not install nasm"]);
+    // After the first cargo step.
+    let late = with(NASM_STEP, "").replacen(
+        "      - run: cargo clippy",
+        &format!("{NASM_STEP}      - run: cargo clippy"),
+        1,
+    );
+    assert_eq!(nasm_problems(&late), ["job test: installs nasm after its first cargo step"]);
+    // Only in a shell comment, or only as a step name.
+    let commented = "      - run: |\n          # choco install nasm\n          echo x >> \"$GITHUB_PATH\"\n";
+    assert_eq!(nasm_problems(&with(NASM_STEP, commented)), ["job test: does not install nasm"]);
+    let named = "      - name: choco install nasm\n        run: echo x >> \"$GITHUB_PATH\"\n";
+    assert_eq!(nasm_problems(&with(NASM_STEP, named)), ["job test: does not install nasm"]);
+    // Installed, but its folder never reaches the path.
+    let no_path = "      - run: choco install nasm --version=2.16.3 --no-progress -y\n";
+    assert_eq!(
+        nasm_problems(&with(NASM_STEP, no_path)),
+        ["job test: the nasm step does not add NASM to GITHUB_PATH"]
+    );
+}
+
+#[test]
+#[rustfmt::skip]
+fn a_nasm_install_without_a_version_pin_is_caught_in_a_fixture() {
+    let path_line = "          echo x >> \"$GITHUB_PATH\"\n";
+    let step = |install: &str| format!("      - run: |\n          {install}\n{path_line}");
+    // No pin at all, in the test job (the first one) and in the build job.
+    let unpinned = step("choco install nasm --no-progress -y");
+    assert_eq!(
+        nasm_problems(&with(NASM_STEP, &unpinned)),
+        ["job test: the nasm install is not pinned with --version="]
+    );
+    let build_unpinned = {
+        let at = good().rfind(NASM_STEP).unwrap();
+        let mut text = good();
+        text.replace_range(at..at + NASM_STEP.len(), &unpinned);
+        text
+    };
+    assert_eq!(
+        nasm_problems(&build_unpinned),
+        ["job build: the nasm install is not pinned with --version="]
+    );
+    // A pin flag with no version after it.
+    let empty = step("choco install nasm --version= --no-progress -y");
+    assert_eq!(
+        nasm_problems(&with(NASM_STEP, &empty)),
+        ["job test: the nasm install is not pinned with --version="]
+    );
+    // A pin on another line of the script does not pin the nasm install.
+    let elsewhere = "      - run: |\n          choco install nasm --no-progress -y\n          choco install other --version=1.0.0\n          echo x >> \"$GITHUB_PATH\"\n";
+    assert_eq!(
+        nasm_problems(&with(NASM_STEP, elsewhere)),
+        ["job test: the nasm install is not pinned with --version="]
+    );
+    // A pinned install is not reported (the positive case), wherever the flag sits.
+    assert_clean(nasm_problems(&with(
+        NASM_STEP,
+        &step("choco install nasm --no-progress -y --version=2.16.3"),
+    )));
 }

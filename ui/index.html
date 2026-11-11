@@ -19,31 +19,69 @@
       <p class="lunaepixDrop__hint">PNG · JPG · SVG · WebP</p>
       <div class="lunaepixDrop__actions">
         <button class="lunaepixDrop__button" id="chooseFiles" type="button">Choose files</button>
-        <button class="lunaepixDrop__button" id="chooseFolder" type="button">Choose folder</button>
       </div>
     </section>
 
-    <p class="lunaepixProgress" id="progress" hidden></p>
     <p class="lunaepixStatus" id="status" role="status"></p>
 
-    <table class="lunaepixResults" id="results" hidden>
-      <caption class="lunaepixResults__caption">Optimised files</caption>
-      <thead>
-        <tr>
-          <th class="lunaepixResults__headCell" scope="col">File</th>
-          <th class="lunaepixResults__headCell -number" scope="col">Before</th>
-          <th class="lunaepixResults__headCell -number" scope="col">After</th>
-          <th class="lunaepixResults__headCell -number" scope="col">Saved</th>
-          <th class="lunaepixResults__headCell -number" scope="col">Time</th>
-        </tr>
-      </thead>
-      <tbody id="resultsBody"></tbody>
-    </table>
+    <section class="lunaepixPanel" id="panel" aria-labelledby="panelHeading" hidden>
+      <div class="lunaepixPanel__head">
+        <h2 class="lunaepixPanel__heading" id="panelHeading"></h2>
+        <button class="lunaepixPanel__button" id="clearList" type="button">Clear</button>
+      </div>
 
-    <div class="lunaepixSummary" id="summary" hidden>
-      <p class="lunaepixSummary__text" id="summaryText"></p>
-      <button class="lunaepixSummary__button" id="openFolder" type="button" aria-disabled="true">Open folder</button>
-    </div>
+      <table class="lunaepixResults" id="results">
+        <caption class="lunaepixResults__caption" id="resultsCaption">Files to optimise</caption>
+        <thead>
+          <tr>
+            <th class="lunaepixResults__headCell" scope="col">File</th>
+            <th class="lunaepixResults__headCell -number" id="headBefore" scope="col">Size</th>
+            <th class="lunaepixResults__headCell -number" id="headAfter" scope="col" colspan="3"><span class="lunaepixResults__hiddenText">Status</span></th>
+            <th class="lunaepixResults__headCell -number" id="headSaved" scope="col" hidden>Saved</th>
+            <th class="lunaepixResults__headCell -number" id="headTime" scope="col" hidden>Time</th>
+          </tr>
+        </thead>
+        <tbody id="resultsBody"></tbody>
+      </table>
+
+      <div class="lunaepixSummary" id="summary" hidden>
+        <p class="lunaepixSummary__text" id="summaryText"></p>
+        <button class="lunaepixSummary__button" id="openFolder" type="button" aria-disabled="true">Open folder</button>
+      </div>
+
+      <div class="lunaepixSettings" id="settings">
+        <fieldset class="lunaepixSettings__row">
+          <legend class="lunaepixSettings__label">Compression</legend>
+          <label class="lunaepixSettings__choice">
+            <input class="lunaepixSettings__radio" id="modeLossless" type="radio" name="mode" value="lossless" checked>
+            Lossless
+          </label>
+          <label class="lunaepixSettings__choice">
+            <input class="lunaepixSettings__radio" id="modeLossy" type="radio" name="mode" value="lossy">
+            Lossy
+          </label>
+        </fieldset>
+
+        <div class="lunaepixSettings__row" id="qualityRow" hidden>
+          <label class="lunaepixSettings__label" for="qualityRange">Quality</label>
+          <input class="lunaepixSettings__range" id="qualityRange" type="range" min="0" max="100" step="1" value="75" disabled>
+          <label class="lunaepixSettings__hiddenText" for="qualityNumber">Quality, a whole number from 0 to 100</label>
+          <input class="lunaepixSettings__number" id="qualityNumber" type="number" min="0" max="100" step="1" value="75" inputmode="numeric" disabled>
+          <p class="lunaepixSettings__error" id="qualityError" hidden>Enter a whole number from 0 to 100.</p>
+        </div>
+
+        <div class="lunaepixSettings__row" role="group" aria-labelledby="saveToLabel">
+          <span class="lunaepixSettings__label" id="saveToLabel">Save to</span>
+          <span class="lunaepixSettings__value" id="saveTo">Next to the originals</span>
+          <button class="lunaepixSettings__button" id="chooseOutput" type="button">Choose folder</button>
+          <button class="lunaepixSettings__button" id="clearOutput" type="button" aria-label="Clear output folder" hidden>Clear</button>
+        </div>
+      </div>
+
+      <div class="lunaepixPanel__foot" id="runRow">
+        <button class="lunaepixPanel__run" id="run" type="button" aria-disabled="true">Run</button>
+      </div>
+    </section>
   </main>
 
   <script type="module" src="app.js"></script>

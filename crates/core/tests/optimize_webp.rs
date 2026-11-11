@@ -6,11 +6,20 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use lunaepix_core::{FileResult, OptimizeError, Worker, optimize_file, plan_folder, run};
+use lunaepix_core::{
+    Compression, FileResult, Note, OptimizeError, Options, Outcome, Quality, Worker, WriteMode,
+    optimize_file, plan_folder, run,
+};
 use tempfile::TempDir;
 
 mod common;
 use common::webp_fixtures as fx;
+
+/// Today's run: lossless, replacing an earlier output.
+const LOSSLESS: Options = Options {
+    compression: Compression::Lossless,
+    write: WriteMode::Replace,
+};
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -76,7 +85,7 @@ fn optimized(bytes: &[u8]) -> Vec<u8> {
     let tmp = TempDir::new().unwrap();
     let src = write(tmp.path(), "a.webp", bytes);
     let dest = tmp.path().join("optimized-a.webp");
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
     fs::read(&dest).unwrap()
 }
 
@@ -143,7 +152,7 @@ fn keeps_the_source_bytes_unchanged_after_a_successful_run() {
     let src = write(tmp.path(), "a.webp", &original);
     let dest = tmp.path().join("optimized-a.webp");
 
-    let outcome = optimize_file(&src, &dest).unwrap();
+    let outcome = optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     assert_eq!(fs::read(&src).unwrap(), original);
     assert_eq!(outcome.before, original.len() as u64);
@@ -289,9 +298,150 @@ fn rejects_png_bytes_named_webp_and_leaves_no_output_file() {
     let src = write(tmp.path(), "a.webp", &png_bytes());
     let dest = tmp.path().join("optimized-a.webp");
 
-    let err = optimize_file(&src, &dest).unwrap_err();
+    let err = optimize_file(&src, &dest, &LOSSLESS).unwrap_err();
 
     assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
     assert!(err.to_string().contains("not a WebP file"), "{err}");
     assert!(!dest.exists());
+}
+
+// --- a lossy run -----------------------------------------------------------------
+
+fn lossy(quality: u8) -> Options {
+    Options {
+        compression: Compression::Lossy(Quality::new(quality).unwrap()),
+        write: WriteMode::Replace,
+    }
+}
+
+/// Optimise `bytes` as `a.webp` twice, lossy at `quality` and lossless: the
+/// outcome and output of the lossy run, and the output of the lossless one.
+/// The source must be unchanged by both.
+fn lossy_and_lossless(bytes: &[u8], quality: u8) -> (Outcome, Vec<u8>, Vec<u8>) {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.webp", bytes);
+    let dest = tmp.path().join("optimized-a.webp");
+    let reference = tmp.path().join("optimized").join("a.webp");
+
+    let outcome = optimize_file(&src, &dest, &lossy(quality)).unwrap();
+    optimize_file(&src, &reference, &LOSSLESS).unwrap();
+
+    assert_eq!(fs::read(&src).unwrap(), bytes, "the source is untouched");
+    (
+        outcome,
+        fs::read(&dest).unwrap(),
+        fs::read(&reference).unwrap(),
+    )
+}
+
+const PHOTO_W: u32 = 128;
+const PHOTO_H: u32 = 96;
+
+#[test]
+fn a_lossy_run_writes_a_smaller_webp_of_the_same_size() {
+    let original = fx::lossless(&fx::photo_rgba(PHOTO_W, PHOTO_H, false), PHOTO_W, PHOTO_H);
+
+    let (outcome, written, lossless) = lossy_and_lossless(&original, 75);
+
+    assert_eq!(outcome.note, None);
+    assert!(
+        written.len() < original.len(),
+        "{} !< {}",
+        written.len(),
+        original.len()
+    );
+    assert_eq!(outcome.before, original.len() as u64);
+    assert_eq!(outcome.after, written.len() as u64);
+    let (w, h, _) = fx::decode_rgba(&written);
+    assert_eq!((w, h), (PHOTO_W, PHOTO_H));
+    // Encoded lossy: a `VP8 ` image, not the lossless output.
+    assert_eq!(fx::chunk_names(&written), ["VP8 "]);
+    assert_ne!(written, lossless);
+}
+
+#[test]
+fn a_lossy_webp_that_is_not_smaller_keeps_the_original_bytes_with_the_note() {
+    let original = fx::lossy(
+        &fx::photo_rgba(PHOTO_W, PHOTO_H, false),
+        PHOTO_W,
+        PHOTO_H,
+        20.0,
+    );
+
+    let (outcome, written, _) = lossy_and_lossless(&original, 100);
+
+    assert_eq!(outcome.note, Some(Note::OriginalKept));
+    assert_eq!(
+        outcome.note.unwrap().to_string(),
+        "original kept: lossy was not smaller"
+    );
+    assert_eq!(written, original);
+    assert_eq!(outcome.after, outcome.before);
+}
+
+/// An animation that only declares its frames: a `VP8X` canvas of `w`x`h`,
+/// `ANIM`, and `frames` frame headers without image data. Nothing in it can
+/// be decoded, so a run that tried would fail, and none of it is large.
+fn declared_animation(w: u32, h: u32, frames: usize) -> Vec<u8> {
+    let mut chunks: Vec<fx::RawChunk> = vec![
+        (*b"VP8X", fx::vp8x_payload(fx::FLAG_ANIMATION, w, h)),
+        (*b"ANIM", fx::anim_payload(0, 0)),
+    ];
+    for _ in 0..frames {
+        // X and Y, width-1, height-1, 100 ms, flags.
+        let mut header = vec![0u8; 6];
+        header.extend_from_slice(&(w - 1).to_le_bytes()[..3]);
+        header.extend_from_slice(&(h - 1).to_le_bytes()[..3]);
+        header.extend_from_slice(&100u32.to_le_bytes()[..3]);
+        header.push(0);
+        chunks.push((*b"ANMF", header));
+    }
+    fx::from_chunks(&chunks)
+}
+
+#[test]
+fn an_animation_over_the_cap_in_a_lossy_run_gets_the_lossless_output_with_the_note() {
+    // 1001 frames of one megapixel: 1,001,000,000 frames x pixels, over
+    // MAX_ANIMATION_PIXELS; and a 10001x5000 canvas, over
+    // MAX_ANIMATION_CANVAS_PIXELS.
+    for original in [
+        declared_animation(1000, 1000, 1001),
+        declared_animation(10_001, 5000, 1),
+    ] {
+        assert!(original.len() < 64 * 1024, "the fixture must be small");
+        let started = std::time::Instant::now();
+
+        let (outcome, written, lossless) = lossy_and_lossless(&original, 75);
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(outcome.note, Some(Note::KeptLosslessAnimationTooLarge));
+        assert_eq!(
+            outcome.note.unwrap().to_string(),
+            "kept lossless: animation too large for lossy"
+        );
+        assert_eq!(written, lossless);
+    }
+}
+
+#[test]
+fn an_animation_within_the_cap_in_a_lossy_run_is_encoded_lossy() {
+    let (w, h) = (64, 48);
+    let frames: Vec<Vec<u8>> = (0u8..3)
+        .map(|k| {
+            let rgba: Vec<u8> = fx::photo_rgba(w, h, false)
+                .iter()
+                .map(|b| b.wrapping_add(k * 40))
+                .collect();
+            fx::lossless(&rgba, w, h)
+        })
+        .collect();
+    let original = fx::animated(&frames, w, h);
+
+    let (outcome, written, lossless) = lossy_and_lossless(&original, 75);
+
+    assert_eq!(outcome.note, None);
+    assert_ne!(written, lossless);
+    for chunks in fx::anmf_image_chunks(&written) {
+        assert!(chunks.contains(&"VP8 ".to_owned()), "{chunks:?}");
+    }
 }

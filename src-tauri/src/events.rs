@@ -1,13 +1,22 @@
 //! What the window receives: the event names and their JSON payloads.
 //!
 //! Every payload is plain data. A file is named by its file name only, never
-//! by its path, and a failure by the core's bare reason, never by the
-//! worker's stderr. `INTERFACE.md` documents the same shapes for the window.
+//! by its path, the output folder by its folder name only, and a failure by
+//! the core's bare reason, never by the worker's stderr. `INTERFACE.md`
+//! documents the same shapes for the window.
 
 use std::path::Path;
 
-use lunaepix_core::{FileResult, MAX_RUN_FILES};
+use lunaepix_core::{Compression, FileResult, MAX_RUN_FILES};
 use serde::Serialize;
+
+/// The compression of a run, as the window names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    Lossless,
+    Lossy,
+}
 
 /// A run has been planned and starts now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -16,6 +25,74 @@ pub struct RunStarted {
     /// (skipped files included), except that the files the run limit left
     /// out share one row ([`over_limit_row`]).
     pub total: usize,
+    /// The run's compression.
+    pub mode: Mode,
+    /// The lossy quality, 0 to 100; `null` for a lossless run.
+    pub quality: Option<u8>,
+}
+
+impl RunStarted {
+    /// The payload for a run of `total` rows with `compression`.
+    pub fn new(total: usize, compression: Compression) -> Self {
+        let (mode, quality) = match compression {
+            Compression::Lossless => (Mode::Lossless, None),
+            Compression::Lossy(quality) => (Mode::Lossy, Some(quality.get())),
+        };
+        RunStarted {
+            total,
+            mode,
+            quality,
+        }
+    }
+}
+
+/// The file at `index` is being compressed now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FileStarted {
+    pub index: usize,
+}
+
+/// One row of the file list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ListRow {
+    /// The file name alone, lossily decoded.
+    pub name: String,
+    /// The size in bytes; `null` for a skipped row.
+    pub size: Option<u64>,
+    /// Why the row will be skipped, a sentence for the user; `null` otherwise.
+    pub skip: Option<String>,
+}
+
+/// The whole file list, in display order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ListChanged {
+    pub files: Vec<ListRow>,
+    /// Why an add changed nothing, a sentence for the status line; or `null`.
+    pub notice: Option<String>,
+}
+
+/// The output setting changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutputChanged {
+    /// The chosen folder's name, never its path; `null` for next to the
+    /// originals.
+    pub folder: Option<String>,
+}
+
+/// The `output-changed` payload for the chosen `folder`, or for none: the
+/// folder's own name, lossily decoded, and empty for a folder without one
+/// (a root such as `/`), never the path.
+pub fn output_changed(folder: Option<&Path>) -> OutputChanged {
+    OutputChanged {
+        folder: folder.map(file_name_of),
+    }
+}
+
+/// The last component of `path`, lossily decoded; empty if it has none.
+pub fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// How one file ended.
@@ -45,6 +122,10 @@ pub struct FileDone {
     /// Why the file was skipped or failed: only when `status` is not `done`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// How a `done` file was handled differently from the run's mode, a
+    /// sentence for the user: only when there is such a note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// The run is over.
@@ -70,10 +151,13 @@ pub struct DragState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum Event {
+    ListChanged(ListChanged),
+    OutputChanged(OutputChanged),
     RunStarted(RunStarted),
+    FileStarted(FileStarted),
     FileDone(FileDone),
     RunFinished(RunFinished),
-    /// A drop or a pick was refused because a run is active.
+    /// A drop or a command was refused because a run, or a dialog, is active.
     RunBusy,
     /// A file or folder dialog was closed without a choice.
     RunCancelled,
@@ -84,7 +168,10 @@ impl Event {
     /// The event name the window listens to.
     pub fn name(&self) -> &'static str {
         match self {
+            Event::ListChanged(_) => "list-changed",
+            Event::OutputChanged(_) => "output-changed",
             Event::RunStarted(_) => "run-started",
+            Event::FileStarted(_) => "file-started",
             Event::FileDone(_) => "file-done",
             Event::RunFinished(_) => "run-finished",
             Event::RunBusy => "run-busy",
@@ -102,7 +189,6 @@ pub const OVER_LIMIT_NAME: &str = "(over the limit)";
 /// The `file-done` payload of row `index`, the one row that stands for the
 /// `count` files the run limit left out, instead of a row for each.
 pub fn over_limit_row(index: usize, count: usize) -> FileDone {
-    let files = if count == 1 { "file" } else { "files" };
     FileDone {
         index,
         name: OVER_LIMIT_NAME.to_owned(),
@@ -110,10 +196,16 @@ pub fn over_limit_row(index: usize, count: usize) -> FileDone {
         before: None,
         after: None,
         millis: None,
-        reason: Some(format!(
-            "{count} more {files} not optimised: over the {MAX_RUN_FILES}-file limit"
-        )),
+        reason: Some(over_limit_reason(count)),
+        note: None,
     }
+}
+
+/// Why the `count` files the run limit left out are not optimised: the
+/// reason on the one row that stands for them, in the list and in the run.
+pub fn over_limit_reason(count: usize) -> String {
+    let files = if count == 1 { "file" } else { "files" };
+    format!("{count} more {files} not optimised: over the {MAX_RUN_FILES}-file limit")
 }
 
 /// The `file-done` payload for job `index`, whose source is `src`.
@@ -123,21 +215,20 @@ pub fn over_limit_row(index: usize, count: usize) -> FileDone {
 pub fn file_done(index: usize, src: &Path, result: &FileResult) -> FileDone {
     let mut payload = FileDone {
         index,
-        name: src
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default(),
+        name: file_name_of(src),
         status: Status::Done,
         before: None,
         after: None,
         millis: None,
         reason: None,
+        note: None,
     };
     match result {
         FileResult::Optimized(outcome) => {
             payload.before = Some(outcome.before);
             payload.after = Some(outcome.after);
             payload.millis = Some(outcome.millis);
+            payload.note = outcome.note.map(|note| note.to_string());
         }
         FileResult::Skipped(skip) => {
             payload.status = Status::Skipped;
@@ -165,6 +256,7 @@ mod tests {
             before,
             after,
             millis: 7,
+            note: None,
         })
     }
 
@@ -250,9 +342,13 @@ mod tests {
     fn each_event_has_its_own_name_and_a_data_only_payload() {
         let events = [
             (
-                Event::RunStarted(RunStarted { total: 4 }),
+                Event::RunStarted(RunStarted {
+                    total: 4,
+                    mode: Mode::Lossless,
+                    quality: None,
+                }),
                 "run-started",
-                r#"{"total":4}"#,
+                r#"{"total":4,"mode":"lossless","quality":null}"#,
             ),
             (Event::RunBusy, "run-busy", "null"),
             (Event::RunCancelled, "run-cancelled", "null"),
@@ -274,6 +370,134 @@ mod tests {
         for (event, name, payload) in &events {
             assert_eq!(event.name(), *name);
             assert_eq!(json(event), *payload);
+        }
+    }
+
+    /// `text` parsed as JSON, so that a payload is compared as data.
+    fn parsed(text: &str) -> serde_json::Value {
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn value(event: &impl Serialize) -> serde_json::Value {
+        serde_json::to_value(event).unwrap()
+    }
+
+    #[test]
+    fn run_started_names_mode_and_quality_and_null_quality_for_lossless() {
+        let lossy = |q| Compression::Lossy(lunaepix_core::Quality::new(q).unwrap());
+        let cases = [
+            (
+                RunStarted::new(3, lossy(75)),
+                r#"{ "total": 3, "mode": "lossy", "quality": 75 }"#,
+            ),
+            (
+                RunStarted::new(3, Compression::Lossless),
+                r#"{ "total": 3, "mode": "lossless", "quality": null }"#,
+            ),
+            // Quality 0 is a quality, not "none".
+            (
+                RunStarted::new(1, lossy(0)),
+                r#"{ "total": 1, "mode": "lossy", "quality": 0 }"#,
+            ),
+            (
+                RunStarted::new(2001, lossy(100)),
+                r#"{ "total": 2001, "mode": "lossy", "quality": 100 }"#,
+            ),
+        ];
+        for (payload, expected) in &cases {
+            assert_eq!(value(&Event::RunStarted(payload.clone())), parsed(expected));
+        }
+    }
+
+    #[test]
+    fn file_done_serialises_note_only_when_present() {
+        let src = Path::new("/srv/photos/anim.png");
+        let noted = FileResult::Optimized(Outcome {
+            before: 512000,
+            after: 498000,
+            millis: 380,
+            note: Some(lunaepix_core::Note::KeptLosslessAnimatedPng),
+        });
+        // The spec's example, compared as JSON.
+        assert_eq!(
+            value(&file_done(1, src, &noted)),
+            parsed(
+                r#"{ "index": 1, "name": "anim.png", "status": "done", "before": 512000, "after": 498000, "millis": 380, "note": "kept lossless: animated PNG" }"#
+            )
+        );
+        // Every note reaches the window as its sentence.
+        let notes = [
+            (
+                lunaepix_core::Note::KeptLosslessCmyk,
+                "kept lossless: CMYK JPG",
+            ),
+            (
+                lunaepix_core::Note::KeptLosslessAnimationTooLarge,
+                "kept lossless: animation too large for lossy",
+            ),
+            (
+                lunaepix_core::Note::OriginalKept,
+                "original kept: lossy was not smaller",
+            ),
+        ];
+        for (note, text) in notes {
+            let result = FileResult::Optimized(Outcome {
+                before: 2,
+                after: 2,
+                millis: 1,
+                note: Some(note),
+            });
+            assert_eq!(file_done(0, src, &result).note.as_deref(), Some(text));
+        }
+        // Without a note there is no `note` key at all, not a `null`.
+        let plain = value(&file_done(0, src, &optimized(100, 60)));
+        assert!(plain.get("note").is_none(), "{plain}");
+    }
+
+    #[test]
+    fn the_new_events_carry_the_specs_json() {
+        let events = [
+            (
+                Event::ListChanged(ListChanged {
+                    files: vec![
+                        ListRow {
+                            name: "holiday.jpg".to_owned(),
+                            size: Some(2400000),
+                            skip: None,
+                        },
+                        ListRow {
+                            name: "notes.txt".to_owned(),
+                            size: None,
+                            skip: Some("Not a PNG, JPG, SVG or WebP file".to_owned()),
+                        },
+                    ],
+                    notice: None,
+                }),
+                "list-changed",
+                r#"{ "files": [
+                    { "name": "holiday.jpg", "size": 2400000, "skip": null },
+                    { "name": "notes.txt", "size": null, "skip": "Not a PNG, JPG, SVG or WebP file" }
+                ], "notice": null }"#,
+            ),
+            (
+                Event::OutputChanged(output_changed(Some(Path::new("/home/someone/exports")))),
+                "output-changed",
+                r#"{ "folder": "exports" }"#,
+            ),
+            (
+                Event::OutputChanged(output_changed(None)),
+                "output-changed",
+                r#"{ "folder": null }"#,
+            ),
+            (
+                Event::FileStarted(FileStarted { index: 1 }),
+                "file-started",
+                r#"{ "index": 1 }"#,
+            ),
+        ];
+        for (event, name, payload) in &events {
+            assert_eq!(event.name(), *name);
+            assert_eq!(value(event), parsed(payload));
         }
     }
 }

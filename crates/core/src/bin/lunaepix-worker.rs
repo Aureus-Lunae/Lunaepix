@@ -10,7 +10,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     lunaepix_core::worker::serve_if_requested().unwrap_or_else(|| {
         eprintln!(
-            "usage: lunaepix-worker {} <src> <dest>",
+            "usage: lunaepix-worker {} [--lossy <0-100>] [--no-replace] <src> <dest>",
             lunaepix_core::WORKER_FLAG
         );
         ExitCode::from(2)

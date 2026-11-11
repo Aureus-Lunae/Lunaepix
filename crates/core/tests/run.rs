@@ -10,12 +10,13 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
+use lunaepix_core::{
+    Compression, FileResult, Job, Note, OptimizeError, Options, Outcome, Quality, RunError, Skip,
+    StopHandle, WORKER_FLAG, WORKER_TIMEOUT, Worker, WriteMode, plan_files, plan_folder, run,
+    run_observed, run_until_stopped,
+};
 #[cfg(unix)]
 use lunaepix_core::{Crash, MAX_WORKER_OUTPUT_BYTES};
-use lunaepix_core::{
-    FileResult, Job, OptimizeError, Outcome, RunError, Skip, StopHandle, WORKER_FLAG,
-    WORKER_TIMEOUT, Worker, plan_files, plan_folder, run, run_until_stopped,
-};
 use tempfile::TempDir;
 
 // --- fixtures ---------------------------------------------------------------
@@ -439,7 +440,7 @@ fn takes_a_well_formed_record_from_any_worker_exactly() {
     let tmp = TempDir::new().unwrap();
     let jobs = one_png_job(tmp.path());
     let fake = script(
-        "printf 'lunaepix-worker 1 ok 4000 3000 12\\n'",
+        "printf 'lunaepix-worker 2 ok 4000 3000 12 -\\n'",
         WORKER_TIMEOUT,
     );
 
@@ -450,7 +451,8 @@ fn takes_a_well_formed_record_from_any_worker_exactly() {
         Outcome {
             before: 4000,
             after: 3000,
-            millis: 12
+            millis: 12,
+            note: None,
         }
     );
 }
@@ -461,7 +463,7 @@ fn takes_a_well_formed_error_record_and_names_the_planned_path() {
     let tmp = TempDir::new().unwrap();
     let jobs = one_png_job(tmp.path());
     let fake = script(
-        "printf 'lunaepix-worker 1 invalid dest no room\\\\nat all\\n'; exit 1",
+        "printf 'lunaepix-worker 2 invalid dest no room\\\\nat all\\n'; exit 1",
         WORKER_TIMEOUT,
     );
 
@@ -499,11 +501,11 @@ fn a_record_that_disagrees_with_the_exit_code_counts_as_crashed() {
     let tmp = TempDir::new().unwrap();
     let jobs = one_png_job(tmp.path());
     let ok_but_failed = script(
-        "printf 'lunaepix-worker 1 ok 4000 3000 12\\n'; exit 1",
+        "printf 'lunaepix-worker 2 ok 4000 3000 12 -\\n'; exit 1",
         WORKER_TIMEOUT,
     );
     let failed_but_ok = script(
-        "printf 'lunaepix-worker 1 invalid src nope\\n'; exit 0",
+        "printf 'lunaepix-worker 2 invalid src nope\\n'; exit 0",
         WORKER_TIMEOUT,
     );
 
@@ -619,7 +621,7 @@ fn stops_and_reaps_a_worker_that_runs_past_its_timeout() {
 fn a_slow_worker_within_its_timeout_is_not_stopped() {
     let tmp = TempDir::new().unwrap();
     let jobs = one_png_job(tmp.path());
-    let body = "sleep 1; printf 'lunaepix-worker 1 ok 4000 3000 1000\\n'";
+    let body = "sleep 1; printf 'lunaepix-worker 2 ok 4000 3000 1000 -\\n'";
 
     let results = run(&jobs, &script(body, Duration::from_secs(30)), |_, _, _| {});
 
@@ -685,4 +687,243 @@ fn a_name_that_is_not_utf8_reaches_the_right_output() {
     expected.sort();
     // Exactly these two: no output under a lossy (U+FFFD) spelling of the name.
     assert_eq!(listing(tmp.path()), expected);
+}
+
+// --- run options -----------------------------------------------------------------
+
+fn lossy(quality: u8) -> Compression {
+    Compression::Lossy(Quality::new(quality).unwrap())
+}
+
+fn options(compression: Compression, write: WriteMode) -> Options {
+    Options { compression, write }
+}
+
+fn names_in_order(list: &[&str]) -> Vec<OsString> {
+    list.iter().map(OsString::from).collect()
+}
+
+#[test]
+fn with_options_appends_lossy_and_no_replace_in_order() {
+    let base = Worker::new("/opt/lunaepix-worker");
+    let cases = [
+        (
+            options(lossy(75), WriteMode::Replace),
+            vec![WORKER_FLAG, "--lossy", "75"],
+        ),
+        (
+            options(lossy(0), WriteMode::NoReplace),
+            vec![WORKER_FLAG, "--lossy", "0", "--no-replace"],
+        ),
+        (
+            options(lossy(100), WriteMode::Replace),
+            vec![WORKER_FLAG, "--lossy", "100"],
+        ),
+        (
+            options(Compression::Lossless, WriteMode::NoReplace),
+            vec![WORKER_FLAG, "--no-replace"],
+        ),
+    ];
+    for (options, expected) in cases {
+        let worker = base.with_options(&options);
+
+        assert_eq!(worker.args, names_in_order(&expected), "{options:?}");
+        assert_eq!(worker.program, base.program);
+        assert_eq!(worker.timeout, base.timeout);
+    }
+    // The worker it was made from keeps its own arguments.
+    assert_eq!(base.args, [OsString::from(WORKER_FLAG)]);
+}
+
+#[test]
+fn with_options_for_a_lossless_replace_run_adds_nothing() {
+    let base = Worker::new("/opt/lunaepix-worker");
+
+    let worker = base.with_options(&options(Compression::Lossless, WriteMode::Replace));
+
+    assert_eq!(worker, base);
+}
+
+/// A small lossless WebP: in a lossy run its lossy form is not smaller, so
+/// the original is kept, with the note.
+fn small_webp() -> Vec<u8> {
+    let pixels: Vec<u8> = (0..32 * 32 * 4).map(|i| (i * 7 % 251) as u8).collect();
+    let mut out = Vec::new();
+    image::codecs::webp::WebPEncoder::new_lossless(&mut out)
+        .encode(&pixels, 32, 32, image::ExtendedColorType::Rgba8)
+        .unwrap();
+    out
+}
+
+#[test]
+fn a_lossy_run_reports_the_note_the_worker_gives() {
+    let tmp = TempDir::new().unwrap();
+    let original = small_webp();
+    let src = write(tmp.path(), "a.webp", &original);
+    let jobs = plan_files(&[src]);
+    let worker = worker().with_options(&options(lossy(75), WriteMode::Replace));
+
+    let results = run(&jobs, &worker, |_, _, _| {});
+
+    let outcome = optimized(&results[0]);
+    assert_eq!(outcome.note, Some(Note::OriginalKept));
+    assert_eq!(outcome.after, original.len() as u64);
+    assert_eq!(
+        fs::read(tmp.path().join("optimized-a.webp")).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn a_lossless_run_reports_no_note() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.webp", &small_webp());
+    let jobs = plan_files(&[src]);
+    let worker = worker().with_options(&options(Compression::Lossless, WriteMode::Replace));
+
+    let results = run(&jobs, &worker, |_, _, _| {});
+
+    assert_eq!(optimized(&results[0]).note, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn takes_a_note_from_any_workers_record_exactly() {
+    let tmp = TempDir::new().unwrap();
+    let jobs = one_png_job(tmp.path());
+    let fake = script(
+        "printf 'lunaepix-worker 2 ok 4000 4000 12 apng\\n'",
+        WORKER_TIMEOUT,
+    );
+
+    let results = run(&jobs, &fake, |_, _, _| {});
+
+    assert_eq!(
+        optimized(&results[0]),
+        Outcome {
+            before: 4000,
+            after: 4000,
+            millis: 12,
+            note: Some(Note::KeptLosslessAnimatedPng),
+        }
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_record_of_version_1_counts_as_crashed() {
+    let tmp = TempDir::new().unwrap();
+    let jobs = one_png_job(tmp.path());
+    let stale = script(
+        "printf 'lunaepix-worker 1 ok 4000 3000 12\\n'",
+        WORKER_TIMEOUT,
+    );
+
+    let results = run(&jobs, &stale, |_, _, _| {});
+
+    assert_eq!(crash(&results[0]), Crash::NoValidResult);
+}
+
+// --- the on-start hook --------------------------------------------------------------
+
+/// One call of a hook, in a comparable form. A start records whether the
+/// job's output existed at that moment.
+#[derive(Debug, PartialEq, Eq)]
+enum Event {
+    Start { index: usize, output_existed: bool },
+    Progress { index: usize, seen: Seen },
+}
+
+/// Run `jobs` with both hooks, and give every call in order.
+fn observed(jobs: &[Job], worker: &Worker) -> Vec<Event> {
+    let events = std::cell::RefCell::new(Vec::new());
+    run_observed(
+        jobs,
+        worker,
+        &StopHandle::new(),
+        |index| {
+            let output_existed = match &jobs[index] {
+                Job::Optimize { dest, .. } => dest.exists(),
+                Job::Skip { .. } => panic!("on_start for a skip at {index}"),
+            };
+            events.borrow_mut().push(Event::Start {
+                index,
+                output_existed,
+            });
+        },
+        |index, _, result| {
+            events.borrow_mut().push(Event::Progress {
+                index,
+                seen: seen(result),
+            });
+        },
+    );
+    events.into_inner()
+}
+
+#[test]
+fn on_start_fires_once_per_optimize_job_before_its_progress() {
+    let tmp = TempDir::new().unwrap();
+    let srcs = [
+        write(tmp.path(), "a.png", &png_bytes()),
+        write(tmp.path(), "b.txt", b"notes"),
+        write(tmp.path(), "c.svg", &svg_bytes()),
+    ];
+    let jobs = plan_files(&srcs);
+
+    let events = observed(&jobs, &worker());
+
+    assert_eq!(
+        events,
+        [
+            Event::Start {
+                index: 0,
+                output_existed: false
+            },
+            Event::Progress {
+                index: 0,
+                seen: Seen::Optimized
+            },
+            Event::Progress {
+                index: 1,
+                seen: Seen::Skipped(Skip::UnsupportedType)
+            },
+            Event::Start {
+                index: 2,
+                output_existed: false
+            },
+            Event::Progress {
+                index: 2,
+                seen: Seen::Optimized
+            },
+        ]
+    );
+    assert!(tmp.path().join("optimized-a.png").exists());
+    assert!(tmp.path().join("optimized-c.svg").exists());
+}
+
+#[test]
+fn on_start_never_fires_for_a_skip() {
+    let tmp = TempDir::new().unwrap();
+    let srcs = [
+        write(tmp.path(), "notes.txt", b"hello"),
+        tmp.path().join("missing.png"),
+    ];
+    let jobs = plan_files(&srcs);
+
+    let events = observed(&jobs, &missing_worker(&tmp));
+
+    assert_eq!(
+        events,
+        [
+            Event::Progress {
+                index: 0,
+                seen: Seen::Skipped(Skip::UnsupportedType)
+            },
+            Event::Progress {
+                index: 1,
+                seen: Seen::Skipped(Skip::NotAFile)
+            },
+        ]
+    );
 }

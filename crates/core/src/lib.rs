@@ -1,4 +1,4 @@
-//! Lunaepix core: lossless PNG, JPG, SVG and WebP optimisation.
+//! Lunaepix core: lossless and lossy PNG, JPG, SVG and WebP optimisation.
 //!
 //! All logic and all tests live here. The CLI and the Tauri app are thin
 //! front ends over this crate.
@@ -8,8 +8,9 @@
 //! in its own worker process ([`worker`]), so a library that crashes the
 //! process fails only that file.
 //!
-//! `unsafe` code is denied everywhere but in `jpg`, the libjpeg FFI, and in
-//! `platform`, the worker's two start-up system calls.
+//! `unsafe` code is denied everywhere but in `jpg`, the libjpeg FFI, in
+//! `platform`, the worker's two start-up system calls, and in `webp::codec`,
+//! the libwebp FFI.
 
 #![deny(unsafe_code)]
 
@@ -23,6 +24,7 @@ use std::time::Instant;
 mod atomic;
 #[allow(unsafe_code)]
 mod jpg;
+mod lossy;
 mod plan;
 #[allow(unsafe_code)]
 mod platform;
@@ -32,12 +34,45 @@ mod svg;
 mod webp;
 pub mod worker;
 
+use lossy::Lossy;
+pub use lossy::{DEFAULT_QUALITY, Note, Quality};
 pub use plan::{
-    MAX_FILE_BYTES, MAX_PIXELS, MAX_RUN_FILES, MAX_SVG_DEPTH, MAX_SVG_ENTITY_BYTES, MAX_SVG_NODES,
-    MAX_WORKER_MESSAGE_BYTES, MAX_WORKER_OUTPUT_BYTES, WORKER_TIMEOUT, plan_files, plan_folder,
+    MAX_ANIMATION_CANVAS_PIXELS, MAX_ANIMATION_PIXELS, MAX_FILE_BYTES, MAX_PIXELS, MAX_RUN_FILES,
+    MAX_SVG_DEPTH, MAX_SVG_ENTITY_BYTES, MAX_SVG_NODES, MAX_WORKER_MESSAGE_BYTES,
+    MAX_WORKER_OUTPUT_BYTES, WORKER_TIMEOUT, images_in_folder, plan_files, plan_files_to,
+    plan_folder, plan_folder_to,
 };
-pub use run::{Crash, FileResult, RunError, StopHandle, Worker, run, run_until_stopped};
+pub use run::{
+    Crash, FileResult, RunError, StopHandle, Worker, run, run_observed, run_until_stopped,
+};
 pub use worker::WORKER_FLAG;
+
+/// How a run compresses its files: one setting for the whole run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    /// Today's treatment: smaller files, not a pixel changed.
+    Lossless,
+    /// JPG, PNG and WebP are re-encoded at this quality; SVG gets the
+    /// lossless treatment.
+    Lossy(Quality),
+}
+
+/// Whether a run may replace an existing output file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    /// The output replaces an earlier output of the same name. The output
+    /// may only go to the source's folder or its `optimized/` folder.
+    Replace,
+    /// Nothing existing is overwritten.
+    NoReplace,
+}
+
+/// The settings of a run, for every file in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Options {
+    pub compression: Compression,
+    pub write: WriteMode,
+}
 
 /// Result of optimising one file. Sizes are in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +80,8 @@ pub struct Outcome {
     pub before: u64,
     pub after: u64,
     pub millis: u64,
+    /// Why a lossy run kept the file's bytes as they were, if it did.
+    pub note: Option<Note>,
 }
 
 /// Why a file is left alone. The `Display` text is shown to the user in the UI.
@@ -116,7 +153,13 @@ impl OptimizeError {
     }
 }
 
-/// Optimise `src` losslessly and write the result to `dest`.
+/// Optimise `src` with the run's `options` and write the result to `dest`.
+///
+/// With [`Compression::Lossless`] every format gets today's lossless
+/// treatment, and no lossy path is ever called. With
+/// [`Compression::Lossy`] a JPG, PNG or WebP goes to its format's lossy path,
+/// which may keep the file lossless or keep the original bytes, with a
+/// [`Note`] that says so; an SVG gets the lossless treatment without a note.
 ///
 /// The format is chosen by the extension, case-insensitively, exactly as the
 /// planner does. `src` is only ever read. `dest` is written atomically (the
@@ -124,15 +167,75 @@ impl OptimizeError {
 /// when there is a result to write. If anything fails, `dest` is not touched
 /// and no temporary file is left behind. The output gets the source's
 /// permissions. A `dest` that is the same file as `src` (after resolving
-/// symlinks and `.`/`..`) is refused, and so is a `dest` whose folder is not
-/// the source's folder or its `optimized/` subfolder (checked before anything
-/// is created). A source of more than [`MAX_FILE_BYTES`] when it is read (it
-/// grew after planning) is refused with the planner's size reason, having
-/// read one byte past the limit at most. On Windows the output does not get
-/// the source's read-only attribute, so a later run can replace it.
-/// `Outcome::millis` is the wall time of
-/// the whole call: read, optimise and write.
-pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> {
+/// symlinks and `.`/`..`) is refused. With [`WriteMode::Replace`] a `dest`
+/// whose folder is not the source's folder or its `optimized/` subfolder is
+/// refused (checked before anything is created). With
+/// [`WriteMode::NoReplace`] `dest` may be in any folder: the output is
+/// written as a new file and nothing existing is replaced. When `dest` is
+/// taken by then (a file appeared after planning), the first free numbered
+/// name beside it is used (`logo-2.png`, up to `logo-9999.png`), and past
+/// that the file fails with "no free name in the output folder". A source of
+/// more than [`MAX_FILE_BYTES`] when it is
+/// read (it grew after planning) is refused with the planner's size reason,
+/// having read one byte past the limit at most. On Windows the output does
+/// not get the source's read-only attribute, so a later run can replace it.
+/// `Outcome::millis` is the wall time of the whole call: read, optimise and
+/// write.
+pub fn optimize_file(src: &Path, dest: &Path, options: &Options) -> Result<Outcome, OptimizeError> {
+    optimize_file_with(src, dest, options, &lossy_dispatch)
+}
+
+/// The formats that have a lossy path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LossyFormat {
+    Png,
+    Jpg,
+    Webp,
+}
+
+impl LossyFormat {
+    /// The lossy path of `format`, if it has one: SVG has none.
+    fn of(format: plan::Format) -> Option<LossyFormat> {
+        match format {
+            plan::Format::Png => Some(LossyFormat::Png),
+            plan::Format::Jpg => Some(LossyFormat::Jpg),
+            plan::Format::Webp => Some(LossyFormat::Webp),
+            plan::Format::Svg => None,
+        }
+    }
+}
+
+/// The lossy path of each format.
+fn lossy_dispatch(format: LossyFormat, bytes: &[u8], quality: Quality) -> Result<Lossy, String> {
+    match format {
+        LossyFormat::Png => png::optimize_lossy(bytes, quality),
+        LossyFormat::Jpg => jpg::optimize_lossy(bytes, quality),
+        LossyFormat::Webp => webp::optimize_lossy(bytes, quality),
+    }
+}
+
+/// Today's lossless treatment of `format`.
+fn lossless(format: plan::Format, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    match format {
+        plan::Format::Png => png::optimize(bytes),
+        plan::Format::Jpg => jpg::optimize(bytes),
+        plan::Format::Svg => svg::optimize(bytes),
+        plan::Format::Webp => webp::optimize(bytes),
+    }
+}
+
+/// The lossy paths, as [`optimize_file_with`] takes them: [`lossy_dispatch`],
+/// or a double in the tests.
+pub(crate) type LossyPaths<'a> = &'a dyn Fn(LossyFormat, &[u8], Quality) -> Result<Lossy, String>;
+
+/// [`optimize_file`] with the lossy paths given: the tests pass a double that
+/// records what it is handed.
+pub(crate) fn optimize_file_with(
+    src: &Path,
+    dest: &Path,
+    options: &Options,
+    lossy: LossyPaths<'_>,
+) -> Result<Outcome, OptimizeError> {
     let started = Instant::now();
     let format = plan::format_of(src).ok_or_else(|| OptimizeError::UnsupportedType {
         path: src.to_path_buf(),
@@ -159,23 +262,36 @@ pub fn optimize_file(src: &Path, dest: &Path) -> Result<Outcome, OptimizeError> 
             path: src.to_path_buf(),
             message: Skip::TooLarge.to_string(),
         })?;
-    let optimized = match format {
-        plan::Format::Png => png::optimize(&original),
-        plan::Format::Jpg => jpg::optimize(&original),
-        plan::Format::Svg => svg::optimize(&original),
-        plan::Format::Webp => webp::optimize(&original),
+    let optimized = match (options.compression, LossyFormat::of(format)) {
+        (Compression::Lossy(quality), Some(lossy_format)) => {
+            lossy(lossy_format, &original, quality)
+        }
+        (Compression::Lossy(_), None) | (Compression::Lossless, _) => {
+            lossless(format, &original).map(|bytes| Lossy { bytes, note: None })
+        }
     }
     .map_err(|message| OptimizeError::Invalid {
         path: src.to_path_buf(),
         message,
     })?;
-    ensure_destination_folder(src, dest)?;
-    atomic::write_atomically(dest, &optimized, permissions).map_err(io_error(dest))?;
+    match options.write {
+        WriteMode::Replace => {
+            ensure_destination_folder(src, dest)?;
+            atomic::write_atomically(dest, &optimized.bytes, permissions)
+                .map_err(io_error(dest))?;
+        }
+        WriteMode::NoReplace => {
+            // Any folder: nothing existing can be overwritten. The name
+            // actually written is not reported back (plan handoff).
+            atomic::write_new(dest, &optimized.bytes, permissions).map_err(io_error(dest))?;
+        }
+    }
 
     Ok(Outcome {
         before: original.len() as u64,
-        after: optimized.len() as u64,
+        after: optimized.bytes.len() as u64,
         millis: started.elapsed().as_millis() as u64,
+        note: optimized.note,
     })
 }
 
@@ -436,6 +552,289 @@ mod tests {
     #[test]
     fn names_ignore_case_exactly_on_windows_and_macos() {
         assert_eq!(NAMES_IGNORE_CASE, cfg!(any(windows, target_os = "macos")));
+    }
+
+    // --- run options: which path a file takes -----------------------------------
+
+    use std::cell::RefCell;
+
+    use tempfile::TempDir;
+
+    const LOSSLESS: Options = Options {
+        compression: Compression::Lossless,
+        write: WriteMode::Replace,
+    };
+
+    fn lossy(quality: u8) -> Options {
+        Options {
+            compression: Compression::Lossy(Quality::new(quality).unwrap()),
+            write: WriteMode::Replace,
+        }
+    }
+
+    /// What the double for the lossy paths was handed: the format, the bytes
+    /// and the quality, per call.
+    type LossyCall = (LossyFormat, Vec<u8>, Quality);
+
+    /// A double for the lossy paths: it records every call and gives `answer`.
+    struct LossyDouble {
+        calls: RefCell<Vec<LossyCall>>,
+        answer: Result<Lossy, String>,
+    }
+
+    impl LossyDouble {
+        fn answering(answer: Result<Lossy, String>) -> Self {
+            LossyDouble {
+                calls: RefCell::new(Vec::new()),
+                answer,
+            }
+        }
+
+        fn call(
+            &self,
+            format: LossyFormat,
+            bytes: &[u8],
+            quality: Quality,
+        ) -> Result<Lossy, String> {
+            self.calls
+                .borrow_mut()
+                .push((format, bytes.to_vec(), quality));
+            self.answer.clone()
+        }
+
+        fn calls(&self) -> Vec<LossyCall> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    /// A double whose answer would be visible in the output if it were used.
+    fn marked_double() -> LossyDouble {
+        LossyDouble::answering(Ok(Lossy {
+            bytes: b"written by the lossy double".to_vec(),
+            note: Some(Note::OriginalKept),
+        }))
+    }
+
+    fn png_fixture() -> Vec<u8> {
+        let (w, h) = (48u32, 32u32);
+        let pixels: Vec<u8> = (0..w * h * 4).map(|i| (i * 7 % 251) as u8).collect();
+        let mut out = Vec::new();
+        let mut encoder = ::png::Encoder::new(&mut out, w, h);
+        encoder.set_color(::png::ColorType::Rgba);
+        encoder.set_depth(::png::BitDepth::Eight);
+        encoder.set_compression(::png::Compression::Fast);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&pixels).unwrap();
+        writer.finish().unwrap();
+        out
+    }
+
+    fn jpg_fixture() -> Vec<u8> {
+        let (w, h) = (48u32, 32u32);
+        let pixels: Vec<u8> = (0..w * h * 3).map(|i| (i * 13 % 241) as u8).collect();
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
+            .encode(&pixels, w, h, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        out
+    }
+
+    fn webp_fixture() -> Vec<u8> {
+        let pixels: Vec<u8> = (0..32 * 32 * 4).map(|i| (i * 7 % 251) as u8).collect();
+        let mut out = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut out)
+            .encode(&pixels, 32, 32, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        out
+    }
+
+    fn svg_fixture() -> Vec<u8> {
+        br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">
+  <!-- a comment to remove -->
+  <rect x="0.000" y="0.000" width="10.000" height="10.000" fill="#ff0000"/>
+</svg>
+"##
+        .to_vec()
+    }
+
+    /// Every format: its file name, its bytes, and today's lossless output.
+    fn every_format() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+        let png = png_fixture();
+        let jpg = jpg_fixture();
+        let svg = svg_fixture();
+        let webp = webp_fixture();
+        vec![
+            ("a.png", png.clone(), crate::png::optimize(&png).unwrap()),
+            ("a.jpg", jpg.clone(), crate::jpg::optimize(&jpg).unwrap()),
+            ("a.svg", svg.clone(), crate::svg::optimize(&svg).unwrap()),
+            (
+                "a.webp",
+                webp.clone(),
+                crate::webp::optimize(&webp).unwrap(),
+            ),
+        ]
+    }
+
+    /// Write `bytes` as `name` in `dir` and optimise it to `optimized-<name>`
+    /// with `options` and `double` as the lossy paths.
+    fn optimise_with(
+        dir: &Path,
+        name: &str,
+        bytes: &[u8],
+        options: &Options,
+        double: &LossyDouble,
+    ) -> (PathBuf, PathBuf, Result<Outcome, OptimizeError>) {
+        let src = dir.join(name);
+        fs::write(&src, bytes).unwrap();
+        let dest = dir.join(format!("optimized-{name}"));
+        let result = optimize_file_with(&src, &dest, options, &|format, bytes, quality| {
+            double.call(format, bytes, quality)
+        });
+        (src, dest, result)
+    }
+
+    #[test]
+    fn a_lossless_run_gives_todays_bytes() {
+        for (name, original, expected) in every_format() {
+            let tmp = TempDir::new().unwrap();
+            let src = tmp.path().join(name);
+            fs::write(&src, &original).unwrap();
+            let dest = tmp.path().join(format!("optimized-{name}"));
+
+            let outcome = optimize_file(&src, &dest, &LOSSLESS).unwrap();
+
+            assert_eq!(fs::read(&dest).unwrap(), expected, "{name}");
+            assert_eq!(outcome.after, expected.len() as u64, "{name}");
+            assert_eq!(outcome.note, None, "{name}");
+            assert_eq!(fs::read(&src).unwrap(), original, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_lossless_run_never_reaches_a_lossy_path() {
+        for (name, original, expected) in every_format() {
+            let tmp = TempDir::new().unwrap();
+            let double = marked_double();
+
+            let (_, dest, result) = optimise_with(tmp.path(), name, &original, &LOSSLESS, &double);
+
+            assert_eq!(result.unwrap().note, None, "{name}");
+            assert_eq!(double.calls(), Vec::<LossyCall>::new(), "{name}");
+            assert_eq!(fs::read(&dest).unwrap(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_lossy_run_hands_each_format_its_bytes_and_quality_and_writes_what_comes_back() {
+        let cases = [
+            ("a.png", png_fixture(), LossyFormat::Png),
+            ("a.jpg", jpg_fixture(), LossyFormat::Jpg),
+            ("a.webp", webp_fixture(), LossyFormat::Webp),
+        ];
+        for (name, original, format) in cases {
+            for quality in [0, 75, 100] {
+                let tmp = TempDir::new().unwrap();
+                let double = marked_double();
+
+                let (src, dest, result) =
+                    optimise_with(tmp.path(), name, &original, &lossy(quality), &double);
+
+                let outcome = result.unwrap();
+                assert_eq!(
+                    double.calls(),
+                    [(format, original.clone(), Quality::new(quality).unwrap())],
+                    "{name} at {quality}"
+                );
+                assert_eq!(fs::read(&dest).unwrap(), b"written by the lossy double");
+                assert_eq!(outcome.before, original.len() as u64);
+                assert_eq!(outcome.after, b"written by the lossy double".len() as u64);
+                assert_eq!(outcome.note, Some(Note::OriginalKept), "{name}");
+                assert_eq!(fs::read(&src).unwrap(), original, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_lossy_path_error_fails_the_file_and_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let double = LossyDouble::answering(Err("the double refused it".to_owned()));
+
+        let (src, dest, result) =
+            optimise_with(tmp.path(), "a.png", &png_fixture(), &lossy(75), &double);
+
+        match result.unwrap_err() {
+            OptimizeError::Invalid { path, message } => {
+                assert_eq!(path, src);
+                assert_eq!(message, "the double refused it");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(double.calls().len(), 1);
+        assert!(!dest.exists());
+        let mut names: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a.png"]);
+    }
+
+    #[test]
+    fn the_lossy_dispatch_double_records_no_call_for_svg() {
+        let tmp = TempDir::new().unwrap();
+        let double = marked_double();
+        let original = svg_fixture();
+
+        let (_, dest, result) = optimise_with(tmp.path(), "a.svg", &original, &lossy(75), &double);
+
+        assert_eq!(result.unwrap().note, None);
+        assert_eq!(double.calls(), Vec::<LossyCall>::new());
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            crate::svg::optimize(&original).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_no_replace_run_writes_beside_an_existing_file_without_replacing_it() {
+        let original = png_fixture();
+        let cases = [
+            (
+                Compression::Lossless,
+                crate::png::optimize(&original).unwrap(),
+            ),
+            (
+                lossy(75).compression,
+                b"written by the lossy double".to_vec(),
+            ),
+        ];
+        for (compression, expected) in cases {
+            let tmp = TempDir::new().unwrap();
+            let existing = tmp.path().join("optimized-a.png");
+            fs::write(&existing, b"an earlier output").unwrap();
+            let options = Options {
+                compression,
+                write: WriteMode::NoReplace,
+            };
+            let double = marked_double();
+
+            let (src, dest, result) =
+                optimise_with(tmp.path(), "a.png", &original, &options, &double);
+
+            let outcome = result.unwrap();
+            assert_eq!(dest, existing);
+            assert_eq!(fs::read(&dest).unwrap(), b"an earlier output");
+            let numbered = tmp.path().join("optimized-a-2.png");
+            assert_eq!(fs::read(&numbered).unwrap(), expected, "{compression:?}");
+            assert_eq!(outcome.after, expected.len() as u64);
+            assert_eq!(fs::read(&src).unwrap(), original);
+            let mut names: Vec<_> = fs::read_dir(tmp.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            names.sort();
+            assert_eq!(names, ["a.png", "optimized-a-2.png", "optimized-a.png"]);
+        }
     }
 
     #[test]

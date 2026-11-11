@@ -22,6 +22,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use lunaepix_core::{Compression, Note, Options, Quality, WriteMode};
 use lunaepix_core::{
     FileResult, MAX_FILE_BYTES, MAX_SVG_DEPTH, MAX_SVG_NODES, OptimizeError, Outcome, RunError,
     Skip, Worker, optimize_file, plan_files, run,
@@ -30,6 +31,12 @@ use tempfile::TempDir;
 
 mod common;
 use common::webp_fixtures as fx;
+
+/// Today's run: lossless, replacing an earlier output.
+const LOSSLESS: Options = Options {
+    compression: Compression::Lossless,
+    write: WriteMode::Replace,
+};
 
 /// Generous: a refusal takes milliseconds; allocating and touching gigabytes
 /// takes far longer.
@@ -54,13 +61,18 @@ fn listing(dir: &Path) -> Vec<OsString> {
 /// `Invalid` error, quickly, with no output and nothing else left behind.
 /// Returns the error text for further checks.
 fn assert_refused(name: &str, bytes: &[u8]) -> String {
+    assert_refused_in(&LOSSLESS, name, bytes)
+}
+
+/// [`assert_refused`] in a run with `options`.
+fn assert_refused_in(options: &Options, name: &str, bytes: &[u8]) -> String {
     let tmp = TempDir::new().unwrap();
     let src = write(tmp.path(), name, bytes);
     let dest = tmp.path().join(format!("optimized-{name}"));
     let before = listing(tmp.path());
 
     let started = Instant::now();
-    let result = optimize_file(&src, &dest);
+    let result = optimize_file(&src, &dest, options);
     let elapsed = started.elapsed();
 
     let err = result.expect_err("hostile input must be refused");
@@ -91,7 +103,7 @@ fn refuses_a_source_that_grew_past_the_size_limit_after_planning() {
     let dest = tmp.path().join("optimized-grown.png");
 
     let started = Instant::now();
-    let err = optimize_file(&src, &dest).unwrap_err();
+    let err = optimize_file(&src, &dest, &LOSSLESS).unwrap_err();
 
     assert!(started.elapsed() < QUICK, "took {:?}", started.elapsed());
     assert_eq!(err.reason(), Skip::TooLarge.to_string());
@@ -111,7 +123,7 @@ fn reads_a_source_of_exactly_the_size_limit_and_hands_it_to_the_optimiser() {
     let src = sized_file(tmp.path(), "full.png", MAX_FILE_BYTES);
     let dest = tmp.path().join("optimized-full.png");
 
-    let err = optimize_file(&src, &dest).unwrap_err();
+    let err = optimize_file(&src, &dest, &LOSSLESS).unwrap_err();
 
     assert_ne!(err.reason(), Skip::TooLarge.to_string());
     assert!(matches!(err, OptimizeError::Invalid { .. }), "{err:?}");
@@ -202,7 +214,7 @@ fn still_optimises_a_normal_png_with_an_ancillary_chunk_after_its_ihdr() {
     let src = write(tmp.path(), "a.png", &original);
     let dest = tmp.path().join("optimized-a.png");
 
-    optimize_file(&src, &dest).unwrap();
+    optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     assert!(fs::metadata(&dest).unwrap().len() < original.len() as u64);
 }
@@ -347,7 +359,7 @@ fn optimise_svg(svg: &str) -> (Result<Outcome, OptimizeError>, PathBuf, TempDir)
     let tmp = TempDir::new().unwrap();
     let src = write(tmp.path(), "a.svg", svg.as_bytes());
     let dest = tmp.path().join("optimized-a.svg");
-    (optimize_file(&src, &dest), dest, tmp)
+    (optimize_file(&src, &dest, &LOSSLESS), dest, tmp)
 }
 
 /// Optimise `svg`, which must succeed, and return the output as text after
@@ -776,7 +788,7 @@ fn still_optimises_a_normal_webp() {
     let src = write(tmp.path(), "a.webp", &original);
     let dest = tmp.path().join("optimized-a.webp");
 
-    let outcome = optimize_file(&src, &dest).unwrap();
+    let outcome = optimize_file(&src, &dest, &LOSSLESS).unwrap();
 
     assert_eq!(outcome.before, original.len() as u64);
     assert!(outcome.after <= outcome.before);
@@ -899,7 +911,7 @@ fn optimised_with_exif(exif: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let dest = tmp.path().join("optimized-exif.webp");
 
     let started = Instant::now();
-    let result = optimize_file(&src, &dest);
+    let result = optimize_file(&src, &dest, &LOSSLESS);
     assert!(started.elapsed() < QUICK, "took {:?}", started.elapsed());
 
     result.expect("a malformed EXIF chunk must not refuse the file");
@@ -1070,4 +1082,277 @@ fn a_normal_svg_with_css_succeeds_through_the_worker_between_two_good_files() {
 
     assert!(matches!(result, FileResult::Optimized(_)), "{result:?}");
     assert!(listing.contains(&OsString::from("optimized-b.svg")));
+}
+
+// --- A lossy run: the same hostile files ------------------------------------------------
+
+fn lossy() -> Options {
+    Options {
+        compression: Compression::Lossy(Quality::new(75).unwrap()),
+        write: WriteMode::Replace,
+    }
+}
+
+/// The 16x16 IHDR over the IDAT of a 2048x2048 image, as in
+/// `refuses_a_png_whose_idat_inflates_far_past_its_small_ihdr`.
+fn png_whose_idat_inflates_past_its_ihdr() -> Vec<u8> {
+    let mut big = Vec::new();
+    let mut encoder = png::Encoder::new(&mut big, 2048, 2048);
+    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&vec![0; 2048 * 2048]).unwrap();
+    writer.finish().unwrap();
+    png(&[ihdr(16, 16, 8, 0), chunk(b"IDAT", &idat_data(&big))])
+}
+
+/// A 64x48 RGBA gradient, as the lossy PNG path's own tests use.
+fn gradient_png() -> Vec<u8> {
+    let (w, h) = (64u32, 48u32);
+    let mut pixels = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            pixels.extend_from_slice(&[
+                (x * 255 / (w - 1)) as u8,
+                (y * 255 / (h - 1)) as u8,
+                ((x + y) * 255 / (w + h - 2)) as u8,
+                255,
+            ]);
+        }
+    }
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, w, h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&pixels).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+/// Every hostile PNG above, with a part of the reason it must be refused
+/// with.
+fn hostile_pngs() -> Vec<(&'static str, Vec<u8>, &'static str)> {
+    let full = gradient_png();
+    let mut damaged = full.clone();
+    let middle = damaged.len() / 2;
+    for byte in &mut damaged[middle..middle + 16] {
+        *byte ^= 0xFF;
+    }
+    vec![
+        (
+            "declares 65535x65535",
+            png(&[ihdr(65_535, 65_535, 8, 6), chunk(b"IDAT", &TOKEN_IDAT)]),
+            "image too large: 65535×65535 exceeds 100 megapixels",
+        ),
+        (
+            "a huge IHDR behind an ancillary chunk",
+            png(&[
+                chunk(b"tEXt", b"Comment\0first"),
+                huge_ihdr(),
+                chunk(b"IDAT", &TOKEN_IDAT),
+            ]),
+            "first chunk is not IHDR",
+        ),
+        (
+            "a second huge IHDR",
+            png(&[ihdr(1, 1, 8, 0), huge_ihdr(), chunk(b"IDAT", &TOKEN_IDAT)]),
+            "more than one IHDR",
+        ),
+        (
+            // The lossless path's own message, word for word: the 16x16
+            // grey IHDR holds 272 bytes of raw data.
+            "an IDAT that inflates past its IHDR",
+            png_whose_idat_inflates_past_its_ihdr(),
+            "could not read the PNG data: Inflated data would exceed the maximum size (272 bytes)",
+        ),
+        (
+            "cut off at two thirds",
+            full[..full.len() * 2 / 3].to_vec(),
+            "could not read the PNG data",
+        ),
+        (
+            "cut off after 60 bytes",
+            full[..60].to_vec(),
+            "could not read the PNG data",
+        ),
+        ("damaged image data", damaged, "could not read the PNG data"),
+    ]
+}
+
+#[test]
+fn every_hostile_png_is_refused_in_a_lossy_run_too() {
+    for (what, bytes, reason) in hostile_pngs() {
+        let message = assert_refused_in(&lossy(), "bomb.png", &bytes);
+        assert!(message.contains(reason), "{what}: {message}");
+    }
+}
+
+#[test]
+fn every_hostile_jpg_is_refused_in_a_lossy_run_too() {
+    let message = assert_refused_in(&lossy(), "bomb.jpg", &jpeg_declaring(65_500, 65_500));
+    assert!(
+        message.contains("image too large: 65500×65500 exceeds 100 megapixels"),
+        "{message}"
+    );
+    let message = assert_refused_in(&lossy(), "bomb.jpg", &jpeg_declaring(65_535, 65_535));
+    assert!(
+        message.contains("could not read the JPEG data"),
+        "{message}"
+    );
+}
+
+/// Every hostile WebP above, with a part of the reason it must be refused
+/// with.
+fn hostile_webps() -> Vec<(&'static str, Vec<u8>, &'static str)> {
+    const UNREADABLE: &str = "could not read the WebP data";
+    let mut wave = b"RIFF".to_vec();
+    wave.extend_from_slice(&36u32.to_le_bytes());
+    wave.extend_from_slice(b"WAVEfmt ");
+    let lossless_8 = || webp_chunk(b"VP8L", &webp_vp8l_payload(8, 8));
+    let whole = webp_riff(&[lossless_8()]);
+    vec![
+        ("only RIFF", b"RIFF".to_vec(), NOT_WEBP),
+        ("empty", Vec::new(), NOT_WEBP),
+        ("a PNG", png(&[ihdr(1, 1, 8, 0)]), NOT_WEBP),
+        ("a WAVE file", wave, NOT_WEBP),
+        (
+            "a chunk of u32::MAX bytes",
+            webp_riff(&[webp_chunk_declaring(
+                b"VP8L",
+                u32::MAX,
+                &webp_vp8l_payload(8, 8),
+            )]),
+            UNREADABLE,
+        ),
+        (
+            "a RIFF size past the end",
+            webp_riff_declaring(u32::MAX, &[lossless_8()]),
+            UNREADABLE,
+        ),
+        (
+            "cut inside VP8L",
+            whole[..whole.len() - 4].to_vec(),
+            UNREADABLE,
+        ),
+        (
+            "a VP8L payload shorter than its header",
+            webp_riff(&[webp_chunk(b"VP8L", &webp_vp8l_payload(8, 8)[..3])]),
+            UNREADABLE,
+        ),
+        (
+            "a misplaced VP8X",
+            webp_riff(&[lossless_8(), webp_vp8x(8, 8)]),
+            UNREADABLE,
+        ),
+        (
+            "a second VP8X",
+            webp_riff(&[webp_vp8x(8, 8), webp_vp8x(65_535, 65_535), lossless_8()]),
+            UNREADABLE,
+        ),
+        (
+            "a canvas over the pixel limit",
+            webp_riff(&[webp_vp8x(20_000, 20_000)]),
+            "image too large: 20000×20000 exceeds 100 megapixels",
+        ),
+        (
+            "a canvas at the limit with no image",
+            webp_riff(&[webp_vp8x(10_000, 10_000)]),
+            UNREADABLE,
+        ),
+    ]
+}
+
+#[test]
+fn every_hostile_webp_is_refused_in_a_lossy_run_too() {
+    for (what, bytes, reason) in hostile_webps() {
+        let message = assert_refused_in(&lossy(), "bomb.webp", &bytes);
+        assert!(message.contains(reason), "{what}: {message}");
+        if what == "a canvas at the limit with no image" {
+            assert!(!message.contains("too large"), "{what}: {message}");
+        }
+    }
+}
+
+#[test]
+fn a_source_that_grew_past_the_size_limit_is_refused_in_a_lossy_run_too() {
+    let tmp = TempDir::new().unwrap();
+    let src = sized_file(tmp.path(), "grown.png", MAX_FILE_BYTES + 1);
+    let dest = tmp.path().join("optimized-grown.png");
+
+    let started = Instant::now();
+    let err = optimize_file(&src, &dest, &lossy()).unwrap_err();
+
+    assert!(started.elapsed() < QUICK, "took {:?}", started.elapsed());
+    assert_eq!(err.reason(), Skip::TooLarge.to_string());
+    assert!(!dest.exists());
+    assert_eq!(listing(tmp.path()), [OsString::from("grown.png")]);
+}
+
+/// Optimise `bytes` as `name` in a lossy run that must succeed, quickly:
+/// the outcome and the output.
+fn lossy_output(name: &str, bytes: &[u8]) -> (Outcome, Vec<u8>) {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), name, bytes);
+    let dest = tmp.path().join(format!("optimized-{name}"));
+
+    let started = Instant::now();
+    let outcome = optimize_file(&src, &dest, &lossy()).expect("a normal file is not refused");
+
+    assert!(started.elapsed() < QUICK, "took {:?}", started.elapsed());
+    assert_eq!(fs::read(&src).unwrap(), bytes, "the original is untouched");
+    (outcome, fs::read(&dest).unwrap())
+}
+
+#[test]
+fn a_normal_png_and_jpg_are_not_refused_in_a_lossy_run() {
+    let (_, written) = lossy_output("a.png", &normal_png_with_text());
+    let decoded = image::load_from_memory_with_format(&written, image::ImageFormat::Png).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (64, 64));
+
+    let (_, written) = lossy_output("a.jpg", &normal_jpeg());
+    let decoded = image::load_from_memory_with_format(&written, image::ImageFormat::Jpeg).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (48, 32));
+}
+
+#[test]
+fn a_normal_webp_keeps_its_original_bytes_in_a_lossy_run() {
+    // At 32x32 the lossy file is not smaller, so the original comes back.
+    let original = normal_webp();
+
+    let (outcome, written) = lossy_output("a.webp", &original);
+
+    assert_eq!(outcome.note, Some(Note::OriginalKept));
+    assert_eq!(written, original);
+}
+
+#[test]
+fn a_webp_with_a_malformed_exif_chunk_is_not_refused_in_a_lossy_run() {
+    let le = |v: u32| v.to_le_bytes();
+    let mut header_cut = fx::EXIF_PREFIX.to_vec();
+    header_cut.extend_from_slice(b"II*");
+    let mut offset_past_end = fx::tiff(false, &[(fx::ORIENTATION, fx::SHORT, 1, 6)]);
+    offset_past_end[4..8].copy_from_slice(&le(u32::MAX));
+    let mut offset_into_header = fx::tiff(true, &[(fx::ORIENTATION, fx::SHORT, 1, 6)]);
+    offset_into_header[4..8].copy_from_slice(&2u32.to_be_bytes());
+    let mut count_too_large = fx::tiff(false, &[]);
+    count_too_large[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+    let wrong_type = fx::tiff(true, &[(fx::ORIENTATION, 4, 1, 6)]);
+    let cases: [(&str, Vec<u8>); 6] = [
+        ("empty", Vec::new()),
+        ("header cut short", header_cut),
+        ("IFD0 offset past the end", offset_past_end),
+        ("IFD0 offset into the header", offset_into_header),
+        ("entry count larger than the payload", count_too_large),
+        ("Orientation of type LONG", wrong_type),
+    ];
+    for (what, exif) in cases {
+        let original = fx::with_chunks(&normal_webp(), &[(*b"EXIF", &exif)]);
+
+        let (outcome, written) = lossy_output("exif.webp", &original);
+
+        // At 32x32 the lossy file is not smaller: the original comes back.
+        assert_eq!(outcome.note, Some(Note::OriginalKept), "{what}");
+        assert_eq!(written, original, "{what}");
+    }
 }
