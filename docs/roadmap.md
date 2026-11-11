@@ -12,6 +12,7 @@ plan (in `docs/pending-approval/` until approved) when it starts.
 | Apple support: a brew formula, and a plain download with one awkward step | Not started |
 | Choose how much it can get compressed (quality, like JPEG 70%) on lossy | Part of lossy compression |
 | Export rename (single file only) | Not started |
+| Reuse files after a run, and thumbnails | Spec written, waiting for approval |
 | Clean and clear UI | Not started |
 | Automated draft release | Not started |
 
@@ -69,7 +70,17 @@ part of lossy compression (quality 0–100, starting at 75).
 
 ## Export rename (single file only)
 
-Give the output file a different name when one file is compressed.
+Give the output file a different name when one file is compressed. For a
+batch job: "that is a prefix / postfix, as it is not good to rename all files
+in a batch job."
+
+## Reuse files after a run, and thumbnails
+
+A "Reuse files" button after a run puts the same files back in the list, so
+they can be run again with other settings. Next to the originals, a run no
+longer replaces an earlier output: a taken name gets a number, as in a chosen
+output folder. Every row shows a small thumbnail before the file name.
+Spec: `docs/pending-approval/specs/2026-11-11-lunaepix-run-again-thumbnails-design.md`.
 
 ## Clean and clear UI
 
