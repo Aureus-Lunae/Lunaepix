@@ -1,6 +1,7 @@
 //! Decoding a JPG, PNG or WebP to the RGBA pixels a thumbnail is made from,
 //! with the decoders the optimisers use and within their bounds, and finding
-//! the EXIF orientation the thumbnail is turned by.
+//! the EXIF orientation the thumbnail is turned by. The size a header declares
+//! ([`header_size`]) is read here too, for the thumbnail and the probe.
 
 use crate::plan::Format;
 
@@ -49,13 +50,36 @@ impl Picture {
 /// Check that `bytes` start like `format` and that the size their header
 /// declares is within [`crate::MAX_PIXELS`] (`check_pixels`), without
 /// decoding any image data. Each format reads its header as its optimiser
-/// does. An SVG has no pixels to check and is refused.
+/// does. An SVG has no pixels to check and is refused. This is
+/// [`header_size`] without the size.
 pub(super) fn check_header(format: Format, bytes: &[u8]) -> Result<(), String> {
-    match format {
-        Format::Png => crate::png::check_header(bytes),
-        Format::Jpg => crate::jpg::check_header(bytes),
-        Format::Webp => crate::webp::check_header(bytes),
-        Format::Svg => Err(NOT_DECODED.to_owned()),
+    header_size(format, bytes).map(drop)
+}
+
+/// The width and height `bytes` declare in their header, without decoding
+/// any image data. [`check_header`] is this function without the size, so
+/// the checks and the messages are the same:
+/// - PNG: the IHDR, which is also an animated PNG's canvas
+///   ([`crate::png::header_size`]);
+/// - JPG: the frame header, read by libjpeg ([`crate::jpg::header_size`]);
+/// - WebP: the canvas of an animation, the `VP8X` canvas or the image
+///   header of a still ([`crate::webp::header_size`]).
+///
+/// A side of 0 is refused too: a header that declares no pixels is not an
+/// image, whatever its format's own checks said. An SVG has no pixel size
+/// and is refused.
+pub(crate) fn header_size(format: Format, bytes: &[u8]) -> Result<(u32, u32), String> {
+    let (name, size) = match format {
+        Format::Png => ("PNG", crate::png::header_size(bytes)),
+        Format::Jpg => ("JPEG", crate::jpg::header_size(bytes)),
+        Format::Webp => ("WebP", crate::webp::header_size(bytes)),
+        Format::Svg => return Err(NOT_DECODED.to_owned()),
+    };
+    match size? {
+        (0, _) | (_, 0) => Err(format!(
+            "could not read the {name} data: the image has no pixels"
+        )),
+        size => Ok(size),
     }
 }
 
@@ -96,7 +120,7 @@ pub(super) fn picture(format: Format, bytes: &[u8], side: u32) -> Result<Picture
 /// block is no error, the picture just stays as stored. The format, not the
 /// content, picks where to look; the content must still be what
 /// [`picture`] decoded.
-pub(super) fn orientation(format: Format, bytes: &[u8]) -> Option<u8> {
+pub(crate) fn orientation(format: Format, bytes: &[u8]) -> Option<u8> {
     match format {
         Format::Jpg => crate::webp::orientation(&crate::jpg::exif_payload(bytes)?),
         Format::Webp => crate::webp::exif_orientation(bytes),
@@ -233,5 +257,108 @@ mod tests {
         // And without a rotation to find, nothing is made up.
         assert_eq!(orientation(Format::Jpg, b""), None);
         assert_eq!(orientation(Format::Webp, b""), None);
+    }
+
+    // --- header_size ------------------------------------------------------------
+
+    /// A WebP of one `VP8 ` chunk whose header declares `w`x`h` (no scale).
+    fn vp8_header(w: u16, h: u16) -> Vec<u8> {
+        let mut data = vec![0, 0, 0, 0x9D, 0x01, 0x2A];
+        data.extend_from_slice(&w.to_le_bytes());
+        data.extend_from_slice(&h.to_le_bytes());
+        fx::from_chunks(&[(*b"VP8 ", data)])
+    }
+
+    #[test]
+    fn header_size_gives_the_declared_size_of_each_format() {
+        for (format, bytes) in headers(300, 200) {
+            assert_eq!(header_size(format, &bytes), Ok((300, 200)), "{format:?}");
+        }
+    }
+
+    #[test]
+    fn header_size_refuses_one_pixel_more_than_max_pixels_and_accepts_exactly_max_pixels() {
+        for (format, bytes) in headers(10_000, 10_001) {
+            assert_eq!(
+                header_size(format, &bytes),
+                Err("image too large: 10000×10001 exceeds 100 megapixels".to_owned()),
+                "{format:?}"
+            );
+        }
+        for (format, bytes) in headers(10_000, 10_000) {
+            assert_eq!(
+                header_size(format, &bytes),
+                Ok((10_000, 10_000)),
+                "{format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_size_refuses_the_content_of_another_format() {
+        let [(_, png), (_, jpg), (_, webp)] = headers(16, 16);
+        for (format, bytes) in [
+            (Format::Png, &jpg),
+            (Format::Png, &webp),
+            (Format::Jpg, &png),
+            (Format::Jpg, &webp),
+            (Format::Webp, &png),
+            (Format::Webp, &jpg),
+        ] {
+            let err = header_size(format, bytes).unwrap_err();
+            assert!(err.starts_with("not a"), "{format:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn header_size_refuses_a_side_of_zero() {
+        let png_wide = file(&[ihdr(0, 5, 8, 6)]);
+        let png_high = file(&[ihdr(5, 0, 8, 6)]);
+        let vp8_wide = vp8_header(0, 5);
+        let vp8_high = vp8_header(5, 0);
+        for (format, bytes, what) in [
+            (Format::Png, &png_wide, "png 0x5"),
+            (Format::Png, &png_high, "png 5x0"),
+            (Format::Webp, &vp8_wide, "vp8 0x5"),
+            (Format::Webp, &vp8_high, "vp8 5x0"),
+        ] {
+            let err = header_size(format, bytes).unwrap_err();
+            assert!(err.contains("no pixels"), "{what}: {err}");
+        }
+    }
+
+    #[test]
+    fn header_size_accepts_a_side_of_one() {
+        assert_eq!(
+            header_size(Format::Png, &file(&[ihdr(1, 1, 8, 6)])),
+            Ok((1, 1))
+        );
+        assert_eq!(header_size(Format::Webp, &vp8_header(1, 1)), Ok((1, 1)));
+    }
+
+    #[test]
+    fn header_size_of_an_svg_is_an_error() {
+        assert!(header_size(Format::Svg, b"<svg/>").is_err());
+    }
+
+    #[test]
+    fn header_size_agrees_with_check_header_on_what_is_refused() {
+        // `check_header` is `header_size` without the size, so the two can
+        // never differ: here on a header over the limit, a wrong format and
+        // a size that is fine.
+        let [(_, png), (_, jpg), (_, _)] = headers(16, 16);
+        let [(_, big_png), ..] = headers(10_000, 10_001);
+        for (format, bytes) in [
+            (Format::Png, &png),
+            (Format::Png, &jpg),
+            (Format::Png, &big_png),
+            (Format::Jpg, &jpg),
+        ] {
+            assert_eq!(
+                check_header(format, bytes),
+                header_size(format, bytes).map(drop),
+                "{format:?}"
+            );
+        }
     }
 }

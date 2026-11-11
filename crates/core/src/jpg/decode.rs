@@ -22,12 +22,14 @@ use crate::plan::check_pixels;
 /// an alpha byte of 255.
 const RGBA: usize = 4;
 
-/// Refuse bytes that do not start like a JPEG, and a header that declares
-/// more than [`crate::MAX_PIXELS`]. libjpeg reads the header only.
-pub(crate) fn check_header(bytes: &[u8]) -> Result<(), String> {
+/// The width and height of a JPEG's header. Refuses bytes that do not start
+/// like a JPEG, a header libjpeg cannot read, and one that declares more than
+/// [`crate::MAX_PIXELS`]. libjpeg reads the header only.
+pub(crate) fn header_size(bytes: &[u8]) -> Result<(u32, u32), String> {
     check_start(bytes)?;
     let shape = read_shape(bytes)?;
-    check_pixels(shape.width, shape.height)
+    check_pixels(shape.width, shape.height)?;
+    Ok((shape.width, shape.height))
 }
 
 /// Decode a JPEG for a thumbnail whose longest side is `side`: at the

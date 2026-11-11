@@ -6,9 +6,11 @@
 //! so that a library that crashes the process (a stack overflow aborts, and
 //! cannot be caught) takes down only that one file. The same binary also
 //! makes a thumbnail, as `<exe> --lunaepix-thumb <src>` (see "The thumbnail
-//! mode" below), for the same reason: the decoders run in a process that can
-//! die without the window. The CLI and the app call [`serve_if_requested`]
-//! first thing in `main`, so both binaries answer both modes.
+//! mode" below), and probes a file's shown size, as `<exe> --lunaepix-probe
+//! <src>` (see "The probe mode" below), for the same reason: the decoders run
+//! in a process that can die without the window. The CLI and the app call
+//! [`serve_if_requested`] first thing in `main`, so both binaries answer all
+//! three modes.
 //!
 //! # The arguments
 //!
@@ -64,6 +66,27 @@
 //! 3. The exit codes 101 (a panic) and 1 (the answer could not be written)
 //! are crashes to the runner ([`crate::run_thumb`]), which reads only exit 3
 //! as "cannot be shown" and only exit 0 with a valid answer as a thumbnail.
+//!
+//! # The probe mode
+//!
+//! `<exe> --lunaepix-probe <src>` takes exactly one argument after the flag,
+//! the source, which is a path even when it looks like an option; anything
+//! else is a usage error (exit code 2, nothing on stdout). The worker sets
+//! itself up as the optimiser does, probes the file ([`probe`]: the size it
+//! is shown at, or the reason Batch would refuse it) and writes one line of
+//! UTF-8 to stdout:
+//!
+//! ```text
+//! lunaepix-probe 1 size <width> <height>      exit 0   (an SVG: "size - -")
+//! lunaepix-probe 1 refused <message>          exit 3
+//! ```
+//!
+//! `1` is the format version. The numbers are plain decimal digits. The
+//! `<message>` is escaped and cut as the optimiser's record is (see "The
+//! result record"). The exit codes 101 (a panic) and 1 (the record could not
+//! be written, or the thread could not start) are crashes to the runner
+//! ([`crate::run_probe`]), which reads only exit 0 with a `size` record and
+//! exit 3 with a `refused` record; anything else is no answer.
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -74,7 +97,7 @@ use std::thread;
 
 use crate::{
     CannotShow, Compression, MAX_WORKER_MESSAGE_BYTES, Note, OptimizeError, Options, Outcome,
-    Quality, Thumbnail, WriteMode, optimize_file, platform, thumbnail,
+    Probe, Quality, Thumbnail, WriteMode, optimize_file, platform, probe, thumbnail,
 };
 
 /// The hidden first argument that starts a binary in worker mode.
@@ -82,6 +105,12 @@ pub const WORKER_FLAG: &str = "--lunaepix-worker";
 
 /// The hidden first argument that starts a binary in thumbnail mode.
 pub const THUMB_FLAG: &str = "--lunaepix-thumb";
+
+/// The hidden first argument that starts a binary in probe mode.
+pub const PROBE_FLAG: &str = "--lunaepix-probe";
+
+/// Start of every probe answer: a magic word and the format version.
+const PROBE_PREFIX: &str = "lunaepix-probe 1 ";
 
 /// The line that starts a worker's answer when the thumbnail is a PNG.
 const THUMB_PNG_HEADER: &[u8] = b"lunaepix-thumb 1 png
@@ -111,6 +140,8 @@ const EXIT_USAGE: u8 = 2;
 const EXIT_NO_RECORD: u8 = 3;
 /// The thumbnail mode's own meaning of 3: the file cannot be shown.
 const EXIT_NO_THUMB: u8 = 3;
+/// The probe mode's own meaning of 3: the file is refused.
+const EXIT_REFUSED: u8 = 3;
 /// What Rust itself exits with after a panic on the main thread.
 const EXIT_PANICKED: u8 = 101;
 
@@ -120,8 +151,9 @@ const EXIT_PANICKED: u8 = 101;
 /// worker sets the size itself and every system gets the same.
 const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
-/// If this process was started as `<exe> --lunaepix-worker ...` or
-/// `<exe> --lunaepix-thumb <src>`, run that worker and return its exit code;
+/// If this process was started as `<exe> --lunaepix-worker ...`,
+/// `<exe> --lunaepix-thumb <src>` or `<exe> --lunaepix-probe <src>`, run that
+/// worker and return its exit code;
 /// `main` returns it at once. Otherwise `None`, and `main` carries on as
 /// usual. The arguments are read with `args_os`, so paths that are not UTF-8
 /// arrive intact.
@@ -132,6 +164,8 @@ pub fn serve_if_requested() -> Option<ExitCode> {
         Some(serve(args))
     } else if flag == OsStr::new(THUMB_FLAG) {
         Some(serve_thumb(args))
+    } else if flag == OsStr::new(PROBE_FLAG) {
+        Some(serve_probe(args))
     } else {
         None
     }
@@ -160,8 +194,8 @@ fn on_worker_stack<T: Send + 'static>(
     on_stack(name, WORKER_STACK_BYTES, job)
 }
 
-/// [`on_worker_stack`] with the stack size given: the thumbnail tests pass
-/// a size the OS refuses, so that the thread cannot start.
+/// [`on_worker_stack`] with the stack size given: the thumbnail and probe
+/// tests pass a size the OS refuses, so that the thread cannot start.
 fn on_stack<T: Send + 'static>(
     name: &str,
     stack_bytes: usize,
@@ -355,6 +389,114 @@ pub(crate) fn parse_thumb_answer(answer: &[u8]) -> Option<Thumbnail> {
         Some(Thumbnail::Svg(bytes.to_vec()))
     } else {
         None
+    }
+}
+
+/// Probe one file and write the answer to stdout. `args` are the arguments
+/// after the flag: exactly one, the source (see the module documentation).
+/// Set up and bounded like [`serve`].
+pub fn serve_probe(args: impl IntoIterator<Item = OsString>) -> ExitCode {
+    start_up();
+    serve_probe_with(args, probe, &mut io::stdout().lock())
+}
+
+/// [`serve_probe`] without the start-up calls, with the prober and the
+/// output given, as [`serve_thumb_with`] is for the thumbnailer.
+///
+/// Exit codes: 0 with a size record written; [`EXIT_REFUSED`] with a refusal
+/// record written; 2 for anything but exactly one argument (nothing
+/// written); 101 if the prober panicked; 1 if the thread could not be
+/// started or the record could not be written. The last two must not be 3,
+/// which the runner reads as "refused".
+pub(crate) fn serve_probe_with<F>(
+    args: impl IntoIterator<Item = OsString>,
+    probe: F,
+    out: &mut dyn Write,
+) -> ExitCode
+where
+    F: FnOnce(&Path) -> Result<Probe, String> + Send + 'static,
+{
+    serve_probe_on_stack(args, probe, out, WORKER_STACK_BYTES)
+}
+
+/// [`serve_probe_with`] with the stack size of the probing thread given,
+/// which production sets to [`WORKER_STACK_BYTES`]: a test passes a size the
+/// OS refuses to reach the exit code of a thread that cannot start.
+pub(crate) fn serve_probe_on_stack<F>(
+    args: impl IntoIterator<Item = OsString>,
+    probe: F,
+    out: &mut dyn Write,
+    stack_bytes: usize,
+) -> ExitCode
+where
+    F: FnOnce(&Path) -> Result<Probe, String> + Send + 'static,
+{
+    let Ok([src]) = <[OsString; 1]>::try_from(args.into_iter().collect::<Vec<_>>()) else {
+        eprintln!("usage: <program> {PROBE_FLAG} <source>");
+        return ExitCode::from(EXIT_USAGE);
+    };
+    let src = PathBuf::from(src);
+
+    let answer = match on_stack("probe", stack_bytes, move || probe(&src)) {
+        Ok(Ok(answer)) => answer,
+        // The panic hook has already written the message to stderr.
+        Ok(Err(_panic)) => return ExitCode::from(EXIT_PANICKED),
+        Err(error) => {
+            eprintln!("could not start the probing thread: {error}");
+            return ExitCode::from(EXIT_FAILED);
+        }
+    };
+
+    let record = format_probe_answer(&answer);
+    if let Err(error) = out.write_all(record.as_bytes()).and_then(|()| out.flush()) {
+        eprintln!("could not write the answer: {error}");
+        return ExitCode::from(EXIT_FAILED);
+    }
+    match answer {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::from(EXIT_REFUSED),
+    }
+}
+
+/// The record for a probe's answer; see the module documentation for the
+/// format. A refusal's message is cut and escaped as the optimiser's record
+/// is ([`escape`]).
+pub(crate) fn format_probe_answer(answer: &Result<Probe, String>) -> String {
+    let body = match answer {
+        Ok(Probe { width, height }) => {
+            let field = |side: &Option<u32>| side.map_or("-".to_owned(), |side| side.to_string());
+            format!("size {} {}", field(width), field(height))
+        }
+        Err(message) => format!("refused {}", escape(message)),
+    };
+    format!("{PROBE_PREFIX}{body}\n")
+}
+
+/// Read a worker's whole stdout as one probe record: `Ok` for a size
+/// record, `Err` with the message for a refusal. `None` unless it is exactly
+/// one well-formed record, which the runner then counts as no answer. Never
+/// panics, whatever the bytes.
+pub(crate) fn parse_probe_answer(answer: &[u8]) -> Option<Result<Probe, String>> {
+    let text = std::str::from_utf8(answer).ok()?;
+    let line = text.strip_suffix('\n')?;
+    if line.contains(['\n', '\r']) {
+        return None;
+    }
+    let body = line.strip_prefix(PROBE_PREFIX)?;
+    let (kind, rest) = body.split_once(' ')?;
+    match kind {
+        "size" => {
+            let (width, height) = rest.split_once(' ')?;
+            let side = |field: &str| match field {
+                "-" => Some(None),
+                digits => u32::try_from(number(digits)?).ok().map(Some),
+            };
+            let (width, height) = (side(width)?, side(height)?);
+            // Both or neither: a size has a width and a height, an SVG none.
+            (width.is_some() == height.is_some()).then_some(Ok(Probe { width, height }))
+        }
+        "refused" => Some(Err(unescape(rest).filter(|message| !message.is_empty())?)),
+        _ => None,
     }
 }
 
@@ -1308,5 +1450,278 @@ mod tests {
     fn the_thumbnail_header_length_is_that_of_both_headers() {
         assert_eq!(b"lunaepix-thumb 1 png\n".len(), THUMB_HEADER_LEN);
         assert_eq!(b"lunaepix-thumb 1 svg\n".len(), THUMB_HEADER_LEN);
+    }
+
+    // --- the probe mode -----------------------------------------------------------
+
+    fn size_of(width: u32, height: u32) -> Result<Probe, String> {
+        Ok(Probe {
+            width: Some(width),
+            height: Some(height),
+        })
+    }
+
+    /// Run the probe mode with `args` and a prober double that answers
+    /// `answer`; the exit code, what was written, and the paths the double
+    /// was handed.
+    fn serve_probe_recorded(
+        args: Vec<OsString>,
+        answer: Result<Probe, String>,
+    ) -> (ExitCode, Vec<u8>, Vec<PathBuf>) {
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&handed);
+        let mut out = Vec::new();
+        let code = serve_probe_with(
+            args,
+            move |src: &Path| {
+                recorder.lock().unwrap().push(src.to_path_buf());
+                answer
+            },
+            &mut out,
+        );
+        let handed = handed.lock().unwrap().clone();
+        (code, out, handed)
+    }
+
+    #[test]
+    fn the_probe_flag_is_the_documented_one() {
+        assert_eq!(PROBE_FLAG, "--lunaepix-probe");
+    }
+
+    #[test]
+    fn probe_serves_a_size_as_one_record_and_exits_0() {
+        let (code, out, _) = serve_probe_recorded(one_source(), size_of(300, 200));
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(out, b"lunaepix-probe 1 size 300 200\n");
+        // An SVG has no size: two dashes.
+        let none = Probe {
+            width: None,
+            height: None,
+        };
+        let (code, out, _) = serve_probe_recorded(one_source(), Ok(none));
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(out, b"lunaepix-probe 1 size - -\n");
+    }
+
+    #[test]
+    fn probe_serves_a_refusal_as_one_record_and_exits_3() {
+        let (code, out, handed) =
+            serve_probe_recorded(one_source(), Err("File is too large".to_owned()));
+        assert_eq!(code, ExitCode::from(3));
+        assert_eq!(out, b"lunaepix-probe 1 refused File is too large\n");
+        assert_eq!(handed.len(), 1);
+    }
+
+    #[test]
+    fn probe_escapes_backslash_and_line_breaks_in_a_refusal() {
+        let (code, out, _) = serve_probe_recorded(one_source(), Err("a\\b\nc\rd".to_owned()));
+        assert_eq!(code, ExitCode::from(3));
+        assert_eq!(out, b"lunaepix-probe 1 refused a\\\\b\\nc\\rd\n");
+        // One line: the only line feed is the last byte.
+        assert_eq!(out.iter().filter(|&&byte| byte == b'\n').count(), 1);
+        assert!(!out.contains(&b'\r'));
+    }
+
+    #[test]
+    fn probe_cuts_a_long_refusal_at_max_worker_message_bytes() {
+        let prefix = "lunaepix-probe 1 refused ";
+        let long = "é".repeat(MAX_WORKER_MESSAGE_BYTES); // twice the cap in bytes
+        let (_, out, _) = serve_probe_recorded(one_source(), Err(long));
+        let record = String::from_utf8(out).unwrap();
+        let message = record
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix('\n'))
+            .unwrap();
+        assert!(
+            message.len() <= MAX_WORKER_MESSAGE_BYTES,
+            "{}",
+            message.len()
+        );
+        assert!(message.ends_with('…'), "{message}");
+        // Exactly at the cap nothing is cut.
+        let exact = "x".repeat(MAX_WORKER_MESSAGE_BYTES);
+        let (_, out, _) = serve_probe_recorded(one_source(), Err(exact.clone()));
+        assert_eq!(out, format!("{prefix}{exact}\n").into_bytes());
+    }
+
+    #[test]
+    fn probe_hands_the_one_argument_to_the_prober_exactly() {
+        let mut sources = vec![
+            OsString::from("--looks-like-an-option"),
+            OsString::from("/photos/Mobilis Logo – zwart é.png"),
+        ];
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            sources.push(OsString::from_vec(b"/photos/caf\xE9.png".to_vec()));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let mut wide: Vec<u16> = "C:\\photos\\caf".encode_utf16().collect();
+            wide.push(0xD800);
+            wide.extend(".png".encode_utf16());
+            sources.push(OsString::from_wide(&wide));
+        }
+        for source in sources {
+            let (code, _, handed) = serve_probe_recorded(vec![source.clone()], size_of(1, 1));
+            assert_eq!(code, ExitCode::SUCCESS, "{source:?}");
+            assert_eq!(handed, [PathBuf::from(&source)], "{source:?}");
+        }
+    }
+
+    #[test]
+    fn probe_refuses_no_source_two_sources_and_an_option_before_the_source_with_exit_2() {
+        let calls: [Vec<OsString>; 3] = [
+            vec![],
+            vec![
+                OsString::from("/photos/a.png"),
+                OsString::from("/photos/b.png"),
+            ],
+            vec![OsString::from("--bogus"), OsString::from("/photos/a.png")],
+        ];
+        for args in calls {
+            let (code, out, handed) = serve_probe_recorded(args.clone(), size_of(1, 1));
+            assert_eq!(code, ExitCode::from(EXIT_USAGE), "{args:?}");
+            assert!(out.is_empty(), "{args:?}");
+            assert!(handed.is_empty(), "{args:?}: the prober must not run");
+        }
+    }
+
+    #[test]
+    fn probe_exits_101_without_an_answer_when_the_prober_panics() {
+        let mut out = Vec::new();
+        let code = serve_probe_with(
+            one_source(),
+            |_: &Path| -> Result<Probe, String> { panic!("the decoder hit a bug") },
+            &mut out,
+        );
+        assert_eq!(code, ExitCode::from(EXIT_PANICKED));
+        assert!(out.is_empty(), "{:?}", String::from_utf8_lossy(&out));
+    }
+
+    #[test]
+    fn probe_exits_1_not_3_when_the_answer_cannot_be_written() {
+        // Exit 3 means "refused" to the runner, so a failed write must not
+        // look like it; the same goes for a refusal that cannot be written.
+        for answer in [size_of(3, 2), Err("File is too large".to_owned())] {
+            let code = serve_probe_with(one_source(), move |_: &Path| answer, &mut ClosedPipe);
+            assert_eq!(code, ExitCode::from(EXIT_FAILED));
+            assert_ne!(code, ExitCode::from(3));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_exits_1_not_3_and_writes_nothing_when_its_thread_cannot_start() {
+        let calls = Arc::new(Mutex::new(0));
+        let recorder = Arc::clone(&calls);
+        let mut out = Vec::new();
+        let code = serve_probe_on_stack(
+            one_source(),
+            move |_: &Path| {
+                *recorder.lock().unwrap() += 1;
+                size_of(3, 2)
+            },
+            &mut out,
+            usize::MAX,
+        );
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+        assert_ne!(code, ExitCode::from(3));
+        assert!(out.is_empty(), "{:?}", String::from_utf8_lossy(&out));
+        assert_eq!(*calls.lock().unwrap(), 0, "the prober must not run");
+
+        // The pair: the same call on the normal stack answers.
+        let mut out = Vec::new();
+        let code = serve_probe_on_stack(
+            one_source(),
+            |_: &Path| size_of(3, 2),
+            &mut out,
+            WORKER_STACK_BYTES,
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(out, b"lunaepix-probe 1 size 3 2\n");
+    }
+
+    #[test]
+    fn parse_probe_answer_reads_a_size_and_a_refusal() {
+        let size = parse_probe_answer(b"lunaepix-probe 1 size 300 200\n");
+        assert_eq!(size, Some(size_of(300, 200)));
+        let none = parse_probe_answer(b"lunaepix-probe 1 size - -\n");
+        assert_eq!(
+            none,
+            Some(Ok(Probe {
+                width: None,
+                height: None
+            }))
+        );
+        let refused = parse_probe_answer(b"lunaepix-probe 1 refused File is too large\n");
+        assert_eq!(refused, Some(Err("File is too large".to_owned())));
+        // The escapes are undone.
+        let escaped = parse_probe_answer(b"lunaepix-probe 1 refused a\\\\b\\nc\\rd\n");
+        assert_eq!(escaped, Some(Err("a\\b\nc\rd".to_owned())));
+    }
+
+    #[test]
+    fn a_record_the_worker_writes_parses_back_to_what_it_was_given() {
+        let answers = [
+            size_of(4032, 3024),
+            size_of(u32::MAX, 1),
+            Ok(Probe {
+                width: None,
+                height: None,
+            }),
+            Err("could not read the PNG data: it has more than one IHDR chunk".to_owned()),
+            Err("a\\b\nc\rd … é".to_owned()),
+        ];
+        for answer in answers {
+            let record = format_probe_answer(&answer);
+            assert_eq!(
+                parse_probe_answer(record.as_bytes()),
+                Some(answer.clone()),
+                "{record:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_probe_answer_rejects_what_is_not_exactly_one_valid_record() {
+        // Control: the valid ones parse.
+        assert!(parse_probe_answer(b"lunaepix-probe 1 size 3 2\n").is_some());
+        assert!(parse_probe_answer(b"lunaepix-probe 1 refused x\n").is_some());
+        let bad: [(&str, &[u8]); 21] = [
+            ("empty", b""),
+            ("version 2", b"lunaepix-probe 2 size 3 2\n"),
+            ("version 0", b"lunaepix-probe 0 size 3 2\n"),
+            ("another magic word", b"lunaepix-thumb 1 size 3 2\n"),
+            ("no newline", b"lunaepix-probe 1 size 3 2"),
+            ("carriage return", b"lunaepix-probe 1 size 3 2\r\n"),
+            (
+                "two lines",
+                b"lunaepix-probe 1 size 3 2\nlunaepix-probe 1 size 3 2\n",
+            ),
+            ("trailing bytes", b"lunaepix-probe 1 size 3 2\nx"),
+            ("unknown kind", b"lunaepix-probe 1 sizes 3 2\n"),
+            ("upper-case kind", b"lunaepix-probe 1 SIZE 3 2\n"),
+            ("one number", b"lunaepix-probe 1 size 3\n"),
+            ("three numbers", b"lunaepix-probe 1 size 3 2 1\n"),
+            ("one dash", b"lunaepix-probe 1 size - 2\n"),
+            ("one dash second", b"lunaepix-probe 1 size 3 -\n"),
+            ("a sign", b"lunaepix-probe 1 size +3 2\n"),
+            ("a minus", b"lunaepix-probe 1 size -3 2\n"),
+            ("letters", b"lunaepix-probe 1 size x 2\n"),
+            ("over u32", b"lunaepix-probe 1 size 4294967296 2\n"),
+            ("no message", b"lunaepix-probe 1 refused\n"),
+            ("an empty message", b"lunaepix-probe 1 refused \n"),
+            ("a bad escape", b"lunaepix-probe 1 refused a\\x\n"),
+        ];
+        for (what, bytes) in bad {
+            assert_eq!(parse_probe_answer(bytes), None, "{what}");
+        }
+        // Not UTF-8.
+        assert_eq!(
+            parse_probe_answer(b"lunaepix-probe 1 refused \xFF\xFE\n"),
+            None
+        );
     }
 }

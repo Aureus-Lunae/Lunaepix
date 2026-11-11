@@ -21,6 +21,9 @@
 //!    document that is then handed to oxvg (oxvg recurses; see
 //!    [`MAX_SVG_DEPTH`]).
 //!
+//! [`check`] runs these five steps and nothing else, for a caller that only
+//! wants to know whether the file would be taken (the probe).
+//!
 //! Nothing here opens a file or a connection: roxmltree has no I/O and
 //! oxvg's crates contain no filesystem or network code. Hrefs, `<use>`
 //! targets and DOCTYPE URLs are only text. A `<script>` is kept, as svgo's
@@ -47,12 +50,8 @@ const VALUES_PER_REFERENCE: u64 = 256;
 /// Optimise SVG bytes. The error is a message for the user: the content is
 /// not an SVG, the file is outside a limit, or oxvg failed.
 pub(crate) fn optimize(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| "not an SVG file (the content is not UTF-8 text)".to_owned())?;
-    check_entities(text)?;
-    let doc = parse(text)?;
-    check_root(&doc)?;
-    check_depth(&doc)?;
+    let text = utf8(bytes)?;
+    let doc = checked_document(text)?;
     let optimized = run_oxvg(&doc)?;
     check_output(&optimized)?;
     if optimized.len() < bytes.len() {
@@ -60,6 +59,29 @@ pub(crate) fn optimize(bytes: &[u8]) -> Result<Vec<u8>, String> {
     } else {
         Ok(bytes.to_vec())
     }
+}
+
+/// Run every check [`optimize`] makes on the input before oxvg sees it
+/// (steps 1 to 5 above), and nothing else: for a caller that wants to know
+/// whether the file would be taken, with the messages `optimize` gives.
+pub(crate) fn check(bytes: &[u8]) -> Result<(), String> {
+    checked_document(utf8(bytes)?).map(drop)
+}
+
+/// Step 1: the bytes as text.
+fn utf8(bytes: &[u8]) -> Result<&str, String> {
+    std::str::from_utf8(bytes)
+        .map_err(|_| "not an SVG file (the content is not UTF-8 text)".to_owned())
+}
+
+/// Steps 2 to 5: the parsed document, once the entity bound, the parse, the
+/// root element and the depth have passed.
+fn checked_document(text: &str) -> Result<Document<'_>, String> {
+    check_entities(text)?;
+    let doc = parse(text)?;
+    check_root(&doc)?;
+    check_depth(&doc)?;
+    Ok(doc)
 }
 
 /// The options for every parse: DTDs allowed, roxmltree's node limit, and
@@ -550,6 +572,45 @@ mod tests {
         for bad in [&b"<svg"[..], b"<g/>", b"\xFF\xFE"] {
             let err = check_output(bad).unwrap_err();
             assert!(err.contains("the optimised SVG"), "{err}");
+        }
+    }
+
+    // --- check: the front half of optimize ---------------------------------------------------
+
+    #[test]
+    fn check_accepts_an_svg_that_optimize_accepts() {
+        let plain = format!("<svg {SVG_NS}/>");
+        assert_eq!(check(plain.as_bytes()), Ok(()));
+        assert!(optimize(plain.as_bytes()).is_ok());
+        let deepest = nested(MAX_SVG_DEPTH);
+        assert_eq!(check(deepest.as_bytes()), Ok(()));
+        let decls = format!("<!ENTITY a \"{}\">", "x".repeat(1000));
+        let (text, _) = with_dtd(&decls, "&a;&a;");
+        assert_eq!(check(text.as_bytes()), Ok(()));
+    }
+
+    #[test]
+    fn check_refuses_what_optimize_refuses_with_the_same_message() {
+        let decls = format!("<!ENTITY a \"{}\">", "x".repeat(1000));
+        let (_, prolog) = with_dtd(&decls, "");
+        let (bomb, _) = with_dtd(&decls, &"&a;".repeat(budget() / prolog + 1));
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("not utf-8", vec![0x89, b'P', b'N', b'G', 0xFF, 0xFE]),
+            ("not well-formed", b"<svg><g></svg>".to_vec()),
+            (
+                "root is not svg",
+                br#"<html xmlns="http://www.w3.org/1999/xhtml"><svg/></html>"#.to_vec(),
+            ),
+            ("too deep", nested(MAX_SVG_DEPTH + 1).into_bytes()),
+            ("entity bomb", bomb.into_bytes()),
+            (
+                "too many nodes",
+                flat(MAX_SVG_NODES as usize - 1).into_bytes(),
+            ),
+        ];
+        for (what, bytes) in cases {
+            let expected = optimize(&bytes).unwrap_err();
+            assert_eq!(check(&bytes), Err(expected), "{what}");
         }
     }
 }
