@@ -28,8 +28,50 @@ function modifierOf(view) {
   return MODIFIERS[view.kind] ?? null;
 }
 
-/** One `<tr>` for a stored row (see `rowView` for what each kind shows). */
-export function buildRow(doc, row) {
+/**
+ * The address function for the thumbnails: Tauri's `convertFileSrc` asked for
+ * the `thumb` scheme, which is the scheme the backend answers (see
+ * INTERFACE.md). The key is the row's `thumb` key; nothing else goes in.
+ */
+export function thumbSource(convertFileSrc) {
+  return (key) => convertFileSrc(key, 'thumb');
+}
+
+/** The 32 px square before a name. It holds an image only for a row with a key. */
+function thumbSquare(doc, key, thumbSrc, kept) {
+  const square = doc.createElement('span');
+  square.classList.add('lunaepixResults__thumb');
+  if (key !== null) {
+    square.append(kept ?? thumbImage(doc, thumbSrc(key)));
+  }
+  return square;
+}
+
+// The thumbnail is decoration: the name beside it says what the file is.
+function thumbImage(doc, src) {
+  const image = doc.createElement('img');
+  image.classList.add('lunaepixResults__thumbImage');
+  image.src = src;
+  image.alt = '';
+  image.width = 32;
+  image.height = 32;
+  image.loading = 'lazy';
+  image.decoding = 'async';
+  return image;
+}
+
+/** The thumbnail `<img>` a built row holds, or null (the square can be empty). */
+function imageOf(tr) {
+  return tr.children[0].children[0].children[0] ?? null;
+}
+
+/**
+ * One `<tr>` for a stored row (see `rowView` for what each kind shows).
+ * `thumbSrc(key)` gives the address of a row's thumbnail. `kept` is an `<img>`
+ * from an earlier build of the same row, put in the square instead of making
+ * a new one, so a row that changes status does not make its picture flicker.
+ */
+export function buildRow(doc, row, thumbSrc, kept = null) {
   const view = rowView(row);
   const tr = doc.createElement('tr');
   tr.classList.add('lunaepixResults__row');
@@ -40,6 +82,7 @@ export function buildRow(doc, row) {
 
   const name = cell(doc, 'th', view.name, '-name');
   name.scope = 'row';
+  name.prepend(thumbSquare(doc, view.thumb, thumbSrc, kept));
   if (view.note !== undefined) {
     const note = doc.createElement('span');
     note.classList.add('lunaepixResults__note');
@@ -106,11 +149,26 @@ export function setHeads(doc, heads, listing) {
  * `<tr>`s) and is returned updated. A new row list (a new list or a new run)
  * rebuilds every row. The same list rebuilds only the rows whose object
  * changed and appends the rows past the end: `state.js` writes a run's rows
- * in place, one new object per change.
+ * in place, one new object per change. A rebuilt row keeps the thumbnail
+ * `<img>` it had when its key is the same, so the picture does not flicker
+ * when a row goes from waiting to compressing to done, or from the list to a
+ * run (a key always names the same file, see INTERFACE.md).
  */
-export function syncRows(doc, body, shown, rows) {
+export function syncRows(doc, body, shown, rows, thumbSrc) {
   if (rows !== shown.rows) {
-    shown.elements = rows.map((row) => buildRow(doc, row));
+    const images = new Map();
+    shown.objects.forEach((row, index) => {
+      if ((row.thumb ?? null) !== null) {
+        images.set(row.thumb, imageOf(shown.elements[index]));
+      }
+    });
+    shown.elements = rows.map((row) => {
+      const key = row.thumb ?? null;
+      const kept = key === null ? null : (images.get(key) ?? null);
+      // One element belongs to one row only.
+      images.delete(key);
+      return buildRow(doc, row, thumbSrc, kept);
+    });
     body.replaceChildren(...shown.elements);
     shown.rows = rows;
     shown.objects = rows.slice();
@@ -120,8 +178,11 @@ export function syncRows(doc, body, shown, rows) {
     if (rows[index] === shown.objects[index]) {
       continue;
     }
-    const tr = buildRow(doc, rows[index]);
-    if (index < shown.elements.length) {
+    const exists = index < shown.elements.length;
+    const key = rows[index].thumb ?? null;
+    const kept = exists && key !== null && key === shown.objects[index].thumb ? imageOf(shown.elements[index]) : null;
+    const tr = buildRow(doc, rows[index], thumbSrc, kept);
+    if (exists) {
       shown.elements[index].replaceWith(tr);
     } else {
       body.append(tr);

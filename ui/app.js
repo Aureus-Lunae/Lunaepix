@@ -31,9 +31,10 @@ import {
   syncNumber,
   syncRows,
   syncStatus,
+  thumbSource,
 } from './table.js';
 
-const { invoke } = window.__TAURI__.core;
+const { convertFileSrc, invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 const drop = document.getElementById('drop');
@@ -67,6 +68,9 @@ const chooseOutput = document.getElementById('chooseOutput');
 const clearOutput = document.getElementById('clearOutput');
 const runRow = document.getElementById('runRow');
 const run = document.getElementById('run');
+
+// The address of a row's thumbnail, from its key (see `thumbSource`).
+const thumbSrc = thumbSource(convertFileSrc);
 
 let state = initialState();
 // What is already on screen: the table's rows (see `syncRows`) and the
@@ -113,7 +117,7 @@ function render() {
   setDisabled(clearList, !canChoose(state));
 
   setHeads(document, heads, view.listing);
-  syncRows(document, resultsBody, shownRows, state.rows);
+  syncRows(document, resultsBody, shownRows, state.rows, thumbSrc);
   results.hidden = !view.showTable;
 
   // Finished: the summary (Re-add and Open folder) takes the place of the

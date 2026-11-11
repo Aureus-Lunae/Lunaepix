@@ -11,6 +11,7 @@ import {
   syncNumber,
   syncRows,
   syncStatus,
+  thumbSource,
 } from '../../ui/table.js';
 import { canChoose, canOpenFolder, initialState, reduce } from '../../ui/state.js';
 
@@ -73,6 +74,13 @@ function fakeDocument() {
         node.parent = this;
       }
       this.children.push(...nodes);
+    }
+
+    prepend(...nodes) {
+      for (const node of nodes) {
+        node.parent = this;
+      }
+      this.children.unshift(...nodes);
     }
 
     replaceChildren(...nodes) {
@@ -181,7 +189,7 @@ test('a_name_with_img_markup_stays_text', () => {
     note: '<b>kept</b>',
   });
   assert.equal(doneRow.children[0].textContent, MARKUP);
-  assert.equal(doneRow.children[0].children[0].textContent, '<b>kept</b>');
+  assert.equal(doneRow.children[0].children[1].textContent, '<b>kept</b>');
 });
 
 test('it_creates_no_element', () => {
@@ -266,17 +274,20 @@ test('the_note_is_built_into_its_row', () => {
   });
   const name = tr.children[0];
   assert.equal(name.textContent, 'anim.png');
-  assert.equal(name.children.length, 1);
-  assert.equal(name.children[0].tagName, 'span');
-  assert.deepEqual(name.children[0].classes, ['lunaepixResults__note']);
-  assert.equal(name.children[0].textContent, 'kept lossless: animated PNG');
+  // The square comes first, the note follows the name.
+  assert.equal(name.children.length, 2);
+  assert.deepEqual(name.children[0].classes, ['lunaepixResults__thumb']);
+  assert.equal(name.children[1].tagName, 'span');
+  assert.deepEqual(name.children[1].classes, ['lunaepixResults__note']);
+  assert.equal(name.children[1].textContent, 'kept lossless: animated PNG');
   assert.equal(tr.children.length, 5);
 });
 
 test('a_row_without_a_note_builds_no_note_element', () => {
   const doc = fakeDocument();
   const tr = buildRow(doc, { kind: 'done', name: 'a.png', before: 1000, after: 800, millis: 3 });
-  assert.equal(tr.children[0].children.length, 0);
+  // Only the square: no note.
+  assert.deepEqual(tr.children[0].children.map((child) => child.classes), [['lunaepixResults__thumb']]);
   assert.equal(doc.created.some((element) => element.classes.includes('lunaepixResults__note')), false);
 });
 
@@ -673,4 +684,295 @@ test('a_click_runs_only_the_handler_of_the_button_it_is_bound_to', () => {
   assert.deepEqual(sent, ['open_output_folder']);
   readdList.click();
   assert.deepEqual(sent, ['open_output_folder', 'readd_list']);
+});
+
+// ---------------------------------------------------------------------
+// Task 7: the thumbnail square before each name.
+// ---------------------------------------------------------------------
+
+// A recording `thumbSrc`: what the table asks it, and what it answers.
+function thumbDouble() {
+  const calls = [];
+  const thumbSrc = (key) => {
+    calls.push(key);
+    return `thumb://localhost/${key}`;
+  };
+  thumbSrc.calls = calls;
+  return thumbSrc;
+}
+
+const ROW_KINDS_WITH_KEY = [
+  { kind: 'listed', name: 'a.png', size: 1000, skip: null, thumb: '3-0' },
+  { kind: 'waiting', name: 'a.png', size: 1000, skip: null, thumb: '3-0' },
+  { kind: 'compressing', name: 'a.png', size: 1000, thumb: '3-0' },
+  { kind: 'done', name: 'a.png', before: 1000, after: 800, millis: 3, thumb: '3-0' },
+  { kind: 'skipped', name: 'a.png', reason: 'x', thumb: '3-0' },
+  { kind: 'failed', name: 'a.png', reason: 'x', thumb: '3-0' },
+];
+
+const thumbSpanOf = (tr) => tr.children[0].children[0];
+const imagesIn = (element) => tree(element).filter((node) => node.tagName === 'img');
+const emptyShown = () => ({ rows: null, objects: [], elements: [] });
+
+test('a_row_with_a_thumb_key_starts_its_name_cell_with_the_square_and_the_image', () => {
+  const doc = fakeDocument();
+  const thumbSrc = thumbDouble();
+  for (const row of ROW_KINDS_WITH_KEY) {
+    thumbSrc.calls.length = 0;
+    const tr = buildRow(doc, row, thumbSrc);
+    const name = tr.children[0];
+    assert.equal(name.tagName, 'th', row.kind);
+    assert.equal(name.scope, 'row', row.kind);
+    const square = name.children[0];
+    assert.equal(square.tagName, 'span', row.kind);
+    assert.deepEqual(square.classes, ['lunaepixResults__thumb'], row.kind);
+    assert.equal(square.children.length, 1, row.kind);
+    const image = square.children[0];
+    assert.equal(image.tagName, 'img', row.kind);
+    assert.deepEqual(image.classes, ['lunaepixResults__thumbImage'], row.kind);
+    assert.equal(image.src, 'thumb://localhost/3-0', row.kind);
+    assert.equal(image.alt, '', row.kind);
+    assert.equal(image.width, 32, row.kind);
+    assert.equal(image.height, 32, row.kind);
+    assert.equal(image.loading, 'lazy', row.kind);
+    assert.equal(image.decoding, 'async', row.kind);
+    assert.deepEqual(thumbSrc.calls, ['3-0'], row.kind);
+  }
+});
+
+test('the_image_address_is_what_the_thumb_src_function_answers_for_the_rows_own_key', () => {
+  const doc = fakeDocument();
+  const addresses = [];
+  const thumbSrc = (key) => {
+    addresses.push(key);
+    return `x:${key}:y`;
+  };
+  const first = buildRow(doc, { ...ROW_KINDS_WITH_KEY[0], thumb: '7-1' }, thumbSrc);
+  const second = buildRow(doc, { ...ROW_KINDS_WITH_KEY[0], thumb: '7-2' }, thumbSrc);
+  assert.equal(thumbSpanOf(first).children[0].src, 'x:7-1:y');
+  assert.equal(thumbSpanOf(second).children[0].src, 'x:7-2:y');
+  assert.deepEqual(addresses, ['7-1', '7-2']);
+});
+
+test('a_row_without_a_thumb_key_has_the_empty_square_and_never_asks_for_an_address', () => {
+  const doc = fakeDocument();
+  const thumbSrc = thumbDouble();
+  for (const row of ROW_KINDS_WITH_KEY) {
+    const noKey = { ...row, thumb: null };
+    const tr = buildRow(doc, noKey, thumbSrc);
+    const square = tr.children[0].children[0];
+    assert.deepEqual(square.classes, ['lunaepixResults__thumb'], row.kind);
+    assert.equal(square.children.length, 0, row.kind);
+    assert.equal(imagesIn(tr).length, 0, row.kind);
+    // A stored row from before the field existed reads the same.
+    const { thumb, ...old } = row;
+    const oldTr = buildRow(doc, old, thumbSrc);
+    assert.deepEqual(oldTr.children[0].children[0].classes, ['lunaepixResults__thumb'], row.kind);
+    assert.equal(imagesIn(oldTr).length, 0, `${row.kind} without the field`);
+  }
+  assert.deepEqual(thumbSrc.calls, []);
+  assert.equal(doc.created.some((element) => element.tagName === 'img'), false);
+});
+
+test('the_name_text_stays_in_the_row_header_after_the_square_and_a_note_follows_the_name', () => {
+  const doc = fakeDocument();
+  const tr = buildRow(
+    doc,
+    {
+      kind: 'done',
+      name: MARKUP,
+      before: 512000,
+      after: 498000,
+      millis: 380,
+      note: 'kept lossless: animated PNG',
+      thumb: '3-4',
+    },
+    thumbDouble(),
+  );
+  const name = tr.children[0];
+  assert.equal(name.tagName, 'th');
+  assert.equal(name.textContent, MARKUP);
+  assert.deepEqual(
+    name.children.map((child) => child.classes[0]),
+    ['lunaepixResults__thumb', 'lunaepixResults__note'],
+  );
+  // The name is text, never markup: the only image is the thumbnail.
+  assert.equal(imagesIn(tr).length, 1);
+  assert.deepEqual(doc.markupWrites, []);
+});
+
+test('a_row_with_a_key_has_the_same_cells_as_one_without', () => {
+  const doc = fakeDocument();
+  const shape = (tr) => tr.children.map((cell) => [cell.tagName, cell.colSpan, cell.textContent]);
+  for (const row of ROW_KINDS_WITH_KEY) {
+    assert.deepEqual(
+      shape(buildRow(doc, row, thumbDouble())),
+      shape(buildRow(doc, { ...row, thumb: null }, thumbDouble())),
+      row.kind,
+    );
+  }
+});
+
+// No flicker: the same image element stays through a status change.
+
+const keyed = (kind, key, extra = {}) => ({ kind, name: 'a.png', size: 1000, skip: null, thumb: key, ...extra });
+
+test('sync_rows_keeps_the_same_image_when_a_row_changes_status', () => {
+  const doc = fakeDocument();
+  const body = new doc.FakeElement('tbody');
+  const thumbSrc = thumbDouble();
+  const rows = [keyed('waiting', '3-0'), keyed('waiting', '3-1')];
+  const shown = syncRows(doc, body, emptyShown(), rows, thumbSrc);
+  const [firstImage, secondImage] = body.children.map((tr) => imagesIn(tr)[0]);
+  const waitingRow = body.children[0];
+  assert.deepEqual(thumbSrc.calls, ['3-0', '3-1']);
+  rows[0] = keyed('compressing', '3-0');
+  syncRows(doc, body, shown, rows, thumbSrc);
+  rows[0] = { kind: 'done', name: 'a.png', before: 1000, after: 800, millis: 3, thumb: '3-0' };
+  syncRows(doc, body, shown, rows, thumbSrc);
+  const first = body.children[0];
+  // The row itself was rebuilt: it is a new element showing the new status.
+  assert.notEqual(first, waitingRow);
+  assert.equal(first.children.length, 5);
+  // The image in it is the old element, and it is the only one in the row.
+  assert.equal(imagesIn(first).length, 1);
+  assert.equal(thumbSpanOf(first).children[0], firstImage);
+  assert.equal(thumbSpanOf(body.children[1]).children[0], secondImage);
+  // The address was asked for once per key, not again for a kept image.
+  assert.deepEqual(thumbSrc.calls, ['3-0', '3-1']);
+});
+
+test('sync_rows_gives_a_row_whose_key_changed_a_new_image', () => {
+  const doc = fakeDocument();
+  const body = new doc.FakeElement('tbody');
+  const thumbSrc = thumbDouble();
+  const rows = [keyed('waiting', '3-0')];
+  const shown = syncRows(doc, body, emptyShown(), rows, thumbSrc);
+  const oldImage = imagesIn(body.children[0])[0];
+  rows[0] = keyed('compressing', '3-9');
+  syncRows(doc, body, shown, rows, thumbSrc);
+  const image = imagesIn(body.children[0])[0];
+  assert.notEqual(image, oldImage);
+  assert.equal(image.src, 'thumb://localhost/3-9');
+  assert.deepEqual(thumbSrc.calls, ['3-0', '3-9']);
+});
+
+test('sync_rows_builds_an_image_for_a_row_that_gains_a_key_and_none_for_one_that_loses_it', () => {
+  const doc = fakeDocument();
+  const body = new doc.FakeElement('tbody');
+  const thumbSrc = thumbDouble();
+  const rows = [keyed('waiting', null), keyed('waiting', '3-1')];
+  const shown = syncRows(doc, body, emptyShown(), rows, thumbSrc);
+  assert.deepEqual(thumbSrc.calls, ['3-1']);
+  rows[0] = keyed('compressing', '3-0');
+  rows[1] = keyed('compressing', null);
+  syncRows(doc, body, shown, rows, thumbSrc);
+  assert.equal(imagesIn(body.children[0]).length, 1);
+  assert.equal(imagesIn(body.children[0])[0].src, 'thumb://localhost/3-0');
+  assert.equal(imagesIn(body.children[1]).length, 0);
+  assert.deepEqual(thumbSrc.calls, ['3-1', '3-0']);
+});
+
+test('sync_rows_builds_an_image_when_the_old_row_shows_none_although_it_had_a_key', () => {
+  const doc = fakeDocument();
+  const body = new doc.FakeElement('tbody');
+  const thumbSrc = thumbDouble();
+  // A shown row whose element holds no image (hand-built): nothing to keep.
+  const bare = new doc.FakeElement('tr');
+  const bareName = new doc.FakeElement('th');
+  bareName.append(new doc.FakeElement('span'));
+  bare.append(bareName);
+  body.append(bare);
+  const rows = [keyed('compressing', '3-0')];
+  const shown = { rows, objects: [keyed('waiting', '3-0')], elements: [bare] };
+  syncRows(doc, body, shown, rows, thumbSrc);
+  assert.equal(imagesIn(body.children[0]).length, 1);
+  assert.deepEqual(thumbSrc.calls, ['3-0']);
+});
+
+test('sync_rows_builds_an_appended_row_with_its_own_image', () => {
+  const doc = fakeDocument();
+  const body = new doc.FakeElement('tbody');
+  const thumbSrc = thumbDouble();
+  const rows = [keyed('waiting', '3-0')];
+  const shown = syncRows(doc, body, emptyShown(), rows, thumbSrc);
+  rows.push(keyed('waiting', '3-1'));
+  syncRows(doc, body, shown, rows, thumbSrc);
+  assert.equal(body.children.length, 2);
+  assert.equal(imagesIn(body.children[1])[0].src, 'thumb://localhost/3-1');
+  assert.deepEqual(thumbSrc.calls, ['3-0', '3-1']);
+});
+
+test('a_new_row_list_keeps_the_images_of_the_keys_it_shares_with_the_old_one', () => {
+  const doc = fakeDocument();
+  const body = new doc.FakeElement('tbody');
+  const thumbSrc = thumbDouble();
+  // The list becomes a run: a new array, the same files.
+  const list = [keyed('listed', '3-0'), keyed('listed', '3-1')];
+  const shown = syncRows(doc, body, emptyShown(), list, thumbSrc);
+  const [firstImage, secondImage] = body.children.map((tr) => imagesIn(tr)[0]);
+  syncRows(doc, body, shown, [keyed('waiting', '3-0'), keyed('waiting', '3-1')], thumbSrc);
+  assert.equal(imagesIn(body.children[0])[0], firstImage);
+  assert.equal(imagesIn(body.children[1])[0], secondImage);
+  assert.deepEqual(thumbSrc.calls, ['3-0', '3-1']);
+});
+
+test('a_new_row_list_builds_new_images_for_keys_the_old_one_did_not_have', () => {
+  const doc = fakeDocument();
+  const body = new doc.FakeElement('tbody');
+  const thumbSrc = thumbDouble();
+  const list = [keyed('listed', '3-0'), keyed('listed', '3-1')];
+  const shown = syncRows(doc, body, emptyShown(), list, thumbSrc);
+  const [firstImage, secondImage] = body.children.map((tr) => imagesIn(tr)[0]);
+  // A new list: another list number, so no key is shared.
+  syncRows(doc, body, shown, [keyed('listed', '4-0'), keyed('listed', '4-1'), keyed('listed', null)], thumbSrc);
+  const images = body.children.map((tr) => imagesIn(tr)[0]);
+  assert.notEqual(images[0], firstImage);
+  assert.notEqual(images[1], secondImage);
+  assert.equal(images[0].src, 'thumb://localhost/4-0');
+  assert.equal(images[1].src, 'thumb://localhost/4-1');
+  assert.equal(images[2], undefined);
+  assert.deepEqual(thumbSrc.calls, ['3-0', '3-1', '4-0', '4-1']);
+});
+
+test('a_kept_image_is_used_by_one_row_only', () => {
+  const doc = fakeDocument();
+  const body = new doc.FakeElement('tbody');
+  const thumbSrc = thumbDouble();
+  const shown = syncRows(doc, body, emptyShown(), [keyed('listed', '3-0')], thumbSrc);
+  // Two rows with one key cannot come from the backend; the window must
+  // still not put one element in two rows.
+  syncRows(doc, body, shown, [keyed('waiting', '3-0'), keyed('waiting', '3-0')], thumbSrc);
+  const images = body.children.map((tr) => imagesIn(tr)[0]);
+  assert.notEqual(images[0], images[1]);
+});
+
+// The address of a thumbnail.
+
+test('thumb_source_asks_the_tauri_function_for_the_thumb_scheme', () => {
+  const asked = [];
+  const convert = (key, scheme) => {
+    asked.push([key, scheme]);
+    return `converted:${scheme}:${key}`;
+  };
+  const thumbSrc = thumbSource(convert);
+  assert.deepEqual(asked, []);
+  assert.equal(thumbSrc('3-0'), 'converted:thumb:3-0');
+  assert.equal(thumbSrc('4-12'), 'converted:thumb:4-12');
+  assert.deepEqual(asked, [
+    ['3-0', 'thumb'],
+    ['4-12', 'thumb'],
+  ]);
+});
+
+test('thumb_source_never_asks_for_the_file_scheme_or_none', () => {
+  const schemes = [];
+  const thumbSrc = thumbSource((key, scheme) => {
+    schemes.push(scheme);
+    return key;
+  });
+  thumbSrc('3-0');
+  assert.deepEqual(schemes, ['thumb']);
+  assert.equal(schemes.includes('asset'), false);
+  assert.equal(schemes.includes(undefined), false);
 });
