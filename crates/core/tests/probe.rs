@@ -329,6 +329,7 @@ fn a_file_over_max_file_bytes_is_refused_with_the_planners_reason() {
     assert_eq!(Skip::TooLarge.to_string(), "File is too large");
 }
 
+// Reads all of a sparse file of MAX_FILE_BYTES (100 MiB of zeros).
 #[test]
 fn a_file_of_exactly_max_file_bytes_is_refused_for_its_content_not_its_size() {
     let tmp = TempDir::new().unwrap();
@@ -619,7 +620,7 @@ fn the_worker_answers_a_size_line_and_exits_0() {
 }
 
 #[test]
-fn the_worker_answers_refused_with_an_escaped_message_and_exits_3() {
+fn the_worker_answers_refused_with_the_probes_message_and_exits_3() {
     let tmp = TempDir::new().unwrap();
     let cases = [
         write(tmp.path(), "a.png", b"just some text"),

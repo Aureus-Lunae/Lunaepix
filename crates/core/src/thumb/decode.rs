@@ -56,9 +56,9 @@ pub(super) fn check_header(format: Format, bytes: &[u8]) -> Result<(), String> {
     header_size(format, bytes).map(drop)
 }
 
-/// The width and height `bytes` declare in their header, as
-/// [`check_header`] reads it (so the same checks and the same messages),
-/// without decoding any image data:
+/// The width and height `bytes` declare in their header, without decoding
+/// any image data. [`check_header`] is this function without the size, so
+/// the checks and the messages are the same:
 /// - PNG: the IHDR, which is also an animated PNG's canvas
 ///   ([`crate::png::header_size`]);
 /// - JPG: the frame header, read by libjpeg ([`crate::jpg::header_size`]);

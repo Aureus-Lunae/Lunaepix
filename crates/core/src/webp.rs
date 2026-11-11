@@ -31,6 +31,9 @@ pub(crate) fn header_size(bytes: &[u8]) -> Result<(u32, u32), String> {
         let header = riff::animation_header(&file)?;
         return Ok((header.width, header.height));
     }
+    // `parse` refuses a file with no image chunk, so a size is always there;
+    // the error is for the day that stops being true. `WebpFile::size`'s
+    // `None` is tested in riff.rs.
     file.size()
         .ok_or_else(|| "could not read the WebP data: it declares no size".to_owned())
 }

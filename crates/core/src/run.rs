@@ -382,17 +382,26 @@ pub enum ProbeAnswer {
     Failed,
 }
 
+/// How long one probe worker may take: a thumbnail's, since a probe reads a
+/// file's header the way a thumbnail does and is waited for by the window
+/// the same way. Not [`crate::WORKER_TIMEOUT`], which is for optimising.
+pub(crate) const PROBE_TIMEOUT: Duration = THUMB_TIMEOUT;
+
+/// The most bytes the runner reads from a probe worker's stdout (and, as for
+/// every worker, from its stderr): a record is at most a few KiB.
+pub(crate) const PROBE_OUTPUT_CAP: usize = MAX_WORKER_OUTPUT_BYTES;
+
 /// Probe `src` in a worker process: `program` started as
 /// `<program> --lunaepix-probe <src>` (see [`crate::worker`]).
 ///
 /// Started and waited for on the calling thread, with no shell and no stdin,
-/// and with [`THUMB_TIMEOUT`] and [`MAX_WORKER_OUTPUT_BYTES`]: a worker that
+/// and with [`PROBE_TIMEOUT`] and [`PROBE_OUTPUT_CAP`]: a worker that
 /// runs past the limit or writes more is killed and reaped. Only exit code 0
 /// with a `size` record is [`ProbeAnswer::Size`] and only exit code 3 with a
 /// `refused` record is [`ProbeAnswer::Refused`]; every other way of not
 /// giving a valid answer is [`ProbeAnswer::Failed`].
 pub fn run_probe(program: &Path, src: &Path) -> ProbeAnswer {
-    run_probe_with(program, src, THUMB_TIMEOUT, MAX_WORKER_OUTPUT_BYTES)
+    run_probe_with(program, src, PROBE_TIMEOUT, PROBE_OUTPUT_CAP)
 }
 
 /// [`run_probe`], with the timeout and the cap on the answer given: the
@@ -918,6 +927,23 @@ mod tests {
         assert_eq!(MAX_THUMB_ANSWER_BYTES, 2 * 1024 * 1024);
         // The largest SVG the worker passes through must fit in an answer.
         assert!(MAX_THUMB_ANSWER_BYTES as u64 >= crate::MAX_SVG_THUMB_BYTES);
+    }
+
+    #[test]
+    fn the_probe_limits_are_the_thumbnail_limits_and_not_a_batch_files() {
+        // A probe reads a header: it gets a thumbnail's ten seconds, not the
+        // ten minutes a file's optimising gets, and the cap a record needs.
+        assert_eq!(PROBE_TIMEOUT, THUMB_TIMEOUT);
+        assert_eq!(PROBE_TIMEOUT, Duration::from_secs(10));
+        assert_ne!(PROBE_TIMEOUT, crate::WORKER_TIMEOUT);
+        assert_eq!(PROBE_OUTPUT_CAP, MAX_WORKER_OUTPUT_BYTES);
+        assert_eq!(PROBE_OUTPUT_CAP, 64 * 1024);
+        // Not the thumbnail's 2 MiB: a record is at most a few KiB.
+        assert_ne!(PROBE_OUTPUT_CAP, MAX_THUMB_ANSWER_BYTES);
+        // A longest record (the message cut at its cap, every byte escaped
+        // to two) fits.
+        let longest = "lunaepix-probe 1 refused ".len() + 2 * crate::MAX_WORKER_MESSAGE_BYTES + 1;
+        assert!(longest <= PROBE_OUTPUT_CAP);
     }
 
     /// The thumbnail runner against doubles: shell scripts that print what a
