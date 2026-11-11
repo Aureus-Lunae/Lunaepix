@@ -226,6 +226,8 @@ body {
 /* The table */
 
 .lunaepixResults {
+  --thumbSize: 32px;
+  --cellPadding: 0.5rem;
   width: 100%;
   margin-top: 0.75rem;
   border-collapse: collapse;
@@ -248,7 +250,7 @@ body {
 
 .lunaepixResults__headCell,
 .lunaepixResults__cell {
-  padding: 0.5rem;
+  padding: var(--cellPadding);
   border-bottom: 1px solid var(--rowLine);
   text-align: left;
   vertical-align: top;
@@ -265,9 +267,35 @@ body {
   text-align: right;
 }
 
-/* The file name is the row header: plain weight, left aligned. */
+/* The file name is the row header: plain weight, left aligned. The square
+   with the thumbnail sits before the name, in the cell's padding; the text
+   (and the note under it) start after it, so they line up with each other and
+   not with the square. The row is as tall as the square. */
 .lunaepixResults__cell.-name {
+  position: relative;
+  height: calc(var(--thumbSize) + 2 * var(--cellPadding));
+  padding-inline-start: calc(var(--thumbSize) + 2 * var(--cellPadding));
   font-weight: 400;
+}
+
+/* The square: 32 x 32, always there, empty (a thin border) when the row has
+   no thumbnail, it is still loading or it could not be made. */
+.lunaepixResults__thumb {
+  position: absolute;
+  inset-block-start: var(--cellPadding);
+  inset-inline-start: var(--cellPadding);
+  box-sizing: border-box;
+  width: var(--thumbSize);
+  height: var(--thumbSize);
+  border: 1px solid var(--rowLine);
+  background: var(--surface);
+}
+
+.lunaepixResults__thumbImage {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }
 
 /* How a file was handled differently from the run's mode, under its name. */
@@ -445,9 +473,8 @@ body {
     padding: 0.5rem;
   }
 
-  .lunaepixResults__headCell,
-  .lunaepixResults__cell {
-    padding: 0.25rem;
+  .lunaepixResults {
+    --cellPadding: 0.25rem;
   }
 
   .lunaepixDrop__button,

@@ -1,7 +1,7 @@
 // The window's state as pure functions: `reduce` turns one backend event, one
 // rejected command or one local action into the next state, and `rowView`
-// turns a stored row into the text for the table. No DOM here, so the node
-// tests can load it.
+// turns a stored row into the text for the table (and the key of its
+// thumbnail). No DOM here, so the node tests can load it.
 //
 // `reduce` never changes the state it is given, with one exception:
 // `file-started` and `file-done` write their row into the run's own row list
@@ -99,6 +99,16 @@ function withMessage(state, message) {
   return { ...state, message, messageSeq: state.messageSeq + 1 };
 }
 
+/**
+ * The key of a row's thumbnail (`<list>-<index>`, see INTERFACE.md): the
+ * value when it is a string of one to ten digits, a dash and one to four
+ * digits, otherwise null. The window builds an image address from it, so
+ * nothing else gets through: no path, no scheme, no extra segment.
+ */
+export function thumbKey(value) {
+  return typeof value === 'string' && /^\d{1,10}-\d{1,4}$/.test(value) ? value : null;
+}
+
 /** One row of a `list-changed` payload. A field of the wrong type reads as none. */
 function listRowFrom(item) {
   const file = isObject(item) ? item : {};
@@ -107,12 +117,13 @@ function listRowFrom(item) {
     name: typeof file.name === 'string' ? file.name : '',
     size: sizeOrNull(file.size),
     skip: sentenceOrNull(file.skip),
+    thumb: thumbKey(file.thumb),
   };
 }
 
 /** A row of a run that has not been handled yet, from the list row in its place. */
 function waitingRow(row) {
-  return { kind: 'waiting', name: row.name, size: row.size ?? null, skip: row.skip ?? null };
+  return { kind: 'waiting', name: row.name, size: row.size ?? null, skip: row.skip ?? null, thumb: row.thumb };
 }
 
 /**
@@ -279,7 +290,7 @@ export function reduce(state, action) {
         return state;
       }
       const row = state.rows[index];
-      writeRow(state, index, { kind: 'compressing', name: row.name, size: row.size });
+      writeRow(state, index, { kind: 'compressing', name: row.name, size: row.size, thumb: row.thumb });
       const next = { ...state, current: index };
       return withMessage(next, headingLine(next));
     }
@@ -289,7 +300,13 @@ export function reduce(state, action) {
         return state;
       }
       const row = rowFrom(payload);
-      if (row === null || !writeRow(state, payload.index, row)) {
+      if (row === null) {
+        return state;
+      }
+      // The result does not carry a key: the row keeps the one it had in the
+      // list (a row past the end of the list has none).
+      row.thumb = isRowIndex(state, payload.index) ? state.rows[payload.index].thumb : null;
+      if (!writeRow(state, payload.index, row)) {
         return state;
       }
       return { ...state, current: state.current === payload.index ? null : state.current };
@@ -307,7 +324,11 @@ export function reduce(state, action) {
       // A run that broke off sends fewer `file-done` events; its rows that
       // never got one say so instead of waiting forever.
       const rows = state.rows.some(isUnfinished)
-        ? state.rows.map((row) => (isUnfinished(row) ? { kind: 'failed', name: row.name, reason: NOT_FINISHED } : row))
+        ? state.rows.map((row) =>
+            isUnfinished(row)
+              ? { kind: 'failed', name: row.name, reason: NOT_FINISHED, thumb: row.thumb }
+              : row,
+          )
         : state.rows;
       return {
         ...withMessage(state, message),
@@ -531,7 +552,8 @@ function sizeText(size) {
 }
 
 /**
- * What the table shows for one stored row.
+ * What the table shows for one stored row; every view also carries the row's
+ * `thumb` key (or null) for the square before the name.
  * - listed: the size, and "Will be skipped: …" for a row that will be skipped;
  * - waiting / compressing: the size and the word, or for a row the list
  *   showed as skipped, its reason;
@@ -539,6 +561,10 @@ function sizeText(size) {
  * - skipped / failed: `text`, the status word and the reason.
  */
 export function rowView(row) {
+  return { ...textView(row), thumb: row.thumb ?? null };
+}
+
+function textView(row) {
   const name = row.name === '' ? NO_NAME : row.name;
   switch (row.kind) {
     case 'done': {
