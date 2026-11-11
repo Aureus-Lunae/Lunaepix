@@ -44,13 +44,14 @@ pub mod worker;
 #[path = "../tests/common/jpeg_fixtures.rs"]
 mod jpeg_fixtures;
 
+pub use atomic::save_new;
 use lossy::Lossy;
 pub use lossy::{DEFAULT_QUALITY, Note, Quality};
 pub use plan::{
     MAX_ANIMATION_CANVAS_PIXELS, MAX_ANIMATION_PIXELS, MAX_FILE_BYTES, MAX_PIXELS, MAX_RUN_FILES,
     MAX_SVG_DEPTH, MAX_SVG_ENTITY_BYTES, MAX_SVG_NODES, MAX_WORKER_MESSAGE_BYTES,
-    MAX_WORKER_OUTPUT_BYTES, WORKER_TIMEOUT, images_in_folder, plan_files, plan_files_to,
-    plan_folder, plan_folder_to,
+    MAX_WORKER_OUTPUT_BYTES, WORKER_TIMEOUT, batch_output_name, first_free_name, images_in_folder,
+    plan_files, plan_files_to, plan_folder, plan_folder_to,
 };
 pub use probe::{Probe, probe};
 pub use run::{

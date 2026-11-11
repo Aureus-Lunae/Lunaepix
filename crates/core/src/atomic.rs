@@ -137,14 +137,7 @@ fn write_new_with(
 
     // Dropping a `NamedTempFile` deletes it, so every early return below
     // (including a failed `persist_noclobber`) leaves no temporary file.
-    // Created and written as in `write_atomically`, so no error carries a
-    // path (see `new_temp_file`).
-    let mut temp = new_temp_file(parent)?;
-    temp.as_file_mut().write_all(bytes)?;
-    temp.as_file_mut().flush()?;
-    temp.as_file()
-        .set_permissions(output_permissions(permissions))?;
-    temp.as_file().sync_all()?;
+    let mut temp = stage(parent, bytes, permissions)?;
 
     let mut candidate = dest.to_path_buf();
     // 0 is the name itself; the first clash gets 1.
@@ -164,6 +157,58 @@ fn write_new_with(
         }
         candidate = parent.join(numbered(name, number));
     }
+}
+
+/// Write `bytes` to a new file at exactly `dest`, and nowhere else: a name
+/// that is taken is `ErrorKind::AlreadyExists`, and the file or folder there
+/// is not touched. It never numbers the name (that is [`write_new`]) and never
+/// creates a missing folder, which is `ErrorKind::NotFound`.
+///
+/// Written as [`write_new`]: the data goes to a temporary file in `dest`'s
+/// folder, is synced, and is renamed onto `dest` by a rename that refuses an
+/// existing name (`persist_noclobber`), so a file or folder that appears at
+/// the name at any moment before it is kept. The file gets `permissions`
+/// (never read-only on Windows, see [`output_permissions`]). On any failure
+/// the temporary file is removed. No error carries a path (see
+/// [`new_temp_file`]).
+pub fn save_new(dest: &Path, bytes: &[u8], permissions: fs::Permissions) -> io::Result<()> {
+    save_new_with(dest, bytes, permissions, &mut |_| {})
+}
+
+/// [`save_new`] with `before_persist` called with the name right before the
+/// rename onto it: the tests use it to make a file appear at that moment.
+fn save_new_with(
+    dest: &Path,
+    bytes: &[u8],
+    permissions: fs::Permissions,
+    before_persist: &mut dyn FnMut(&Path),
+) -> io::Result<()> {
+    if dest.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the destination has no file name",
+        ));
+    }
+    let temp = stage(folder_of(dest), bytes, permissions)?;
+    before_persist(dest);
+    // The failed persist hands the temporary file back; dropping it removes it.
+    temp.persist_noclobber(dest)
+        .map(|_| ())
+        .map_err(|failed| failed.error)
+}
+
+/// A temporary file in `folder` holding `bytes`, with `permissions` (as
+/// [`output_permissions`] allows) and synced to disk, ready to be renamed.
+/// `folder` is not created. Created and written as in `write_atomically`, so
+/// no error carries a path (see `new_temp_file`).
+fn stage(folder: &Path, bytes: &[u8], permissions: fs::Permissions) -> io::Result<NamedTempFile> {
+    let mut temp = new_temp_file(folder)?;
+    temp.as_file_mut().write_all(bytes)?;
+    temp.as_file_mut().flush()?;
+    temp.as_file()
+        .set_permissions(output_permissions(permissions))?;
+    temp.as_file().sync_all()?;
+    Ok(temp)
 }
 
 /// `name` with `-<n>` before its last extension (`logo.png` → `logo-1.png`,
@@ -756,6 +801,98 @@ mod tests {
             let dest = tmp.path().join(format!("out-{mode:o}.bin"));
             let written = write_new(&dest, b"x", fs::Permissions::from_mode(mode)).unwrap();
             let actual = fs::metadata(&written).unwrap().permissions().mode() & 0o777;
+            assert_eq!(actual, mode);
+        }
+    }
+
+    // --- save_new: exactly this name, never a number -------------------------
+
+    #[test]
+    fn save_new_a_file_appearing_just_before_the_rename_is_kept() {
+        // The file appears after the temporary file is written and right
+        // before the rename: only a rename that refuses to replace keeps it.
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("logo.png");
+        let mut seen = Vec::new();
+
+        let error = save_new_with(&dest, b"new", perms(tmp.path()), &mut |p| {
+            fs::write(p, b"appeared").unwrap();
+            seen.push(p.to_path_buf());
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&dest).unwrap(), b"appeared");
+        assert_eq!(seen, std::slice::from_ref(&dest));
+        assert_eq!(listing(tmp.path()), ["logo.png"]);
+    }
+
+    #[test]
+    fn save_new_with_nothing_appearing_writes_the_name_once() {
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("logo.png");
+        let mut seen = Vec::new();
+
+        save_new_with(&dest, b"new", perms(tmp.path()), &mut |p| {
+            seen.push(p.to_path_buf())
+        })
+        .unwrap();
+
+        assert_eq!(seen, std::slice::from_ref(&dest));
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+        assert_eq!(listing(tmp.path()), ["logo.png"]);
+    }
+
+    #[test]
+    fn save_new_refuses_a_destination_without_a_file_name() {
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("sub").join("..");
+
+        let error = save_new(&dest, b"new", perms(tmp.path())).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(listing(tmp.path()), Vec::<OsString>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_new_returns_a_rename_error_that_is_not_a_taken_name_and_leaves_no_temp_file() {
+        // 256 bytes: the temporary file is made, the rename onto the name
+        // fails with a different error than "taken".
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join(format!("{}.png", "a".repeat(252)));
+
+        let error = save_new(&dest, b"new", perms(tmp.path())).unwrap_err();
+
+        assert_ne!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_ne!(error.kind(), io::ErrorKind::NotFound, "{error}");
+        assert_eq!(listing(tmp.path()), Vec::<OsString>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_new_into_a_read_only_folder_gives_the_os_permission_error() {
+        let tmp = TempDir::new().unwrap();
+        let Some(folder) = read_only_folder(tmp.path()) else {
+            return;
+        };
+
+        let error = save_new(&folder.join("out.png"), b"x", perms(tmp.path())).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(error.raw_os_error().is_some(), "{error}");
+        assert_no_path(&error.to_string(), &folder);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_new_gives_the_output_exactly_the_permissions_it_is_handed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        for mode in [0o600, 0o644, 0o640] {
+            let dest = tmp.path().join(format!("out-{mode:o}.bin"));
+            save_new(&dest, b"x", fs::Permissions::from_mode(mode)).unwrap();
+            let actual = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
             assert_eq!(actual, mode);
         }
     }
