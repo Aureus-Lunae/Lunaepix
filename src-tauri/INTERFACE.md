@@ -2,8 +2,9 @@
 
 The contract between the window (`ui/`, vanilla JS) and the Rust backend
 (`src-tauri/src/lib.rs`, with the logic in `session.rs` and the payloads in
-`events.rs`). The window never sends a path, and it never receives one: it
-gets file names, the output folder's name and numbers.
+`events.rs`; the thumbnails in `thumbs.rs`). The window never sends a path,
+and it never receives one: it gets file names, the output folder's name,
+numbers and thumbnail keys.
 
 Use the global API (`app.withGlobalTauri` is on):
 
@@ -110,17 +111,22 @@ a fresh list: the full list each time, in display order.
 - `size`: in bytes, or `null` for a skipped row.
 - `skip`: why the row will be skipped, a sentence for the user; `null` for a
   row that will be compressed.
+- `thumb`: the key of the row's thumbnail, `<list>-<index>` (for example
+  `"3-0"`), or `null` for a skipped row and for the over-the-limit row. See
+  [Thumbnails](#thumbnails-the-thumb-scheme).
 - `notice`: a sentence for the status line, or `null`. It says why an add
   changed nothing: a dropped folder with no images directly in it. (The
   file dialog picks files only, so a folder arrives by a drop.)
 
 ```json
 { "files": [
-  { "name": "holiday.jpg", "size": 2400000, "skip": null },
-  { "name": "logo.png", "size": 88000, "skip": null },
-  { "name": "notes.txt", "size": null, "skip": "Not a PNG, JPG, SVG or WebP file" }
+  { "name": "holiday.jpg", "size": 2400000, "skip": null, "thumb": "3-0" },
+  { "name": "logo.svg", "size": 4100, "skip": null, "thumb": "3-1" },
+  { "name": "notes.txt", "size": null, "skip": "Not a PNG, JPG, SVG or WebP file", "thumb": null }
 ], "notice": null }
 ```
+
+`thumb` is in every file row, always a string or `null`.
 
 After Clear:
 
@@ -250,6 +256,47 @@ its `list-changed`.
 { "over": true }
 ```
 
+## Thumbnails: the `thumb` scheme
+
+Each `list-changed` row with a `thumb` key has a thumbnail at an address of
+the custom URI scheme `thumb`. Build it with
+`window.__TAURI__.core.convertFileSrc(key, 'thumb')`: that gives
+`thumb://localhost/3-0` on Linux and macOS and `http://thumb.localhost/3-0`
+on Windows. Accept only a key matching `^\d{1,10}-\d{1,4}$` and treat
+anything else as `null`, so no other text reaches an image address.
+
+- **The key** is `<list>-<index>`: `index` is the row's place in that
+  `list-changed`; `list` is a number the backend raises when a new list
+  starts (Clear, and the first add after a finished run). Adds and
+  `readd_list` keep the earlier rows' keys. A key never names another file:
+  when re-planning would move a file into a row whose key was already sent
+  (a row dropped from the middle of the list), the list number is raised
+  too, and every row gets a new key.
+- **The answer:** the path must be exactly `/<list>-<index>` as received
+  (not percent-decoded), of the current list, for a row whose `thumb` is not
+  `null`. Then `200` with `Content-Type: image/png` and the thumbnail
+  (longest side 64 px), or, for a row whose name ends in `.svg`,
+  `200` with `Content-Type: image/svg+xml` and the file's own bytes. Anything
+  else, and a thumbnail that cannot be made (not an image, damaged, too
+  large, the worker failed or timed out), is `404` with an empty body. Show
+  an empty square then; nothing goes to the status line.
+- **How:** a worker process makes each thumbnail (the window process never
+  opens the file), at most two at a time; other requests wait their turn.
+  Thumbnails and "cannot be shown" are kept for the current list and dropped
+  when a new list starts. A failure of any other kind is tried again on the
+  next request.
+
+```text
+GET thumb://localhost/3-0     → 200, image/png
+GET thumb://localhost/3-1     → 200, image/svg+xml
+GET thumb://localhost/2-0     → 404 (list 2 is gone)
+GET thumb://localhost/3-2     → 404 (notes.txt is a skipped row)
+GET thumb://localhost/3%2D0   → 404 (encoded; not a key as received)
+GET thumb://localhost/3-x     → 404 (not a key)
+```
+
+The scheme needs no permission: it is not a command.
+
 ## Rules for the window
 
 - **Runs never overlap, so events are strictly ordered.** Handle them in the
@@ -272,12 +319,14 @@ its `list-changed`.
   `alert()` and `confirm()` do not work (the dialog plugin overrides them,
   and the window has no dialog permission). Show messages in the page.
 - **CSP** (`tauri.conf.json`): `default-src 'self'; script-src 'self';
-  style-src 'self'; img-src 'self'; font-src 'self'; connect-src ipc:
-  http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action
-  'none'; frame-src 'none'`. So: scripts and styles come from files in `ui/`
-  only. No inline `<script>`, no `on…=` attributes, no `style="…"`
-  attributes, no `eval` or `new Function`, nothing remote, no `data:`
-  images. Setting `element.style.foo` from JS is allowed; `setAttribute('style', …)`
+  style-src 'self'; img-src 'self' thumb: http://thumb.localhost; font-src
+  'self'; connect-src ipc: http://ipc.localhost; object-src 'none';
+  base-uri 'none'; form-action 'none'; frame-src 'none'`. So: scripts and
+  styles come from files in `ui/` only. No inline `<script>`, no `on…=`
+  attributes, no `style="…"` attributes, no `eval` or `new Function`,
+  nothing remote, no `data:` images; images come from `ui/` or from the
+  `thumb` scheme (`thumb:` on Linux and macOS, `http://thumb.localhost` on
+  Windows). Setting `element.style.foo` from JS is allowed; `setAttribute('style', …)`
   is not.
 - **Do not lock the buttons while a dialog is open** in the page's own state.
   The backend refuses a second request with `"busy"`, and the page can say

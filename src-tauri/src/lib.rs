@@ -1,24 +1,31 @@
 //! Thin Tauri shell over `lunaepix-core`: seven commands, the window's drag
-//! and drop, and events back to the window. `INTERFACE.md` is the contract
-//! for the window; `session` holds what the commands do.
+//! and drop, events back to the window, and the `thumb` scheme that serves
+//! the list's thumbnails. `INTERFACE.md` is the contract for the window;
+//! `session` holds what the commands do, `thumbs` what the scheme answers.
 //!
 //! The window never hands the backend a path. Paths come only from a native
 //! dialog opened here, or from a drop that Tauri delivers here as a window
-//! event; the window hears file names, folder names and numbers, never paths.
+//! event; the window hears file names, folder names, numbers and thumbnail
+//! keys, never paths.
 
 pub mod events;
 pub mod session;
+pub mod thumbs;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lunaepix_core::{StopHandle, Worker};
-use tauri::{AppHandle, DragDropEvent, Emitter, Manager, Window, WindowEvent, Wry};
+use tauri::{
+    AppHandle, DragDropEvent, Emitter, Manager, UriSchemeContext, UriSchemeResponder, Window,
+    WindowEvent, Wry,
+};
 use tauri_plugin_dialog::{DialogExt, FileDialogBuilder, FilePath};
 
 use events::{DragState, Event};
 use session::{CommandError, Session};
+use thumbs::ThumbResponse;
 
 /// Extensions the file dialog shows. GTK matches them case-sensitively, so
 /// both spellings are listed; "All files" covers any other spelling, and the
@@ -32,8 +39,11 @@ const IMAGE_FILTER_NAME: &str = "PNG, JPG, SVG and WebP images";
 
 /// Everything the backend keeps between calls.
 struct AppState {
-    /// The list, the output setting, the busy guard and the last output.
+    /// The list, the output setting, the busy guard, the last output and
+    /// the list's thumbnails.
     session: Session,
+    /// The worker [`choose_worker`] chose: its program optimises each file
+    /// of a run and makes each thumbnail.
     worker: Worker,
     /// Stops the active run when the window closes.
     stop: StopHandle,
@@ -64,6 +74,38 @@ fn spawn_work_thread(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
         .name("lunaepix-run".to_owned())
         .spawn(job)
         .map(drop)
+}
+
+/// Start `job` on a thread of its own named `thumbnail`: it starts a
+/// thumbnail worker and waits for it there.
+fn spawn_thumbnail_thread(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("thumbnail".to_owned())
+        .spawn(job)
+        .map(drop)
+}
+
+/// The `thumb` scheme: a request is answered by [`thumbs::serve`] on a
+/// thread of its own, which starts the thumbnail worker and waits for it,
+/// so the webview's thread never waits. Only the request's path goes along,
+/// as received. If no thread can be started, the request gets `404`.
+fn thumb_protocol(
+    context: UriSchemeContext<'_, Wry>,
+    request: tauri::http::Request<Vec<u8>>,
+    responder: UriSchemeResponder,
+) {
+    let app = context.app_handle().clone();
+    let path = request.uri().path().to_owned();
+    session::on_own_thread_or_else(
+        (app, path, responder),
+        |(app, path, responder)| {
+            let state = app.state::<AppState>();
+            let answer = thumbs::serve(state.session.thumbs(), &state.worker.program, &path);
+            responder.respond(answer.into_http());
+        },
+        spawn_thumbnail_thread,
+        |(_, _, responder)| responder.respond(ThumbResponse::not_found().into_http()),
+    );
 }
 
 /// Dialog paths as plain paths. On desktop every entry is a path.
@@ -280,6 +322,7 @@ pub fn run() -> ExitCode {
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
+        .register_asynchronous_uri_scheme_protocol("thumb", thumb_protocol)
         .invoke_handler(tauri::generate_handler![
             choose_files,
             clear_list,

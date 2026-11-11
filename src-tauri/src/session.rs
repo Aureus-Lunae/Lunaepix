@@ -24,6 +24,7 @@ use crate::events::{
     Event, FileStarted, ListChanged, ListRow, OVER_LIMIT_NAME, RunFinished, RunStarted, file_done,
     file_name_of, output_changed, over_limit_reason, over_limit_row,
 };
+use crate::thumbs::Thumbs;
 
 /// Why a command did nothing. Serialised as a bare string: `"busy"`,
 /// `"no-output"`, `"open-failed"`, `"invalid-settings"`, `"empty-list"` or
@@ -216,8 +217,14 @@ pub fn file_size(path: &Path) -> Option<u64> {
 
 /// The `list-changed` rows for `jobs`, with each compressible row's size from
 /// `size_of`. The files the run limit leaves out share one row at the end,
-/// as in the run ([`over_limit_row`]).
-pub fn list_rows(jobs: &[Job], size_of: impl Fn(&Path) -> Option<u64>) -> Vec<ListRow> {
+/// as in the run ([`over_limit_row`]). `keys_for` gets the image path of
+/// each row (`None` for a skipped row and for the over-limit row) and
+/// answers each row's thumbnail key ([`Thumbs::snapshot`]).
+pub fn list_rows(
+    jobs: &[Job],
+    size_of: impl Fn(&Path) -> Option<u64>,
+    keys_for: impl FnOnce(&[Option<PathBuf>]) -> Vec<Option<String>>,
+) -> Vec<ListRow> {
     let (kept, left_out) = without_over_limit(jobs);
     let mut rows: Vec<ListRow> = kept
         .iter()
@@ -226,11 +233,13 @@ pub fn list_rows(jobs: &[Job], size_of: impl Fn(&Path) -> Option<u64>) -> Vec<Li
                 name: file_name_of(src),
                 size: size_of(src),
                 skip: None,
+                thumb: None,
             },
             Job::Skip { src, reason } => ListRow {
                 name: file_name_of(src),
                 size: None,
                 skip: Some(reason.to_string()),
+                thumb: None,
             },
         })
         .collect();
@@ -239,7 +248,19 @@ pub fn list_rows(jobs: &[Job], size_of: impl Fn(&Path) -> Option<u64>) -> Vec<Li
             name: OVER_LIMIT_NAME.to_owned(),
             size: None,
             skip: Some(over_limit_reason(left_out)),
+            thumb: None,
         });
+    }
+    let images: Vec<Option<PathBuf>> = kept
+        .iter()
+        .map(|job| match job {
+            Job::Optimize { src, .. } => Some(src.clone()),
+            Job::Skip { .. } => None,
+        })
+        .chain((left_out > 0).then_some(None))
+        .collect();
+    for (row, key) in rows.iter_mut().zip(keys_for(&images)) {
+        row.thumb = key;
     }
     rows
 }
@@ -265,12 +286,23 @@ pub fn on_own_thread_or_here<T: Send + 'static>(
     work: impl FnOnce(T) + Clone + Send + 'static,
     spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
 ) {
+    on_own_thread_or_else(value, work.clone(), spawn, work);
+}
+
+/// Run `work(value)` on a thread that `spawn` starts. If no thread can be
+/// started, `otherwise(value)` runs on this thread instead, so `value` (a
+/// ticket, or a request's responder) is never lost.
+pub fn on_own_thread_or_else<T: Send + 'static>(
+    value: T,
+    work: impl FnOnce(T) + Send + 'static,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    otherwise: impl FnOnce(T),
+) {
     // The value waits here until one side takes it: the new thread, or this
     // one when the thread never started.
     let slot = Arc::new(Mutex::new(Some(value)));
     let on_thread = {
         let slot = Arc::clone(&slot);
-        let work = work.clone();
         move || {
             if let Some(value) = lock(&slot).take() {
                 work(value);
@@ -278,9 +310,9 @@ pub fn on_own_thread_or_here<T: Send + 'static>(
         }
     };
     if let Err(error) = spawn(Box::new(on_thread)) {
-        eprintln!("lunaepix: no thread could be started ({error}); working on this one");
+        eprintln!("lunaepix: no thread could be started ({error})");
         if let Some(value) = lock(&slot).take() {
-            work(value);
+            otherwise(value);
         }
     }
 }
@@ -319,16 +351,23 @@ pub struct Session {
     output: Mutex<Option<PathBuf>>,
     /// Output folder of the last completed run, if it wrote anything.
     last_output: Mutex<Option<PathBuf>>,
+    /// The thumbnail keys of the list sent last, and their thumbnails.
+    thumbs: Thumbs,
 }
 
 /// `mutex`'s value, also after a panic elsewhere poisoned it.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Session {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The thumbnails of the list, for the `thumb` scheme's handler.
+    pub fn thumbs(&self) -> &Thumbs {
+        &self.thumbs
     }
 
     /// `choose_files`: claim the guard and hand the ticket to `open_dialog`,
@@ -345,7 +384,8 @@ impl Session {
     /// A file dialog's answer, or a drop: add the paths and send the list.
     /// `None` or no paths (a closed dialog) gives the ticket back and then
     /// sends `run-cancelled` instead. Otherwise the ticket is given back
-    /// after `list-changed` has gone out.
+    /// after `list-changed` has gone out. The first add after a finished run
+    /// starts a new list, so its rows get keys of a new list number.
     pub fn add_paths(
         &self,
         ticket: RunTicket,
@@ -357,19 +397,26 @@ impl Session {
             emit(Event::RunCancelled);
             return;
         };
-        let notice = lock(&self.list).add(&paths);
+        let notice = {
+            let mut list = lock(&self.list);
+            if list.finished {
+                self.thumbs.new_list();
+            }
+            list.add(&paths)
+        };
         emit(self.list_changed(notice));
         drop(ticket);
     }
 
     /// The `list-changed` event for the list as it is now, planned against
-    /// the output setting. The two locks are taken one after the other,
-    /// never together.
+    /// the output setting, with each row's thumbnail key; the keys' snapshot
+    /// is taken as the event is made. The two locks are taken one after the
+    /// other, never together.
     fn list_changed(&self, notice: Option<String>) -> Event {
         let out = lock(&self.output).clone();
         let jobs = lock(&self.list).rows(out.as_deref());
         Event::ListChanged(ListChanged {
-            files: list_rows(&jobs, file_size),
+            files: list_rows(&jobs, file_size, |rows| self.thumbs.snapshot(rows)),
             notice,
         })
     }
@@ -391,10 +438,11 @@ impl Session {
         }
     }
 
-    /// `clear_list`.
+    /// `clear_list`: an empty list, which is a new list for the thumbnails.
     pub fn clear_list(&self, emit: &mut impl FnMut(Event)) -> Result<(), CommandError> {
         let ticket = claim_run(&self.guard, emit)?;
         lock(&self.list).clear();
+        self.thumbs.new_list();
         emit(self.list_changed(None));
         drop(ticket);
         Ok(())
@@ -403,7 +451,8 @@ impl Session {
     /// `readd_list`: the list as it was added, after a run, so another run
     /// can start on the same files. The list is planned again now, so a file
     /// deleted since is a skipped row. Busy as `clear_list` is; the next add
-    /// appends to the list instead of starting a fresh one.
+    /// appends to the list instead of starting a fresh one. It is the same
+    /// list for the thumbnails: the rows keep their keys and thumbnails.
     pub fn readd_list(&self, emit: &mut impl FnMut(Event)) -> Result<(), CommandError> {
         let ticket = claim_run(&self.guard, emit)?;
         lock(&self.list).readd();
@@ -1706,9 +1755,9 @@ mod tests {
         assert_eq!(
             value(&events[0]),
             json!({ "files": [
-                { "name": "holiday.jpg", "size": 6, "skip": null },
-                { "name": "logo.png", "size": 3, "skip": null },
-                { "name": "icon.svg", "size": 6, "skip": null }
+                { "name": "holiday.jpg", "size": 6, "skip": null, "thumb": "1-0" },
+                { "name": "logo.png", "size": 3, "skip": null, "thumb": "1-1" },
+                { "name": "icon.svg", "size": 6, "skip": null, "thumb": "1-2" }
             ], "notice": null })
         );
         // The dialog's ticket is given back once the list is sent.
@@ -1833,7 +1882,7 @@ mod tests {
         assert_eq!(
             value(&events[0]),
             json!({ "files": [
-                { "name": "locked", "size": null, "skip": "Not a readable file" }
+                { "name": "locked", "size": null, "skip": "Not a readable file", "thumb": null }
             ], "notice": null })
         );
     }
@@ -1848,8 +1897,8 @@ mod tests {
         assert_eq!(
             value(&window.take()[0]),
             json!({ "files": [
-                { "name": "notes.txt", "size": null, "skip": "Not a PNG, JPG, SVG or WebP file" },
-                { "name": "missing.png", "size": null, "skip": "Not a readable file" }
+                { "name": "notes.txt", "size": null, "skip": "Not a PNG, JPG, SVG or WebP file", "thumb": null },
+                { "name": "missing.png", "size": null, "skip": "Not a readable file", "thumb": null }
             ], "notice": null })
         );
     }
@@ -1861,20 +1910,65 @@ mod tests {
             dest: PathBuf::from("/srv/optimized-a.png"),
         }];
         let asked = RefCell::new(Vec::new());
-        let rows = list_rows(&jobs, |path| {
-            asked.borrow_mut().push(path.to_path_buf());
-            None
-        });
+        let rows = list_rows(
+            &jobs,
+            |path| {
+                asked.borrow_mut().push(path.to_path_buf());
+                None
+            },
+            |_| vec![None],
+        );
         assert_eq!(
             rows,
             [ListRow {
                 name: "a.png".to_owned(),
                 size: None,
                 skip: None,
+                thumb: None,
             }]
         );
         assert_eq!(*asked.borrow(), [PathBuf::from("/srv/a.png")]);
-        assert_eq!(list_rows(&jobs, |_| Some(7))[0].size, Some(7));
+        assert_eq!(
+            list_rows(&jobs, |_| Some(7), |_| vec![None])[0].size,
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn list_rows_asks_for_keys_with_each_image_rows_path_and_puts_them_on_the_rows() {
+        let jobs = [
+            Job::Optimize {
+                src: PathBuf::from("/srv/a.png"),
+                dest: PathBuf::from("/srv/optimized-a.png"),
+            },
+            Job::Skip {
+                src: PathBuf::from("/srv/notes.txt"),
+                reason: Skip::UnsupportedType,
+            },
+            Job::Optimize {
+                src: PathBuf::from("/srv/c.svg"),
+                dest: PathBuf::from("/srv/optimized-c.svg"),
+            },
+        ];
+        let asked = RefCell::new(Vec::new());
+        let rows = list_rows(
+            &jobs,
+            |_| Some(1),
+            |images| {
+                asked.borrow_mut().push(images.to_vec());
+                vec![Some("7-0".to_owned()), None, Some("7-2".to_owned())]
+            },
+        );
+        assert_eq!(
+            *asked.borrow(),
+            [vec![
+                Some(PathBuf::from("/srv/a.png")),
+                None,
+                Some(PathBuf::from("/srv/c.svg"))
+            ]]
+        );
+        let thumbs: Vec<Option<&str>> = rows.iter().map(|row| row.thumb.as_deref()).collect();
+        assert_eq!(thumbs, [Some("7-0"), None, Some("7-2")]);
     }
 
     // Settings.
@@ -2558,6 +2652,7 @@ mod tests {
                 name: "(over the limit)".to_owned(),
                 size: None,
                 skip: Some("1 more file not optimised: over the 2000-file limit".to_owned()),
+                thumb: None,
             })
         );
         let placeholders = list
@@ -2899,9 +2994,9 @@ mod tests {
         assert_eq!(
             events.iter().map(value).collect::<Vec<_>>(),
             [json!({ "files": [
-                { "name": "a.png", "size": 4, "skip": null },
-                { "name": "b.png", "size": null, "skip": "Not a readable file" },
-                { "name": "c.png", "size": 7, "skip": null }
+                { "name": "a.png", "size": 4, "skip": null, "thumb": "1-0" },
+                { "name": "b.png", "size": null, "skip": "Not a readable file", "thumb": null },
+                { "name": "c.png", "size": 7, "skip": null, "thumb": "1-2" }
             ], "notice": null })]
         );
     }
@@ -2971,8 +3066,8 @@ mod tests {
         assert_eq!(
             window.take().iter().map(value).collect::<Vec<_>>(),
             [json!({ "files": [
-                { "name": "a.txt", "size": null, "skip": "Not a PNG, JPG, SVG or WebP file" },
-                { "name": "b.txt", "size": null, "skip": "Not a PNG, JPG, SVG or WebP file" }
+                { "name": "a.txt", "size": null, "skip": "Not a PNG, JPG, SVG or WebP file", "thumb": null },
+                { "name": "b.txt", "size": null, "skip": "Not a PNG, JPG, SVG or WebP file", "thumb": null }
             ], "notice": null })]
         );
     }
@@ -2992,8 +3087,8 @@ mod tests {
         assert_eq!(
             window.take().iter().map(value).collect::<Vec<_>>(),
             [json!({ "files": [
-                { "name": "a.png", "size": null, "skip": "Not a readable file" },
-                { "name": "b.png", "size": null, "skip": "Not a readable file" }
+                { "name": "a.png", "size": null, "skip": "Not a readable file", "thumb": null },
+                { "name": "b.png", "size": null, "skip": "Not a readable file", "thumb": null }
             ], "notice": null })]
         );
     }
@@ -3108,8 +3203,8 @@ mod tests {
         assert_eq!(
             window.take().iter().map(value).collect::<Vec<_>>(),
             [json!({ "files": [
-                { "name": "big.png", "size": null, "skip": "File is too large" },
-                { "name": "small.png", "size": 3, "skip": null }
+                { "name": "big.png", "size": null, "skip": "File is too large", "thumb": null },
+                { "name": "small.png", "size": 3, "skip": null, "thumb": "1-1" }
             ], "notice": null })]
         );
     }
@@ -3132,6 +3227,7 @@ mod tests {
                 name: "(over the limit)".to_owned(),
                 size: None,
                 skip: Some("1 more file not optimised: over the 2000-file limit".to_owned()),
+                thumb: None,
             })
         );
 
@@ -3443,7 +3539,7 @@ mod tests {
         assert_eq!(
             value(&window.take()[0]),
             json!({ "files": [
-                { "name": "s.png", "size": null, "skip": "Not a readable file" }
+                { "name": "s.png", "size": null, "skip": "Not a readable file", "thumb": null }
             ], "notice": null })
         );
     }
@@ -3462,7 +3558,7 @@ mod tests {
         assert_eq!(
             value(&window.take()[0]),
             json!({ "files": [
-                { "name": "big.png", "size": null, "skip": "File is too large" }
+                { "name": "big.png", "size": null, "skip": "File is too large", "thumb": null }
             ], "notice": null })
         );
     }
@@ -3478,7 +3574,7 @@ mod tests {
         assert_eq!(
             value(&window.take()[0]),
             json!({ "files": [
-                { "name": "a.png", "size": null, "skip": "Its output would overwrite the file itself" }
+                { "name": "a.png", "size": null, "skip": "Its output would overwrite the file itself", "thumb": null }
             ], "notice": null })
         );
     }
@@ -3524,7 +3620,7 @@ mod tests {
         assert_eq!(
             value(&window.take()[0]),
             json!({ "files": [
-                { "name": "a.png", "size": 3, "skip": null }
+                { "name": "a.png", "size": 3, "skip": null, "thumb": "1-0" }
             ], "notice": null })
         );
     }
@@ -3539,5 +3635,272 @@ mod tests {
         let window = Window::default();
         drop_on(&session, &window, &[dir.path().to_path_buf()]);
         assert_eq!(row_names(last_list(&window.take())), ["a.png"]);
+    }
+
+    // --- thumbnail keys -------------------------------------------------------
+
+    use lunaepix_core::ThumbAnswer;
+
+    /// The `thumb` of each row of `list`.
+    fn thumbs_of(list: &ListChanged) -> Vec<Option<String>> {
+        list.files.iter().map(|row| row.thumb.clone()).collect()
+    }
+
+    /// The `thumb`s of the last `list-changed` the window heard.
+    fn last_thumbs(window: &Window) -> Vec<Option<String>> {
+        thumbs_of(last_list(&window.take()))
+    }
+
+    /// The list number in `key`, read by the test itself.
+    fn list_number(key: &Option<String>) -> u64 {
+        let key = key.as_deref().expect("a key");
+        key.split('-').next().unwrap().parse().unwrap()
+    }
+
+    fn key(list: u64, index: usize) -> Option<String> {
+        Some(format!("{list}-{index}"))
+    }
+
+    /// Ask the session's thumbnails for `key` with a `make` double that
+    /// records the paths it is given: the status answered.
+    fn ask(session: &Session, key: &Option<String>, calls: &RefCell<Vec<PathBuf>>) -> u16 {
+        let uri = format!("/{}", key.as_deref().expect("a key"));
+        let make = |path: &Path| {
+            calls.borrow_mut().push(path.to_path_buf());
+            ThumbAnswer::Png(b"\x89PNG\r\n\x1a\n".to_vec())
+        };
+        session.thumbs().answer(&uri, make).status
+    }
+
+    #[test]
+    fn three_images_get_keys_n_0_n_1_n_2() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.jpg", b"jpg"), ("c.svg", b"<svg/>")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths);
+        let thumbs = last_thumbs(&window);
+        let n = list_number(&thumbs[0]);
+        assert_eq!(thumbs, [key(n, 0), key(n, 1), key(n, 2)]);
+        // Each key names its own row's file.
+        let calls = RefCell::new(Vec::new());
+        for key in &thumbs {
+            assert_eq!(ask(&session, key, &calls), 200);
+        }
+        assert_eq!(*calls.borrow(), paths);
+    }
+
+    #[test]
+    fn a_skipped_row_and_the_over_limit_row_have_no_thumb() {
+        let dir = folder_with_pngs(MAX_RUN_FILES + 1, &[]);
+        let (_loose, notes) = files(&[("notes.txt", b"x")]);
+        let session = Session::new();
+        let window = Window::default();
+        drop_on(
+            &session,
+            &window,
+            &[notes[0].clone(), dir.path().to_path_buf()],
+        );
+        let events = window.take();
+        let list = last_list(&events);
+        // `notes.txt`, the 2000 images, then the row for the one left out.
+        assert_eq!(list.files.len(), MAX_RUN_FILES + 2);
+        let thumbs = thumbs_of(list);
+        assert_eq!(list.files[0].name, "notes.txt");
+        assert_eq!(thumbs[0], None);
+        let n = list_number(&thumbs[1]);
+        for (index, thumb) in thumbs.iter().enumerate().take(MAX_RUN_FILES + 1).skip(1) {
+            assert_eq!(*thumb, key(n, index));
+        }
+        assert_eq!(list.files[MAX_RUN_FILES + 1].name, "(over the limit)");
+        assert_eq!(thumbs[MAX_RUN_FILES + 1], None);
+    }
+
+    #[test]
+    fn an_add_keeps_the_earlier_keys() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths[..1]);
+        let first = last_thumbs(&window);
+        let n = list_number(&first[0]);
+        assert_eq!(first, [key(n, 0)]);
+        pick(&session, &window, &paths[1..]);
+        assert_eq!(last_thumbs(&window), [key(n, 0), key(n, 1)]);
+    }
+
+    #[test]
+    fn clear_raises_the_list_number_and_drops_the_cache() {
+        let (_dir, paths) = files(&[("a.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths);
+        let first = last_thumbs(&window);
+        let n = list_number(&first[0]);
+        let calls = RefCell::new(Vec::new());
+        assert_eq!(ask(&session, &first[0], &calls), 200);
+        assert_eq!(session.clear_list(&mut window.emit()), Ok(()));
+        // The same file again: only the Clear explains a new number.
+        pick(&session, &window, &paths);
+        let second = last_thumbs(&window);
+        assert_eq!(second, [key(n + 1, 0)]);
+        assert_eq!(ask(&session, &second[0], &calls), 200);
+        assert_eq!(ask(&session, &first[0], &calls), 404);
+        assert_eq!(*calls.borrow(), [paths[0].clone(), paths[0].clone()]);
+    }
+
+    #[test]
+    fn a_busy_clear_keeps_the_list_number() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths[..1]);
+        let n = list_number(&last_thumbs(&window)[0]);
+        let ticket = session.guard.try_start().unwrap();
+        assert_eq!(
+            session.clear_list(&mut window.emit()),
+            Err(CommandError::Busy)
+        );
+        drop(ticket);
+        window.take();
+        pick(&session, &window, &paths[1..]);
+        assert_eq!(last_thumbs(&window), [key(n, 0), key(n, 1)]);
+    }
+
+    #[test]
+    fn the_first_add_after_a_finished_run_raises_the_list_number_and_the_next_add_keeps_it() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths[..1]);
+        let n = list_number(&last_thumbs(&window)[0]);
+        run_the_list(&session, &window);
+        window.take();
+        // The same file again: only the new list explains a new number.
+        pick(&session, &window, &paths[..1]);
+        assert_eq!(last_thumbs(&window), [key(n + 1, 0)]);
+        pick(&session, &window, &paths[1..]);
+        assert_eq!(last_thumbs(&window), [key(n + 1, 0), key(n + 1, 1)]);
+    }
+
+    #[test]
+    fn a_cancelled_dialog_after_a_run_starts_no_list() {
+        let (_dir, paths) = files(&[("a.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths);
+        let n = list_number(&last_thumbs(&window)[0]);
+        run_the_list(&session, &window);
+        for cancelled in [None, Some(Vec::new())] {
+            session
+                .choose_files(&mut window.emit(), |ticket| {
+                    session.add_paths(ticket, cancelled, &mut window.emit());
+                })
+                .unwrap();
+        }
+        window.take();
+        pick(&session, &window, &paths);
+        // One new list, not one per cancelled dialog.
+        assert_eq!(last_thumbs(&window), [key(n + 1, 0)]);
+    }
+
+    #[test]
+    fn readd_keeps_the_list_number_and_the_cache() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths);
+        let first = last_thumbs(&window);
+        let calls = RefCell::new(Vec::new());
+        assert_eq!(ask(&session, &first[0], &calls), 200);
+        run_the_list(&session, &window);
+        window.take();
+        readd(&session, &window);
+        assert_eq!(last_thumbs(&window), first);
+        assert_eq!(ask(&session, &first[0], &calls), 200);
+        assert_eq!(*calls.borrow(), [paths[0].clone()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_row_dropped_from_the_middle_raises_the_list_number() {
+        let (dir, paths) = files(&[
+            ("a.png", b"png"),
+            ("link.png", b"png"),
+            ("b.png", b"png"),
+            ("d.png", b"png"),
+        ]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths[..3]);
+        let first = last_thumbs(&window);
+        let n = list_number(&first[0]);
+        assert_eq!(first, [key(n, 0), key(n, 1), key(n, 2)]);
+        // `link.png` becomes the same file as `a.png`: planned once, so
+        // `b.png` moves up to index 1.
+        let link = dir.path().join("link.png");
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&paths[0], &link).unwrap();
+        pick(&session, &window, &paths[3..]);
+        let events = window.take();
+        assert_eq!(row_names(last_list(&events)), ["a.png", "b.png", "d.png"]);
+        let second = thumbs_of(last_list(&events));
+        assert_eq!(second, [key(n + 1, 0), key(n + 1, 1), key(n + 1, 2)]);
+        // No key changed its file: the old index 1 names nothing, the new
+        // one names `b.png`.
+        let calls = RefCell::new(Vec::new());
+        assert_eq!(ask(&session, &first[1], &calls), 404);
+        assert_eq!(ask(&session, &second[1], &calls), 200);
+        assert_eq!(*calls.borrow(), [paths[2].clone()]);
+    }
+
+    #[test]
+    fn an_entry_that_became_a_folder_keeps_the_list_number_and_has_no_thumb() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png"), ("c.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths[..2]);
+        let n = list_number(&last_thumbs(&window)[0]);
+        fs::remove_file(&paths[0]).unwrap();
+        fs::create_dir(&paths[0]).unwrap();
+        pick(&session, &window, &paths[2..]);
+        let events = window.take();
+        assert_eq!(row_names(last_list(&events)), ["a.png", "b.png", "c.png"]);
+        assert_eq!(thumbs_of(last_list(&events)), [None, key(n, 1), key(n, 2)]);
+    }
+
+    // --- off the calling thread, or else --------------------------------------
+
+    #[test]
+    fn other_work_runs_on_the_started_thread_and_not_the_fallback() {
+        let ran: Ran = Arc::default();
+        let fell_back = Cell::new(None);
+        on_own_thread_or_else(
+            7,
+            recording_work(&ran),
+            |job| {
+                std::thread::spawn(job).join().unwrap();
+                Ok(())
+            },
+            |value| fell_back.set(Some(value)),
+        );
+        assert_eq!(*ran.lock().unwrap(), [(7, false)]);
+        assert_eq!(fell_back.get(), None);
+    }
+
+    #[test]
+    fn the_fallback_gets_the_value_when_no_thread_starts() {
+        let ran: Ran = Arc::default();
+        let fell_back = Cell::new(None);
+        on_own_thread_or_else(
+            7,
+            recording_work(&ran),
+            |job| {
+                drop(job);
+                Err(io::Error::other("no threads left"))
+            },
+            |value| fell_back.set(Some(value)),
+        );
+        assert!(ran.lock().unwrap().is_empty());
+        assert_eq!(fell_back.get(), Some(7));
     }
 }
