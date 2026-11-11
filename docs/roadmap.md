@@ -33,8 +33,8 @@ plan (in `docs/pending-approval/` until approved) when it starts.
 Smaller files by allowing a change in pixels that the eye should not notice.
 Built together with the quality setting ("Why not. Make them at once."), plus
 a Run button, an output folder and the same options on the command line.
-Spec: `docs/in-progress/specs/2026-11-09-lunaepix-lossy-design.md`.
-Plan: `docs/in-progress/plans/2026-11-09-lunaepix-lossy.md`.
+Spec: `docs/finished/specs/2026-11-09-lunaepix-lossy-design.md`.
+Plan: `docs/finished/plans/2026-11-09-lunaepix-lossy.md`.
 
 ## Preview single image compression before compressing
 

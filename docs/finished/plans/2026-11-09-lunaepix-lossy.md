@@ -112,25 +112,27 @@ Calls made while planning (not user decisions; flagged for the plan review):
 The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 still starts by checking `command -v nasm` and stops if it is missing.
 
 ### Task 1: Measure, then stop (hard gate)
+Status: Completed
 
 **Files:** none in the repository. A throwaway Cargo project goes in `.superpowers/sdd/2026-11-09-lunaepix-lossy/measure/`, and the report in `.superpowers/sdd/2026-11-09-lunaepix-lossy/task-1-report.md`. Both are gitignored scratch.
 
-- [ ] **Step 1:** Check `command -v nasm`. Stop and report if it is missing.
-- [ ] **Step 2:** Build the throwaway measurer:
+- [x] **Step 1:** Check `command -v nasm`. Stop and report if it is missing.
+- [x] **Step 2:** Build the throwaway measurer:
   - Dependencies: `mozjpeg-sys =2.2.3` with `nasm_simd`, `libwebp-sys =0.14.4`, `quantizr =1.4.3`, `png`, `oxipng =10.2.1`.
   - It runs each lossy path the spec describes at quality 75.
   - JPG: decode, encode at the quality.
   - PNG: decode, then quantizr to 256 colours with dithering, then indexed PNG, then oxipng.
   - Still WebP: decode, then `WebPEncodeRGBA`.
   - Animated WebP: `WebPAnimDecoder`, then `WebPAnimEncoder` with lossy config.
-- [ ] **Step 3:** Measure and write into the report:
+- [x] **Step 3:** Measure and write into the report:
   - The saving per file and in total at quality 75, for `samples/jpg`, `samples/png` and WebP files made from them.
   - The wall time and peak memory (`/usr/bin/time -v`) at about 25 megapixels for JPG, PNG and still WebP, scaled to `MAX_PIXELS`. Flag anything over 3 minutes or 4 GB.
   - For animated WebP: the time and peak memory for at least three animations of different canvas sizes and frame counts, expressed per million (frames × canvas pixels).
   - The proposed cap: the largest frames × canvas pixels whose scaled time is ≤ 3 minutes on this machine (so ≤ about 9 minutes on a laptop three times slower, within `WORKER_TIMEOUT`) and whose peak memory is ≤ 4 GB.
-- [ ] **Step 4:** Stop. Report the numbers and the proposed cap to the user. Do not pick a cap, a format limit or a memory limit yourself. Record the user's ruling as a new line in this plan's Handoff before Task 2 starts, with the cap as `MAX_ANIMATION_PIXELS`.
+- [x] **Step 4:** Stop. Report the numbers and the proposed cap to the user. Do not pick a cap, a format limit or a memory limit yourself. Record the user's ruling as a new line in this plan's Handoff before Task 2 starts, with the cap as `MAX_ANIMATION_PIXELS`.
 
 ### Task 2: The shared lossy core
+Status: Completed
 
 **Files:**
 - Create: `crates/core/src/lossy.rs`
@@ -152,7 +154,7 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
   - `pub(crate) fn kept_lossless(bytes: Vec<u8>, note: Note) -> Lossy`
   - `Outcome { before, after, millis, note: Option<Note> }`. Every existing constructor passes `note: None`.
 
-- [ ] **Step 1: Write the test and failure-branch tables** (see "Implementer report" at the end). Then write the failing tests:
+- [x] **Step 1: Write the test and failure-branch tables** (see "Implementer report" at the end). Then write the failing tests:
   - `quality_accepts_0_75_and_100`
   - `quality_rejects_101_and_text_signs_fractions_and_spaces`, covering `"101"`, `"-1"`, `"+5"`, `"7.5"`, `"abc"`, `""`, `" 75"` and `"1000"`
   - `notes_read_as_the_exact_sentences` and `note_codes_round_trip`, plus `an_unknown_note_code_is_none`
@@ -161,12 +163,13 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
   - `check_shape_rejects_a_still_output_for_an_animation`: `duration_ms` is `None` against `Some`, and the other way round
   - `finish_keeps_a_smaller_candidate_without_note`
   - `finish_keeps_the_original_with_the_note_when_the_candidate_is_equal_or_larger`, at equal size and at larger size
-- [ ] **Step 2:** Run `cargo test -p lunaepix-core lossy` and expect it to fail (the module does not exist yet). Record the output for the report.
-- [ ] **Step 3:** Implement `lossy.rs`, add `note` to `Outcome`, and update every `Outcome { … }` in the workspace.
-- [ ] **Step 4:** Run `cargo test --workspace` and expect everything to pass.
-- [ ] **Step 5:** Commit: "Add the shared lossy core: quality, notes, shape check".
+- [x] **Step 2:** Run `cargo test -p lunaepix-core lossy` and expect it to fail (the module does not exist yet). Record the output for the report.
+- [x] **Step 3:** Implement `lossy.rs`, add `note` to `Outcome`, and update every `Outcome { … }` in the workspace.
+- [x] **Step 4:** Run `cargo test --workspace` and expect everything to pass.
+- [x] **Step 5:** Commit: "Add the shared lossy core: quality, notes, shape check".
 
 ### Task 3: Lossy JPG (and the SIMD speed-up)
+Status: Completed
 
 **Files:**
 - Modify: `crates/core/Cargo.toml` (add the `nasm_simd` feature to `mozjpeg-sys`, and update the comment that says SIMD is not needed)
@@ -193,7 +196,7 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
 - **Shape check:** decode the result header and run `check_shape`.
 - Then `finish(bytes, result)`.
 
-- [ ] **Step 1:** Write the tables, then the failing tests:
+- [x] **Step 1:** Write the tables, then the failing tests:
   - `a_photo_jpg_gets_smaller_at_75_and_keeps_its_size`. Decode with `image` and compare width and height.
   - `an_already_small_jpg_at_100_keeps_the_original_with_the_note`
   - `exif_with_orientation_6_and_icc_are_kept_byte_for_byte`
@@ -210,12 +213,13 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
   - `the_same_double_returning_a_valid_jpg_gets_it_back`
   - `a_header_over_max_pixels_is_refused_before_decoding`, within 5 s
   - `a_corrupt_jpg_fails_with_a_reason_without_panic`. This one goes in `hostile_input.rs`, in its lossy section.
-- [ ] **Step 2:** Run `cargo test -p lunaepix-core jpg` and expect the new tests to fail. Record the output.
-- [ ] **Step 3:** Implement. Turn on `nasm_simd`. In `windows.yml`, add a step before the cargo steps of both jobs that installs NASM with `choco install nasm --no-progress -y` and appends `C:\Program Files\NASM` to `$GITHUB_PATH`. The step uses no `${{ }}` and no new action, so `workflow.rs` keeps passing.
-- [ ] **Step 4:** Run `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`, and expect both to pass.
-- [ ] **Step 5:** Commit: "Add lossy JPG with mozjpeg's SIMD build".
+- [x] **Step 2:** Run `cargo test -p lunaepix-core jpg` and expect the new tests to fail. Record the output.
+- [x] **Step 3:** Implement. Turn on `nasm_simd`. In `windows.yml`, add a step before the cargo steps of both jobs that installs NASM with `choco install nasm --no-progress -y` and appends `C:\Program Files\NASM` to `$GITHUB_PATH`. The step uses no `${{ }}` and no new action, so `workflow.rs` keeps passing.
+- [x] **Step 4:** Run `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`, and expect both to pass.
+- [x] **Step 5:** Commit: "Add lossy JPG with mozjpeg's SIMD build".
 
 ### Task 4: Lossy PNG
+Status: Completed
 
 **Files:**
 - Modify: `crates/core/Cargo.toml`. Add `quantizr = "=1.4.3"`. Move `png = "0.17.16"` into `[dependencies]`; the version stays.
@@ -238,7 +242,7 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
 - **Shape check:** from the output's IHDR.
 - Then `finish`.
 
-- [ ] **Step 1:** Write the tables, then the failing tests:
+- [x] **Step 1:** Write the tables, then the failing tests:
   - `a_gradient_rgba_png_gets_smaller_as_indexed_with_the_same_size`
   - `an_indexed_16_colour_png_keeps_the_original_with_the_note`
   - `alpha_0_stays_0_and_alpha_128_stays_within_8`. Include the fixture self-check `the_fixture_really_has_alpha_0_and_128`.
@@ -254,12 +258,13 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
   - `a_valid_double_result_is_written`
   - Over `MAX_PIXELS` refused before decoding, within 5 s.
   - A truncated PNG in a lossy run fails without panic. This one goes in `hostile_input.rs`.
-- [ ] **Step 2:** Run `cargo test -p lunaepix-core png` and expect the new tests to fail. Record the output.
-- [ ] **Step 3:** Implement.
-- [ ] **Step 4:** Run `cargo test --workspace` and clippy, and expect both to pass.
-- [ ] **Step 5:** Commit: "Add lossy PNG with quantizr".
+- [x] **Step 2:** Run `cargo test -p lunaepix-core png` and expect the new tests to fail. Record the output.
+- [x] **Step 3:** Implement.
+- [x] **Step 4:** Run `cargo test --workspace` and clippy, and expect both to pass.
+- [x] **Step 5:** Commit: "Add lossy PNG with quantizr".
 
 ### Task 5: Lossy still WebP
+Status: Completed
 
 **Files:**
 - Modify: `crates/core/Cargo.toml` (move `libwebp-sys = "=0.14.4"` into `[dependencies]`)
@@ -280,7 +285,7 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
 - `with_metadata`, then the shape check (`WebPGetInfo`), then `finish`.
 - Lossless and lossy sources both go this way.
 
-- [ ] **Step 1:** Write the tables, then the failing tests:
+- [x] **Step 1:** Write the tables, then the failing tests:
   - `a_lossless_webp_becomes_a_smaller_vp8_with_the_same_size`
   - `an_alpha_webp_keeps_an_alpha_channel`
   - `a_small_lossy_webp_at_100_keeps_the_original_with_the_note`
@@ -295,12 +300,13 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
   - Codec doubles: a decode error, an encode error, an encode returning another size, an encode returning bytes that are not WebP, and a valid result. Each fails or succeeds as the core tests in Task 3 do.
   - Over `MAX_PIXELS` refused before decoding.
   - In `hostile_input.rs`: the existing hostile WebP cases run in a lossy run too.
-- [ ] **Step 2:** Run `cargo test -p lunaepix-core webp` and expect the new tests to fail. Record the output.
-- [ ] **Step 3:** Implement.
-- [ ] **Step 4:** Run `cargo test --workspace` and clippy, and expect both to pass.
-- [ ] **Step 5:** Commit: "Add lossy still WebP through libwebp".
+- [x] **Step 2:** Run `cargo test -p lunaepix-core webp` and expect the new tests to fail. Record the output.
+- [x] **Step 3:** Implement.
+- [x] **Step 4:** Run `cargo test --workspace` and clippy, and expect both to pass.
+- [x] **Step 5:** Commit: "Add lossy still WebP through libwebp".
 
 ### Task 6: Lossy animated WebP
+Status: Completed
 
 **Files:**
 - Modify: `crates/core/src/webp/codec.rs` (`WebPAnimDecoder`, `WebPAnimEncoder`), `crates/core/src/webp/lossy.rs`, `crates/core/src/plan.rs` (`pub const MAX_ANIMATION_PIXELS: u64 = 1_000_000_000` and `pub const MAX_ANIMATION_CANVAS_PIXELS: u64 = 50_000_000`, the values the user set at Task 1, both re-exported from `lib.rs`)
@@ -321,7 +327,7 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
 - **Shape check:** canvas width and height plus total duration (the last frame's end timestamp). The frame count is not compared.
 - Then `finish`.
 
-- [ ] **Step 1:** Write the tables, then the failing tests:
+- [x] **Step 1:** Write the tables, then the failing tests:
   - `distinct_frames_keep_canvas_loop_count_frame_count_and_durations`
   - `two_identical_frames_in_a_row_merge_into_one_with_the_same_total_duration`
   - `an_animation_just_over_the_cap_is_kept_lossless_with_the_note_and_never_decoded`. A double records no decode call.
@@ -332,12 +338,13 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
   - `a_decode_error_and_an_encode_error_fail_with_their_reasons`
   - `iccp_kept_and_xmp_dropped_on_an_animation`
   - In `hostile_input.rs`: `an_animation_with_a_frame_running_off_the_canvas_fails_without_panic_within_5_s`
-- [ ] **Step 2:** Run `cargo test -p lunaepix-core webp` and expect the new tests to fail. Record the output.
-- [ ] **Step 3:** Implement.
-- [ ] **Step 4:** Run `cargo test --workspace` and clippy, and expect both to pass.
-- [ ] **Step 5:** Commit: "Add lossy animated WebP".
+- [x] **Step 2:** Run `cargo test -p lunaepix-core webp` and expect the new tests to fail. Record the output.
+- [x] **Step 3:** Implement.
+- [x] **Step 4:** Run `cargo test --workspace` and clippy, and expect both to pass.
+- [x] **Step 5:** Commit: "Add lossy animated WebP".
 
 ### Task 7: Licences for the new product libraries
+Status: Completed
 
 **Files:**
 - Modify: `about.toml`, `about.hbs`, `THIRD-PARTY-LICENSES.html` (regenerated), `README.md` (licence section), `src-tauri/tests/config.rs` (if its checks cover the clarifications)
@@ -349,15 +356,16 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
 - **`png` and its dependencies:** these were already in the tree through dev-dependencies and are now shipped. Their licences must already be in `accepted`. If one is not, stop and report it.
 - Regenerate with `cargo about generate -c about.toml about.hbs -o THIRD-PARTY-LICENSES.html`.
 
-- [ ] **Step 1:** Write the tables, then the failing tests in `config.rs`. Parse `about.toml` with `toml` and the HTML with `html5ever`:
+- [x] **Step 1:** Write the tables, then the failing tests in `config.rs`. Parse `about.toml` with `toml` and the HTML with `html5ever`:
   - `about_toml_clarifies_libwebp_sys_and_quantizr_with_checksums`, and its negative: a fixture without the quantizr entry is flagged.
   - `the_licence_page_names_libwebp_quantizr_and_the_patents_grant`, and its negative: a fixture page without them is flagged.
-- [ ] **Step 2:** Run `cargo test -p lunaepix-app --test config` and expect the new tests to fail. Record the output.
-- [ ] **Step 3:** Edit and regenerate. If `cargo about` reports a licence outside `accepted`, stop and report it.
-- [ ] **Step 4:** Run `cargo test --workspace` and expect it to pass.
-- [ ] **Step 5:** Commit: "Ship the licences of libwebp and quantizr".
+- [x] **Step 2:** Run `cargo test -p lunaepix-app --test config` and expect the new tests to fail. Record the output.
+- [x] **Step 3:** Edit and regenerate. If `cargo about` reports a licence outside `accepted`, stop and report it.
+- [x] **Step 4:** Run `cargo test --workspace` and expect it to pass.
+- [x] **Step 5:** Commit: "Ship the licences of libwebp and quantizr".
 
 ### Task 8: Run options, worker protocol v2, output folder and no-replace writes
+Status: Completed
 
 **Files:**
 - Modify: `crates/core/src/lib.rs` (`optimize_file` signature, the lossy dispatch, the destination rule)
@@ -379,7 +387,7 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
   - Record v2 is `lunaepix-worker 2 ok <before> <after> <millis> <note-code or ->`. The error records are unchanged apart from the version. `parse_record` refuses version 1.
   - `pub fn run_observed(jobs, worker, stop, on_start: impl FnMut(usize), on_progress: impl FnMut(usize, &Path, &FileResult)) -> Vec<FileResult>`. `on_start(index)` is called right before each `Job::Optimize`'s worker starts, and never for a `Job::Skip`. `run_until_stopped` calls it with a no-op.
 
-- [ ] **Step 1:** Write the tables, then the failing tests:
+- [x] **Step 1:** Write the tables, then the failing tests:
   - **Lossless unchanged:** `a_lossless_run_gives_todays_bytes` (the existing fixture tests, through the new signature), and its negative `a_lossless_run_never_reaches_a_lossy_path`. A double for the lossy dispatch records no call; use a `_with` variant of `optimize_file`.
   - **SVG in a lossy run:** `an_svg_in_a_lossy_run_gets_the_lossless_output_without_note`, and its negative `the_lossy_dispatch_double_records_no_call_for_svg`.
   - **Worker settings:**
@@ -400,12 +408,13 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
   - **Next to the originals:** `without_an_output_folder_optimized_name_replaces_as_today`, and its negative `nothing_is_written_outside_the_originals_folder`.
   - **Replace rule:** `replace_mode_still_refuses_a_destination_outside_the_two_allowed_folders`, and its negative `no_replace_mode_accepts_any_folder`.
   - **Folder images:** `images_in_folder_lists_supported_files_only_sorted_and_skips_subfolders`, with `optimized-a.jpg` beside `a.jpg` listed. Its negative is `a_folder_with_no_images_gives_an_empty_list`.
-- [ ] **Step 2:** Run `cargo test -p lunaepix-core` and expect the new tests to fail. Record the output.
-- [ ] **Step 3:** Implement. Update the existing callers (CLI and app) only as far as needed to compile, passing lossless and `Replace`. Their features come in Tasks 9 and 10.
-- [ ] **Step 4:** Run `cargo test --workspace` and clippy, and expect both to pass.
-- [ ] **Step 5:** Commit: "Pass run options to the worker and add the output folder".
+- [x] **Step 2:** Run `cargo test -p lunaepix-core` and expect the new tests to fail. Record the output.
+- [x] **Step 3:** Implement. Update the existing callers (CLI and app) only as far as needed to compile, passing lossless and `Replace`. Their features come in Tasks 9 and 10.
+- [x] **Step 4:** Run `cargo test --workspace` and clippy, and expect both to pass.
+- [x] **Step 5:** Commit: "Pass run options to the worker and add the output folder".
 
 ### Task 9: Command line
+Status: Completed
 
 **Files:**
 - Modify: `crates/cli/src/args.rs`, `crates/cli/src/main.rs`, `crates/cli/src/report.rs`
@@ -425,19 +434,20 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
   - A row with a note prints the note on the line after its block.
   - Lossless output is unchanged.
 
-- [ ] **Step 1:** Write the tables, then the failing tests:
+- [x] **Step 1:** Write the tables, then the failing tests:
   - `parses_lossy_quality_0_and_100_out_with_files_and_with_dir`
   - `usage_error_for_quality_without_lossy_101_minus_1_7_5_abc_repeated_quality_lossy_or_out_and_out_without_value`
   - `lossy_alone_uses_75`, and its negative `without_lossy_the_output_is_byte_identical_to_todays`
   - `out_creates_a_missing_folder_with_parents_and_writes_original_names`, and its negative `out_never_overwrites_an_existing_file`
   - `dir_without_out_writes_to_dir_optimized`, and its negative `dir_with_out_writes_nothing_to_dir_optimized`
   - `a_lossy_run_prints_the_mode_once_and_notes_after_their_row`, and its negative `a_lossless_run_prints_no_mode_line_and_no_note`
-- [ ] **Step 2:** Run `cargo test -p lunaepix-cli` and expect the new tests to fail. Record the output.
-- [ ] **Step 3:** Implement, and update the crate doc in `main.rs`.
-- [ ] **Step 4:** Run `cargo test --workspace` and expect it to pass.
-- [ ] **Step 5:** Commit: "Add --lossy, --quality and --out to the command line".
+- [x] **Step 2:** Run `cargo test -p lunaepix-cli` and expect the new tests to fail. Record the output.
+- [x] **Step 3:** Implement, and update the crate doc in `main.rs`.
+- [x] **Step 4:** Run `cargo test --workspace` and expect it to pass.
+- [x] **Step 5:** Commit: "Add --lossy, --quality and --out to the command line".
 
 ### Task 10: App backend — list, settings, output folder, events
+Status: Completed
 
 **Files:**
 - Modify: `src-tauri/src/lib.rs` (commands, drop handling, dialogs), `src-tauri/src/session.rs` (list, settings validation, run session), `src-tauri/src/events.rs` (new and changed events), `src-tauri/capabilities/default.json`, `src-tauri/INTERFACE.md` (rewritten to the spec's interface section)
@@ -474,7 +484,7 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
 - Open folder uses the chosen output folder when there is one.
 - `output-changed` sends `file_name()` of the chosen folder only.
 
-- [ ] **Step 1:** Write the tables, then the failing tests:
+- [x] **Step 1:** Write the tables, then the failing tests:
   - `adding_three_files_sends_three_rows`, and its negative `the_same_file_twice_is_listed_once`
   - `a_dropped_folder_adds_its_images_including_optimized_ones_but_not_subfolders`, and its negatives `notes_txt_in_the_folder_is_not_listed` and `an_empty_folder_sends_the_notice_and_adds_nothing`
   - `parse_settings_accepts_lossy_0_and_100_and_lossless_75`, and its negative `parse_settings_rejects_minus_1_101_75_5_string_75_null_missing_key_extra_key_and_mode_fast`
@@ -489,12 +499,13 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
   - `run_started_names_mode_and_quality_and_null_quality_for_lossless`
   - `file_done_serialises_note_only_when_present`
   - In `config.rs`: `the_capability_grants_exactly_the_six_commands_and_event_listening` (parsed JSON), and its negative `a_capability_listing_choose_folder_is_flagged`
-- [ ] **Step 2:** Run `cargo test -p lunaepix-app` and expect the new tests to fail. Record the output.
-- [ ] **Step 3:** Implement, and rewrite `INTERFACE.md` to the spec's commands, events and examples, keeping its window rules (ordering, no Tauri drag events, CSP, permissions).
-- [ ] **Step 4:** Run `cargo test --workspace` and clippy, and expect both to pass.
-- [ ] **Step 5:** Commit: "Keep a file list and run it with the chosen settings".
+- [x] **Step 2:** Run `cargo test -p lunaepix-app` and expect the new tests to fail. Record the output.
+- [x] **Step 3:** Implement, and rewrite `INTERFACE.md` to the spec's commands, events and examples, keeping its window rules (ordering, no Tauri drag events, CSP, permissions).
+- [x] **Step 4:** Run `cargo test --workspace` and clippy, and expect both to pass.
+- [x] **Step 5:** Commit: "Keep a file list and run it with the chosen settings".
 
 ### Task 11: The window
+Status: Completed
 
 **Files:**
 - Modify: `ui/index.html`, `ui/state.js`, `ui/app.js`, `ui/app.css`, `ui/format.js` (only if a new text helper is needed)
@@ -530,7 +541,7 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
   - `headingLine(state)`
 - `rowView(row)` gains the views `waiting` and `compressing` and the `note`.
 
-- [ ] **Step 1:** Write the tables, then the failing tests:
+- [x] **Step 1:** Write the tables, then the failing tests:
   - `launch_state_is_lossless_75_no_folder_empty`, and its negative `quality_cannot_change_while_lossless`
   - `list_changed_fills_rows_and_writes_a_notice_to_the_status`, and its negative `an_empty_list_hides_the_panel_and_notice_null_leaves_the_status`
   - `can_run_with_one_compressible_row`, and its negative `cannot_run_empty_only_skipped_or_running`
@@ -541,20 +552,21 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
   - `a_note_shows_on_its_row`, and its negative `no_note_no_text`
   - `a_list_changed_after_run_finished_replaces_the_rows`, and its negative `an_add_before_run_finished_is_busy_and_keeps_the_rows`
   - `a_name_with_img_markup_stays_text`, and its negative `it_creates_no_element`. This one sits in `config.rs`'s JS lint and the `textContent` rule.
-- [ ] **Step 2:** Run `node --test "tests/ui/*.test.js"` and expect the new tests to fail. Record the output.
-- [ ] **Step 3:** Implement. Keep `aria-disabled` on buttons that cannot be used right now. Use `disabled` on the quality inputs while Lossless is picked. Announce progress only through the existing `role="status"` line. Add no animation.
-- [ ] **Step 4:** Run `node --test "tests/ui/*.test.js"` and `cargo test --workspace` (config checks), and expect both to pass.
-- [ ] **Step 5:** Commit: "Show the file list, the settings and Run in one panel".
+- [x] **Step 2:** Run `node --test "tests/ui/*.test.js"` and expect the new tests to fail. Record the output.
+- [x] **Step 3:** Implement. Keep `aria-disabled` on buttons that cannot be used right now. Use `disabled` on the quality inputs while Lossless is picked. Announce progress only through the existing `role="status"` line. Add no animation.
+- [x] **Step 4:** Run `node --test "tests/ui/*.test.js"` and `cargo test --workspace` (config checks), and expect both to pass.
+- [x] **Step 5:** Commit: "Show the file list, the settings and Run in one panel".
 
 ### Task 12: Documentation and the hand-test list
+Status: Completed
 
 **Files:**
 - Modify: `README.md` (what Lunaepix does, building with `nasm`, the CLI usage, the window flow), `docs/roadmap.md` (status), crate descriptions in `crates/core/Cargo.toml` and the `lib.rs` doc ("Lossless" becomes "Lossless and lossy")
 - Create: none
 
-- [ ] **Step 1:** Update the texts.
-- [ ] **Step 2:** Run the whole suite: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` and `node --test "tests/ui/*.test.js"`. All must pass.
-- [ ] **Step 3:** Write the user's hand-test list into the report, not the repository:
+- [x] **Step 1:** Update the texts.
+- [x] **Step 2:** Run the whole suite: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` and `node --test "tests/ui/*.test.js"`. All must pass.
+- [x] **Step 3:** Write the user's hand-test list into the report, not the repository:
   - a lossy run at 75 over `samples/` with one transparent PNG, one rotated phone JPG, one animated WebP and one SVG;
   - quality 0 and 100;
   - an output folder holding a file of the same name;
@@ -564,7 +576,7 @@ The user installs `nasm` (`sudo dnf install nasm`); done on 2026-11-09. Task 1 s
   - a 200-character file name;
   - Clear;
   - the Windows build from the workflow.
-- [ ] **Step 4:** Commit: "Document lossy compression".
+- [x] **Step 4:** Commit: "Document lossy compression".
 
 ## Implementer report
 
@@ -582,5 +594,6 @@ The report then gives:
 Reviewers check the diff against both tables and probe alternative spellings in any structured-file check. Lunaepix has no Grunt build and no devsync deployment, so there is nothing to build or upload beyond `cargo` and `node`.
 
 ### Task 13: Hand-test changes to the settings (added 2026-11-10)
+Status: Completed
 
 Added after the user's hand test; see the Handoff line "Hand-test changes (user, 2026-11-10)". The Quality row shows only while Lossy is picked; Save to has one "Choose folder" button and, while a folder is chosen, a "Clear" button (accessible name "Clear output folder"). Tests: `settingsView.showQuality` positive (lossy ready/running) and negative (lossless ready/running); a config.rs parser check on the two button texts, the aria-label and the quality row, with negative fixtures for the old text, a missing aria-label and an input outside the row.

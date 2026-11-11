@@ -2,6 +2,13 @@
 
 **Owner:** Aureus-Lunae · **Started:** 2026-11-09
 
+Plan filename: 2026-11-09-lunaepix-lossy.md
+Plan Status: Completed
+Date plan executed: 2026-11-10
+
+Audits performed:
+- None
+
 ## Handoff
 
 Decided in conversation (2026-11-09). The user's words are quoted as they were said.
