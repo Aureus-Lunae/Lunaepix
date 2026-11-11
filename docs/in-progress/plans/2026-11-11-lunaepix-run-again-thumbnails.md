@@ -1,5 +1,7 @@
 # Lunaepix "Re-add" and thumbnails — implementation plan
 
+**Owner:** Aureus-Lunae · **Started:** 2026-11-11
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A "Re-add" button after a run puts the same files back in the list; the app never replaces an output and numbers a taken name from `-1` everywhere; every row shows a 32 px thumbnail before the file name.
@@ -17,6 +19,7 @@
 
 Copied verbatim from the spec's Handoff, plus the standing process rules and the calls made while planning. Give every implementer these lines as they are. An implementer that wants to deviate from one stops and asks instead of choosing.
 
+- **Plan approved by the user (2026-11-11):** "approved", including the calls made while planning (listed below). Execute in a fresh session, subagent-driven, on `feature/lunaepix-run-again-thumbnails`.
 - **Spec approved by the user (2026-11-11):** "Otherwise, approved", after one change to the button (next line).
 - **The button is "Re-add", not "Reuse files":** "We already have clear to clear the list. We can just use readd". Spelled "Re-add"; the command is `readd_list`, the permission `allow-readd-list`, the button `#readdList`.
 - **Starting point:** "Tested, and latest build works on windows." The lossy branch was finalized and merged into `main` locally (f54b5a2, not pushed). This work is on `feature/lunaepix-run-again-thumbnails`, from `main` at f54b5a2.

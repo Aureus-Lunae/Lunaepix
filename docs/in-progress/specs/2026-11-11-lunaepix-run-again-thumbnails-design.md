@@ -6,7 +6,8 @@
 
 Decided in conversation (2026-11-11). The user's words are quoted as they were said.
 
-- **Spec approved by the user (2026-11-11):** "Otherwise, approved", after one change to the button (next line). Plan: `docs/pending-approval/plans/2026-11-11-lunaepix-run-again-thumbnails.md` (waiting for approval).
+- **Spec approved by the user (2026-11-11):** "Otherwise, approved", after one change to the button (next line). Plan: `docs/in-progress/plans/2026-11-11-lunaepix-run-again-thumbnails.md`.
+- **Plan approved by the user (2026-11-11):** "approved", including its calls made while planning. Execute in a fresh session, subagent-driven.
 - **The button is "Re-add", not "Reuse files":** "We already have clear to clear the list. We can just use readd". Spelled "Re-add"; the command is `readd_list`, the permission `allow-readd-list`, the button `#readdList`.
 - **Starting point:** "Tested, and latest build works on windows." The lossy branch was finalized and merged into `main` locally (f54b5a2, not pushed). This work is on `feature/lunaepix-run-again-thumbnails`, from `main` at f54b5a2.
 - **Request 1, run the same batch again:** "We can't rerun the same batch right now. We need to reselect all. Possible to just readd all the ones that ran for if one both want a lossy and lossless compression, or different lossless ones."

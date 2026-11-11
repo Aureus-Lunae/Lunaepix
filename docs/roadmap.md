@@ -12,7 +12,7 @@ plan (in `docs/pending-approval/` until approved) when it starts.
 | Apple support: a brew formula, and a plain download with one awkward step | Not started |
 | Choose how much it can get compressed (quality, like JPEG 70%) on lossy | Part of lossy compression |
 | Export rename (single file only) | Not started |
-| Re-add after a run, and thumbnails | Spec approved; plan waiting for approval |
+| Re-add after a run, and thumbnails | Plan approved; not started |
 | Clean and clear UI | Not started |
 | Automated draft release | Not started |
 
@@ -81,6 +81,7 @@ they can be run again with other settings. Next to the originals, a run no
 longer replaces an earlier output: a taken name gets a number, as in a chosen
 output folder. Every row shows a small thumbnail before the file name.
 Spec: `docs/in-progress/specs/2026-11-11-lunaepix-run-again-thumbnails-design.md`.
+Plan: `docs/in-progress/plans/2026-11-11-lunaepix-run-again-thumbnails.md`.
 
 ## Clean and clear UI
 
