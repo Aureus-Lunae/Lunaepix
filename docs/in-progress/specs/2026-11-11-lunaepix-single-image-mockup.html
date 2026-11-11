@@ -1,0 +1,122 @@
+<h2>Single image mode: where do settings and sizes go?</h2>
+<p class="subtitle">Both mock-ups work: drag the white handle on the picture to compare, and move Quality to see the expected size change (numbers are made up). Click the layout that feels right.</p>
+
+<style>
+  .lx { font-family: system-ui, sans-serif; background:#f3f4f7; color:#15181e; border-radius:8px; padding:12px; }
+  .lx__top { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+  .lx__logo { width:22px; height:22px; border-radius:50%; background:#1b4fc4; }
+  .lx__title { font-weight:700; margin-right:auto; }
+  .lx__switch { display:inline-flex; border:1px solid #5d6572; border-radius:6px; overflow:hidden; }
+  .lx__switch span { padding:4px 12px; font-size:13px; }
+  .lx__switch .-on { background:#1b4fc4; color:#fff; }
+  .lx__file { display:flex; align-items:center; gap:8px; font-size:13px; margin-bottom:8px; }
+  .lx__file b { margin-right:auto; }
+  .lx__btn { border:1px solid #5d6572; border-radius:6px; padding:3px 10px; font-size:13px; background:#fff; }
+  .lx__btn.-main { background:#1b4fc4; color:#fff; border-color:#1b4fc4; padding:6px 18px; font-size:14px; }
+  .lx__cmp { position:relative; aspect-ratio: 4/3; border-radius:6px; overflow:hidden; background:#ddd; user-select:none; }
+  .lx__cmp svg { position:absolute; inset:0; width:100%; height:100%; }
+  .lx__after { position:absolute; inset:0; }
+  .lx__line { position:absolute; top:0; bottom:0; width:2px; background:#fff; box-shadow:0 0 3px #0008; }
+  .lx__line::after { content:"⟷"; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:#fff; color:#15181e; border-radius:50%; width:26px; height:26px; display:grid; place-items:center; font-size:14px; }
+  .lx__tag { position:absolute; top:6px; font-size:11px; background:#000a; color:#fff; padding:1px 6px; border-radius:4px; }
+  .lx__range { position:absolute; inset:0; width:100%; height:100%; opacity:0; cursor:ew-resize; margin:0; }
+  .lx__set { font-size:13px; display:grid; gap:8px; }
+  .lx__set label { display:inline-flex; gap:4px; align-items:center; margin-right:10px; }
+  .lx__q { display:flex; align-items:center; gap:6px; }
+  .lx__q input[type=range] { flex:1; }
+  .lx__sizes { background:#fff; border:1px solid #c9cdd6; border-radius:6px; padding:8px 10px; font-size:13px; display:grid; grid-template-columns:auto 1fr; gap:2px 12px; }
+  .lx__sizes dd { margin:0; text-align:right; font-variant-numeric:tabular-nums; }
+  .lx__sizes .-save { font-weight:700; color:#0b6b2e; }
+  .lx__foot { display:flex; justify-content:flex-end; margin-top:10px; }
+  .lx.-side .lx__body { display:grid; grid-template-columns: 1fr 200px; gap:12px; }
+  .lx.-under .lx__body { display:grid; gap:10px; }
+  .lx.-under .lx__row { display:grid; grid-template-columns: 1fr 1fr; gap:12px; align-items:start; }
+</style>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <symbol id="scene" viewBox="0 0 400 300">
+      <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3a6fd8"/><stop offset="1" stop-color="#f7c58a"/></linearGradient>
+      <rect width="400" height="300" fill="url(#sky)"/>
+      <circle cx="300" cy="90" r="34" fill="#ffe7a8"/>
+      <path d="M0 200 L80 120 L150 190 L230 100 L320 180 L400 130 L400 300 L0 300Z" fill="#2c4a3a"/>
+      <path d="M0 240 Q100 210 200 240 T400 235 L400 300 L0 300Z" fill="#4f7d3f"/>
+      <g fill="#1c2e22"><path d="M40 250 l12 -40 l12 40z"/><path d="M70 255 l10 -32 l10 32z"/><path d="M330 250 l14 -46 l14 46z"/></g>
+    </symbol>
+    <filter id="lossy"><feComponentTransfer><feFuncR type="discrete" tableValues="0 .2 .4 .6 .8 1"/><feFuncG type="discrete" tableValues="0 .2 .4 .6 .8 1"/><feFuncB type="discrete" tableValues="0 .2 .4 .6 .8 1"/></feComponentTransfer><feGaussianBlur stdDeviation=".6"/></filter>
+  </defs>
+</svg>
+
+<div class="cards">
+  <div class="card" data-choice="side" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="lx -side" data-mock>
+        <div class="lx__top"><span class="lx__logo"></span><span class="lx__title">Lunaepix</span>
+          <span class="lx__switch"><span class="-on">Single image</span><span>Batch</span></span></div>
+        <div class="lx__file"><b>holiday.jpg</b><span>4032 × 3024</span><span class="lx__btn">Choose other</span></div>
+        <div class="lx__body">
+          <div class="lx__cmp">
+            <svg><use href="#scene"/></svg>
+            <div class="lx__after" style="clip-path: inset(0 0 0 50%)"><svg style="filter:url(#lossy)"><use href="#scene"/></svg></div>
+            <span class="lx__tag" style="left:6px">Original</span><span class="lx__tag" style="right:6px">Compressed</span>
+            <div class="lx__line" style="left:50%"></div>
+            <input class="lx__range" type="range" min="0" max="100" value="50" aria-label="Compare">
+          </div>
+          <div class="lx__set">
+            <div><label><input type="radio" name="m1"> Lossless</label><label><input type="radio" name="m1" checked> Lossy</label></div>
+            <div class="lx__q">Quality <input type="range" min="0" max="100" value="75" data-q><span data-qv>75</span></div>
+            <dl class="lx__sizes"><dt>Original</dt><dd>2.40 MB</dd><dt>Expected</dt><dd data-exp>612 KB</dd><dt>Saves</dt><dd class="-save" data-save>75%</dd></dl>
+            <div>Save to: next to the original</div>
+          </div>
+        </div>
+        <div class="lx__foot"><span class="lx__btn -main">Save</span></div>
+      </div>
+    </div>
+    <div class="card-body"><h3>A · Settings beside the picture</h3><p>Picture large on the left; mode, quality, sizes and output in a column on the right. Needs a wider window.</p></div>
+  </div>
+
+  <div class="card" data-choice="under" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="lx -under" data-mock>
+        <div class="lx__top"><span class="lx__logo"></span><span class="lx__title">Lunaepix</span>
+          <span class="lx__switch"><span class="-on">Single image</span><span>Batch</span></span></div>
+        <div class="lx__file"><b>holiday.jpg</b><span>4032 × 3024</span><span class="lx__btn">Choose other</span></div>
+        <div class="lx__body">
+          <div class="lx__cmp">
+            <svg><use href="#scene"/></svg>
+            <div class="lx__after" style="clip-path: inset(0 0 0 50%)"><svg style="filter:url(#lossy)"><use href="#scene"/></svg></div>
+            <span class="lx__tag" style="left:6px">Original</span><span class="lx__tag" style="right:6px">Compressed</span>
+            <div class="lx__line" style="left:50%"></div>
+            <input class="lx__range" type="range" min="0" max="100" value="50" aria-label="Compare">
+          </div>
+          <div class="lx__row">
+            <div class="lx__set">
+              <div><label><input type="radio" name="m2"> Lossless</label><label><input type="radio" name="m2" checked> Lossy</label></div>
+              <div class="lx__q">Quality <input type="range" min="0" max="100" value="75" data-q><span data-qv>75</span></div>
+              <div>Save to: next to the original</div>
+            </div>
+            <dl class="lx__sizes"><dt>Original</dt><dd>2.40 MB</dd><dt>Expected</dt><dd data-exp>612 KB</dd><dt>Saves</dt><dd class="-save" data-save>75%</dd></dl>
+          </div>
+        </div>
+        <div class="lx__foot"><span class="lx__btn -main">Save</span></div>
+      </div>
+    </div>
+    <div class="card-body"><h3>B · Settings under the picture</h3><p>Picture full width; settings and the size box in a row below. Same order as the batch window today.</p></div>
+  </div>
+</div>
+
+<script>
+document.querySelectorAll('[data-mock]').forEach(function (m) {
+  var r = m.querySelector('.lx__range'), after = m.querySelector('.lx__after'), line = m.querySelector('.lx__line');
+  r.addEventListener('click', function (e) { e.stopPropagation(); });
+  r.addEventListener('input', function () { after.style.clipPath = 'inset(0 0 0 ' + r.value + '%)'; line.style.left = r.value + '%'; });
+  var q = m.querySelector('[data-q]');
+  q.addEventListener('click', function (e) { e.stopPropagation(); });
+  q.addEventListener('input', function () {
+    var v = +q.value, kb = Math.round(2400 * (0.06 + 0.0025 * v * v / 100 * 1.4));
+    m.querySelector('[data-qv]').textContent = v;
+    m.querySelector('[data-exp]').textContent = kb >= 1000 ? (kb / 1000).toFixed(2) + ' MB' : kb + ' KB';
+    m.querySelector('[data-save]').textContent = Math.max(0, Math.round(100 - kb / 24)) + '%';
+  });
+});
+</script>
