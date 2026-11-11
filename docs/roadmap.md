@@ -12,7 +12,7 @@ plan (in `docs/pending-approval/` until approved) when it starts.
 | Apple support: a brew formula, and a plain download with one awkward step | Not started |
 | Choose how much it can get compressed (quality, like JPEG 70%) on lossy | Part of lossy compression |
 | Export rename (single file only) | Not started |
-| Re-add after a run, and thumbnails | Spec approved; plan being written |
+| Re-add after a run, and thumbnails | Spec approved; plan waiting for approval |
 | Clean and clear UI | Not started |
 | Automated draft release | Not started |
 
