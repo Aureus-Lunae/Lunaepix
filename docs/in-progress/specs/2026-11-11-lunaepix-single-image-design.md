@@ -6,7 +6,8 @@
 
 Decided in conversation (2026-11-11). The user's words are quoted as they were said.
 
-- **Spec approved by the user (2026-11-11):** "Approved, write the plan". The calls listed under "Calls I made" were shown with the design and approved with it. Plan: `docs/pending-approval/plans/2026-11-11-lunaepix-single-image.md` (until approved).
+- **Spec approved by the user (2026-11-11):** "Approved, write the plan". The calls listed under "Calls I made" were shown with the design and approved with it. Plan: `docs/in-progress/plans/2026-11-11-lunaepix-single-image.md`.
+- **Plan approved by the user (2026-11-11):** "yes", including its calls made while planning. Execute in a fresh session, subagent-driven.
 - **Starting point:** the Re-add + thumbnails work was finalized, merged into `main` and pushed (`main` = origin/main at 13715c4, version 0.1.1). This work is on `feature/lunaepix-single-image`, from `main` at 13715c4.
 - **Roadmap item:** "Preview single image compression -> This means a gui change. Like in top the option to switch between batch and single image."
 - **Start mode:** "Default open single image, still able to select or drop a file in it."

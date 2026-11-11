@@ -8,7 +8,7 @@ plan (in `docs/pending-approval/` until approved) when it starts.
 |---|---|
 | Image lossless compression | Done |
 | Lossy image compression | Done |
-| Preview single image compression before compressing (before/after slider) | Spec approved; plan being written |
+| Preview single image compression before compressing (before/after slider) | Plan approved; execution not started |
 | Apple support: a brew formula, and a plain download with one awkward step | Not started |
 | Choose how much it can get compressed (quality, like JPEG 70%) on lossy | Part of lossy compression |
 | Export rename (single file only) | Part of single image mode |
@@ -43,6 +43,7 @@ Single image mode: a Single image / Batch switch at the top, a before/after
 divider with zoom, exact sizes, and Save under a chosen name. Two layouts
 (settings under the picture by default, beside it as an option).
 Spec: `docs/in-progress/specs/2026-11-11-lunaepix-single-image-design.md`.
+Plan: `docs/in-progress/plans/2026-11-11-lunaepix-single-image.md`.
 
 A before/after slider on one image, so the result can be judged before the
 files are written. Needs lossy compression for there to be a visible
