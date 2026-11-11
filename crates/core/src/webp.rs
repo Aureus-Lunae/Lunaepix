@@ -18,11 +18,21 @@ pub(crate) use lossy::optimize_lossy;
 use codec::{Codec, LibWebp, Rgba};
 use riff::Kind;
 
-/// Check that `bytes` is WebP data with well-formed chunks whose declared
-/// size is within [`crate::MAX_PIXELS`] ([`riff::parse`]); nothing is
-/// decoded.
-pub(crate) fn check_header(bytes: &[u8]) -> Result<(), String> {
-    riff::parse(bytes).map(drop)
+/// The width and height `bytes` declare, without decoding, after the
+/// container check ([`riff::parse`]: WebP data with well-formed chunks whose
+/// declared sizes are within [`crate::MAX_PIXELS`]):
+/// - an animation: its canvas, read as the lossy path reads it
+///   ([`riff::animation_header`], which refuses a file with no `VP8X`);
+/// - a still: the `VP8X` canvas if there is one, else the header of its
+///   image chunk ([`riff::WebpFile::size`]).
+pub(crate) fn header_size(bytes: &[u8]) -> Result<(u32, u32), String> {
+    let file = riff::parse(bytes)?;
+    if file.kind == Kind::Animated {
+        let header = riff::animation_header(&file)?;
+        return Ok((header.width, header.height));
+    }
+    file.size()
+        .ok_or_else(|| "could not read the WebP data: it declares no size".to_owned())
 }
 
 /// The pixels a thumbnail of `side` pixels is made from, as width, height
@@ -298,8 +308,11 @@ mod tests {
             thumbnail_rgba(b"RIFF", 64).unwrap_err(),
             "not a WebP file (the content is not WebP data)"
         );
-        assert_eq!(check_header(b"RIFF"), thumbnail_rgba(b"RIFF", 64).map(drop));
-        assert_eq!(check_header(&clean()), Ok(()));
+        assert_eq!(
+            header_size(b"RIFF").map(drop),
+            thumbnail_rgba(b"RIFF", 64).map(drop)
+        );
+        assert_eq!(header_size(&clean()), Ok((SIZE, SIZE)));
     }
 
     #[test]
@@ -350,5 +363,53 @@ mod tests {
         let mut cut = fx::with_chunks(&clean(), &[(*b"EXIF", &exif(6))]);
         cut.truncate(cut.len() - 3);
         assert_eq!(exif_orientation(&cut), None);
+    }
+
+    // --- header_size ------------------------------------------------------------
+
+    #[test]
+    fn header_size_of_a_still_is_its_declared_size() {
+        assert_eq!(header_size(&real_lossless()), Ok((16, 16)));
+        // With a VP8X the canvas is the size (as libwebp reports it).
+        let extended = fx::with_chunks(&real_lossless(), &[]);
+        assert_eq!(header_size(&extended), Ok((16, 16)));
+        let mut chunks = fx::chunks_of(&extended);
+        chunks[0].1 = fx::vp8x_payload(0, 20, 10);
+        assert_eq!(header_size(&fx::from_chunks(&chunks)), Ok((20, 10)));
+    }
+
+    #[test]
+    fn header_size_of_an_animation_is_its_canvas() {
+        let frame = fx::lossless(&fx::photo_rgba(20, 10, true), 20, 10);
+        let animation = fx::animated(&[frame.clone(), frame], 20, 10);
+        assert_eq!(header_size(&animation), Ok((20, 10)));
+    }
+
+    #[test]
+    fn header_size_refuses_an_animation_without_a_canvas() {
+        let frame = fx::lossless(&fx::photo_rgba(20, 10, true), 20, 10);
+        let animation = fx::animated(&[frame], 20, 10);
+        let without: Vec<_> = fx::chunks_of(&animation)
+            .into_iter()
+            .filter(|(name, _)| name != b"VP8X")
+            .collect();
+        let err = header_size(&fx::from_chunks(&without)).unwrap_err();
+        assert!(err.contains("no VP8X"), "{err}");
+    }
+
+    #[test]
+    fn header_size_passes_on_the_parse_error_and_the_size_limit() {
+        assert_eq!(
+            header_size(b"RIFF"),
+            Err("not a WebP file (the content is not WebP data)".to_owned())
+        );
+        let mut cut = real_lossless();
+        cut.truncate(cut.len() - 3);
+        let err = header_size(&cut).unwrap_err();
+        assert!(err.starts_with("could not read the WebP data:"), "{err}");
+        let mut chunks = fx::chunks_of(&fx::with_chunks(&real_lossless(), &[]));
+        chunks[0].1 = fx::vp8x_payload(0, 10_000, 10_001);
+        let big = header_size(&fx::from_chunks(&chunks)).unwrap_err();
+        assert_eq!(big, "image too large: 10000×10001 exceeds 100 megapixels");
     }
 }

@@ -40,7 +40,7 @@ use mozjpeg_sys::{
 mod decode;
 mod lossy;
 
-pub(crate) use decode::{check_header, decode_scaled, exif_payload};
+pub(crate) use decode::{decode_scaled, exif_payload, header_size};
 pub(crate) use lossy::optimize_lossy;
 
 /// Every JPEG starts with the SOI marker, followed by the next marker's 0xFF.

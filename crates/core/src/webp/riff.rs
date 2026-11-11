@@ -145,6 +145,16 @@ impl WebpFile<'_> {
         }
     }
 
+    /// The size the file declares first: the `VP8X` canvas (always the first
+    /// chunk when there is one), else the header of the first `VP8L` or
+    /// `VP8 ` chunk. `parse` read every header already, so it is well-formed;
+    /// `None` only for chunks that declare none.
+    pub(crate) fn size(&self) -> Option<(u32, u32)> {
+        self.chunks
+            .iter()
+            .find_map(|chunk| declared_size(chunk).ok().flatten())
+    }
+
     /// The largest width or height any size header of the file declares:
     /// the `VP8X` canvas and the `VP8L` and `VP8 ` image headers. Nothing is
     /// decoded. `parse` read every header already, so each is there and

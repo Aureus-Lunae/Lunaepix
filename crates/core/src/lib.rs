@@ -6,7 +6,9 @@
 //! The `plan_*` functions never write to the filesystem; destination folders
 //! are created only when a job runs. [`run`] runs the planned jobs, each file
 //! in its own worker process ([`worker`]), so a library that crashes the
-//! process fails only that file. [`run_thumb`] makes a thumbnail the same way.
+//! process fails only that file. [`run_thumb`] makes a thumbnail the same way,
+//! and [`run_probe`] reads a file's shown size, or Batch's reason for
+//! refusing it ([`probe`]), the same way.
 //!
 //! `unsafe` code is denied everywhere but in `jpg`, the libjpeg FFI, in
 //! `platform`, the worker's two start-up system calls, and in `webp::codec`,
@@ -29,6 +31,7 @@ mod plan;
 #[allow(unsafe_code)]
 mod platform;
 mod png;
+mod probe;
 mod run;
 mod svg;
 mod thumb;
@@ -49,12 +52,13 @@ pub use plan::{
     MAX_WORKER_OUTPUT_BYTES, WORKER_TIMEOUT, images_in_folder, plan_files, plan_files_to,
     plan_folder, plan_folder_to,
 };
+pub use probe::{Probe, probe};
 pub use run::{
-    Crash, FileResult, MAX_THUMB_ANSWER_BYTES, RunError, StopHandle, THUMB_TIMEOUT, ThumbAnswer,
-    Worker, run, run_observed, run_thumb, run_until_stopped,
+    Crash, FileResult, MAX_THUMB_ANSWER_BYTES, ProbeAnswer, RunError, StopHandle, THUMB_TIMEOUT,
+    ThumbAnswer, Worker, run, run_observed, run_probe, run_thumb, run_until_stopped,
 };
 pub use thumb::{CannotShow, MAX_SVG_THUMB_BYTES, THUMB_SIDE, Thumbnail, thumbnail};
-pub use worker::{THUMB_FLAG, WORKER_FLAG};
+pub use worker::{PROBE_FLAG, THUMB_FLAG, WORKER_FLAG};
 
 /// How a run compresses its files: one setting for the whole run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
