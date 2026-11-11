@@ -55,7 +55,8 @@ lossy run. Run lossy on your originals, not on earlier lossy outputs.
   `logo-2.png`, …), so nothing in that folder is ever overwritten. Choosing the
   originals' own folder is safe for the same reason.
 - The command line without `--out` is the one place that still replaces: it
-  overwrites an earlier `optimized-<name>`. With `--out` it numbers like the app.
+  overwrites an earlier `optimized-<name>` (with `--dir` and no `--out`, the
+  one in the `optimized/` folder). With `--out` it numbers like the app.
 - A file that is already as small as it gets is copied as it is, so the output
   is never larger than the input.
 
@@ -66,8 +67,9 @@ One run handles at most 2000 files, and each file has its own limits (100 MiB,
 
 1. Drop images on the window, or press "Choose files". A dropped folder adds
    the PNG, JPG, SVG and WebP files directly inside it (not its subfolders).
-   Adding files does not start anything: they appear in a list, and a file
-   that cannot be compressed is listed with "Will be skipped" and its reason.
+   Adding files does not start anything: they appear in a list, each with a
+   small picture before its name (see "Thumbnails" below), and a file that
+   cannot be compressed is listed with "Will be skipped" and its reason.
 2. Choose **Lossless** or **Lossy**. The quality appears when Lossy is
    picked: set it with the slider or type a whole number from 0 to 100 (it
    starts at 75). Under "Save to", leave "Next to the originals" or press
@@ -76,11 +78,37 @@ One run handles at most 2000 files, and each file has its own limits (100 MiB,
    result: sizes, saving, time, and a note where a file was kept as it was. The
    heading shows the progress, for example "Compressing 2 of 3 · Lossy 75".
 4. When it is done the heading says "Done · Lossy 75", with the total saved
-   and an "Open folder" button. The next drop or pick starts a new list.
-   "Clear" empties the list before a run.
+   and two buttons: "Open folder", and **Re-add**.
+   - **Re-add** puts the files of that run back in the list, with the
+     settings as you left them, so the same files can run again with another
+     setting: lossless, then Re-add, then Lossy 60, then Run. The first run's
+     files stay as they were, and the second run's get a number
+     (`optimized-photo.jpg`, then `optimized-photo-1.jpg`). Re-add brings back
+     the files you added, not the `optimized-` files written next to them.
+     Drop or pick more files after Re-add and they join the list.
+   - Without Re-add, the next drop or pick starts a new list.
+   - "Clear" empties the list, before or after a run.
 
 Nothing is remembered between launches: every start is Lossless, quality 75,
 next to the originals.
+
+### Thumbnails
+
+Every row starts with a small picture of the file, 32 pixels square (made
+from a 64 pixel image, so it stays sharp on a high-resolution screen). It
+shows for a PNG, JPG, WebP and SVG; an animated PNG or WebP shows its first
+picture, and a photo that carries a rotation is shown the right way up. A
+row that is skipped, or whose picture cannot be made (a damaged file, a CMYK
+JPG, more than 100 megapixels, an SVG over 2 MiB), shows an empty square;
+nothing is reported for it.
+
+The window never opens your files itself: the same small worker program that
+optimises them makes each picture, two at a time and at most 10 seconds each,
+so a list of 2000 files appears at once and the pictures fill in as the rows
+come into view. The pictures are kept in memory only, up to 64 MiB per list
+(a picture that does not fit is made again when it is needed), and are gone
+when the list is cleared or a new list starts. The app writes nothing to
+disk for them.
 
 ## The command line
 
@@ -148,9 +176,9 @@ cargo test --workspace                                        # the Rust tests
 node --test "tests/ui/*.test.js"                              # the window script tests
 ```
 
-The `--config` file adds the small worker program that optimises each file,
-and builds it first; without it the app still works, but starts each file
-about ten times slower.
+The `--config` file adds the small worker program that optimises each file
+and makes each thumbnail, and builds it first; without it the app still
+works, but starts each file about ten times slower.
 
 `cargo tauri dev` runs the window app from the source without bundling.
 
