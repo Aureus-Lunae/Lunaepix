@@ -12,6 +12,7 @@ mod exif;
 mod lossy;
 mod riff;
 
+pub(crate) use exif::{PREFIX as EXIF_PREFIX, orientation};
 pub(crate) use lossy::optimize_lossy;
 
 use codec::{Codec, LibWebp, Rgba};
@@ -49,6 +50,17 @@ pub(crate) fn thumbnail_rgba(bytes: &[u8], side: u32) -> Result<(u32, u32, Vec<u
     Ok((image.width, image.height, image.pixels))
 }
 
+/// The EXIF Orientation of a WebP file as 1 to 8 ([`exif::orientation`]),
+/// from its first `EXIF` chunk, the one [`riff::WebpFile`] keeps when it
+/// strips a file. `None` when the container cannot be read, there is no
+/// such chunk, or its Orientation is missing, damaged or out of range; a
+/// later `EXIF` chunk is not looked at then.
+pub(crate) fn exif_orientation(bytes: &[u8]) -> Option<u8> {
+    let file = riff::parse(bytes).ok()?;
+    let chunk = file.chunks.iter().find(|chunk| &chunk.fourcc == b"EXIF")?;
+    orientation(chunk.data)
+}
+
 /// The first frame of an animated WebP, as a full canvas: the first that
 /// `codec`'s animation decoder gives. Only that frame is decoded.
 fn first_frame(bytes: &[u8], codec: &impl Codec) -> Result<Rgba, String> {
@@ -69,7 +81,7 @@ fn first_frame(bytes: &[u8], codec: &impl Codec) -> Result<Rgba, String> {
 #[cfg(test)]
 #[path = "../tests/common/webp_fixtures.rs"]
 #[allow(unsafe_code)]
-mod fixtures;
+pub(crate) mod fixtures;
 
 /// Optimise WebP bytes losslessly: check the file, strip its metadata and
 /// return the smaller of the result and the source.
@@ -296,5 +308,47 @@ mod tests {
         let mut input = clean.clone();
         input.extend_from_slice(&[0xAB; 100]);
         assert_eq!(optimize(&input), Ok(clean));
+    }
+
+    // --- EXIF orientation ---------------------------------------------------------
+
+    fn exif(orientation: u16) -> Vec<u8> {
+        fx::exif_with_orientation(orientation, false, true)
+    }
+
+    #[test]
+    fn exif_orientation_reads_the_first_exif_chunk() {
+        let file = fx::with_chunks(&clean(), &[(*b"EXIF", &exif(6))]);
+        assert_eq!(exif_orientation(&file), Some(6));
+        // The first chunk decides, whichever comes second.
+        let (first_6, first_1) = (exif(6), exif(1));
+        let both = fx::with_chunks(&clean(), &[(*b"EXIF", &first_6), (*b"EXIF", &first_1)]);
+        assert_eq!(exif_orientation(&both), Some(6));
+        let both = fx::with_chunks(&clean(), &[(*b"EXIF", &first_1), (*b"EXIF", &first_6)]);
+        assert_eq!(exif_orientation(&both), Some(1));
+        // An animation holds it the same way.
+        let frames = [fx::lossless(&fx::photo_rgba(16, 16, false), 16, 16)];
+        let animation = fx::with_chunks(&fx::animated(&frames, 16, 16), &[(*b"EXIF", &exif(3))]);
+        assert_eq!(exif_orientation(&animation), Some(3));
+    }
+
+    #[test]
+    fn exif_orientation_is_none_without_a_usable_exif_chunk() {
+        assert_eq!(exif_orientation(&clean()), None);
+        let garbage = fx::with_chunks(&clean(), &[(*b"EXIF", &[9u8; 40])]);
+        assert_eq!(exif_orientation(&garbage), None);
+        // Another chunk's payload is not looked at.
+        let xmp = fx::with_chunks(&clean(), &[(*b"XMP ", &exif(6))]);
+        assert_eq!(exif_orientation(&xmp), None);
+        // Behind a garbage first EXIF chunk the second one is not used.
+        let (junk, six) = (vec![9u8; 40], exif(6));
+        let second = fx::with_chunks(&clean(), &[(*b"EXIF", &junk), (*b"EXIF", &six)]);
+        assert_eq!(exif_orientation(&second), None);
+        // Not a WebP, or cut off in a chunk.
+        assert_eq!(exif_orientation(b"RIFF"), None);
+        assert_eq!(exif_orientation(&[]), None);
+        let mut cut = fx::with_chunks(&clean(), &[(*b"EXIF", &exif(6))]);
+        cut.truncate(cut.len() - 3);
+        assert_eq!(exif_orientation(&cut), None);
     }
 }

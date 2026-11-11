@@ -673,3 +673,271 @@ fn bytes_named_svg_that_are_not_svg_text_cannot_be_shown() {
         reason(thumb_of("a.svg", bytes), what);
     }
 }
+
+// --- EXIF orientation -----------------------------------------------------------
+
+use common::jpeg_fixtures::with_app1;
+
+const GREEN: [u8; 4] = [0, 255, 0, 255];
+const YELLOW: [u8; 4] = [255, 255, 0, 255];
+
+/// `w`x`h` RGBA pixels in four quadrants: red top left, blue top right,
+/// green bottom left, yellow bottom right.
+fn quadrants(w: u32, h: u32) -> Vec<u8> {
+    let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            pixels.extend_from_slice(match (x < w / 2, y < h / 2) {
+                (true, true) => &RED,
+                (false, true) => &BLUE,
+                (true, false) => &GREEN,
+                (false, false) => &YELLOW,
+            });
+        }
+    }
+    pixels
+}
+
+/// The colours at a thumbnail's four corners: top left, top right, bottom
+/// left, bottom right.
+type Corners = [[u8; 4]; 4];
+
+/// What each EXIF Orientation makes of the quadrants (red `A` top left, blue
+/// `B` top right, green `C` bottom left, yellow `D` bottom right), written
+/// from the standard's description of the stored image: the size of the
+/// 400x200 picture's thumbnail, then the colours at the top left, top
+/// right, bottom left and bottom right.
+const UPRIGHT: [(u16, (u32, u32), Corners); 8] = [
+    (1, (64, 32), [RED, BLUE, GREEN, YELLOW]),
+    (2, (64, 32), [BLUE, RED, YELLOW, GREEN]),
+    (3, (64, 32), [YELLOW, GREEN, BLUE, RED]),
+    (4, (64, 32), [GREEN, YELLOW, RED, BLUE]),
+    (5, (32, 64), [RED, GREEN, BLUE, YELLOW]),
+    (6, (32, 64), [GREEN, RED, YELLOW, BLUE]),
+    (7, (32, 64), [YELLOW, BLUE, GREEN, RED]),
+    (8, (32, 64), [BLUE, YELLOW, RED, GREEN]),
+];
+
+/// The colours at the four corners of a thumbnail, a little way in.
+fn corners(pixels: &image::RgbaImage) -> [image::Rgba<u8>; 4] {
+    let (w, h) = pixels.dimensions();
+    [(2, 2), (w - 3, 2), (2, h - 3), (w - 3, h - 3)].map(|(x, y)| *pixels.get_pixel(x, y))
+}
+
+/// Whether the corners of `pixels` are `want`.
+fn corners_are(pixels: &image::RgbaImage, want: Corners) -> bool {
+    corners(pixels)
+        .iter()
+        .zip(want)
+        .all(|(pixel, colour)| near(pixel, colour))
+}
+
+/// A WebP with this `EXIF` chunk payload.
+fn webp_with_exif(webp: &[u8], payload: &[u8]) -> Vec<u8> {
+    fx::with_chunks(webp, &[(*b"EXIF", payload)])
+}
+
+/// The quadrants as every file kind that can carry an EXIF block, each with
+/// the payload set to Orientation `value`: a JPG (little- and big-endian),
+/// a lossless and a lossy WebP (with and without the `Exif\0\0` prefix) and
+/// an animated WebP.
+fn oriented_files(w: u32, h: u32, value: u16) -> Vec<(String, Vec<u8>)> {
+    let rgba = quadrants(w, h);
+    let jpg = rgb_jpg(w, h, &rgba);
+    let lossless = fx::lossless(&rgba, w, h);
+    let lossy = fx::lossy(&rgba, w, h, 95.0);
+    let animated = fx::animated(&[lossless.clone(), lossless.clone()], w, h);
+    let exif = |big_endian, prefix| fx::exif_with_orientation(value, big_endian, prefix);
+    vec![
+        ("a.jpg".into(), with_app1(&jpg, &exif(false, true))),
+        ("b.jpg".into(), with_app1(&jpg, &exif(true, true))),
+        (
+            "a.webp".into(),
+            webp_with_exif(&lossless, &exif(false, false)),
+        ),
+        (
+            "b.webp".into(),
+            webp_with_exif(&lossless, &exif(true, true)),
+        ),
+        ("c.webp".into(), webp_with_exif(&lossy, &exif(false, true))),
+        (
+            "d.webp".into(),
+            webp_with_exif(&animated, &exif(true, false)),
+        ),
+    ]
+}
+
+#[test]
+fn every_orientation_of_a_jpg_and_a_webp_puts_the_corners_where_the_standard_says() {
+    for (value, size, want) in UPRIGHT {
+        for (name, bytes) in oriented_files(400, 200, value) {
+            let what = format!("orientation {value}, {name}");
+            let pixels = png_pixels(thumb_of(&name, &bytes), &what);
+            assert_eq!(pixels.dimensions(), size, "{what}");
+            assert!(corners_are(&pixels, want), "{what}: {:?}", corners(&pixels));
+        }
+    }
+}
+
+#[test]
+fn orientation_6_gives_a_32x64_thumbnail_and_5_the_mirrored_corner() {
+    // The two the brief names, pinned on their own beside the table above.
+    for (name, bytes) in oriented_files(400, 200, 6) {
+        let pixels = png_pixels(thumb_of(&name, &bytes), &name);
+        assert_eq!(pixels.dimensions(), (32, 64), "{name}");
+        // The stored top left (red) is the thumbnail's top right.
+        assert!(near(pixels.get_pixel(29, 2), RED), "{name}");
+    }
+    for (name, bytes) in oriented_files(400, 200, 5) {
+        let pixels = png_pixels(thumb_of(&name, &bytes), &name);
+        assert_eq!(pixels.dimensions(), (32, 64), "{name}");
+        // Mirrored along the diagonal: red stays top left, blue goes to the
+        // bottom left and green to the top right.
+        assert!(near(pixels.get_pixel(2, 2), RED), "{name}");
+        assert!(near(pixels.get_pixel(2, 61), BLUE), "{name}");
+        assert!(near(pixels.get_pixel(29, 2), GREEN), "{name}");
+    }
+}
+
+#[test]
+fn orientation_1_and_no_exif_keep_the_picture_as_stored() {
+    let stored = [RED, BLUE, GREEN, YELLOW];
+    let mut files = oriented_files(400, 200, 1);
+    let rgba = quadrants(400, 200);
+    files.push(("plain.jpg".into(), rgb_jpg(400, 200, &rgba)));
+    files.push(("plain.webp".into(), fx::lossless(&rgba, 400, 200)));
+    files.push(("plain-lossy.webp".into(), fx::lossy(&rgba, 400, 200, 95.0)));
+    for (name, bytes) in files {
+        let pixels = png_pixels(thumb_of(&name, &bytes), &name);
+        assert_eq!(pixels.dimensions(), (64, 32), "{name}");
+        assert!(
+            corners_are(&pixels, stored),
+            "{name}: {:?}",
+            corners(&pixels)
+        );
+    }
+}
+
+#[test]
+fn an_orientation_of_0_or_9_is_not_applied() {
+    for value in [0, 9, 256] {
+        for (name, bytes) in oriented_files(400, 200, value) {
+            let what = format!("orientation {value}, {name}");
+            let pixels = png_pixels(thumb_of(&name, &bytes), &what);
+            assert_eq!(pixels.dimensions(), (64, 32), "{what}");
+            assert!(corners_are(&pixels, [RED, BLUE, GREEN, YELLOW]), "{what}");
+        }
+    }
+}
+
+/// EXIF payloads that cannot be read, each as the bytes of the block.
+fn damaged_exif_blocks() -> Vec<(&'static str, Vec<u8>)> {
+    let prefix = fx::EXIF_PREFIX;
+    let with_prefix = |tiff: Vec<u8>| [prefix, tiff.as_slice()].concat();
+    let mut offset_past_end = fx::tiff(false, &[(fx::ORIENTATION, fx::SHORT, 1, 6)]);
+    offset_past_end[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+    let mut huge_count = fx::tiff(true, &[]);
+    huge_count[8..10].copy_from_slice(&u16::MAX.to_be_bytes());
+    let mut cut = fx::tiff(false, &[(fx::ORIENTATION, fx::SHORT, 1, 6)]);
+    cut.truncate(15);
+    vec![
+        ("empty", Vec::new()),
+        ("only the prefix", prefix.to_vec()),
+        ("a header and nothing else", with_prefix(b"II*\0".to_vec())),
+        ("IFD0 past the end", with_prefix(offset_past_end)),
+        ("an entry count nothing backs", with_prefix(huge_count)),
+        ("cut inside the entry", with_prefix(cut)),
+        (
+            "an Orientation of the wrong type",
+            with_prefix(fx::tiff(false, &[(fx::ORIENTATION, 4, 1, 6)])),
+        ),
+        ("garbage", with_prefix(vec![0x9D; 200])),
+        // Nearly the longest a JPEG segment can be.
+        ("a large garbage segment", with_prefix(vec![0x4D; 65_000])),
+    ]
+}
+
+#[test]
+fn a_damaged_exif_block_gives_the_picture_as_stored() {
+    let (w, h) = (400, 200);
+    let rgba = quadrants(w, h);
+    let jpg = rgb_jpg(w, h, &rgba);
+    let webp = fx::lossless(&rgba, w, h);
+    for (what, payload) in damaged_exif_blocks() {
+        for (name, bytes) in [
+            ("a.jpg", with_app1(&jpg, &payload)),
+            ("a.webp", webp_with_exif(&webp, &payload)),
+        ] {
+            let at = format!("{what}, {name}");
+            let pixels = png_pixels(thumb_of(name, &bytes), &at);
+            assert_eq!(pixels.dimensions(), (64, 32), "{at}");
+            assert!(corners_are(&pixels, [RED, BLUE, GREEN, YELLOW]), "{at}");
+        }
+    }
+}
+
+#[test]
+fn a_jpg_app1_without_the_exif_prefix_is_not_read() {
+    let (w, h) = (400, 200);
+    let jpg = rgb_jpg(w, h, &quadrants(w, h));
+    let tiff = fx::tiff(false, &[(fx::ORIENTATION, fx::SHORT, 1, 6)]);
+    // A valid orientation-6 stream, in an APP1 that is not marked EXIF: the
+    // XMP kind, and the bare stream a WebP chunk may hold.
+    let xmp = [b"http://ns.adobe.com/xap/1.0/\0".as_slice(), &tiff].concat();
+    for (what, payload) in [("xmp", xmp), ("no prefix", tiff.clone())] {
+        let pixels = png_pixels(thumb_of("a.jpg", &with_app1(&jpg, &payload)), what);
+        assert_eq!(pixels.dimensions(), (64, 32), "{what}");
+    }
+    // The same stream behind the prefix is read.
+    let prefixed = [fx::EXIF_PREFIX, &tiff].concat();
+    let pixels = png_pixels(thumb_of("a.jpg", &with_app1(&jpg, &prefixed)), "prefix");
+    assert_eq!(pixels.dimensions(), (32, 64));
+}
+
+#[test]
+fn the_first_exif_chunk_of_a_webp_decides() {
+    let rgba = quadrants(400, 200);
+    let webp = fx::lossless(&rgba, 400, 200);
+    let (six, one) = (
+        fx::exif_with_orientation(6, false, false),
+        fx::exif_with_orientation(1, false, false),
+    );
+    let first_6 = fx::with_chunks(&webp, &[(*b"EXIF", &six), (*b"EXIF", &one)]);
+    let first_1 = fx::with_chunks(&webp, &[(*b"EXIF", &one), (*b"EXIF", &six)]);
+    let rotated = png_pixels(thumb_of("a.webp", &first_6), "first 6");
+    assert_eq!(rotated.dimensions(), (32, 64));
+    let stored = png_pixels(thumb_of("a.webp", &first_1), "first 1");
+    assert_eq!(stored.dimensions(), (64, 32));
+}
+
+#[test]
+fn a_small_picture_is_turned_without_being_enlarged() {
+    // 20x10 is under the thumbnail size, so it is only turned: 10x20.
+    for (name, bytes) in oriented_files(20, 10, 6) {
+        let pixels = png_pixels(thumb_of(&name, &bytes), &name);
+        assert_eq!(pixels.dimensions(), (10, 20), "{name}");
+    }
+    // A lossless WebP is exact: the stored top left is the top right.
+    let lossless = webp_with_exif(
+        &fx::lossless(&quadrants(20, 10), 20, 10),
+        &fx::exif_with_orientation(6, false, false),
+    );
+    let pixels = png_pixels(thumb_of("a.webp", &lossless), "lossless");
+    assert_eq!(pixels.get_pixel(9, 0).0, RED);
+    assert_eq!(pixels.get_pixel(0, 0).0, GREEN);
+    assert_eq!(pixels.get_pixel(0, 19).0, YELLOW);
+    assert_eq!(pixels.get_pixel(9, 19).0, BLUE);
+}
+
+#[test]
+fn a_png_is_not_turned_whatever_it_holds() {
+    let png = rgba_png(400, 200, &quadrants(400, 200));
+    // An `eXIf` chunk right after the IHDR (8-byte signature, 25-byte chunk).
+    let exif = fx::exif_with_orientation(6, false, false);
+    let mut with_exif = png[..33].to_vec();
+    with_exif.extend_from_slice(&png_chunk(b"eXIf", &exif));
+    with_exif.extend_from_slice(&png[33..]);
+    let pixels = png_pixels(thumb_of("a.png", &with_exif), "png with eXIf");
+    assert_eq!(pixels.dimensions(), (64, 32));
+    assert!(corners_are(&pixels, [RED, BLUE, GREEN, YELLOW]));
+}

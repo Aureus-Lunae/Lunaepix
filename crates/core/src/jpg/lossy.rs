@@ -38,7 +38,7 @@ const APP14: u8 = 0xEE;
 const COM: u8 = 0xFE;
 /// Save each marker whole: a segment's length field is 16 bits, so its
 /// payload is never longer than this.
-const MARKER_LIMIT: c_uint = 0xFFFF;
+pub(super) const MARKER_LIMIT: c_uint = 0xFFFF;
 
 /// The source's pixels and the markers to carry over: what an encoder gets.
 struct Decoded {
@@ -88,9 +88,9 @@ impl Colour {
 }
 
 /// One saved marker segment: its code and its payload.
-struct Marker {
-    code: u8,
-    data: Vec<u8>,
+pub(super) struct Marker {
+    pub(super) code: u8,
+    pub(super) data: Vec<u8>,
 }
 
 impl Marker {
@@ -215,7 +215,7 @@ unsafe fn read_pixels(bytes: &[u8], len: c_ulong) -> Source {
 ///
 /// `source.marker_list` must be libjpeg's list of saved markers: valid after
 /// `jpeg_read_header` and until the decompressor is finished or destroyed.
-unsafe fn saved_markers(source: &jpeg_decompress_struct) -> Vec<Marker> {
+pub(super) unsafe fn saved_markers(source: &jpeg_decompress_struct) -> Vec<Marker> {
     let mut markers = Vec::new();
     let mut node = source.marker_list;
     while !node.is_null() {
