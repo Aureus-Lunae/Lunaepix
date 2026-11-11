@@ -3061,6 +3061,36 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn readd_with_an_output_folder_plans_into_it_so_a_link_beside_the_original_does_not_skip_it() {
+        let (dir, paths) = files(&[("a.png", b"png")]);
+        let out = dir.path().join("exports");
+        fs::create_dir(&out).unwrap();
+        let session = Session::new();
+        let window = Window::default();
+        choose_output(&session, &window, &out);
+        pick(&session, &window, &paths);
+        run_the_list(&session, &window);
+        // Next to the original, the output name `optimized-a.png` would be the
+        // file itself (a link back to it). Into the output folder it is not.
+        std::os::unix::fs::symlink(&paths[0], dir.path().join("optimized-a.png")).unwrap();
+        window.take();
+        readd(&session, &window);
+        let events = window.take();
+        assert_eq!(last_list(&events).files[0].skip, None);
+        assert_eq!(last_list(&events).files[0].size, Some(3));
+
+        // The same files and the same link with no output folder: skipped.
+        assert_eq!(session.clear_output_folder(&mut window.emit()), Ok(()));
+        window.take();
+        readd(&session, &window);
+        assert_eq!(
+            last_list(&window.take()).files[0].skip.as_deref(),
+            Some("Its output would overwrite the file itself")
+        );
+    }
+
     #[test]
     fn readd_lists_a_too_large_file_as_skipped() {
         let (dir, paths) = files(&[("small.png", b"png")]);
