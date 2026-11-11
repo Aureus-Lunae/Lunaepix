@@ -1,9 +1,13 @@
-# Lunaepix "Reuse files" and thumbnails — design
+# Lunaepix "Re-add" and thumbnails — design
+
+**Owner:** Aureus-Lunae · **Started:** 2026-11-11
 
 ## Handoff
 
 Decided in conversation (2026-11-11). The user's words are quoted as they were said.
 
+- **Spec approved by the user (2026-11-11):** "Otherwise, approved", after one change to the button (next line). Plan: to be written in `docs/pending-approval/plans/`.
+- **The button is "Re-add", not "Reuse files":** "We already have clear to clear the list. We can just use readd". Spelled "Re-add"; the command is `readd_list`, the permission `allow-readd-list`, the button `#readdList`.
 - **Starting point:** "Tested, and latest build works on windows." The lossy branch was finalized and merged into `main` locally (f54b5a2, not pushed). This work is on `feature/lunaepix-run-again-thumbnails`, from `main` at f54b5a2.
 - **Request 1, run the same batch again:** "We can't rerun the same batch right now. We need to reselect all. Possible to just readd all the ones that ran for if one both want a lossy and lossless compression, or different lossless ones."
 - **Request 2, preview:** "Is a small preview possible of the image files that will get compressed?"
@@ -13,7 +17,7 @@ Decided in conversation (2026-11-11). The user's words are quoted as they were s
 - **Numbering starts at `-1` everywhere:** "Start at -1, as everything does normally on a computer on a duplicate name." This changes the existing numbering too (chosen folder, the command line's `--out`), not only next to the originals.
 - **Thumbnail placement:** "Small thumbnail before the filename."
 - **Order of work:** asked whether to finish the lossy branch first and start this on a new branch from `main`. The user answered "Yes".
-- **Not decided by the user, my calls (listed under "Calls I made"):** the button's label and place, the command line staying unchanged, and the technical choices under "Thumbnails".
+- **Not decided by the user, my calls (listed under "Calls I made", approved with the spec):** the button's place, the command line staying unchanged, and the technical choices under "Thumbnails".
 
 ## Problem
 
@@ -42,22 +46,22 @@ The list shows only file names. Nothing shows which picture a name stands for.
 - **A file path reaches the window.** The window still gets names, numbers and now thumbnail keys, never a path. A thumbnail address names a row, never a file.
 - **A broken image takes the app down.** Decoding a hostile or damaged file must not crash the window, just as compression cannot.
 - **The list waits for thumbnails.** The list appears at once; thumbnails fill in as they are made.
-- **Outputs of the last run sneak into the reused list.** "Reuse files" gives back exactly the files that were in the list, not the `optimized-*` files the run wrote beside them.
+- **Outputs of the last run sneak into the re-added list.** "Re-add" gives back exactly the files that were in the list, not the `optimized-*` files the run wrote beside them.
 - **A wrong picture beside a name.** A thumbnail from an earlier list must never show on a row of a new one.
 
 ## Design
 
-### 1. "Reuse files"
+### 1. "Re-add"
 
 **Today:** the backend keeps the list after a run and marks it finished. The next add (dialog or drop) clears it first. The window shows the summary and "Open folder" in place of the settings and Run.
 
 **Changes:**
 
-- **New command `reuse_list`** (no argument). It clears the list's "finished" mark and sends `list-changed` with the list planned again at that moment. Rows are what they are now: a file deleted since becomes "Not a readable file", as `start_run` already does. It rejects only with `"busy"` (a run is going, or a dialog is open), with a `run-busy` event as for every other command.
+- **New command `readd_list`** (no argument). It clears the list's "finished" mark and sends `list-changed` with the list planned again at that moment. Rows are what they are now: a file deleted since becomes "Not a readable file", as `start_run` already does. It rejects only with `"busy"` (a run is going, or a dialog is open), with a `run-busy` event as for every other command.
 - **It works in any state that is not busy.** In a ready state it changes nothing but re-sending the list. With an empty list it sends `{ "files": [], … }`. The window shows the button only after a finished run.
-- **The list holds the paths as they were added.** A dropped folder was expanded into its images when it was dropped, so the reused list does not pick up the `optimized-*` files the run wrote into that folder.
-- **After a reuse, adds go to the end of the list** (the "finished" mark is gone), and Clear empties it as today.
-- **Window:** the summary row gets a "Reuse files" button. Clicking it calls `reuse_list`. `list-changed` brings the window back to ready: the list, the settings and Run. The settings keep the mode and quality the window already holds, which are those of the last run. Focus on "Reuse files" moves to Run when the summary hides.
+- **The list holds the paths as they were added.** A dropped folder was expanded into its images when it was dropped, so the re-added list does not pick up the `optimized-*` files the run wrote into that folder.
+- **After a re-add, adds go to the end of the list** (the "finished" mark is gone), and Clear empties it as today.
+- **Window:** the summary row gets a "Re-add" button. Clicking it calls `readd_list`. `list-changed` brings the window back to ready: the list, the settings and Run. The settings keep the mode and quality the window already holds, which are those of the last run. Focus on "Re-add" moves to Run when the summary hides.
 - The gate is `canChoose` (not running), like the other list buttons. The button keeps `aria-disabled` while a run is going.
 
 ### 2. Numbering: never replace, start at `-1`
@@ -96,7 +100,7 @@ After Clear (unchanged apart from the shape it shares):
 
 What the shapes share: `thumb` is in every file row, always a string or `null`. The window does not take it apart, but it accepts only a string matching `^\d{1,10}-\d{1,4}$` and reads anything else as `null`, so no other text ever reaches an image address.
 
-- The key is `<list>-<index>`. (Not a slash: `convertFileSrc` percent-encodes its argument, so a `/` would arrive as `%2F`; a digit and `-` pass through unchanged.) `list` is a number the backend raises every time a new list starts (Clear, and the first add after a finished run). `index` is the row's place in the list as that `list-changed` sent it. The backend keeps, per `list-changed`, the key → path snapshot of the rows it sent, so the handler never plans the list again per request. Adds keep the earlier rows' keys, and so does "Reuse files", so thumbnails already made are not made again.
+- The key is `<list>-<index>`. (Not a slash: `convertFileSrc` percent-encodes its argument, so a `/` would arrive as `%2F`; a digit and `-` pass through unchanged.) `list` is a number the backend raises every time a new list starts (Clear, and the first add after a finished run). `index` is the row's place in the list as that `list-changed` sent it. The backend keeps, per `list-changed`, the key → path snapshot of the rows it sent, so the handler never plans the list again per request. Adds keep the earlier rows' keys, and so does "Re-add", so thumbnails already made are not made again.
 - The window turns the key into an address with `window.__TAURI__.core.convertFileSrc(key, 'thumb')`. That gives `thumb://localhost/3-0` on Linux and `http://thumb.localhost/3-0` on Windows.
 - The run rows take the `thumb` of the list row in their place, the same way they already take its name and size. Done, skipped and failed rows keep the `thumb` of the row they replace.
 
@@ -137,7 +141,7 @@ GET thumb://localhost/3-x     → 404 (not a key)
 #### What changes in the window's settings
 
 - **CSP:** `img-src 'self' thumb: http://thumb.localhost`. Nothing else in the CSP changes. The config test that guards the CSP is updated to allow exactly these two, and its negative cases still refuse `data:`, `blob:` and any other host.
-- **Permissions:** the scheme needs no permission (it is not a command). `reuse_list` is a command: it gets `allow-reuse-list` (in `build.rs`'s command list and `capabilities/default.json`), and the config test that guards "exactly these commands" names seven.
+- **Permissions:** the scheme needs no permission (it is not a command). `readd_list` is a command: it gets `allow-readd-list` (in `build.rs`'s command list and `capabilities/default.json`), and the config test that guards "exactly these commands" names seven.
 
 ## Layout
 
@@ -155,10 +159,10 @@ The binding layout is the current window (`ui/index.html`) with these changes.
  └──┘                                     (empty square)
 ```
 
-**The summary row after a run:** the total on the left. On the right, "Reuse files" and then "Open folder", side by side, in the same button style.
+**The summary row after a run:** the total on the left. On the right, "Re-add" and then "Open folder", side by side, in the same button style.
 
 ```text
- Saved 1.8 MB on 2 files            [ Reuse files ] [ Open folder ]
+ Saved 1.8 MB on 2 files            [ Re-add ] [ Open folder ]
 ```
 
 - At narrow widths (the window's minimum is 360 px), the two buttons wrap under the text, together, in the same order.
@@ -166,7 +170,7 @@ The binding layout is the current window (`ui/index.html`) with these changes.
 
 **Markup and class names (BBEM):**
 - The square: `<span class="lunaepixResults__thumb">` inside the name cell, before the name text. The `<img>` inside it: `class="lunaepixResults__thumbImage"`, `alt=""`, `width="32"`, `height="32"`, `loading="lazy"`, `decoding="async"`. It is decorative: the file name beside it says what it is.
-- The button: `<button class="lunaepixSummary__button" id="reuseList" type="button">Reuse files</button>`, before `#openFolder`.
+- The button: `<button class="lunaepixSummary__button" id="readdList" type="button">Re-add</button>`, before `#openFolder`.
 - Changing a row's status (waiting → compressing → done) must not make its thumbnail flicker. Keep the same `<img>` element, or rely on the webview's cache; the builder chooses.
 
 ## Tests
@@ -177,11 +181,11 @@ CSS is not tested (`unit-testing.md`). Every behaviour below gets a positive and
 
 | Behaviour | Positive | Negative |
 |---|---|---|
-| `reuse_list` brings back the list after a run | After a finished run of 3 files, `reuse_list` sends `list-changed` with the same 3 names, in order, with their `thumb` keys | Without `reuse_list`, the first add after a run still starts a new list with only the new files |
-| Adds after a reuse append | After `reuse_list`, an add gives the 3 old rows plus the new one | After a run and no reuse, the add gives only the new one (same as above, kept as its own test) |
-| The reused list is the added paths, not the outputs | Drop a folder of `a.png`, run next to the originals (writes `optimized-a.png`), reuse: one row, `a.png` | Drop the same folder again after the run without reuse: two rows, `a.png` and `optimized-a.png` (the existing behaviour, which the reuse must not inherit) |
-| Rows are planned again on reuse | A file deleted after the run is "Not a readable file" after reuse, with `thumb: null` | A file still present keeps its `thumb` key |
-| `reuse_list` is refused while busy | During a run it rejects `"busy"` and sends `run-busy` | When not busy it resolves and sends `list-changed` |
+| `readd_list` brings back the list after a run | After a finished run of 3 files, `readd_list` sends `list-changed` with the same 3 names, in order, with their `thumb` keys | Without `readd_list`, the first add after a run still starts a new list with only the new files |
+| Adds after a re-add append | After `readd_list`, an add gives the 3 old rows plus the new one | After a run and no re-add, the add gives only the new one (same as above, kept as its own test) |
+| The re-added list is the added paths, not the outputs | Drop a folder of `a.png`, run next to the originals (writes `optimized-a.png`), re-add: one row, `a.png` | Drop the same folder again after the run without re-add: two rows, `a.png` and `optimized-a.png` (the existing behaviour, which the re-add must not inherit) |
+| Rows are planned again on re-add | A file deleted after the run is "Not a readable file" after re-add, with `thumb: null` | A file still present keeps its `thumb` key |
+| `readd_list` is refused while busy | During a run it rejects `"busy"` and sends `run-busy` | When not busy it resolves and sends `list-changed` |
 | Numbering starts at `-1` | A first clash gives `-1` in the no-replace write and in the planner (output folder), in the core and through the CLI's `--out`; with `-1` taken too, the next is `-2` | No name ends in `-0`; `-2` is never used while `-1` is free; at `MAX_NAME_NUMBER` taken the file still fails with "no free name" |
 | Next to the originals, no replace | Two runs on `a.png` with no output folder leave `optimized-a.png` and `optimized-a-1.png`, the first unchanged | The command line, run twice on `a.png`, leaves one `optimized-a.png` (it still replaces) |
 | Thumbnail keys | Rows get `<list>-<index>`; an add keeps the earlier keys | Clear, and the first add after a run, raise the list number; a skipped row and the over-the-limit row get `null` |
@@ -211,10 +215,10 @@ CSS is not tested (`unit-testing.md`). Every behaviour below gets a positive and
 | `thumb` is read from `list-changed` | `"3-0"` and `"4294967295-1999"` are kept on the row | A number, an object, an empty string, a missing key, `"3/0"`, `"3-0-1"`, `"../a"`, `"3-x"`, `"thumb://localhost/3-0"` and an 11-digit list number each read as `null` |
 | Run rows keep the thumbnail | `run-started` and every `file-done` keep the list row's `thumb` | A row with `thumb: null` stays `null` after `file-done` |
 | The row shows a square | A row with a key gets the square with an `<img>` whose `src` is the converted key and `alt=""` | A row with `null` gets the empty square and no `<img>` |
-| "Reuse files" shows after a run only | Finished: the button shows and is usable | Ready and running: hidden; running: `aria-disabled="true"` if it is ever shown, and a click sends nothing |
-| A click sends `reuse_list` | Finished: one `reuse_list` call | Running: no call |
-| Settings survive a reuse | After a lossy 60 run and reuse, the mode is lossy and the quality 60 | A Clear and a new add do not reset them either (existing behaviour, kept) |
-| Focus | Focus on "Reuse files" moves to Run when the summary hides | Focus on another element does not move |
+| "Re-add" shows after a run only | Finished: the button shows and is usable | Ready and running: hidden; running: `aria-disabled="true"` if it is ever shown, and a click sends nothing |
+| A click sends `readd_list` | Finished: one `readd_list` call | Running: no call |
+| Settings survive a re-add | After a lossy 60 run and re-add, the mode is lossy and the quality 60 | A Clear and a new add do not reset them either (existing behaviour, kept) |
+| Focus | Focus on "Re-add" moves to Run when the summary hides | Focus on another element does not move |
 | The address | The window builds the address with `convertFileSrc(key, 'thumb')` | A row never gets a `src` that is not from `convertFileSrc` (a double records each call) |
 
 ### Config (`src-tauri/tests/config.rs`, parsed, not scanned)
@@ -222,20 +226,20 @@ CSS is not tested (`unit-testing.md`). Every behaviour below gets a positive and
 | Behaviour | Positive | Negative |
 |---|---|---|
 | CSP | `img-src` is exactly `'self' thumb: http://thumb.localhost` | `data:`, `blob:`, `*`, `https:` or another host in `img-src` are each refused; every other directive is unchanged |
-| Commands | The capability allows exactly the seven commands, `allow-reuse-list` among them | A fixture with six (no `allow-reuse-list`) or with an eighth is refused |
-| The button | `index.html` has `#reuseList` with the text "Reuse files", before `#openFolder`, inside the summary | A fixture without it, with it after `#openFolder`, or outside the summary is refused |
+| Commands | The capability allows exactly the seven commands, `allow-readd-list` among them | A fixture with six (no `allow-readd-list`) or with an eighth is refused |
+| The button | `index.html` has `#readdList` with the text "Re-add", before `#openFolder`, inside the summary | A fixture without it, with it after `#openFolder`, or outside the summary is refused |
 
 ### Edges the tests cover
 
 - **More content than a demo:** a list of 2000 rows gets a key per row, and the over-the-limit row gets `null`.
-- **Optional parts present and absent:** with and without an output folder (numbering both ways); with a list that has only skipped rows (no thumbnails, Run not usable, "Reuse files" still brings it back).
+- **Optional parts present and absent:** with and without an output folder (numbering both ways); with a list that has only skipped rows (no thumbnails, Run not usable, "Re-add" still brings it back).
 - **Bounds:** 64 px exactly and 65 px; 100 megapixels exactly and one more; 2 MiB SVG exactly and one byte more; worker output of 2 MiB plus the header exactly and one byte more.
 
 ## Calls I made
 
 These were not settled in conversation; each is my choice, open to change.
 
-1. **The button reads "Reuse files"** and sits before "Open folder" in the summary row.
+1. **The button sits before "Open folder"** in the summary row. (Its label "Re-add" is the user's.)
 2. **The command line keeps replacing** next to the originals. Your "Yes" was about the app's window; scripts that run the CLI again expect the same output name.
 3. **Thumbnails are made in a worker process,** as compression is, so a damaged image cannot crash the window.
 4. **No new decoding library.** The decoders the product already ships cover JPG, PNG and WebP. SVG is shown by the webview itself.
