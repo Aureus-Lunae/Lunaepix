@@ -1149,6 +1149,15 @@ mod tests {
             use std::os::unix::ffi::OsStringExt;
             sources.push(OsString::from_vec(b"/photos/caf\xE9.png".to_vec()));
         }
+        // The Windows counterpart: a lone UTF-16 surrogate is not Unicode.
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let mut wide: Vec<u16> = "C:\\photos\\caf".encode_utf16().collect();
+            wide.push(0xD800);
+            wide.extend(".png".encode_utf16());
+            sources.push(OsString::from_wide(&wide));
+        }
         for source in sources {
             let (code, _, handed) =
                 serve_thumb_recorded(vec![source.clone()], Ok(Thumbnail::Png(png_thumb())));
