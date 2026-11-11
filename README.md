@@ -47,11 +47,15 @@ lossy run. Run lossy on your originals, not on earlier lossy outputs.
 ## Where the files go
 
 - **Next to the original** (the default): `optimized-<name>`, so `logo.png`
-  gives `optimized-logo.png`. An earlier `optimized-logo.png` is replaced.
+  gives `optimized-logo.png`. The app never replaces an output: when
+  `optimized-logo.png` is already there, the new one is `optimized-logo-1.png`,
+  then `optimized-logo-2.png`, and so on.
 - **In an output folder you choose:** each file keeps its own name. A name that
-  is already taken gets a number before the extension (`logo.png`, `logo-2.png`,
-  `logo-3.png`), so nothing in that folder is ever overwritten. Choosing the
+  is already taken gets a number before the extension (`logo.png`, `logo-1.png`,
+  `logo-2.png`, …), so nothing in that folder is ever overwritten. Choosing the
   originals' own folder is safe for the same reason.
+- The command line without `--out` is the one place that still replaces: it
+  overwrites an earlier `optimized-<name>`. With `--out` it numbers like the app.
 - A file that is already as small as it gets is copied as it is, so the output
   is never larger than the input.
 

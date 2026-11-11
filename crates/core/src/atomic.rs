@@ -89,16 +89,17 @@ fn without_path(error: io::Error) -> io::Error {
     }
 }
 
-/// Highest number an output name in a chosen output folder may get:
-/// `logo-2.png` … `logo-9999.png` are tried, then the file fails with "no
-/// free name in the output folder". An explicit bound on the loop.
+/// Highest number an output name may get when its name is taken:
+/// `logo-1.png` … `logo-9999.png` are tried (never `logo-0.png`), then the
+/// file fails with "no free name in the output folder". An explicit bound on
+/// the loop.
 pub(crate) const MAX_NAME_NUMBER: u32 = 9999;
 
 /// The error when every name up to [`MAX_NAME_NUMBER`] is taken.
 const NO_FREE_NAME: &str = "no free name in the output folder";
 
 /// Write `bytes` to a new file at `dest`, or at the first free numbered name
-/// beside it (`numbered(name, 2)` … `numbered(name, MAX_NAME_NUMBER)`), and
+/// beside it (`numbered(name, 1)` … `numbered(name, MAX_NAME_NUMBER)`), and
 /// return the path written. Nothing that exists is ever replaced: the final
 /// step is a rename that refuses an existing name (`persist_noclobber`), so a
 /// file or folder that appears at the name at any moment before it is kept,
@@ -146,7 +147,8 @@ fn write_new_with(
     temp.as_file().sync_all()?;
 
     let mut candidate = dest.to_path_buf();
-    let mut number = 1;
+    // 0 is the name itself; the first clash gets 1.
+    let mut number = 0;
     loop {
         before_persist(&candidate);
         match temp.persist_noclobber(&candidate) {
@@ -164,10 +166,10 @@ fn write_new_with(
     }
 }
 
-/// `name` with `-<n>` before its last extension (`logo.png` → `logo-2.png`,
-/// `a.tar.gz` → `a.tar-2.gz`), or at the end of a name without one
-/// (`README` → `README-2`, `.png` → `.png-2`). Built from the `OsStr`
-/// pieces, so a name that is not valid UTF-8 keeps its bytes.
+/// `name` with `-<n>` before its last extension (`logo.png` → `logo-1.png`,
+/// `a.tar.gz` → `a.tar-1.gz`), or at the end of a name without one
+/// (`README` → `README-1`, `.png` → `.png-1`). Callers start at 1. Built from
+/// the `OsStr` pieces, so a name that is not valid UTF-8 keeps its bytes.
 pub(crate) fn numbered(name: &OsStr, n: u32) -> OsString {
     let path = Path::new(name);
     let mut out = OsString::from(path.file_stem().unwrap_or(name));
@@ -391,17 +393,72 @@ mod tests {
     }
 
     #[test]
-    fn readme_clashes_to_readme_2() {
+    fn a_first_clash_gets_minus_one() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("logo.png"), b"taken").unwrap();
+
+        let written = write_new(&tmp.path().join("logo.png"), b"new", perms(tmp.path())).unwrap();
+
+        assert_eq!(written, tmp.path().join("logo-1.png"));
+        assert_eq!(fs::read(&written).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_second_clash_gets_minus_two() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["logo.png", "logo-1.png"] {
+            fs::write(tmp.path().join(name), b"taken").unwrap();
+        }
+
+        let written = write_new(&tmp.path().join("logo.png"), b"new", perms(tmp.path())).unwrap();
+
+        assert_eq!(written, tmp.path().join("logo-2.png"));
+        assert_eq!(
+            listing(tmp.path()),
+            ["logo-1.png", "logo-2.png", "logo.png"]
+        );
+    }
+
+    #[test]
+    fn minus_two_is_not_used_while_minus_one_is_free() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["logo.png", "logo-2.png"] {
+            fs::write(tmp.path().join(name), b"taken").unwrap();
+        }
+
+        let written = write_new(&tmp.path().join("logo.png"), b"new", perms(tmp.path())).unwrap();
+
+        assert_eq!(written, tmp.path().join("logo-1.png"));
+        assert_eq!(fs::read(tmp.path().join("logo-2.png")).unwrap(), b"taken");
+    }
+
+    #[test]
+    fn no_name_ends_in_minus_zero() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("logo.png"), b"taken").unwrap();
+        for _ in 0..3 {
+            write_new(&tmp.path().join("logo.png"), b"new", perms(tmp.path())).unwrap();
+        }
+
+        assert_eq!(
+            listing(tmp.path()),
+            ["logo-1.png", "logo-2.png", "logo-3.png", "logo.png"]
+        );
+        assert!(!tmp.path().join("logo-0.png").exists());
+    }
+
+    #[test]
+    fn readme_clashes_to_readme_1() {
         let tmp = TempDir::new().unwrap();
         let dest = tmp.path().join("README");
         fs::write(&dest, b"existing").unwrap();
 
         let written = write_new(&dest, b"new", perms(tmp.path())).unwrap();
 
-        assert_eq!(written, tmp.path().join("README-2"));
+        assert_eq!(written, tmp.path().join("README-1"));
         assert_eq!(fs::read(&dest).unwrap(), b"existing");
         assert_eq!(fs::read(&written).unwrap(), b"new");
-        assert_eq!(listing(tmp.path()), ["README", "README-2"]);
+        assert_eq!(listing(tmp.path()), ["README", "README-1"]);
     }
 
     #[test]
@@ -439,11 +496,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(written, tmp.path().join("logo-2.png"));
+        assert_eq!(written, tmp.path().join("logo-1.png"));
         assert_eq!(fs::read(&dest).unwrap(), b"appeared");
         assert_eq!(fs::read(&written).unwrap(), b"new");
         assert_eq!(seen, [dest, written]);
-        assert_eq!(listing(tmp.path()), ["logo-2.png", "logo.png"]);
+        assert_eq!(listing(tmp.path()), ["logo-1.png", "logo.png"]);
     }
 
     #[test]
@@ -470,7 +527,7 @@ mod tests {
     #[test]
     fn numbering_stops_after_max_name_number_with_the_reason() {
         let tmp = TempDir::new().unwrap();
-        for name in ["README", "README-2", "README-3"] {
+        for name in ["README", "README-1", "README-2", "README-3"] {
             fs::write(tmp.path().join(name), name).unwrap();
         }
         let mut seen = Vec::new();
@@ -486,9 +543,12 @@ mod tests {
 
         assert_eq!(error.to_string(), "no free name in the output folder");
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(seen, ["README", "README-2", "README-3"]);
-        assert_eq!(listing(tmp.path()), ["README", "README-2", "README-3"]);
-        for name in ["README", "README-2", "README-3"] {
+        assert_eq!(seen, ["README", "README-1", "README-2", "README-3"]);
+        assert_eq!(
+            listing(tmp.path()),
+            ["README", "README-1", "README-2", "README-3"]
+        );
+        for name in ["README", "README-1", "README-2", "README-3"] {
             assert_eq!(fs::read(tmp.path().join(name)).unwrap(), name.as_bytes());
         }
     }
@@ -496,7 +556,7 @@ mod tests {
     #[test]
     fn a_free_name_below_the_bound_is_used() {
         let tmp = TempDir::new().unwrap();
-        for name in ["README", "README-2"] {
+        for name in ["README", "README-1", "README-2"] {
             fs::write(tmp.path().join(name), name).unwrap();
         }
 
@@ -512,7 +572,10 @@ mod tests {
         assert_eq!(written, tmp.path().join("README-3"));
         assert_eq!(fs::read(&written).unwrap(), b"new");
         assert_eq!(temp_files(tmp.path()), Vec::<OsString>::new());
-        assert_eq!(listing(tmp.path()), ["README", "README-2", "README-3"]);
+        assert_eq!(
+            listing(tmp.path()),
+            ["README", "README-1", "README-2", "README-3"]
+        );
     }
 
     #[test]
@@ -523,7 +586,7 @@ mod tests {
 
         let written = write_new(&dest, b"new", perms(tmp.path())).unwrap();
 
-        assert_eq!(written, tmp.path().join("logo-2.png"));
+        assert_eq!(written, tmp.path().join("logo-1.png"));
         assert!(dest.is_dir());
         assert_eq!(fs::read(&written).unwrap(), b"new");
     }
@@ -538,7 +601,7 @@ mod tests {
 
         let written = write_new(&dest, b"new", perms(tmp.path())).unwrap();
 
-        assert_eq!(written, tmp.path().join("logo-2.png"));
+        assert_eq!(written, tmp.path().join("logo-1.png"));
         assert!(!target.exists());
         assert!(
             fs::symlink_metadata(&dest)
@@ -552,7 +615,7 @@ mod tests {
     #[test]
     fn a_name_too_long_to_number_fails_and_leaves_no_temp_file() {
         // 250 + ".png" is 254 bytes, within the usual 255-byte name limit;
-        // with "-2" it is 256, and the rename fails with another error.
+        // with "-1" it is 256, and the rename fails with another error.
         let tmp = TempDir::new().unwrap();
         let name = format!("{}.png", "a".repeat(250));
         let dest = tmp.path().join(&name);

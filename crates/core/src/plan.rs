@@ -107,7 +107,7 @@ pub fn plan_folder(dir: &Path) -> Vec<Job> {
 
 /// [`plan_files`], or, with `Some(out)`, a run into the output folder `out`:
 /// every file (also those of a directory among the inputs) goes to
-/// `out/<original name>`. That name gets a number (`logo-2.png`, see
+/// `out/<original name>`. That name gets a number (`logo-1.png`, see
 /// `atomic::numbered`) when it clashes with an entry already in `out` or with
 /// an earlier job's destination in this plan. Names clash case-insensitively
 /// on every platform: they are compared after full Unicode lowercasing of
@@ -216,7 +216,7 @@ impl OutputFolder {
         if is_free(name) {
             return name.to_owned();
         }
-        (2..=MAX_NAME_NUMBER)
+        (1..=MAX_NAME_NUMBER)
             .map(|n| numbered(name, n))
             .find(|candidate| is_free(candidate))
             .unwrap_or_else(|| name.to_owned())
