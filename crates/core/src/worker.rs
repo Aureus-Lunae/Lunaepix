@@ -157,9 +157,19 @@ fn on_worker_stack<T: Send + 'static>(
     name: &str,
     job: impl FnOnce() -> T + Send + 'static,
 ) -> io::Result<thread::Result<T>> {
+    on_stack(name, WORKER_STACK_BYTES, job)
+}
+
+/// [`on_worker_stack`] with the stack size given: the thumbnail tests pass
+/// a size the OS refuses, so that the thread cannot start.
+fn on_stack<T: Send + 'static>(
+    name: &str,
+    stack_bytes: usize,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> io::Result<thread::Result<T>> {
     thread::Builder::new()
         .name(name.to_owned())
-        .stack_size(WORKER_STACK_BYTES)
+        .stack_size(stack_bytes)
         .spawn(job)
         .map(thread::JoinHandle::join)
 }
@@ -284,13 +294,28 @@ pub(crate) fn serve_thumb_with<F>(
 where
     F: FnOnce(&Path) -> Result<Thumbnail, CannotShow> + Send + 'static,
 {
+    serve_thumb_on_stack(args, make, out, WORKER_STACK_BYTES)
+}
+
+/// [`serve_thumb_with`] with the stack size of the thumbnail thread given,
+/// which production sets to [`WORKER_STACK_BYTES`]: a test passes a size the
+/// OS refuses to reach the exit code of a thread that cannot start.
+pub(crate) fn serve_thumb_on_stack<F>(
+    args: impl IntoIterator<Item = OsString>,
+    make: F,
+    out: &mut dyn Write,
+    stack_bytes: usize,
+) -> ExitCode
+where
+    F: FnOnce(&Path) -> Result<Thumbnail, CannotShow> + Send + 'static,
+{
     let Ok([src]) = <[OsString; 1]>::try_from(args.into_iter().collect::<Vec<_>>()) else {
         eprintln!("usage: <program> {THUMB_FLAG} <source>");
         return ExitCode::from(EXIT_USAGE);
     };
     let src = PathBuf::from(src);
 
-    let thumbnail = match on_worker_stack("thumbnail", move || make(&src)) {
+    let thumbnail = match on_stack("thumbnail", stack_bytes, move || make(&src)) {
         Ok(Ok(result)) => result,
         // The panic hook has already written the message to stderr.
         Ok(Err(_panic)) => return ExitCode::from(EXIT_PANICKED),
@@ -1186,6 +1211,40 @@ mod tests {
         );
         assert_eq!(code, ExitCode::from(EXIT_FAILED));
         assert_ne!(code, ExitCode::from(3));
+    }
+
+    /// `usize::MAX` is a stack size Linux refuses (`EINVAL`), so the thread
+    /// cannot start; this is checked to give an `Err`, not a panic.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn thumb_exits_1_not_3_and_writes_nothing_when_its_thread_cannot_start() {
+        let calls = Arc::new(Mutex::new(0));
+        let recorder = Arc::clone(&calls);
+        let mut out = Vec::new();
+        let code = serve_thumb_on_stack(
+            one_source(),
+            move |_: &Path| {
+                *recorder.lock().unwrap() += 1;
+                Ok(Thumbnail::Png(png_thumb()))
+            },
+            &mut out,
+            usize::MAX,
+        );
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+        assert_ne!(code, ExitCode::from(3));
+        assert!(out.is_empty(), "{:?}", String::from_utf8_lossy(&out));
+        assert_eq!(*calls.lock().unwrap(), 0, "the thumbnailer must not run");
+
+        // The pair: the same call on the normal stack answers.
+        let mut out = Vec::new();
+        let code = serve_thumb_on_stack(
+            one_source(),
+            |_: &Path| Ok(Thumbnail::Png(png_thumb())),
+            &mut out,
+            WORKER_STACK_BYTES,
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(out.starts_with(b"lunaepix-thumb 1 png\n"));
     }
 
     #[test]
