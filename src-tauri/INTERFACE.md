@@ -35,6 +35,7 @@ takes an argument.
 |---|---|---|---|
 | `choose_files` | none | Opens a native multi-file dialog (PNG, JPG, SVG, WebP; "All files" as a second filter). The files picked are added to the list. Resolves as soon as the dialog is open; the outcome arrives as events. | `"busy"` |
 | `clear_list` | none | Empties the list. | `"busy"` |
+| `readd_list` | none | After a run, puts the files that were in the list back: sends `list-changed` with the list as it was added, planned again now. It adds nothing and removes nothing; it only ends the "run has finished" state, so the next add appends. | `"busy"` |
 | `choose_output_folder` | none | Opens a native folder dialog; the folder picked becomes the output folder. Resolves as soon as the dialog is open. | `"busy"` |
 | `clear_output_folder` | none | Back to "next to the originals". | `"busy"` |
 | `start_run` | `{ "settings": { "mode": "lossy", "quality": 75 } }` | Runs the list with these settings and the output setting. It writes next to the originals or into the chosen folder, and never replaces an existing output: a taken name gets a number before the extension, from `-1` (`optimized-a-1.png`). Resolves once the run has started; its progress arrives as events. | `"busy"`, `"invalid-settings"`, `"empty-list"`, `"output-missing"` |
@@ -79,8 +80,16 @@ JPG, SVG and WebP files directly inside it (not its subfolders), earlier
 `run-busy`.
 
 A file is listed once, however often it is added. The first add after a
-run has finished starts a fresh list: only the new files are in it. Until
-then, adds go to the end of the list.
+run has finished starts a fresh list: only the new files are in it, unless
+`readd_list` was called after the run. Until then, and after a `readd_list`,
+adds go to the end of the list.
+
+`readd_list` gives back the paths that were added, not the outputs the run
+wrote beside them (`optimized-*`): dropping the folder again after a run does
+list those too, a re-add does not. The list is planned again at that moment,
+so a file deleted since the run is a skipped row ("Not a readable file"), as
+in `start_run`. Called with an empty list, it sends an empty list. The
+window's settings (mode, quality) and the output folder are not touched.
 
 ## Events
 
@@ -94,8 +103,8 @@ and `file-done` gained fields.
 
 ### `list-changed`
 
-Sent after every add and every Clear, and at the start of a fresh list: the
-full list each time, in display order.
+Sent after every add, every Clear and every `readd_list`, and at the start of
+a fresh list: the full list each time, in display order.
 
 - `name`: the file name alone, never a path.
 - `size`: in bytes, or `null` for a skipped row.
@@ -254,8 +263,8 @@ its `list-changed`.
   `tauri://drag-enter`, `tauri://drag-over` or `tauri://drag-drop`: Tauri
   puts the dropped paths in them, and they reach the page only when a
   listener asks for them. `drag-state` is the replacement.
-- **Permissions:** the six commands (`allow-choose-files`,
-  `allow-clear-list`, `allow-choose-output-folder`,
+- **Permissions:** the seven commands (`allow-choose-files`,
+  `allow-clear-list`, `allow-readd-list`, `allow-choose-output-folder`,
   `allow-clear-output-folder`, `allow-start-run`,
   `allow-open-output-folder`), `core:event:allow-listen` and
   `core:event:allow-unlisten`, nothing more (`capabilities/default.json`; a

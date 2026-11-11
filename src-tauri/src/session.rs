@@ -85,7 +85,8 @@ pub struct FileList {
     entries: Vec<PathBuf>,
     /// Canonical paths of the entries, so that a file is listed once.
     seen: HashSet<PathBuf>,
-    /// A run over this list has finished: the next add starts a fresh list.
+    /// A run over this list has finished: the next add starts a fresh list,
+    /// unless [`FileList::readd`] was called first.
     finished: bool,
 }
 
@@ -181,9 +182,18 @@ impl FileList {
         has_optimize(&self.rows(out))
     }
 
-    /// A run over the list has ended: the next add first empties the list.
+    /// A run over the list has ended: the next add first empties the list,
+    /// unless [`FileList::readd`] is called first.
     pub fn mark_finished(&mut self) {
         self.finished = true;
+    }
+
+    /// Bring the list back after a run: the entries and the canonical paths
+    /// stay as they were, and the next add appends instead of starting a
+    /// fresh list. What was added stays what is listed, so the outputs a run
+    /// wrote beside the originals are not in it.
+    pub fn readd(&mut self) {
+        self.finished = false;
     }
 }
 
@@ -385,6 +395,18 @@ impl Session {
     pub fn clear_list(&self, emit: &mut impl FnMut(Event)) -> Result<(), CommandError> {
         let ticket = claim_run(&self.guard, emit)?;
         lock(&self.list).clear();
+        emit(self.list_changed(None));
+        drop(ticket);
+        Ok(())
+    }
+
+    /// `readd_list`: the list as it was added, after a run, so another run
+    /// can start on the same files. The list is planned again now, so a file
+    /// deleted since is a skipped row. Busy as `clear_list` is; the next add
+    /// appends to the list instead of starting a fresh one.
+    pub fn readd_list(&self, emit: &mut impl FnMut(Event)) -> Result<(), CommandError> {
+        let ticket = claim_run(&self.guard, emit)?;
+        lock(&self.list).readd();
         emit(self.list_changed(None));
         drop(ticket);
         Ok(())
@@ -2700,6 +2722,404 @@ mod tests {
         );
         assert!(session.guard.try_start().is_some());
         refused(&session, &window, &lossless(), CommandError::EmptyList);
+    }
+
+    // --- Re-add: `readd_list` -------------------------------------------------
+
+    /// The file names of the list as it is planned now, next to the originals.
+    fn listed_names(list: &FileList) -> Vec<String> {
+        sources(&list.rows(None))
+            .iter()
+            .map(|path| file_name_of(path))
+            .collect()
+    }
+
+    /// `readd_list` that must be accepted.
+    fn readd(session: &Session, window: &Window) {
+        assert_eq!(session.readd_list(&mut window.emit()), Ok(()));
+    }
+
+    /// A lossless run over the whole list with the fake runner: the jobs it got.
+    fn run_the_list(session: &Session, window: &Window) -> Vec<Job> {
+        let prepared = started(session, window, &lossless());
+        run_fake(session, window, prepared)
+    }
+
+    #[test]
+    fn readd_clears_the_finished_mark_so_the_next_add_appends() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png")]);
+        let mut list = FileList::new();
+        list.add(&paths[..1]);
+        list.mark_finished();
+        list.readd();
+        list.add(&paths[1..]);
+        assert_eq!(listed_names(&list), ["a.png", "b.png"]);
+    }
+
+    #[test]
+    fn without_readd_a_finished_list_starts_afresh_on_the_next_add() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png")]);
+        let mut list = FileList::new();
+        list.add(&paths[..1]);
+        list.mark_finished();
+        list.add(&paths[1..]);
+        assert_eq!(listed_names(&list), ["b.png"]);
+    }
+
+    #[test]
+    fn a_readd_keeps_the_seen_set_so_a_file_is_listed_once() {
+        let (dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png"), ("c.png", b"png")]);
+        let mut list = FileList::new();
+        list.add(&paths[..2]);
+        list.mark_finished();
+        list.readd();
+        // `a.png` again, through another spelling, beside a new file.
+        let alias = dir.path().join(".").join("a.png");
+        list.add(&[alias, paths[2].clone()]);
+        assert_eq!(listed_names(&list), ["a.png", "b.png", "c.png"]);
+    }
+
+    #[test]
+    fn a_cleared_list_forgets_the_seen_set() {
+        let (_dir, paths) = files(&[("a.png", b"png")]);
+        let mut list = FileList::new();
+        list.add(&paths);
+        list.clear();
+        assert_eq!(listed_names(&list), Vec::<String>::new());
+        list.add(&paths);
+        assert_eq!(listed_names(&list), ["a.png"]);
+    }
+
+    #[test]
+    fn readd_after_a_run_brings_back_the_same_rows_in_order() {
+        let (_dir, paths) = files(&[("b.png", b"png"), ("a.png", b"png"), ("c.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths);
+        run_the_list(&session, &window);
+        window.take();
+        readd(&session, &window);
+        let events = window.take();
+        // The list in the order it was added, and nothing else is sent.
+        assert_eq!(events.len(), 1);
+        assert_eq!(row_names(last_list(&events)), ["b.png", "a.png", "c.png"]);
+        assert_eq!(last_list(&events).notice, None);
+    }
+
+    #[test]
+    fn without_readd_the_first_add_after_a_run_starts_a_new_list() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png"), ("c.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths[..2]);
+        run_the_list(&session, &window);
+        window.take();
+        pick(&session, &window, &paths[2..]);
+        assert_eq!(row_names(last_list(&window.take())), ["c.png"]);
+    }
+
+    #[test]
+    fn adds_after_a_readd_append() {
+        let (_dir, paths) = files(&[
+            ("a.png", b"png"),
+            ("b.png", b"png"),
+            ("c.png", b"png"),
+            ("d.png", b"png"),
+        ]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths[..2]);
+        run_the_list(&session, &window);
+        readd(&session, &window);
+        window.take();
+        pick(&session, &window, &paths[2..3]);
+        assert_eq!(
+            row_names(last_list(&window.take())),
+            ["a.png", "b.png", "c.png"]
+        );
+        // And the next one appends as well.
+        pick(&session, &window, &paths[3..]);
+        assert_eq!(
+            row_names(last_list(&window.take())),
+            ["a.png", "b.png", "c.png", "d.png"]
+        );
+    }
+
+    /// The file a fake run "wrote" for the first job, an optimise job.
+    fn write_the_output(jobs: &[Job]) -> PathBuf {
+        let Some(Job::Optimize { dest, .. }) = jobs.first() else {
+            panic!("the run has an optimise job first");
+        };
+        fs::write(dest, b"optimised").unwrap();
+        dest.clone()
+    }
+
+    #[test]
+    fn readd_lists_the_added_paths_not_the_outputs() {
+        let (dir, _paths) = files(&[("a.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        drop_on(&session, &window, &[dir.path().to_path_buf()]);
+        let jobs = run_the_list(&session, &window);
+        // The run wrote its output next to the original.
+        let output = write_the_output(&jobs);
+        assert_eq!(output, dir.path().join("optimized-a.png"));
+        window.take();
+        readd(&session, &window);
+        assert_eq!(row_names(last_list(&window.take())), ["a.png"]);
+    }
+
+    #[test]
+    fn dropping_the_folder_again_lists_the_output_too() {
+        let (dir, _paths) = files(&[("a.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        drop_on(&session, &window, &[dir.path().to_path_buf()]);
+        let jobs = run_the_list(&session, &window);
+        write_the_output(&jobs);
+        window.take();
+        drop_on(&session, &window, &[dir.path().to_path_buf()]);
+        assert_eq!(
+            row_names(last_list(&window.take())),
+            ["a.png", "optimized-a.png"]
+        );
+    }
+
+    #[test]
+    fn readd_plans_the_rows_again() {
+        let (_dir, paths) = files(&[("a.png", b"aaaa"), ("b.png", b"bb"), ("c.png", b"ccccccc")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths);
+        run_the_list(&session, &window);
+        fs::remove_file(&paths[1]).unwrap();
+        window.take();
+        readd(&session, &window);
+        let events = window.take();
+        assert_eq!(
+            events.iter().map(value).collect::<Vec<_>>(),
+            [json!({ "files": [
+                { "name": "a.png", "size": 4, "skip": null },
+                { "name": "b.png", "size": null, "skip": "Not a readable file" },
+                { "name": "c.png", "size": 7, "skip": null }
+            ], "notice": null })]
+        );
+    }
+
+    #[test]
+    fn readd_while_busy_is_refused_and_tells_the_window() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths[..1]);
+        run_the_list(&session, &window);
+        window.take();
+
+        let ticket = session.guard.try_start().expect("the guard is free");
+        assert_eq!(
+            session.readd_list(&mut window.emit()),
+            Err(CommandError::Busy)
+        );
+        assert_eq!(window.take(), vec![Event::RunBusy]);
+        drop(ticket);
+
+        // The refusal changed nothing: the list is still finished, so an add
+        // starts a fresh list.
+        pick(&session, &window, &paths[1..]);
+        assert_eq!(row_names(last_list(&window.take())), ["b.png"]);
+    }
+
+    #[test]
+    fn readd_when_idle_resolves_and_sends_the_list() {
+        let (_dir, paths) = files(&[("a.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths);
+        run_the_list(&session, &window);
+        window.take();
+        assert_eq!(session.readd_list(&mut window.emit()), Ok(()));
+        let events = window.take();
+        assert!(!events.contains(&Event::RunBusy));
+        assert_eq!(
+            events.iter().map(Event::name).collect::<Vec<_>>(),
+            ["list-changed"]
+        );
+        assert!(session.guard.try_start().is_some(), "the guard is free");
+    }
+
+    #[test]
+    fn readd_of_an_empty_list_sends_an_empty_list() {
+        let session = Session::new();
+        let window = Window::default();
+        readd(&session, &window);
+        assert_eq!(
+            window.take().iter().map(value).collect::<Vec<_>>(),
+            [json!({ "files": [], "notice": null })]
+        );
+    }
+
+    #[test]
+    fn readd_of_an_all_skipped_list_brings_it_back() {
+        let (_dir, paths) = files(&[("a.txt", b"x"), ("b.txt", b"x")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths);
+        // Nothing to compress, so no run can start and finish on this list.
+        refused(&session, &window, &lossless(), CommandError::EmptyList);
+        window.take();
+        readd(&session, &window);
+        assert_eq!(
+            window.take().iter().map(value).collect::<Vec<_>>(),
+            [json!({ "files": [
+                { "name": "a.txt", "size": null, "skip": "Not a PNG, JPG, SVG or WebP file" },
+                { "name": "b.txt", "size": null, "skip": "Not a PNG, JPG, SVG or WebP file" }
+            ], "notice": null })]
+        );
+    }
+
+    #[test]
+    fn readd_after_every_file_was_deleted_brings_back_skipped_rows() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths);
+        run_the_list(&session, &window);
+        for path in &paths {
+            fs::remove_file(path).unwrap();
+        }
+        window.take();
+        readd(&session, &window);
+        assert_eq!(
+            window.take().iter().map(value).collect::<Vec<_>>(),
+            [json!({ "files": [
+                { "name": "a.png", "size": null, "skip": "Not a readable file" },
+                { "name": "b.png", "size": null, "skip": "Not a readable file" }
+            ], "notice": null })]
+        );
+    }
+
+    #[test]
+    fn readd_lists_an_entry_that_became_a_folder_as_one_skipped_row() {
+        let (dir, paths) = files(&[("a.png", b"png")]);
+        let later = dir.path().join("later");
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &[later.clone(), paths[0].clone()]);
+        // A path that does not exist is one "Not a readable file" row.
+        let events = window.take();
+        assert_eq!(row_names(last_list(&events)), ["later", "a.png"]);
+        assert_eq!(
+            last_list(&events).files[0].skip.as_deref(),
+            Some("Not a readable file")
+        );
+        run_the_list(&session, &window);
+        fs::create_dir(&later).unwrap();
+        fs::write(later.join("inside.png"), b"png").unwrap();
+        window.take();
+        readd(&session, &window);
+        let events = window.take();
+        let list = last_list(&events);
+        // Still one row: nothing inside the folder is listed.
+        assert_eq!(row_names(list), ["later", "a.png"]);
+        assert_eq!(list.files[0].skip.as_deref(), Some("Not a readable file"));
+        assert_eq!(list.files[1].skip, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readd_lists_an_entry_that_became_the_same_file_once() {
+        let (dir, paths) = files(&[("a.png", b"png")]);
+        let link = dir.path().join("link.png");
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &[paths[0].clone(), link.clone()]);
+        // Before the link exists, two rows.
+        assert_eq!(row_names(last_list(&window.take())), ["a.png", "link.png"]);
+        run_the_list(&session, &window);
+        std::os::unix::fs::symlink(&paths[0], &link).unwrap();
+        window.take();
+        readd(&session, &window);
+        assert_eq!(row_names(last_list(&window.take())), ["a.png"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readd_lists_a_file_whose_output_name_links_back_to_it_as_skipped() {
+        let (dir, paths) = files(&[("a.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &paths);
+        run_the_list(&session, &window);
+        // Without the link the re-added row is compressible.
+        readd(&session, &window);
+        assert_eq!(last_list(&window.take()).files[0].skip, None);
+        std::os::unix::fs::symlink(&paths[0], dir.path().join("optimized-a.png")).unwrap();
+        readd(&session, &window);
+        assert_eq!(
+            last_list(&window.take()).files[0].skip.as_deref(),
+            Some("Its output would overwrite the file itself")
+        );
+    }
+
+    #[test]
+    fn readd_lists_a_too_large_file_as_skipped() {
+        let (dir, paths) = files(&[("small.png", b"png")]);
+        let big = dir.path().join("big.png");
+        fs::File::create(&big)
+            .unwrap()
+            .set_len(lunaepix_core::MAX_FILE_BYTES + 1)
+            .unwrap();
+        let session = Session::new();
+        let window = Window::default();
+        pick(&session, &window, &[big, paths[0].clone()]);
+        run_the_list(&session, &window);
+        window.take();
+        readd(&session, &window);
+        assert_eq!(
+            window.take().iter().map(value).collect::<Vec<_>>(),
+            [json!({ "files": [
+                { "name": "big.png", "size": null, "skip": "File is too large" },
+                { "name": "small.png", "size": 3, "skip": null }
+            ], "notice": null })]
+        );
+    }
+
+    #[test]
+    fn readd_after_a_run_over_the_limit_keeps_the_limit_row() {
+        let dir = folder_with_pngs(MAX_RUN_FILES + 1, &[]);
+        let session = Session::new();
+        let window = Window::default();
+        drop_on(&session, &window, &[dir.path().to_path_buf()]);
+        run_the_list(&session, &window);
+        window.take();
+        readd(&session, &window);
+        let events = window.take();
+        let list = last_list(&events);
+        assert_eq!(list.files.len(), MAX_RUN_FILES + 1);
+        assert_eq!(
+            list.files.last(),
+            Some(&ListRow {
+                name: "(over the limit)".to_owned(),
+                size: None,
+                skip: Some("1 more file not optimised: over the 2000-file limit".to_owned()),
+            })
+        );
+
+        // A list of exactly the limit has no such row.
+        let exact = folder_with_pngs(MAX_RUN_FILES, &[]);
+        let session = Session::new();
+        drop_on(&session, &window, &[exact.path().to_path_buf()]);
+        run_the_list(&session, &window);
+        window.take();
+        readd(&session, &window);
+        let events = window.take();
+        assert_eq!(last_list(&events).files.len(), MAX_RUN_FILES);
+        assert!(
+            last_list(&events)
+                .files
+                .iter()
+                .all(|row| row.skip.is_none())
+        );
     }
 
     // --- fix round 1 ----------------------------------------------------------

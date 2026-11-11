@@ -172,3 +172,38 @@ export function markInvalid(input, error, invalid) {
   }
   error.hidden = !invalid;
 }
+
+/**
+ * The summary (with Re-add and Open folder) and the settings with the Run row
+ * take each other's place. `parts` holds `summary`, `settings`, `runRow`,
+ * `run` and `openFolder`. Whichever block comes up is shown first, so the
+ * fallback that catches the focus of the block that goes is visible when it
+ * is focused (a hidden element cannot take focus): back to ready, focus on
+ * Re-add or Open folder moves to Run; finished, focus on Run or in the
+ * settings moves to Open folder. Focus anywhere else stays.
+ */
+export function swapSummaryAndSettings(doc, parts, showSummary) {
+  if (showSummary) {
+    hideKeepingFocus(doc, parts.summary, false, parts.run);
+    hideKeepingFocus(doc, parts.settings, true, parts.openFolder);
+    hideKeepingFocus(doc, parts.runRow, true, parts.openFolder);
+  } else {
+    hideKeepingFocus(doc, parts.settings, false, parts.openFolder);
+    hideKeepingFocus(doc, parts.runRow, false, parts.openFolder);
+    hideKeepingFocus(doc, parts.summary, true, parts.run);
+  }
+}
+
+/**
+ * Sends `command` through `send` when `button` is clicked and `gate(state)`
+ * allows it. The gate is asked at the time of the click, with the state as it
+ * is then (`getState`), so a button that cannot be used right now (it stays
+ * focusable, with aria-disabled) does nothing when clicked.
+ */
+export function bindCommand(button, getState, gate, command, send) {
+  button.addEventListener('click', () => {
+    if (gate(getState())) {
+      send(command);
+    }
+  });
+}
