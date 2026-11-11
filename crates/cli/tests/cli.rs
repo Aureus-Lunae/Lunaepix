@@ -1056,3 +1056,63 @@ fn without_out_a_dir_rerun_replaces_the_earlier_output_in_optimized() {
     );
     assert_eq!(listing(&out_dir), names(&["a.png"]));
 }
+
+// --- the thumbnail mode (the runner's thumbnail worker is this binary) --------
+
+const THUMB_FLAG: &str = "--lunaepix-thumb";
+
+/// A 200 x 100 RGB gradient: scaled to 64 x 32 by the thumbnail mode.
+fn wide_png_bytes() -> Vec<u8> {
+    let (w, h) = (200u32, 100u32);
+    let pixels: Vec<u8> = (0..w * h)
+        .flat_map(|i| [(i % w) as u8, (i / w) as u8, 90])
+        .collect();
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, w, h);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&pixels).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+fn thumb(cwd: &Path, src: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_lunaepix"))
+        .arg(THUMB_FLAG)
+        .arg(src)
+        .current_dir(cwd)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn thumb_flag_answers_a_png_with_the_header_and_a_decodable_thumbnail() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &wide_png_bytes());
+
+    let output = thumb(tmp.path(), &src);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let header = b"lunaepix-thumb 1 png\n";
+    assert!(output.stdout.starts_with(header), "{:?}", output.stdout);
+    let mut reader = png::Decoder::new(&output.stdout[header.len()..])
+        .read_info()
+        .unwrap();
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut buffer).unwrap();
+    assert_eq!((frame.width, frame.height), (64, 32));
+    // Nothing was optimised or written next to the source.
+    assert_eq!(listing(tmp.path()), names(&["a.png"]));
+}
+
+#[test]
+fn thumb_flag_exits_3_for_a_text_file_and_prints_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "notes.txt", b"just some text");
+
+    let output = thumb(tmp.path(), &src);
+
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+}
