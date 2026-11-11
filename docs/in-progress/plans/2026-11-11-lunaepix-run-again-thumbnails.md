@@ -36,6 +36,7 @@ Copied verbatim from the spec's Handoff, plus the standing process rules and the
   - "Branch table covers choices": the failure-branch table also lists every if/else driven by a setting or option, each side with a named test.
   - "Add a cross-module row": the branch table gets one row for every core function the task newly calls, naming the branches inside it the new caller can reach.
   - "No 'glue' exemption": code that decides what is sent or shown is moved into a function a test can reach; only true pass-through calls may stay untested.
+- **During execution (user, 2026-11-11, after the Task 5 review found the second untested branch rated Important):** remedy "Controller gate (Recommended)": before each review the controller reads the failure-branch table, and any "untested" row on a branch that decides what the caller gets goes back to the implementer unless it names how a test could reach it and why that does not work. Task 5's fix: "Fix thumbnail only (Recommended)"; the optimiser's matching untested arm goes on the final review's list.
 
 Calls made while planning (not user decisions; flagged for the plan review):
 
