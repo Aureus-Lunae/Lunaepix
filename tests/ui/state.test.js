@@ -1437,3 +1437,64 @@ test('a_skip_reason_keeps_an_acronym_a_single_letter_and_a_digit_start', () => {
     assert.equal(rowView(row).text, `skipped: ${kept[index]}`);
   });
 });
+
+// ---------------------------------------------------------------------
+// Re-add: the button sits in the summary and `readd_list` brings the list
+// back as a `list-changed` (Task 2). These pin the state the button and the
+// reducer depend on.
+// ---------------------------------------------------------------------
+
+test('the_summary_with_readd_shows_only_when_finished', () => {
+  // "Re-add" is inside the summary, so it shows exactly when the summary does.
+  assert.equal(panelView(finishedRun()).showSummary, true);
+  assert.equal(canChoose(finishedRun()), true);
+  const others = [initialState(), readyList(), reduce(readyList(), started(3))];
+  for (const state of others) {
+    assert.equal(panelView(state).showSummary, false, state.phase);
+  }
+});
+
+test('settings_survive_a_readd', () => {
+  const lossyRun = apply(
+    initialState(),
+    threeFiles(),
+    setMode('lossy'),
+    setQuality('60'),
+    started(3, 'lossy', 60),
+    done(0, 'holiday.jpg'),
+    done(1, 'logo.png'),
+    done(2, 'banner.webp'),
+    finished(3, 10, true),
+  );
+  assert.equal(lossyRun.phase, 'finished');
+  const readded = reduce(lossyRun, threeFiles());
+  assert.equal(readded.phase, 'ready');
+  assert.equal(readded.mode, 'lossy');
+  assert.equal(readded.quality, 60);
+  assert.equal(readded.qualityText, '60');
+  assert.deepEqual(startRunArgs(readded), { settings: { mode: 'lossy', quality: 60 } });
+  assert.deepEqual(
+    readded.rows.map((row) => row.name),
+    ['holiday.jpg', 'logo.png', 'banner.webp'],
+  );
+  assert.equal(panelView(readded).showSummary, false);
+  assert.equal(panelView(readded).showSettings, true);
+});
+
+test('a_list_changed_during_a_run_changes_nothing', () => {
+  const running = reduce(readyList(), started(3, 'lossy', 60));
+  assert.equal(running.phase, 'running');
+  assert.equal(reduce(running, threeFiles()), running);
+});
+
+test('an_all_skipped_list_after_a_readd_is_ready_but_cannot_run', () => {
+  const finishedState = finishedRun();
+  const skippedOnly = reduce(finishedState, listed([entry('a.txt', null, SKIP), entry('b.txt', null, SKIP)]));
+  assert.equal(skippedOnly.phase, 'ready');
+  assert.equal(skippedOnly.rows.length, 2);
+  assert.equal(canRun(skippedOnly), false);
+  assert.equal(startRunArgs(skippedOnly), null);
+  // One compressible row among them can run.
+  const mixed = reduce(finishedState, listed([entry('a.txt', null, SKIP), entry('b.png')]));
+  assert.equal(canRun(mixed), true);
+});

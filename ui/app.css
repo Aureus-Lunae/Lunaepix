@@ -308,6 +308,14 @@ body {
   margin: 0;
 }
 
+/* Re-add and Open folder side by side on the right; at narrow widths they
+   wrap under the text together, not one by one. */
+.lunaepixSummary__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
 /* The settings: one row each for Compression, Quality and Save to, the
    label on the left. */
 

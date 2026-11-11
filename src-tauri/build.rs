@@ -5,6 +5,7 @@ fn main() {
     let manifest = tauri_build::AppManifest::new().commands(&[
         "choose_files",
         "clear_list",
+        "readd_list",
         "choose_output_folder",
         "clear_output_folder",
         "start_run",

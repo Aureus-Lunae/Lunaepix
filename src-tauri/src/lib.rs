@@ -1,4 +1,4 @@
-//! Thin Tauri shell over `lunaepix-core`: six commands, the window's drag
+//! Thin Tauri shell over `lunaepix-core`: seven commands, the window's drag
 //! and drop, and events back to the window. `INTERFACE.md` is the contract
 //! for the window; `session` holds what the commands do.
 //!
@@ -106,6 +106,13 @@ fn choose_files(app: AppHandle) -> Result<(), CommandError> {
 #[tauri::command]
 fn clear_list(app: AppHandle) -> Result<(), CommandError> {
     session(&app).clear_list(&mut |event| emit(&app, event))
+}
+
+/// Bring the list of the last run back, so it can run again with other
+/// settings. Sends the list as `list-changed`.
+#[tauri::command]
+fn readd_list(app: AppHandle) -> Result<(), CommandError> {
+    session(&app).readd_list(&mut |event| emit(&app, event))
 }
 
 /// Open a native folder dialog; the folder picked becomes the output folder.
@@ -276,6 +283,7 @@ pub fn run() -> ExitCode {
         .invoke_handler(tauri::generate_handler![
             choose_files,
             clear_list,
+            readd_list,
             choose_output_folder,
             clear_output_folder,
             start_run,

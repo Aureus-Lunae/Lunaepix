@@ -2,14 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  bindCommand,
   buildRow,
   hideKeepingFocus,
   markInvalid,
   setHeads,
+  swapSummaryAndSettings,
   syncNumber,
   syncRows,
   syncStatus,
 } from '../../ui/table.js';
+import { canChoose, canOpenFolder, initialState, reduce } from '../../ui/state.js';
 
 // A recording stand-in for `document`: it creates plain objects, records
 // every element it creates, and records any write that would put markup into
@@ -18,7 +21,10 @@ import {
 function fakeDocument() {
   const created = [];
   const markupWrites = [];
-  const doc = { created, markupWrites, activeElement: null };
+  // `strictFocus` makes `focus()` behave as a browser does: an element that is
+  // hidden, or sits under a hidden element, cannot take focus. A refused
+  // focus is recorded and leaves `activeElement` where it was.
+  const doc = { created, markupWrites, activeElement: null, strictFocus: false, refusedFocus: [] };
 
   class FakeElement {
     constructor(tagName) {
@@ -31,6 +37,7 @@ function fakeDocument() {
       this.hidden = false;
       this.parent = null;
       this.attributes = new Map();
+      this.listeners = [];
       this.valueText = '';
       this.valueWrites = 0;
       const classes = this.classes;
@@ -93,7 +100,28 @@ function fakeDocument() {
     }
 
     focus() {
+      if (doc.strictFocus) {
+        for (let current = this; current; current = current.parent) {
+          if (current.hidden) {
+            doc.refusedFocus.push(this);
+            return;
+          }
+        }
+      }
       doc.activeElement = this;
+    }
+
+    addEventListener(type, handler) {
+      this.listeners.push([type, handler]);
+    }
+
+    // What a click on the element runs: the handlers added for 'click'.
+    click() {
+      for (const [type, handler] of this.listeners) {
+        if (type === 'click') {
+          handler();
+        }
+      }
     }
 
     setAttribute(name, value) {
@@ -465,4 +493,184 @@ test('mark_invalid_false_clears_the_flag_and_the_tie', () => {
   assert.equal(input.getAttribute('aria-invalid'), 'false');
   assert.equal(input.getAttribute('aria-describedby'), null);
   assert.equal(error.hidden, true);
+});
+
+// swapSummaryAndSettings (R3): the summary and the settings + Run row take
+// each other's place, in an order that never focuses a hidden element.
+
+/**
+ * The panel as `index.html` builds it: the head's Clear, the summary (Re-add
+ * and Open folder), the settings (a radio) and the Run row (Run). `finished`
+ * says which of the two blocks shows. Focus is strict: a hidden target
+ * refuses it.
+ */
+function panelLayout(doc, finished) {
+  doc.strictFocus = true;
+  const make = (tag) => new doc.FakeElement(tag);
+  const parts = {
+    panel: make('section'),
+    clearList: make('button'),
+    summary: make('div'),
+    readdList: make('button'),
+    openFolder: make('button'),
+    settings: make('div'),
+    radio: make('input'),
+    runRow: make('div'),
+    run: make('button'),
+  };
+  parts.summary.append(parts.readdList, parts.openFolder);
+  parts.settings.append(parts.radio);
+  parts.runRow.append(parts.run);
+  parts.panel.append(parts.clearList, parts.summary, parts.settings, parts.runRow);
+  parts.summary.hidden = !finished;
+  parts.settings.hidden = finished;
+  parts.runRow.hidden = finished;
+  return parts;
+}
+
+test('focus_on_readd_moves_to_a_run_that_is_visible_at_that_moment', () => {
+  for (const focused of ['readdList', 'openFolder']) {
+    const doc = fakeDocument();
+    const parts = panelLayout(doc, true);
+    parts[focused].focus();
+    assert.equal(doc.activeElement, parts[focused]);
+    swapSummaryAndSettings(doc, parts, false);
+    // Run took the focus, and the double never refused it (it was visible).
+    assert.equal(doc.activeElement, parts.run, focused);
+    assert.deepEqual(doc.refusedFocus, [], focused);
+    assert.equal(parts.summary.hidden, true);
+    assert.equal(parts.settings.hidden, false);
+    assert.equal(parts.runRow.hidden, false);
+  }
+});
+
+test('the_old_order_loses_focus_on_a_strict_document', () => {
+  // The order before R3: the summary hides first, while Run is still hidden.
+  const doc = fakeDocument();
+  const parts = panelLayout(doc, true);
+  parts.readdList.focus();
+  hideKeepingFocus(doc, parts.summary, true, parts.run);
+  hideKeepingFocus(doc, parts.settings, false, parts.openFolder);
+  hideKeepingFocus(doc, parts.runRow, false, parts.openFolder);
+  // The double refused the hidden Run: focus is still on the hidden Re-add.
+  assert.deepEqual(doc.refusedFocus, [parts.run]);
+  assert.equal(doc.activeElement, parts.readdList);
+  assert.notEqual(doc.activeElement, parts.run);
+});
+
+test('focus_on_run_moves_to_open_folder_when_the_summary_shows', () => {
+  const doc = fakeDocument();
+  const parts = panelLayout(doc, false);
+  parts.run.focus();
+  swapSummaryAndSettings(doc, parts, true);
+  assert.equal(doc.activeElement, parts.openFolder);
+  assert.deepEqual(doc.refusedFocus, []);
+  assert.equal(parts.summary.hidden, false);
+  assert.equal(parts.settings.hidden, true);
+  assert.equal(parts.runRow.hidden, true);
+});
+
+test('focus_in_the_settings_moves_to_open_folder_when_the_summary_shows', () => {
+  const doc = fakeDocument();
+  const parts = panelLayout(doc, false);
+  parts.radio.focus();
+  swapSummaryAndSettings(doc, parts, true);
+  assert.equal(doc.activeElement, parts.openFolder);
+  assert.deepEqual(doc.refusedFocus, []);
+});
+
+test('focus_on_the_block_that_stays_does_not_move', () => {
+  // The summary stays: focus on its buttons stays.
+  const finishedDoc = fakeDocument();
+  const finishedParts = panelLayout(finishedDoc, true);
+  for (const kept of ['readdList', 'openFolder']) {
+    finishedParts[kept].focus();
+    swapSummaryAndSettings(finishedDoc, finishedParts, true);
+    assert.equal(finishedDoc.activeElement, finishedParts[kept], kept);
+  }
+  // The settings and Run stay: focus on Run and on the radio stays.
+  const readyDoc = fakeDocument();
+  const readyParts = panelLayout(readyDoc, false);
+  for (const kept of ['run', 'radio']) {
+    readyParts[kept].focus();
+    swapSummaryAndSettings(readyDoc, readyParts, false);
+    assert.equal(readyDoc.activeElement, readyParts[kept], kept);
+  }
+});
+
+test('focus_elsewhere_does_not_move_in_either_direction', () => {
+  const doc = fakeDocument();
+  const parts = panelLayout(doc, true);
+  parts.clearList.focus();
+  swapSummaryAndSettings(doc, parts, false);
+  assert.equal(doc.activeElement, parts.clearList);
+  swapSummaryAndSettings(doc, parts, true);
+  assert.equal(doc.activeElement, parts.clearList);
+  assert.deepEqual(doc.refusedFocus, []);
+  // And with focus nowhere at all.
+  const none = fakeDocument();
+  const noneParts = panelLayout(none, true);
+  swapSummaryAndSettings(none, noneParts, false);
+  assert.equal(none.activeElement, null);
+});
+
+// bindCommand: the click decision of every button
+
+const FILES = { type: 'list-changed', payload: { files: [{ name: 'a.png', size: 10, skip: null }], notice: null } };
+const RUN_STARTED = { type: 'run-started', payload: { total: 1, mode: 'lossless', quality: null } };
+const FILE_DONE = {
+  type: 'file-done',
+  payload: { index: 0, name: 'a.png', status: 'done', before: 10, after: 5, millis: 3 },
+};
+const RUN_FINISHED = { type: 'run-finished', payload: { optimised: 1, saved_bytes: 5, has_output: true } };
+const stateAfter = (...actions) => actions.reduce(reduce, initialState());
+
+test('a_click_on_a_bound_button_sends_its_command_when_the_gate_allows_it', () => {
+  const doc = fakeDocument();
+  const button = new doc.FakeElement('button');
+  let state = stateAfter(FILES, RUN_STARTED, FILE_DONE, RUN_FINISHED);
+  assert.equal(state.phase, 'finished');
+  const sent = [];
+  bindCommand(button, () => state, canChoose, 'readd_list', (command) => sent.push(command));
+  button.click();
+  assert.deepEqual(sent, ['readd_list']);
+  // The gate is asked at the time of the click, with the state at that time.
+  state = stateAfter(FILES);
+  button.click();
+  assert.deepEqual(sent, ['readd_list', 'readd_list']);
+});
+
+test('a_click_on_a_bound_button_sends_nothing_when_the_gate_refuses', () => {
+  const doc = fakeDocument();
+  const button = new doc.FakeElement('button');
+  let state = stateAfter(FILES, RUN_STARTED);
+  assert.equal(state.phase, 'running');
+  const sent = [];
+  bindCommand(button, () => state, canChoose, 'readd_list', (command) => sent.push(command));
+  button.click();
+  assert.deepEqual(sent, []);
+  // The same button sends as soon as the state allows it.
+  state = stateAfter(FILES, RUN_STARTED, FILE_DONE, RUN_FINISHED);
+  button.click();
+  assert.deepEqual(sent, ['readd_list']);
+  // Another gate: Open folder with no output written yet sends nothing.
+  const open = new doc.FakeElement('button');
+  bindCommand(open, () => stateAfter(FILES), canOpenFolder, 'open_output_folder', (command) => sent.push(command));
+  open.click();
+  assert.deepEqual(sent, ['readd_list']);
+});
+
+test('a_click_runs_only_the_handler_of_the_button_it_is_bound_to', () => {
+  const doc = fakeDocument();
+  const readdList = new doc.FakeElement('button');
+  const openFolder = new doc.FakeElement('button');
+  const state = stateAfter(FILES, RUN_STARTED, FILE_DONE, RUN_FINISHED);
+  const sent = [];
+  const send = (command) => sent.push(command);
+  bindCommand(readdList, () => state, canChoose, 'readd_list', send);
+  bindCommand(openFolder, () => state, canOpenFolder, 'open_output_folder', send);
+  openFolder.click();
+  assert.deepEqual(sent, ['open_output_folder']);
+  readdList.click();
+  assert.deepEqual(sent, ['open_output_folder', 'readd_list']);
 });
