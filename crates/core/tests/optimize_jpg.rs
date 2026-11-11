@@ -2,9 +2,13 @@
 //! here: nothing depends on `samples/`. The DCT-coefficient comparison needs
 //! libjpeg, so it lives with the other `unsafe` code in `src/jpg.rs`.
 
+mod common;
+
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use common::jpeg_fixtures::{ADOBE_CMYK, four_component_jpeg};
 
 use lunaepix_core::{
     Compression, Note, OptimizeError, Options, Outcome, Quality, WriteMode, optimize_file,
@@ -665,46 +669,9 @@ fn a_lossy_jpg_that_is_not_smaller_keeps_the_original_bytes_with_the_note() {
     assert_eq!(outcome.after, outcome.before);
 }
 
-/// A 16x16 CMYK baseline JPEG, put together by hand (the `image` crate
-/// cannot write CMYK): an Adobe APP14 marker with transform 0, four
-/// components at 1x1, and a scan in which every block is flat. Two
-/// one-code Huffman tables make each block two bits: DC difference 0, then
-/// end of block.
-fn cmyk_jpeg() -> Vec<u8> {
-    let mut bytes = vec![0xFF, 0xD8];
-    // APP14 "Adobe": version 100, flags 0 and 0, transform 0 (no transform).
-    bytes.extend_from_slice(&[0xFF, 0xEE, 0x00, 0x0E]);
-    bytes.extend_from_slice(b"Adobe");
-    bytes.extend_from_slice(&[0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    // DQT: table 0, 8-bit, all ones.
-    bytes.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
-    bytes.extend_from_slice(&[1; 64]);
-    // SOF0: precision 8, 16x16, four components (ids 1-4, 1x1, table 0).
-    bytes.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x14, 0x08, 0x00, 0x10, 0x00, 0x10, 0x04]);
-    for id in 1..=4 {
-        bytes.extend_from_slice(&[id, 0x11, 0x00]);
-    }
-    // DHT: DC table 0 and AC table 0, each one code of one bit for symbol 0.
-    for class in [0x00, 0x10] {
-        bytes.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x14, class, 1]);
-        bytes.extend_from_slice(&[0; 15]);
-        bytes.push(0);
-    }
-    // SOS: four components, tables 0/0, full spectrum.
-    bytes.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x0E, 0x04]);
-    for id in 1..=4 {
-        bytes.extend_from_slice(&[id, 0x00]);
-    }
-    bytes.extend_from_slice(&[0x00, 0x3F, 0x00]);
-    // Four MCUs of four blocks, two zero bits per block.
-    bytes.extend_from_slice(&[0x00; 4]);
-    bytes.extend_from_slice(&[0xFF, 0xD9]);
-    bytes
-}
-
 #[test]
 fn a_cmyk_jpg_in_a_lossy_run_gets_the_lossless_output_with_the_note() {
-    let original = cmyk_jpeg();
+    let original = four_component_jpeg(ADOBE_CMYK);
     // The fixture says what the test relies on: four components.
     let (_, sof) = segments(&original)
         .into_iter()

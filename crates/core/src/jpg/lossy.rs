@@ -23,14 +23,12 @@ use std::slice;
 use mozjpeg_sys::{
     J_COLOR_SPACE, JCP_MAX_COMPRESSION, JINT_COMPRESS_PROFILE, jpeg_c_set_int_param,
     jpeg_decompress_struct, jpeg_finish_compress, jpeg_finish_decompress, jpeg_mem_src,
-    jpeg_read_header, jpeg_read_scanlines, jpeg_save_markers, jpeg_set_defaults, jpeg_set_quality,
-    jpeg_start_compress, jpeg_start_decompress, jpeg_write_marker, jpeg_write_scanlines,
+    jpeg_read_header, jpeg_save_markers, jpeg_set_defaults, jpeg_set_quality, jpeg_start_compress,
+    jpeg_start_decompress, jpeg_write_marker, jpeg_write_scanlines,
 };
 
-use super::{Compress, Decompress, check_start, fail, run_libjpeg, source_len};
-use crate::lossy::{
-    Lossy, Note, Quality, Shape, check_shape, finish, kept_lossless, reserve_pixels,
-};
+use super::{Compress, Decompress, check_start, fail, read_scanlines, run_libjpeg, source_len};
+use crate::lossy::{Lossy, Note, Quality, Shape, check_shape, finish, kept_lossless};
 
 /// The first APPn marker code; APP15 is `APP0 + 15`.
 const APP0: u8 = 0xE0;
@@ -197,25 +195,12 @@ unsafe fn read_pixels(bytes: &[u8], len: c_ulong) -> Source {
             y: source.Y_density,
         };
         jpeg_start_decompress(source);
-        let width = source.output_width;
-        let height = source.output_height;
         // At most 100 megapixels of 3 bytes (`check_pixels` above).
-        let row = width as usize * colour.components();
-        let mut pixels =
-            reserve_pixels(row * height as usize).unwrap_or_else(|message| fail(message));
-        while source.output_scanline < height {
-            let at = source.output_scanline as usize * row;
-            let mut rows = [pixels[at..at + row].as_mut_ptr()];
-            // A memory source never suspends, so libjpeg returns 0 rows only
-            // in a state it has already reported; refuse to loop forever.
-            if jpeg_read_scanlines(source, rows.as_mut_ptr(), 1) == 0 {
-                fail("could not read the JPEG data: libjpeg returned no rows".to_owned());
-            }
-        }
+        let pixels = read_scanlines(source, colour.components());
         jpeg_finish_decompress(source);
         Source::Pixels(Decoded {
-            width,
-            height,
+            width: source.output_width,
+            height: source.output_height,
             colour,
             pixels,
             markers,
@@ -311,8 +296,9 @@ unsafe fn write_jpeg(decoded: &Decoded, quality: Quality) -> Vec<u8> {
     compress.into_output()
 }
 
-/// The size in the header of a lossy result.
-fn read_shape(bytes: &[u8]) -> Result<Shape, String> {
+/// The size in a JPEG's header, read by libjpeg without decoding the image:
+/// a lossy result's, and a thumbnail source's ([`super::check_header`]).
+pub(super) fn read_shape(bytes: &[u8]) -> Result<Shape, String> {
     let len = source_len(bytes)?;
     run_libjpeg(|| {
         let mut decompress = Decompress::new();
