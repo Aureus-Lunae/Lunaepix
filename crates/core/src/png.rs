@@ -4,7 +4,16 @@ use crate::plan::{MAX_PIXELS, check_pixels};
 
 mod lossy;
 
-pub(crate) use lossy::optimize_lossy;
+pub(crate) use lossy::{decode_rgba, optimize_lossy};
+
+/// Refuse bytes that are not PNG data, and check the chunk order and the
+/// declared size ([`check_chunks`]), without decoding anything.
+pub(crate) fn check_header(bytes: &[u8]) -> Result<(), String> {
+    if !bytes.starts_with(&SIGNATURE) {
+        return Err("not a PNG file (the content is not PNG data)".to_owned());
+    }
+    check_chunks(bytes).map(drop)
+}
 
 /// The eight bytes every PNG file starts with.
 const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
@@ -39,10 +48,7 @@ const MAX_DECOMPRESSED_BYTES: usize = 10 * MAX_PIXELS as usize;
 /// The error is a message for the user: the content is not a PNG, the image
 /// is too large, or oxipng could not decode it (truncated or corrupt data).
 pub(crate) fn optimize(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    if !bytes.starts_with(&SIGNATURE) {
-        return Err("not a PNG file (the content is not PNG data)".to_owned());
-    }
-    check_chunks(bytes)?;
+    check_header(bytes)?;
     run_oxipng(bytes)
 }
 

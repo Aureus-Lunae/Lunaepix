@@ -45,10 +45,10 @@ const MAX_COLOURS: usize = 256;
 
 /// A source decoded to 8-bit RGBA, four bytes per pixel, row by row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Rgba {
-    width: u32,
-    height: u32,
-    pixels: Vec<u8>,
+pub(crate) struct Rgba {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pixels: Vec<u8>,
 }
 
 /// A palette of RGBA entries and one palette index per pixel, row by row.
@@ -228,8 +228,18 @@ fn check_with_oxipng(bytes: &[u8]) -> Result<(), String> {
 /// second tRNS chunk, where oxipng keeps the last). Its reason says so: "could
 /// not decode the PNG for lossy: …".
 fn decode(bytes: &[u8]) -> Result<Rgba, String> {
-    let unreadable =
-        |error: ::png::DecodingError| format!("could not decode the PNG for lossy: {error}");
+    decode_rgba(bytes, "could not decode the PNG for lossy")
+}
+
+/// Decode the image of a PNG to 8-bit RGBA: palette and `tRNS` expanded,
+/// greyscale expanded to RGB, 16-bit samples reduced to 8. For an animated
+/// PNG that is its default image (the `IDAT` one), the first the decoder
+/// gives. A decoder error's reason starts with `context`.
+///
+/// The caller checks the pixel count from IHDR first ([`super::check_chunks`]).
+/// The lossy path and thumbnails share it.
+pub(crate) fn decode_rgba(bytes: &[u8], context: &str) -> Result<Rgba, String> {
+    let unreadable = |error: ::png::DecodingError| format!("{context}: {error}");
     // The pixel count is already checked from IHDR. The limit covers the
     // decoder's own buffers, of which a row is the largest: at most
     // 8 bytes per pixel of the widest image within MAX_PIXELS.

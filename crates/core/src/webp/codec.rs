@@ -6,7 +6,10 @@
 //! and everything libwebp allocates is released by a guard on every path,
 //! the error paths included: [`LibWebpBuffer`] and [`LibWebpData`] for
 //! encoded bytes, [`AnimDecoder`] and [`AnimEncoder`] for the animation
-//! decoder and encoder, [`Picture`] for a frame handed to the encoder.
+//! decoder and encoder, [`Picture`] for a frame handed to the encoder. The
+//! scaled decode ([`decode_scaled`]) decodes into a buffer of our own and
+//! calls `WebPFreeDecBuffer` straight after `WebPDecode`, with no path in
+//! between.
 
 use std::ffi::CStr;
 use std::marker::PhantomData;
@@ -15,15 +18,16 @@ use std::os::raw::c_int;
 use std::{ptr, slice};
 
 use libwebp_sys::{
-    WEBP_CSP_MODE, WEBP_DEMUX_ABI_VERSION, WEBP_ENCODER_ABI_VERSION, WEBP_MUX_ABI_VERSION,
-    WebPAnimDecoder, WebPAnimDecoderDelete, WebPAnimDecoderGetInfo, WebPAnimDecoderGetNext,
-    WebPAnimDecoderHasMoreFrames, WebPAnimDecoderNewInternal, WebPAnimDecoderOptions,
-    WebPAnimDecoderOptionsInitInternal, WebPAnimEncoder, WebPAnimEncoderAdd,
-    WebPAnimEncoderAssemble, WebPAnimEncoderDelete, WebPAnimEncoderGetError,
-    WebPAnimEncoderNewInternal, WebPAnimEncoderOptions, WebPAnimEncoderOptionsInitInternal,
-    WebPAnimInfo, WebPConfig, WebPConfigInitInternal, WebPData, WebPDecodeRGBAInto, WebPEncodeRGBA,
-    WebPFree, WebPGetInfo, WebPMuxAnimParams, WebPPicture, WebPPictureFree, WebPPictureImportRGBA,
-    WebPPictureInitInternal, WebPPreset, WebPValidateConfig,
+    VP8StatusCode, WEBP_CSP_MODE, WEBP_DECODER_ABI_VERSION, WEBP_DEMUX_ABI_VERSION,
+    WEBP_ENCODER_ABI_VERSION, WEBP_MUX_ABI_VERSION, WebPAnimDecoder, WebPAnimDecoderDelete,
+    WebPAnimDecoderGetInfo, WebPAnimDecoderGetNext, WebPAnimDecoderHasMoreFrames,
+    WebPAnimDecoderNewInternal, WebPAnimDecoderOptions, WebPAnimDecoderOptionsInitInternal,
+    WebPAnimEncoder, WebPAnimEncoderAdd, WebPAnimEncoderAssemble, WebPAnimEncoderDelete,
+    WebPAnimEncoderGetError, WebPAnimEncoderNewInternal, WebPAnimEncoderOptions,
+    WebPAnimEncoderOptionsInitInternal, WebPAnimInfo, WebPConfig, WebPConfigInitInternal, WebPData,
+    WebPDecode, WebPDecodeRGBAInto, WebPDecoderConfig, WebPEncodeRGBA, WebPFree, WebPFreeDecBuffer,
+    WebPGetInfo, WebPInitDecoderConfigInternal, WebPMuxAnimParams, WebPPicture, WebPPictureFree,
+    WebPPictureImportRGBA, WebPPictureInitInternal, WebPPreset, WebPRGBABuffer, WebPValidateConfig,
 };
 
 use super::riff;
@@ -361,6 +365,7 @@ impl Codec for LibWebp {
 
 /// The ABI versions of the headers libwebp-sys was generated from, which
 /// libwebp checks on every `…Internal` call.
+const DECODER_ABI: c_int = WEBP_DECODER_ABI_VERSION as c_int;
 const DEMUX_ABI: c_int = WEBP_DEMUX_ABI_VERSION as c_int;
 const MUX_ABI: c_int = WEBP_MUX_ABI_VERSION as c_int;
 const ENCODER_ABI: c_int = WEBP_ENCODER_ABI_VERSION as c_int;
@@ -571,6 +576,71 @@ pub(super) fn info(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
 }
 
+/// Decode a still WebP straight to the size `size` gives for the size in
+/// its header, with libwebp's scaled decode (`WebPDecoderConfig` with
+/// `use_scaling`, set only when that size differs from the header's), into
+/// a buffer of our own, as non-premultiplied RGBA.
+///
+/// The header's size is checked against [`crate::MAX_PIXELS`] first, as in
+/// [`LibWebp::decode_rgba`]: libwebp's lossless decoder holds the whole
+/// picture whatever the output size. libwebp allocates no output buffer of
+/// its own on this path (`is_external_memory`).
+pub(super) fn decode_scaled(
+    bytes: &[u8],
+    size: impl FnOnce(u32, u32) -> (u32, u32),
+) -> Result<Rgba, String> {
+    let unreadable = |why: &str| format!("could not read the WebP data: {why}");
+    let header = info(bytes).ok_or_else(|| unreadable("libwebp could not read its header"))?;
+    check_pixels(header.0, header.1)?;
+    let (width, height) = size(header.0, header.1);
+    // Every size handed to libwebp is a C int, checked before the buffer
+    // is reserved. A product too large for memory saturates, and then
+    // cannot be reserved.
+    let too_large = |why: String| unreadable(&why);
+    let c_width = c_int_of(width as usize).map_err(too_large)?;
+    let c_height = c_int_of(height as usize).map_err(too_large)?;
+    let stride = (width as usize).saturating_mul(4);
+    let c_stride = c_int_of(stride).map_err(too_large)?;
+    let mut pixels = reserve_pixels(stride.saturating_mul(height as usize))?;
+
+    let mut config = MaybeUninit::<WebPDecoderConfig>::uninit();
+    // SAFETY: libwebp writes its defaults into the struct and returns 0
+    // without writing on an ABI mismatch.
+    if unsafe { WebPInitDecoderConfigInternal(config.as_mut_ptr(), DECODER_ABI) } == 0 {
+        return Err(unreadable("libwebp's decoder is of another version"));
+    }
+    // SAFETY: initialised by the call above, which succeeded.
+    let mut config = unsafe { config.assume_init() };
+    // Only when the size changes: libwebp's rescaler, even at 1:1, drops
+    // the colour under a fully transparent pixel.
+    config.options.use_scaling = c_int::from((width, height) != header);
+    config.options.scaled_width = c_width;
+    config.options.scaled_height = c_height;
+    config.output.colorspace = WEBP_CSP_MODE::MODE_RGBA;
+    config.output.is_external_memory = 1;
+    config.output.u.RGBA = WebPRGBABuffer {
+        rgba: pixels.as_mut_ptr(),
+        stride: c_stride,
+        size: pixels.len(),
+    };
+    // SAFETY: libwebp reads at most `bytes.len()` bytes from `bytes`, and
+    // writes at most `pixels.len()` bytes into `pixels`, `c_stride` bytes
+    // per row of the scaled size; it fails instead when the scaled image
+    // does not fit that buffer. Both outlive the call.
+    let status = unsafe { WebPDecode(bytes.as_ptr(), bytes.len(), &raw mut config) };
+    // SAFETY: frees whatever libwebp allocated for the output, which with
+    // external memory is nothing; never `pixels`, which stays ours.
+    unsafe { WebPFreeDecBuffer(&raw mut config.output) };
+    if status != VP8StatusCode::VP8_STATUS_OK {
+        return Err(unreadable("libwebp could not decode the image"));
+    }
+    Ok(Rgba {
+        width,
+        height,
+        pixels,
+    })
+}
+
 /// `value` as a C `int`, for a size handed to libwebp.
 fn c_int_of(value: usize) -> Result<c_int, String> {
     c_int::try_from(value).map_err(|_| "the image is too large for libwebp".to_owned())
@@ -639,6 +709,93 @@ mod tests {
             "image too large: 16384×16384 exceeds 100 megapixels"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    // --- scaled decoding --------------------------------------------------------
+
+    /// A size for `decode_scaled` that ignores the header's.
+    fn to(width: u32, height: u32) -> impl FnOnce(u32, u32) -> (u32, u32) {
+        move |_, _| (width, height)
+    }
+
+    #[test]
+    fn the_scaled_decoder_at_full_size_gives_the_same_pixels_as_the_decoder() {
+        let file = fx::lossless(&fx::photo_rgba(W, H, true), W, H);
+        let scaled = decode_scaled(&file, to(W, H)).unwrap();
+        assert_eq!(scaled, LibWebp.decode_rgba(&file).unwrap());
+    }
+
+    #[test]
+    fn the_scaled_decoder_gives_the_requested_size() {
+        for file in [
+            fx::lossless(&fx::photo_rgba(W, H, true), W, H),
+            fx::lossy(&fx::photo_rgba(W, H, true), W, H, 80.0),
+        ] {
+            let mut header = None;
+            let scaled = decode_scaled(&file, |w, h| {
+                header = Some((w, h));
+                (W / 4, H / 4)
+            })
+            .unwrap();
+            // The size is chosen from the header's.
+            assert_eq!(header, Some((W, H)));
+            assert_eq!((scaled.width, scaled.height), (W / 4, H / 4));
+            assert_eq!(scaled.pixels.len(), (W / 4 * H / 4 * 4) as usize);
+            // The transparent top-left quarter of the photo stays transparent.
+            assert_eq!(scaled.pixels[3], 0);
+            // Opaque at the bottom right.
+            assert_ne!(scaled.pixels[scaled.pixels.len() - 1], 0);
+        }
+    }
+
+    #[test]
+    fn the_scaled_decoder_refuses_bytes_it_cannot_decode() {
+        for garbage in [&b"not a WebP"[..], b""] {
+            assert_eq!(
+                decode_scaled(garbage, to(8, 8)).unwrap_err(),
+                "could not read the WebP data: libwebp could not read its header"
+            );
+        }
+        let broken = riff(&[vp8l(8, 8)]);
+        assert_eq!(info(&broken), Some((8, 8)), "fixture: the header reads");
+        assert_eq!(
+            decode_scaled(&broken, to(4, 4)).unwrap_err(),
+            "could not read the WebP data: libwebp could not decode the image"
+        );
+    }
+
+    #[test]
+    fn the_scaled_decoder_refuses_a_header_over_max_pixels() {
+        // 16384x16384 (268 MP) in a few bytes: libwebp's lossless decoder
+        // would allocate the whole picture, whatever the scaled size.
+        let bomb = riff(&[vp8l(16_384, 16_384)]);
+        assert_eq!(
+            decode_scaled(&bomb, to(64, 64)).unwrap_err(),
+            "image too large: 16384×16384 exceeds 100 megapixels"
+        );
+    }
+
+    #[test]
+    fn the_scaled_decoder_refuses_a_size_no_c_int_holds_before_allocating() {
+        let file = fx::lossless(&fx::photo_rgba(W, H, false), W, H);
+        // The width, the height, and the row of four bytes per pixel.
+        for (width, height) in [(u32::MAX, 1), (1, u32::MAX), (0x2000_0000, 1)] {
+            assert_eq!(
+                decode_scaled(&file, to(width, height)).unwrap_err(),
+                "could not read the WebP data: the image is too large for libwebp",
+                "{width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scaled_decoder_refuses_a_buffer_it_cannot_reserve() {
+        // Every number fits a C int, but not the buffer in memory.
+        let file = fx::lossless(&fx::photo_rgba(W, H, false), W, H);
+        assert_eq!(
+            decode_scaled(&file, to(0x1FFF_FFFF, 0x7FFF_FFFF)).unwrap_err(),
+            "not enough memory for the pixels"
+        );
     }
 
     // --- encoding --------------------------------------------------------------

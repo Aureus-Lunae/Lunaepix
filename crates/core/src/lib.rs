@@ -31,8 +31,15 @@ mod platform;
 mod png;
 mod run;
 mod svg;
+mod thumb;
 mod webp;
 pub mod worker;
+
+/// The JPEG fixture helpers of the integration tests, shared with the unit
+/// tests (`jpg::decode`, `thumb::decode`).
+#[cfg(test)]
+#[path = "../tests/common/jpeg_fixtures.rs"]
+mod jpeg_fixtures;
 
 use lossy::Lossy;
 pub use lossy::{DEFAULT_QUALITY, Note, Quality};
@@ -45,6 +52,7 @@ pub use plan::{
 pub use run::{
     Crash, FileResult, RunError, StopHandle, Worker, run, run_observed, run_until_stopped,
 };
+pub use thumb::{CannotShow, MAX_SVG_THUMB_BYTES, THUMB_SIDE, Thumbnail, thumbnail};
 pub use worker::WORKER_FLAG;
 
 /// How a run compresses its files: one setting for the whole run.
