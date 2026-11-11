@@ -12,7 +12,7 @@ plan (in `docs/pending-approval/` until approved) when it starts.
 | Apple support: a brew formula, and a plain download with one awkward step | Not started |
 | Choose how much it can get compressed (quality, like JPEG 70%) on lossy | Part of lossy compression |
 | Export rename (single file only) | Not started |
-| Re-add after a run, and thumbnails | Built; being tested by hand |
+| Re-add after a run, and thumbnails | Done |
 | Clean and clear UI | Not started |
 | Automated draft release | Not started |
 
@@ -74,7 +74,7 @@ Give the output file a different name when one file is compressed. For a
 batch job: "that is a prefix / postfix, as it is not good to rename all files
 in a batch job."
 
-## Re-add after a run, and thumbnails
+## Re-add after a run, and thumbnails — Done
 
 A "Re-add" button after a run puts the same files back in the list, so
 they can be run again with other settings. Next to the originals, a run no
@@ -82,10 +82,9 @@ longer replaces an earlier output: a taken name gets a number, as in a chosen
 output folder. Every row shows a small thumbnail before the file name.
 Numbering starts at `-1` everywhere (`optimized-a-1.png`), also in a chosen
 output folder and with the command line's `--out`; the command line without
-`--out` still replaces. Built (all eight plan tasks); being tested by hand
-now. Then `/finalize-plan` closes the plan.
-Spec: `docs/in-progress/specs/2026-11-11-lunaepix-run-again-thumbnails-design.md`.
-Plan: `docs/in-progress/plans/2026-11-11-lunaepix-run-again-thumbnails.md`.
+`--out` still replaces. Version 0.1.1; tested by hand on Linux and Windows.
+Spec: `docs/finished/specs/2026-11-11-lunaepix-run-again-thumbnails-design.md`.
+Plan: `docs/finished/plans/2026-11-11-lunaepix-run-again-thumbnails.md`.
 
 ## Clean and clear UI
 

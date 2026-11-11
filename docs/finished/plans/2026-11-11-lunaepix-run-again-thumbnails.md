@@ -76,6 +76,7 @@ Calls made while planning (not user decisions; flagged for the plan review):
 ---
 
 ### Task 1: Never replace in the app; number from `-1`
+Status: Completed
 
 **Files:**
 - Modify: `crates/core/src/atomic.rs` (`write_new` start number, doc comments of `MAX_NAME_NUMBER`, `write_new`, `numbered`), `crates/core/src/plan.rs:110,219`, `crates/core/src/lib.rs:176` doc, `src-tauri/src/session.rs:294-307` (`PreparedRun::options`), `crates/cli/src/main.rs` doc only if it names `-2`, `README.md:52`, `src-tauri/INTERFACE.md`.
@@ -84,17 +85,18 @@ Calls made while planning (not user decisions; flagged for the plan review):
 **Interfaces:**
 - Produces: `PreparedRun::options()` returns `write: WriteMode::NoReplace` always. `atomic::numbered(name, n)` unchanged; callers start at `n = 1`.
 
-- [ ] **Step 1: Write the tables, then the failing tests.** Change every existing expectation of a first clash from `-2` to `-1` (find them with `git grep -nE -- '-2\.(png|jpg|webp|svg)|numbered\(name, 2\)|2\.\.=MAX_NAME_NUMBER'`) and add:
+- [x] **Step 1: Write the tables, then the failing tests.** Change every existing expectation of a first clash from `-2` to `-1` (find them with `git grep -nE -- '-2\.(png|jpg|webp|svg)|numbered\(name, 2\)|2\.\.=MAX_NAME_NUMBER'`) and add:
   - `atomic`: `a_first_clash_gets_minus_one` (`logo.png` taken → `logo-1.png`); `a_second_clash_gets_minus_two` (`logo.png`, `logo-1.png` taken → `logo-2.png`); `minus_two_is_not_used_while_minus_one_is_free` (`logo.png`, `logo-2.png` taken → `logo-1.png`); `no_name_ends_in_minus_zero` (after 3 clashes the folder holds no `logo-0.png`); the existing "no free name" test now fills `logo.png` and `logo-1.png` … `logo-9999.png` (or shrinks the bound through the existing test hook if there is one) and still fails.
   - `plan` / `output_folder.rs`: two inputs named `a.png` into one output folder → `a.png`, `a-1.png`.
   - `cli.rs`: `--out` with `a.png` already there → `a-1.png`; and `the_cli_without_out_still_replaces` (run twice, one `optimized-a.png`, its bytes from the second run).
   - `session.rs`: `the_app_never_replaces_next_to_the_originals` (`PreparedRun::options().write == NoReplace` with no output folder); `the_app_never_replaces_in_an_output_folder` (same with a folder). Plus one end-to-end test through `Session::run_with_worker` and a real worker: two runs on `a.png` with no folder leave `optimized-a.png` (first run's bytes, unchanged) and `optimized-a-1.png`.
-- [ ] **Step 2:** Run `cargo test --workspace` and expect the new and changed tests to fail. Record the output.
-- [ ] **Step 3:** Implement: `write_new` and `plan::free_name` start at 1 (`1..=MAX_NAME_NUMBER`); `PreparedRun::options` returns `NoReplace`; update the doc comments, `README.md` ("`logo.png`, `logo-1.png`, …"; the app never replaces an output, the command line without `--out` does) and `INTERFACE.md` (`start_run` writes next to the originals without replacing).
-- [ ] **Step 4:** Run `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`; both pass.
-- [ ] **Step 5:** Commit: "Number a taken name from -1, and never replace an output in the app".
+- [x] **Step 2:** Run `cargo test --workspace` and expect the new and changed tests to fail. Record the output.
+- [x] **Step 3:** Implement: `write_new` and `plan::free_name` start at 1 (`1..=MAX_NAME_NUMBER`); `PreparedRun::options` returns `NoReplace`; update the doc comments, `README.md` ("`logo.png`, `logo-1.png`, …"; the app never replaces an output, the command line without `--out` does) and `INTERFACE.md` (`start_run` writes next to the originals without replacing).
+- [x] **Step 4:** Run `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`; both pass.
+- [x] **Step 5:** Commit: "Number a taken name from -1, and never replace an output in the app".
 
 ### Task 2: "Re-add", backend and window
+Status: Completed
 
 **Files:**
 - Modify: `src-tauri/src/session.rs` (`FileList`, `Session`), `src-tauri/src/lib.rs` (command, `generate_handler!`), `src-tauri/build.rs` (command list), `src-tauri/capabilities/default.json` (permission, description "seven"), `src-tauri/tests/config.rs` (commands and button checks), `src-tauri/INTERFACE.md`, `ui/index.html`, `ui/app.js`, `ui/state.js` (only if a view function needs a field), `ui/app.css` (summary buttons side by side, wrapping together).
@@ -104,17 +106,18 @@ Calls made while planning (not user decisions; flagged for the plan review):
 - Produces: `FileList::readd(&mut self)` — clears `finished`, keeps `entries` and `seen`. `Session::readd_list(&self, emit: &mut impl FnMut(Event)) -> Result<(), CommandError>` — claims the guard (busy → `Err(Busy)` and `run-busy`, as `clear_list`), calls `readd`, emits `self.list_changed(None)`. Tauri command `readd_list(app: AppHandle) -> Result<(), CommandError>`.
 - Window: `panelView(state).showSummary` already gates the summary; the button uses `canChoose`.
 
-- [ ] **Step 1: Write the tables, then the failing tests:**
+- [x] **Step 1: Write the tables, then the failing tests:**
   - `session.rs`: `readd_after_a_run_brings_back_the_same_rows_in_order` (3 files, run to `run-finished`, `readd_list` → `list-changed` with the 3 names in order); `without_readd_the_first_add_after_a_run_starts_a_new_list` (existing behaviour, kept as its pair); `adds_after_a_readd_append`; `readd_lists_the_added_paths_not_the_outputs` (drop a folder holding `a.png`, run next to the originals, `readd_list` → one row `a.png`) with its pair `dropping_the_folder_again_lists_the_output_too` (two rows); `readd_plans_the_rows_again` (delete one file after the run → that row is "Not a readable file"; the others keep their sizes); `readd_while_busy_is_refused_and_tells_the_window` (`Err(Busy)` and one `run-busy`, no `list-changed`) with its pair `readd_when_idle_resolves_and_sends_the_list`; `readd_of_an_empty_list_sends_an_empty_list`; `readd_of_an_all_skipped_list_brings_it_back` (two `.txt` files: both rows come back as skipped, and the window's `canRun` stays false for that state in `state.test.js`).
   - `config.rs` (parsed JSON / HTML): `the_capability_allows_exactly_the_seven_commands` with negative fixtures (six without `allow-readd-list`; eight with an extra); `build_rs_declares_readd_list` if config.rs already checks `build.rs` (otherwise the capability test covers it, because a missing `allow-readd-list` permission fails the build); `the_summary_has_readd_before_open_folder` with negative fixtures (missing, after `#openFolder`, outside `#summary`, text other than "Re-add").
   - `state.test.js`: the button view — `readd shows only when finished` (finished → shown and usable; ready, running, empty → hidden) and `a readd click sends readd_list only when canChoose` (move the click decision into a tested function, as the other buttons use `onClick(button, gate, command)`; the test asserts finished → one call, running → none); `settings survive a readd` (state after a lossy 60 run, then `list-changed` → `mode === 'lossy'`, `quality === 60`, `phase === 'ready'`), with its pair that a `list-changed` during `running` changes nothing (existing).
   - Focus: `hideKeepingFocus(document, summary, …, run)` — test that focus on `#readdList` moves to Run when the summary hides, and focus elsewhere does not move (extend the existing `hideKeepingFocus` tests in `table.test.js` with the summary case if the fallback argument changes from `chooseFiles` to `run`).
-- [ ] **Step 2:** Run `cargo test -p lunaepix-app` and `node --test tests/ui/*.test.js`; the new tests fail. Record the output.
-- [ ] **Step 3:** Implement. In `app.js`: look up `#readdList`, wire `onClick(readdList, canChoose, 'readd_list')`, set `aria-disabled` from `canChoose`, and pass Run as the summary's focus fallback. In `index.html`: the button before `#openFolder`, inside `#summary`. In `app.css`: the two summary buttons side by side, wrapping together under the text at narrow widths (no test). Update `INTERFACE.md`: the command table, its rejection, "The first add after a run has finished starts a fresh list, unless `readd_list` was called", and the permissions list of seven.
-- [ ] **Step 4:** Run `cargo test --workspace`, `node --test tests/ui/*.test.js` and clippy; all pass.
-- [ ] **Step 5:** Commit: "Add Re-add: put the last run's files back in the list".
+- [x] **Step 2:** Run `cargo test -p lunaepix-app` and `node --test tests/ui/*.test.js`; the new tests fail. Record the output.
+- [x] **Step 3:** Implement. In `app.js`: look up `#readdList`, wire `onClick(readdList, canChoose, 'readd_list')`, set `aria-disabled` from `canChoose`, and pass Run as the summary's focus fallback. In `index.html`: the button before `#openFolder`, inside `#summary`. In `app.css`: the two summary buttons side by side, wrapping together under the text at narrow widths (no test). Update `INTERFACE.md`: the command table, its rejection, "The first add after a run has finished starts a fresh list, unless `readd_list` was called", and the permissions list of seven.
+- [x] **Step 4:** Run `cargo test --workspace`, `node --test tests/ui/*.test.js` and clippy; all pass.
+- [x] **Step 5:** Commit: "Add Re-add: put the last run's files back in the list".
 
 ### Task 3: Make a thumbnail (core, pure)
+Status: Completed
 
 **Files:**
 - Create: `crates/core/src/thumb.rs` (the public entry, sizing, PNG encode), `crates/core/src/thumb/decode.rs` (per-format decode to RGBA, bounded).
@@ -139,7 +142,7 @@ Behaviour:
 - SVG: the bytes are returned as `Thumbnail::Svg` when they are valid UTF-8 and the first non-whitespace character (after an optional BOM) is `<`; otherwise `CannotShow`.
 - Orientation is Task 4; this task returns the picture as stored.
 
-- [ ] **Step 1: Write the tables, then the failing tests** (fixtures made in the test with the `image` dev-dependency, `png` and the existing helpers in `crates/core/tests/common`):
+- [x] **Step 1: Write the tables, then the failing tests** (fixtures made in the test with the `image` dev-dependency, `png` and the existing helpers in `crates/core/tests/common`):
   - `fit`: `(400, 200) → (64, 32)`, `(200, 400) → (32, 64)`, `(20, 10) → (20, 10)`, `(64, 64) → (64, 64)`, `(65, 64) → (64, 63)`, `(10000, 1) → (64, 1)`, `(1, 10000) → (1, 64)`; negative: no output side is 0, none exceeds 64, none exceeds its input.
   - `a_400x200_jpg_png_and_webp_each_give_a_64x32_rgba_png` (decode the output with `image`; check size and colour type) / `a_20x10_image_is_not_enlarged`.
   - Colour fidelity: a red left half / blue right half 400 × 200 gives a thumbnail whose left pixel is red-ish and right pixel blue-ish (tolerance 16 per channel) — so a channel swap fails.
@@ -149,12 +152,13 @@ Behaviour:
   - Bounds: `an_image_of_exactly_max_pixels_passes_the_check` (call the header check on 10000 × 10000; a header-only PNG fixture where decoding is not needed) / `one_pixel_more_cannot_be_shown_without_decoding` (10000 × 10001 header with no image data → `CannotShow` whose reason names the size, proving the check came first).
   - Not images: an empty file, a text file named `.png`, a truncated JPG, a folder named `a.png` → `CannotShow`, never a panic.
   - SVG: an SVG under 2 MiB → `Thumbnail::Svg(same bytes)`; with a BOM and leading whitespace → still `Svg`; exactly `MAX_SVG_THUMB_BYTES` → `Svg` / one byte more → `CannotShow`; binary bytes named `.svg` → `CannotShow`.
-- [ ] **Step 2:** Run `cargo test -p lunaepix-core thumb`; the new tests fail. Record the output.
-- [ ] **Step 3:** Implement.
-- [ ] **Step 4:** Run `cargo test --workspace` and clippy; both pass.
-- [ ] **Step 5:** Commit: "Make a 64 px thumbnail from a JPG, PNG or WebP; pass an SVG through".
+- [x] **Step 2:** Run `cargo test -p lunaepix-core thumb`; the new tests fail. Record the output.
+- [x] **Step 3:** Implement.
+- [x] **Step 4:** Run `cargo test --workspace` and clippy; both pass.
+- [x] **Step 5:** Commit: "Make a 64 px thumbnail from a JPG, PNG or WebP; pass an SVG through".
 
 ### Task 4: Upright thumbnails (EXIF orientation)
+Status: Completed
 
 **Files:**
 - Modify: `crates/core/src/webp/exif.rs` (expose `pub(crate) fn orientation(tiff: &[u8]) -> Option<u8>`, built on its existing bounded TIFF reader), `crates/core/src/thumb.rs` (find the EXIF block: JPEG `APP1` with `Exif\0\0`; WebP `EXIF` chunk through `webp/riff.rs`; apply the orientation before scaling or after, the builder's choice).
@@ -163,16 +167,17 @@ Behaviour:
 **Interfaces:**
 - Consumes: `thumbnail` from Task 3. Produces: `pub(crate) fn orientation(tiff: &[u8]) -> Option<u8>` (1–8, `None` for missing, damaged or out-of-range), `pub(crate) fn orient(rgba, width, height, orientation: u8) -> (rgba, width, height)`.
 
-- [ ] **Step 1: Write the tables, then the failing tests:**
+- [x] **Step 1: Write the tables, then the failing tests:**
   - `orientation`: little- and big-endian TIFF with tag 0x0112 = 6 → `Some(6)`; each of 1–8 → itself; value 0 or 9 → `None`; a truncated IFD, an offset past the end, an entry count past the end → `None`, never a panic.
   - `orient` on a 3 × 2 image with distinct corner colours: each of the 8 values puts the top-left source pixel in the corner the EXIF standard says (table in the test), and 5–8 swap width and height. Negative: 1 leaves the buffer unchanged.
   - End to end: a 400 × 200 JPG and a WebP with orientation 6 → 32 × 64 thumbnail; orientation 5 → 32 × 64 with the mirrored corner (pixel check); orientation 1 and no EXIF → 64 × 32; a damaged EXIF block → 64 × 32 and no error.
-- [ ] **Step 2:** Run `cargo test -p lunaepix-core thumb exif`; the new tests fail. Record the output.
-- [ ] **Step 3:** Implement.
-- [ ] **Step 4:** Run `cargo test --workspace` and clippy; both pass.
-- [ ] **Step 5:** Commit: "Show thumbnails upright for all eight EXIF orientations".
+- [x] **Step 2:** Run `cargo test -p lunaepix-core thumb exif`; the new tests fail. Record the output.
+- [x] **Step 3:** Implement.
+- [x] **Step 4:** Run `cargo test --workspace` and clippy; both pass.
+- [x] **Step 5:** Commit: "Show thumbnails upright for all eight EXIF orientations".
 
 ### Task 5: The thumbnail worker and its runner
+Status: Completed
 
 **Files:**
 - Modify: `crates/core/src/worker.rs` (answer `THUMB_FLAG`), `crates/core/src/run.rs` (runner side), `crates/core/src/lib.rs` (re-exports), `crates/core/src/bin/lunaepix-worker.rs` (usage text names both modes).
@@ -191,18 +196,19 @@ lunaepix-thumb 1 png\n<bytes>
 lunaepix-thumb 1 svg\n<bytes>
 ```
 
-- [ ] **Step 1: Write the tables, then the failing tests:**
+- [x] **Step 1: Write the tables, then the failing tests:**
   - Worker (unit, with `serve_with`-style injection of `thumbnail` and the output): a `Png` answer writes the `png` header and the bytes, exit 0; `Svg` likewise; `CannotShow` → exit 3 and nothing written; no source, two sources, an unknown option → exit 2 and nothing written.
   - Real binaries: the sidecar and the CLI binary both answer `--lunaepix-thumb` for a PNG fixture (header + a decodable 64 px PNG) / both exit 3 for a text file.
   - Names (Review Focus 4): a PNG named `Mobilis Logo – zwart é.png` and, on Unix only, a name with byte `0xE9` → a thumbnail.
   - `run_thumb` with double programs (small scripts or the test helper binary the existing `run.rs` tests use): a valid `png` answer → `Png(bytes)`; exit 3 → `CannotShow`; exit 1, a crash by signal, a program that does not exist → `Failed`; an answer of exactly `MAX_THUMB_ANSWER_BYTES` plus header → `Png` / one byte more → `Failed`; a header `lunaepix-thumb 2 png` or none → `Failed`; a `png` header with non-PNG bytes → `Failed`.
   - Timeout (Review Focus 5): a program that sleeps past the limit (run the test with a shortened limit through an internal `run_thumb_with(program, src, timeout, cap)`) → `Failed`, and the child is reaped (no zombie: `kill_and_reap` was reached; reuse how the existing timeout test checks it).
-- [ ] **Step 2:** Run `cargo test -p lunaepix-core worker run`; the new tests fail. Record the output.
-- [ ] **Step 3:** Implement.
-- [ ] **Step 4:** Run `cargo test --workspace` and clippy; both pass.
-- [ ] **Step 5:** Commit: "Make thumbnails in a worker process".
+- [x] **Step 2:** Run `cargo test -p lunaepix-core worker run`; the new tests fail. Record the output.
+- [x] **Step 3:** Implement.
+- [x] **Step 4:** Run `cargo test --workspace` and clippy; both pass.
+- [x] **Step 5:** Commit: "Make thumbnails in a worker process".
 
 ### Task 6: Thumbnail keys and the `thumb://` scheme in the app
+Status: Completed
 
 **Files:**
 - Create: `src-tauri/src/thumbs.rs` (keys, snapshot, cache, two-slot pool, the answer to one request).
@@ -223,7 +229,7 @@ lunaepix-thumb 1 svg\n<bytes>
   - `image/svg+xml` only when the row's file name ends in `.svg` (ASCII case-insensitive) and the answer is `Svg`; `image/png` only for `Png`. Anything else → 404.
 - Registration in `lib.rs`: `.register_asynchronous_uri_scheme_protocol("thumb", …)`; the handler moves the request path and an `AppHandle` onto a new thread (`std::thread::Builder`, named `thumbnail`), calls `thumbs.answer(path, |src| run_thumb(&program, src))` there, and responds with the `ThumbResponse`. `make` runs on that thread, so the worker is spawned and waited on by the same thread.
 
-- [ ] **Step 1: Write the tables, then the failing tests:**
+- [x] **Step 1: Write the tables, then the failing tests:**
   - `parse_key`: `/3-0`, `/4294967295-1999`, `/0-9999` → `Some` / `/3-x`, `/-1`, `/3/0`, `/3%2D0`, `/3-0-1`, `/12345678901-0`, `/3-12345`, `/3-0/extra`, `/3-0?x=1`, `3-0` (no slash), `/%2Fetc%2Fpasswd`, `/../a.png`, empty → `None`.
   - Keys via `Session` (`list_changed` payloads): 3 images → `"N-0"`, `"N-1"`, `"N-2"`; a skipped row and the over-limit row (2001 files) → `null`; an add keeps the earlier keys; Clear raises N; the first add after a finished run raises N; `readd_list` keeps N; re-planning that drops a middle row (make an entry a folder, as the existing `rows()` test does) raises N so no key changes its path.
   - `answer` with a recording `make` double: current key of an image row → 200 `image/png` with the double's bytes and the double got that row's path (not row 0's or 2's) / an earlier list number, an index past the end, a skipped row's index, every bad shape above → 404, empty body, and the double recorded no call.
@@ -233,12 +239,13 @@ lunaepix-thumb 1 svg\n<bytes>
   - Stale answer (Review Focus 1): a `make` double that calls `new_list()` before it returns → 404 and nothing cached; a request for the new list's key then calls again.
   - Pool: three requests on three threads with a double that blocks on a barrier → at most two inside `make` at once (the double counts the peak) / with two requests both run at once (peak 2, so the pool is not a single slot).
   - `config.rs` CSP (parsed): `img-src` is exactly `'self' thumb: http://thumb.localhost` / fixtures with `data:`, `blob:`, `*`, `https:`, `http://evil.localhost` added are refused; every other directive equals today's.
-- [ ] **Step 2:** Run `cargo test -p lunaepix-app`; the new tests fail. Record the output.
-- [ ] **Step 3:** Implement.
-- [ ] **Step 4:** Run `cargo test --workspace` and clippy; both pass.
-- [ ] **Step 5:** Commit: "Serve thumbnails per list row over thumb://".
+- [x] **Step 2:** Run `cargo test -p lunaepix-app`; the new tests fail. Record the output.
+- [x] **Step 3:** Implement.
+- [x] **Step 4:** Run `cargo test --workspace` and clippy; both pass.
+- [x] **Step 5:** Commit: "Serve thumbnails per list row over thumb://".
 
 ### Task 7: Thumbnails in the window
+Status: Completed
 
 **Files:**
 - Modify: `ui/state.js` (`listRowFrom`, `waitingRow`, the `file-started` and `file-done` cases keep `thumb`; `rowView` passes it on), `ui/table.js` (`buildRow`: the square and the image; `syncRows` keeps an unchanged image), `ui/app.js` (passes a `thumbSrc(key)` built on `window.__TAURI__.core.convertFileSrc` into the table code), `ui/app.css` (square, image, note alignment; no test).
@@ -248,32 +255,33 @@ lunaepix-thumb 1 svg\n<bytes>
 - Consumes: `thumb` in `list-changed` (Task 6).
 - Produces: `export function thumbKey(value): string | null` in `state.js` — the value when it is a string matching `^\d{1,10}-\d{1,4}$`, otherwise `null`. Rows carry `thumb: string | null`. `buildRow(doc, row, thumbSrc)` where `thumbSrc(key) → string`.
 
-- [ ] **Step 1: Write the tables, then the failing tests:**
+- [x] **Step 1: Write the tables, then the failing tests:**
   - `thumbKey`: `"3-0"`, `"4294967295-1999"` → kept / `3`, `{}`, `""`, `undefined`, `"3/0"`, `"3-0-1"`, `"../a"`, `"3-x"`, `"thumb://localhost/3-0"`, `"12345678901-0"` → `null`.
   - Rows: `list-changed` keeps `thumb` on each row; `run-started` gives the waiting rows the list row's `thumb`; `file-started` and every `file-done` kind (done, skipped, failed, and a row marked unfinished at `run-finished`) keep it / a row with `thumb: null` stays `null` through the run.
   - `buildRow` with a recording `thumbSrc` double: a row with a key → name cell starts with `span.lunaepixResults__thumb` holding `img.lunaepixResults__thumbImage` with `src` from the double, `alt=""`, `width`/`height` 32, `loading="lazy"`, `decoding="async"`, and the double got that key / a row with `null` → the empty span, no `img`, no call to the double.
   - The name text stays in the `th` (row header) and a note still follows the name (existing note test extended).
   - No flicker: `syncRows` replacing a waiting row by its compressing and done rows keeps the same `img` element (or, if the builder chooses the cache route, assert the `src` is identical and document the choice in the report).
-- [ ] **Step 2:** Run `node --test tests/ui/*.test.js`; the new tests fail. Record the output.
-- [ ] **Step 3:** Implement. CSS: the square is 32 × 32 with a 1 px `--rowLine` border, `object-fit: contain`, on the table background; the name cell lays out square and text side by side with the note lined up under the text.
-- [ ] **Step 4:** Run `node --test tests/ui/*.test.js` and `cargo test --workspace` (config checks); both pass.
-- [ ] **Step 5:** Commit: "Show a thumbnail before each file name".
+- [x] **Step 2:** Run `node --test tests/ui/*.test.js`; the new tests fail. Record the output.
+- [x] **Step 3:** Implement. CSS: the square is 32 × 32 with a 1 px `--rowLine` border, `object-fit: contain`, on the table background; the name cell lays out square and text side by side with the note lined up under the text.
+- [x] **Step 4:** Run `node --test tests/ui/*.test.js` and `cargo test --workspace` (config checks); both pass.
+- [x] **Step 5:** Commit: "Show a thumbnail before each file name".
 
 ### Task 8: Documentation, the full suite and the hand-test list
+Status: Completed
 
 **Files:**
 - Modify: `README.md` (Re-add, thumbnails, numbering), `src-tauri/INTERFACE.md` (read whole; it matches every change above), `docs/roadmap.md` (item status "Built; being tested by hand").
 
-- [ ] **Step 1:** Update the texts.
-- [ ] **Step 2:** Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` and `node --test tests/ui/*.test.js`. All pass.
-- [ ] **Step 3:** Write the user's hand-test list into the report (not the repository), for Linux and Windows:
+- [x] **Step 1:** Update the texts.
+- [x] **Step 2:** Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` and `node --test tests/ui/*.test.js`. All pass.
+- [x] **Step 3:** Write the user's hand-test list into the report (not the repository), for Linux and Windows:
   - Run lossless, press Re-add, switch to Lossy 60, Run: both `optimized-x.jpg` and `optimized-x-1.jpg` exist next to the originals, the first unchanged.
   - Re-add, then drop one more file: the list has the old files plus the new one.
   - A chosen output folder with a name clash gives `-1`.
   - Thumbnails for a JPG, a rotated phone photo, a transparent PNG, an animated WebP, an SVG, a skipped `.txt` (empty square), a 2000-file folder (list appears at once, thumbnails fill in).
   - Clear, then add other files: no old picture appears beside a new name.
   - The window at 360 px wide: the summary buttons wrap together.
-- [ ] **Step 4:** Commit: "Document Re-add, thumbnails and numbering from -1".
+- [x] **Step 4:** Commit: "Document Re-add, thumbnails and numbering from -1".
 
 ## Implementer report
 
