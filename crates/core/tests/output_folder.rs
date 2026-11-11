@@ -3,13 +3,14 @@
 //! (`plan_files_to`, `plan_folder_to`), `optimize_file` with
 //! `WriteMode::NoReplace`, and `images_in_folder`.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use lunaepix_core::{
-    Compression, Job, OptimizeError, Options, Quality, WriteMode, images_in_folder, optimize_file,
-    plan_files_to, plan_folder_to,
+    Compression, Job, OptimizeError, Options, Quality, WriteMode, batch_output_name,
+    first_free_name, images_in_folder, optimize_file, plan_files_to, plan_folder_to, save_new,
 };
 use tempfile::TempDir;
 
@@ -697,4 +698,229 @@ fn images_in_folder_fails_for_a_missing_folder() {
 
     assert!(images_in_folder(&tmp.path().join("missing")).is_err());
     assert!(images_in_folder(&file).is_err());
+}
+
+// --- save_new: exactly this name, never a number -----------------------------
+
+/// Some permissions to hand to `save_new`.
+fn some_permissions(dir: &Path) -> fs::Permissions {
+    fs::metadata(dir).unwrap().permissions()
+}
+
+#[test]
+fn save_new_writes_exactly_the_bytes_under_exactly_the_name() {
+    let tmp = TempDir::new().unwrap();
+    let dest = tmp.path().join("vakantie-café.png");
+
+    save_new(&dest, b"new bytes", some_permissions(tmp.path())).unwrap();
+
+    assert_eq!(fs::read(&dest).unwrap(), b"new bytes");
+    assert_eq!(listing(tmp.path()), ["vakantie-café.png"]);
+}
+
+#[test]
+fn save_new_refuses_a_taken_name_and_leaves_that_file_byte_for_byte() {
+    let tmp = TempDir::new().unwrap();
+    let dest = write(tmp.path(), "logo.png", b"existing");
+
+    let error = save_new(&dest, b"new", some_permissions(tmp.path())).unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::AlreadyExists, "{error}");
+    assert_eq!(fs::read(&dest).unwrap(), b"existing");
+    assert_eq!(listing(tmp.path()), ["logo.png"]);
+}
+
+#[test]
+fn save_new_refuses_a_taken_name_that_is_a_folder_and_leaves_it_alone() {
+    let tmp = TempDir::new().unwrap();
+    let dest = folder(tmp.path(), "logo.png");
+    write(&dest, "inside", b"kept");
+
+    let error = save_new(&dest, b"new", some_permissions(tmp.path())).unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::AlreadyExists, "{error}");
+    assert!(dest.is_dir());
+    assert_eq!(fs::read(dest.join("inside")).unwrap(), b"kept");
+    assert_eq!(listing(tmp.path()), ["logo.png"]);
+}
+
+#[test]
+fn save_new_never_numbers() {
+    // `write_new` would take `logo-1.png` here; a typed name is not changed.
+    let tmp = TempDir::new().unwrap();
+    let dest = write(tmp.path(), "logo.png", b"existing");
+
+    save_new(&dest, b"new", some_permissions(tmp.path())).unwrap_err();
+
+    assert_eq!(listing(tmp.path()), ["logo.png"]);
+}
+
+#[test]
+fn save_new_refuses_a_missing_folder_and_creates_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let dest = tmp.path().join("exports").join("logo.png");
+
+    let error = save_new(&dest, b"new", some_permissions(tmp.path())).unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+    assert_eq!(listing(tmp.path()), Vec::<OsString>::new());
+}
+
+#[test]
+fn save_new_leaves_no_temporary_file_after_a_refusal() {
+    let tmp = TempDir::new().unwrap();
+    let dest = write(tmp.path(), "logo.png", b"existing");
+    let before = listing(tmp.path());
+
+    save_new(&dest, b"new", some_permissions(tmp.path())).unwrap_err();
+
+    assert_eq!(listing(tmp.path()), before);
+}
+
+// --- first_free_name -----------------------------------------------------------
+
+#[test]
+fn first_free_name_gives_the_name_when_free() {
+    let tmp = TempDir::new().unwrap();
+    write(tmp.path(), "other.png", b"x");
+
+    assert_eq!(
+        first_free_name(tmp.path(), OsStr::new("a.png")),
+        Some(OsString::from("a.png"))
+    );
+}
+
+#[test]
+fn first_free_name_gives_minus_one_then_minus_two() {
+    let tmp = TempDir::new().unwrap();
+    write(tmp.path(), "a.png", b"x");
+    assert_eq!(
+        first_free_name(tmp.path(), OsStr::new("a.png")),
+        Some(OsString::from("a-1.png"))
+    );
+
+    write(tmp.path(), "a-1.png", b"x");
+    assert_eq!(
+        first_free_name(tmp.path(), OsStr::new("a.png")),
+        Some(OsString::from("a-2.png"))
+    );
+}
+
+#[test]
+fn first_free_name_skips_a_taken_minus_one() {
+    let tmp = TempDir::new().unwrap();
+    write(tmp.path(), "a.png", b"x");
+    write(tmp.path(), "a-1.png", b"x");
+
+    assert_eq!(
+        first_free_name(tmp.path(), OsStr::new("a.png")),
+        Some(OsString::from("a-2.png"))
+    );
+}
+
+#[test]
+fn first_free_name_does_not_number_while_the_name_is_free() {
+    let tmp = TempDir::new().unwrap();
+    write(tmp.path(), "a-1.png", b"x");
+
+    assert_eq!(
+        first_free_name(tmp.path(), OsStr::new("a.png")),
+        Some(OsString::from("a.png"))
+    );
+}
+
+#[test]
+fn first_free_name_treats_a_name_that_differs_only_in_case_as_taken() {
+    // The planner compares names this way on every platform.
+    let tmp = TempDir::new().unwrap();
+    write(tmp.path(), "A.PNG", b"x");
+
+    assert_eq!(
+        first_free_name(tmp.path(), OsStr::new("a.png")),
+        Some(OsString::from("a-1.png"))
+    );
+}
+
+#[test]
+fn first_free_name_counts_a_folder_as_taken() {
+    let tmp = TempDir::new().unwrap();
+    folder(tmp.path(), "a.png");
+
+    assert_eq!(
+        first_free_name(tmp.path(), OsStr::new("a.png")),
+        Some(OsString::from("a-1.png"))
+    );
+}
+
+#[test]
+fn first_free_name_in_a_missing_folder_gives_the_name() {
+    let tmp = TempDir::new().unwrap();
+
+    assert_eq!(
+        first_free_name(&tmp.path().join("missing"), OsStr::new("a.png")),
+        Some(OsString::from("a.png"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn first_free_name_keeps_the_bytes_of_a_name_that_is_not_utf8() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let tmp = TempDir::new().unwrap();
+    let name = OsString::from_vec(b"caf\xe9.png".to_vec());
+    fs::write(tmp.path().join(&name), b"x").unwrap();
+
+    let free = first_free_name(tmp.path(), &name).unwrap();
+
+    assert_eq!(free.as_bytes(), b"caf\xe9-1.png");
+    assert_ne!(free, name);
+}
+
+// --- batch_output_name ---------------------------------------------------------
+
+#[test]
+fn batch_output_name_prefixes_only_next_to_the_original() {
+    let src = Path::new("/photos/holiday.jpg");
+
+    assert_eq!(
+        batch_output_name(src, false),
+        OsString::from("optimized-holiday.jpg")
+    );
+    assert_eq!(batch_output_name(src, true), OsString::from("holiday.jpg"));
+}
+
+#[test]
+fn batch_output_name_is_the_name_the_planner_gives() {
+    let tmp = TempDir::new().unwrap();
+    let out = folder(tmp.path(), "exports");
+    let src = write(tmp.path(), "holiday.jpg", &jpg());
+
+    let next_to = dests(&plan_files_to(std::slice::from_ref(&src), None));
+    let chosen = dests(&plan_files_to(std::slice::from_ref(&src), Some(&out)));
+
+    assert_eq!(
+        next_to[0].file_name().unwrap(),
+        batch_output_name(&src, false)
+    );
+    assert_eq!(
+        chosen[0].file_name().unwrap(),
+        batch_output_name(&src, true)
+    );
+    assert_ne!(
+        batch_output_name(&src, false),
+        batch_output_name(&src, true)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn batch_output_name_keeps_the_bytes_of_a_name_that_is_not_utf8() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let src = PathBuf::from(OsString::from_vec(b"/photos/caf\xe9.jpg".to_vec()));
+
+    assert_eq!(
+        batch_output_name(&src, false).as_bytes(),
+        b"optimized-caf\xe9.jpg"
+    );
+    assert_eq!(batch_output_name(&src, true).as_bytes(), b"caf\xe9.jpg");
 }
