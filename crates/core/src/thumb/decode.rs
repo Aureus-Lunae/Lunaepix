@@ -69,7 +69,8 @@ const NOT_DECODED: &str = "an SVG is not decoded";
 ///   at least the thumbnail's, as RGBA (greyscale expanded); CMYK and YCCK
 ///   are refused.
 /// - WebP: a still image decoded by libwebp straight to the thumbnail's
-///   size; an animation's first frame at its canvas size.
+///   size; an animation's first frame at its canvas size, a canvas over
+///   [`crate::MAX_ANIMATION_CANVAS_PIXELS`] refused before decoding.
 pub(super) fn picture(format: Format, bytes: &[u8], side: u32) -> Result<Picture, String> {
     check_header(format, bytes)?;
     let (width, height, rgba) = match format {

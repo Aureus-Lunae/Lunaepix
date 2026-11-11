@@ -53,7 +53,9 @@ pub struct CannotShow(pub String);
 ///   plain area average to [`fit`] [`THUMB_SIDE`] and written as an 8-bit
 ///   RGBA PNG. A JPG and a still WebP are decoded at a reduced scale where
 ///   the size allows; an animated PNG gives its default image and an
-///   animated WebP its first frame. A CMYK or YCCK JPG cannot be shown.
+///   animated WebP its first frame, its canvas checked against
+///   [`crate::MAX_ANIMATION_CANVAS_PIXELS`] first. A CMYK or YCCK JPG
+///   cannot be shown.
 /// - An SVG is returned as its own bytes when they are UTF-8 text whose
 ///   first character, after an optional byte order mark and whitespace, is
 ///   `<`. It is not parsed or rendered.

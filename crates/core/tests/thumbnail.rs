@@ -421,6 +421,47 @@ fn an_image_of_exactly_max_pixels_is_not_refused_for_its_size() {
     }
 }
 
+/// An animated WebP of only its headers: a `VP8X` canvas of `w`x`h`, `ANIM`
+/// and one `ANMF` frame header covering the canvas, with no image data.
+fn animated_webp_header_only(w: u32, h: u32) -> Vec<u8> {
+    let mut anmf = vec![0; 6];
+    anmf.extend_from_slice(&(w - 1).to_le_bytes()[..3]);
+    anmf.extend_from_slice(&(h - 1).to_le_bytes()[..3]);
+    anmf.extend_from_slice(&100u32.to_le_bytes()[..3]);
+    anmf.push(0);
+    fx::from_chunks(&[
+        (*b"VP8X", fx::vp8x_payload(fx::FLAG_ANIMATION, w, h)),
+        (*b"ANIM", fx::anim_payload(0, 0)),
+        (*b"ANMF", anmf),
+    ])
+}
+
+#[test]
+fn an_animated_webp_one_pixel_over_the_canvas_cap_cannot_be_shown_without_decoding() {
+    // 10001x5000: 50,005,000 pixels, within MAX_PIXELS but over the canvas cap.
+    let why = reason(
+        thumb_of("a.webp", &animated_webp_header_only(10_001, 5000)),
+        "over the canvas cap",
+    );
+    // The header check's reason, not libwebp's: nothing was decoded.
+    assert_eq!(
+        why,
+        "animation too large: 10001×5000 canvas exceeds 50 megapixels"
+    );
+}
+
+#[test]
+fn an_animated_webp_of_exactly_the_canvas_cap_is_not_refused_for_its_canvas() {
+    // 10000x5000: exactly MAX_ANIMATION_CANVAS_PIXELS. No image data, so it
+    // fails later, in libwebp's animation decoder.
+    let why = reason(
+        thumb_of("a.webp", &animated_webp_header_only(10_000, 5000)),
+        "at the canvas cap",
+    );
+    assert!(!why.contains("too large"), "{why}");
+    assert!(why.contains("libwebp"), "{why}");
+}
+
 #[test]
 fn a_file_over_max_file_bytes_cannot_be_shown() {
     let tmp = TempDir::new().unwrap();

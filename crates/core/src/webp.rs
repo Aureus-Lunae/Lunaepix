@@ -29,8 +29,17 @@ pub(crate) fn check_header(bytes: &[u8]) -> Result<(), String> {
 /// - a still image, decoded by libwebp straight to the thumbnail's size
 ///   ([`crate::thumb::fit`] of the size in its header);
 /// - an animation's first frame, at the canvas size ([`first_frame`]).
+///
+/// An animation's canvas is checked against
+/// [`crate::MAX_ANIMATION_CANVAS_PIXELS`] from its header first, as the
+/// optimiser does: libwebp's animation decoder holds two canvases, and
+/// the frame is a third. The frame-count cap does not apply here, because
+/// the frames are decoded one at a time and only the first is taken.
 pub(crate) fn thumbnail_rgba(bytes: &[u8], side: u32) -> Result<(u32, u32, Vec<u8>), String> {
-    let image = if riff::parse(bytes)?.kind == Kind::Animated {
+    let file = riff::parse(bytes)?;
+    let image = if file.kind == Kind::Animated {
+        let header = riff::animation_header(&file)?;
+        crate::plan::check_animation_canvas(header.width, header.height)?;
         first_frame(bytes, &LibWebp)?
     } else {
         codec::decode_scaled(bytes, |width, height| {
