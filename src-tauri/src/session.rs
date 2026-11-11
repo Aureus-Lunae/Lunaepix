@@ -410,8 +410,8 @@ impl Session {
 
     /// The `list-changed` event for the list as it is now, planned against
     /// the output setting, with each row's thumbnail key; the keys' snapshot
-    /// is taken as the event is made. The two locks are taken one after the
-    /// other, never together.
+    /// is taken as the event is made. The three locks (the output setting, the
+    /// list and the thumbnails) are taken one after another, never together.
     fn list_changed(&self, notice: Option<String>) -> Event {
         let out = lock(&self.output).clone();
         let jobs = lock(&self.list).rows(out.as_deref());
