@@ -1,6 +1,7 @@
 //! Guards on the window's security settings, so a later change cannot widen
 //! them silently: the capability grants the seven app commands and event
-//! listening only, and the content security policy stays strict.
+//! listening only, and the content security policy stays strict (only
+//! `img-src` names the `thumb` scheme).
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -46,7 +47,8 @@ fn unexpected_permissions(capability: &Value) -> Vec<String> {
 
 /// What makes a content security policy weaker than we allow: inline code,
 /// `eval`, wildcards, `data:`/`blob:`, and any remote source. The only
-/// network origin allowed is Tauri's IPC endpoint on Windows. Also missing
+/// network origins allowed are Tauri's IPC endpoint on Windows, and the
+/// `thumb` scheme's origin on Windows in `img-src` only. Also missing
 /// `default-src 'self'` or `script-src 'self'`.
 fn csp_problems(csp: &str) -> Vec<String> {
     let mut problems = Vec::new();
@@ -56,8 +58,11 @@ fn csp_problems(csp: &str) -> Vec<String> {
         .filter(|tokens: &Vec<&str>| !tokens.is_empty())
         .collect();
     for tokens in &directives {
+        let img_src = tokens[0].eq_ignore_ascii_case("img-src");
         for source in &tokens[1..] {
             let lower = source.to_ascii_lowercase();
+            let allowed_origin =
+                lower == "http://ipc.localhost" || (img_src && lower == "http://thumb.localhost");
             let weak = lower.starts_with("'unsafe-")
                 || lower == "*"
                 || lower.contains("*.")
@@ -66,7 +71,7 @@ fn csp_problems(csp: &str) -> Vec<String> {
                 || lower == "http:"
                 || lower == "https:"
                 || ((lower.starts_with("http://") || lower.starts_with("https://"))
-                    && lower != "http://ipc.localhost");
+                    && !allowed_origin);
             if weak {
                 problems.push(format!("{} {source}", tokens[0]));
             }
@@ -82,6 +87,75 @@ fn csp_problems(csp: &str) -> Vec<String> {
     }
     problems
 }
+
+/// The policy as it must be, directive by directive. Only `img-src` differs
+/// from the policy before thumbnails: the `thumb` scheme, as Linux and macOS
+/// name it (`thumb:`) and as Windows serves it (`http://thumb.localhost`).
+const EXPECTED_CSP: &[(&str, &[&str])] = &[
+    ("default-src", &["'self'"]),
+    ("script-src", &["'self'"]),
+    ("style-src", &["'self'"]),
+    ("img-src", &["'self'", "thumb:", "http://thumb.localhost"]),
+    ("font-src", &["'self'"]),
+    ("connect-src", &["ipc:", "http://ipc.localhost"]),
+    ("object-src", &["'none'"]),
+    ("base-uri", &["'none'"]),
+    ("form-action", &["'none'"]),
+    ("frame-src", &["'none'"]),
+];
+
+/// How a policy differs from [`EXPECTED_CSP`]: a directive missing, given
+/// twice, not expected, or with other sources. Names and sources are
+/// compared without case (as the browser reads them) and sources in any
+/// order.
+fn csp_shape_problems(csp: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let directives: Vec<(String, Vec<String>)> = csp
+        .split(';')
+        .map(|directive| directive.split_whitespace().collect::<Vec<_>>())
+        .filter(|tokens| !tokens.is_empty())
+        .map(|tokens| {
+            let mut sources: Vec<String> =
+                tokens[1..].iter().map(|s| s.to_ascii_lowercase()).collect();
+            sources.sort();
+            (tokens[0].to_ascii_lowercase(), sources)
+        })
+        .collect();
+    for (name, _) in &directives {
+        if !EXPECTED_CSP.iter().any(|(expected, _)| expected == name) {
+            problems.push(format!("unexpected directive {name}"));
+        }
+    }
+    for (name, expected) in EXPECTED_CSP {
+        let given: Vec<&Vec<String>> = directives
+            .iter()
+            .filter(|(directive, _)| directive == name)
+            .map(|(_, sources)| sources)
+            .collect();
+        let mut expected: Vec<String> = expected.iter().map(|s| s.to_ascii_lowercase()).collect();
+        expected.sort();
+        match given.as_slice() {
+            [] => problems.push(format!("missing {name}")),
+            [sources] if **sources == expected => {}
+            [sources] => problems.push(format!("{name} is {sources:?}, not {expected:?}")),
+            _ => problems.push(format!("{name} given more than once")),
+        }
+    }
+    problems
+}
+
+/// Every problem [`csp_problems`] and [`csp_shape_problems`] find.
+fn all_csp_problems(csp: &str) -> Vec<String> {
+    let mut problems = csp_problems(csp);
+    problems.extend(csp_shape_problems(csp));
+    problems
+}
+
+/// The policy the window must have, written out as a fixture.
+const GOOD_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
+    img-src 'self' thumb: http://thumb.localhost; font-src 'self'; \
+    connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; \
+    form-action 'none'; frame-src 'none'";
 
 /// The permissions a capability grants that are plain names, in order.
 fn granted(capability: &Value) -> Vec<&str> {
@@ -201,10 +275,59 @@ fn the_content_security_policy_is_strict() {
         .as_str()
         .expect("the csp is set, as one string");
     assert_eq!(csp_problems(csp), Vec::<String>::new());
-    assert!(
-        csp.contains("connect-src ipc: http://ipc.localhost"),
-        "{csp}"
+    assert_eq!(csp_shape_problems(csp), Vec::<String>::new());
+}
+
+#[test]
+fn an_img_src_with_anything_more_or_another_changed_directive_is_flagged() {
+    // The control: the policy as it must be, also in another spelling.
+    assert_eq!(all_csp_problems(GOOD_CSP), Vec::<String>::new());
+    let respelled = GOOD_CSP.replace(
+        "img-src 'self' thumb: http://thumb.localhost",
+        "IMG-SRC http://THUMB.localhost 'SELF'  thumb:",
     );
+    assert_eq!(all_csp_problems(&respelled), Vec::<String>::new());
+
+    let img_src = "img-src 'self' thumb: http://thumb.localhost";
+    for extra in [
+        "data:",
+        "blob:",
+        "*",
+        "https:",
+        "http:",
+        "http://evil.localhost",
+        "http://*.localhost",
+        "https://thumb.localhost",
+        "thumbs:",
+        "'unsafe-inline'",
+    ] {
+        let widened = GOOD_CSP.replace(img_src, &format!("{img_src} {extra}"));
+        assert_ne!(widened, GOOD_CSP);
+        assert!(!all_csp_problems(&widened).is_empty(), "{extra}");
+    }
+    let changed = [
+        // The scheme anywhere but `img-src`.
+        GOOD_CSP.replace(
+            "script-src 'self'",
+            "script-src 'self' http://thumb.localhost",
+        ),
+        GOOD_CSP.replace("script-src 'self'", "script-src 'self' thumb:"),
+        GOOD_CSP.replace(
+            "connect-src ipc: http://ipc.localhost",
+            "connect-src ipc: http://ipc.localhost thumb:",
+        ),
+        // `img-src` narrowed, given twice, or dropped.
+        GOOD_CSP.replace(img_src, "img-src 'self' thumb:"),
+        GOOD_CSP.replace(img_src, &format!("{img_src}; img-src 'self'")),
+        GOOD_CSP.replace(&format!("{img_src}; "), ""),
+        // Another directive changed or added.
+        GOOD_CSP.replace("object-src 'none'", "object-src 'self'"),
+        format!("{GOOD_CSP}; worker-src 'self'"),
+    ];
+    for csp in &changed {
+        assert_ne!(csp, GOOD_CSP);
+        assert!(!all_csp_problems(csp).is_empty(), "{csp}");
+    }
 }
 
 #[test]
@@ -2641,8 +2764,8 @@ fn a_page_without_webp_in_its_text_does_not_say_it_in_a_fixture() {
 
 // ---------------------------------------------------------------------
 // The moon logo in the window header: one decorative image, loaded from the
-// window folder (the CSP allows `img-src 'self'` only), made from the same
-// SVG as the app icon.
+// window folder (the CSP allows images from the window folder and the
+// `thumb` scheme only), made from the same SVG as the app icon.
 // ---------------------------------------------------------------------
 
 /// Problems with the images in `html`. The page must hold exactly one `<img>`;

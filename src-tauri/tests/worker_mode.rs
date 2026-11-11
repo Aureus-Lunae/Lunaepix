@@ -167,3 +167,84 @@ fn thumb_flag_exits_3_for_a_text_file_and_prints_nothing() {
     assert_eq!(output.status.code(), Some(3));
     assert!(output.stdout.is_empty(), "{:?}", output.stdout);
 }
+
+// --- the `thumb` handler's answer, with the app binary as the worker --------
+
+use lunaepix_app_lib::thumbs::{self, Thumbs};
+
+/// The request path for `key`.
+fn uri(key: &Option<String>) -> String {
+    format!("/{}", key.as_deref().expect("a key"))
+}
+
+fn app_binary() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_lunaepix-app"))
+}
+
+#[test]
+fn serve_with_the_app_binary_answers_a_png_and_an_svg() {
+    let dir = TempDir::new().unwrap();
+    let png = dir.path().join("hero image.png");
+    fs::write(&png, wide_png_bytes()).unwrap();
+    let svg = dir.path().join("logo.svg");
+    let svg_bytes = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>"#;
+    fs::write(&svg, svg_bytes).unwrap();
+    let thumbs = Thumbs::new();
+    let keys = thumbs.snapshot(&[Some(png), Some(svg)]);
+
+    let answer = thumbs::serve(&thumbs, app_binary(), &uri(&keys[0]));
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.content_type, Some("image/png"));
+    let mut reader = png::Decoder::new(answer.body.as_slice())
+        .read_info()
+        .unwrap();
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut buffer).unwrap();
+    assert_eq!((frame.width, frame.height), (64, 32));
+
+    let answer = thumbs::serve(&thumbs, app_binary(), &uri(&keys[1]));
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.content_type, Some("image/svg+xml"));
+    assert_eq!(answer.body, svg_bytes);
+}
+
+#[test]
+fn serve_with_the_app_binary_is_404_for_a_text_file_and_remembers_it() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("notes.png");
+    fs::write(&src, b"just some text").unwrap();
+    let thumbs = Thumbs::new();
+    let keys = thumbs.snapshot(&[Some(src.clone())]);
+
+    let answer = thumbs::serve(&thumbs, app_binary(), &uri(&keys[0]));
+    assert_eq!(
+        (answer.status, answer.content_type, answer.body.len()),
+        (404, None, 0)
+    );
+    // Remembered: even once the file is a picture, the key stays 404.
+    fs::write(&src, wide_png_bytes()).unwrap();
+    assert_eq!(
+        thumbs::serve(&thumbs, app_binary(), &uri(&keys[0])).status,
+        404
+    );
+}
+
+#[test]
+fn serve_with_a_program_that_is_not_there_is_404_and_tries_again() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("a.png");
+    fs::write(&src, wide_png_bytes()).unwrap();
+    let thumbs = Thumbs::new();
+    let keys = thumbs.snapshot(&[Some(src)]);
+
+    let missing = dir.path().join("no-such-worker");
+    let answer = thumbs::serve(&thumbs, &missing, &uri(&keys[0]));
+    assert_eq!(
+        (answer.status, answer.content_type, answer.body.len()),
+        (404, None, 0)
+    );
+    // Not remembered: with a worker that is there, the same key is made.
+    let answer = thumbs::serve(&thumbs, app_binary(), &uri(&keys[0]));
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.content_type, Some("image/png"));
+}
