@@ -7,7 +7,7 @@ plan (in `docs/pending-approval/` until approved) when it starts.
 | Item | Status |
 |---|---|
 | Image lossless compression | Done |
-| Lossy image compression | Built; being tested by hand |
+| Lossy image compression | Done |
 | Preview single image compression before compressing (before/after slider) | Not started |
 | Apple support: a brew formula, and a plain download with one awkward step | Not started |
 | Choose how much it can get compressed (quality, like JPEG 70%) on lossy | Part of lossy compression |
@@ -28,7 +28,7 @@ plan (in `docs/pending-approval/` until approved) when it starts.
 - Being tested by hand now. Then `/finalize-plan` closes the WebP plan.
 - The looks are picked up under "Clean and clear UI".
 
-## Lossy image compression
+## Lossy image compression — Done
 
 Smaller files by allowing a change in pixels that the eye should not notice.
 Built together with the quality setting ("Why not. Make them at once."), plus
