@@ -283,8 +283,10 @@ anything else as `null`, so no other text reaches an image address.
 - **How:** a worker process makes each thumbnail (the window process never
   opens the file), at most two at a time; other requests wait their turn.
   Thumbnails and "cannot be shown" are kept for the current list and dropped
-  when a new list starts. A failure of any other kind is tried again on the
-  next request.
+  when a new list starts. At most 64 MiB of thumbnails are kept per list: one
+  that does not fit is still sent, but made again when it is asked for
+  again ("cannot be shown" takes no room). A failure of any other kind is
+  tried again on the next request.
 
 ```text
 GET thumb://localhost/3-0     → 200, image/png

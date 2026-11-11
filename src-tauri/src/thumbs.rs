@@ -6,7 +6,8 @@
 //! the row's file through the key alone: nothing else in the address is
 //! read. A worker process makes the thumbnail ([`serve`] with
 //! [`lunaepix_core::run_thumb`]), at most [`MAX_THUMB_WORKERS`] at a time,
-//! and the answers of the current list are kept until a new list starts.
+//! and the answers of the current list are kept until a new list starts,
+//! up to [`MAX_THUMB_CACHE_BYTES`] of them.
 //!
 //! A key never changes its file: the list number is raised when a new list
 //! starts ([`Thumbs::new_list`]) and whenever a snapshot would give a key
@@ -26,6 +27,10 @@ use crate::session::lock;
 
 /// At most this many thumbnail workers run at a time; other requests wait.
 pub const MAX_THUMB_WORKERS: usize = 2;
+
+/// The most bytes of thumbnails kept per list. An answer that would pass it
+/// is still served, but made again when it is asked for again.
+pub const MAX_THUMB_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 /// The number of the first list.
 const FIRST_LIST: u64 = 1;
@@ -106,6 +111,8 @@ impl ThumbResponse {
 pub struct Thumbs {
     list: Mutex<List>,
     pool: Pool,
+    /// The most bytes of answer bodies kept per list.
+    budget: usize,
 }
 
 /// The current list, as its keys see it.
@@ -121,6 +128,8 @@ struct List {
     named: Vec<Option<PathBuf>>,
     /// The answers kept, by row index: thumbnails, and "cannot be shown".
     answers: HashMap<usize, ThumbResponse>,
+    /// The bytes of the bodies in `answers`.
+    kept_bytes: usize,
 }
 
 impl List {
@@ -130,6 +139,7 @@ impl List {
         self.rows.clear();
         self.named.clear();
         self.answers.clear();
+        self.kept_bytes = 0;
     }
 }
 
@@ -143,21 +153,30 @@ enum Found {
 
 impl Default for Thumbs {
     fn default() -> Self {
+        Self::with_budget(MAX_THUMB_CACHE_BYTES)
+    }
+}
+
+impl Thumbs {
+    /// With the budget [`MAX_THUMB_CACHE_BYTES`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// With a budget of `bytes` of answer bodies kept per list; the tests
+    /// use a small one.
+    pub fn with_budget(bytes: usize) -> Self {
         Thumbs {
             list: Mutex::new(List {
                 number: FIRST_LIST,
                 rows: Vec::new(),
                 named: Vec::new(),
                 answers: HashMap::new(),
+                kept_bytes: 0,
             }),
             pool: Pool::default(),
+            budget: bytes,
         }
-    }
-}
-
-impl Thumbs {
-    pub fn new() -> Self {
-        Self::default()
     }
 
     /// Take the rows of a `list-changed`: the image path of each row, or
@@ -235,9 +254,11 @@ impl Thumbs {
     }
 
     /// The response to what `make` answered for `path`, the file of the key
-    /// `(number, index)`; kept when it is a thumbnail or "cannot be shown"
-    /// and the key's list is still the current one. An SVG answer for a
-    /// file whose name does not end in `.svg` is not believed.
+    /// `(number, index)`; kept when it is a thumbnail or "cannot be shown",
+    /// the key's list is still the current one, and its body fits in what
+    /// is left of the budget ("cannot be shown" has no body, so it always
+    /// fits). An SVG answer for a file whose name does not end in `.svg` is
+    /// not believed.
     fn store(
         &self,
         (number, index): (u64, usize),
@@ -254,7 +275,9 @@ impl Thumbs {
         if list.number != number {
             return ThumbResponse::not_found();
         }
-        if keep {
+        let kept_bytes = list.kept_bytes + response.body.len();
+        if keep && kept_bytes <= self.budget {
+            list.kept_bytes = kept_bytes;
             list.answers.insert(index, response.clone());
         }
         response
@@ -774,6 +797,101 @@ mod tests {
         );
         assert_eq!(thumbs.answer(&uri(&old[0]), &make), not_found());
         assert_eq!(calls.taken(), [path("a.png"), path("a.png")]);
+    }
+
+    // --- the byte budget of the kept answers ------------------------------------
+
+    #[test]
+    fn a_new_thumbs_has_the_64_mib_budget() {
+        assert_eq!(MAX_THUMB_CACHE_BYTES, 64 * 1024 * 1024);
+        assert_eq!(Thumbs::new().budget, MAX_THUMB_CACHE_BYTES);
+    }
+
+    /// Two PNG rows, `a.png` and `b.png`, with a budget of `extra` bytes on
+    /// top of their two bodies (negative: below them).
+    fn two_rows_with_budget(extra: isize) -> (Thumbs, Vec<Option<String>>) {
+        let both = png_of(&path("a.png")).len() + png_of(&path("b.png")).len();
+        let thumbs = Thumbs::with_budget(both.checked_add_signed(extra).unwrap());
+        let keys = thumbs.snapshot(&[Some(path("a.png")), Some(path("b.png"))]);
+        (thumbs, keys)
+    }
+
+    #[test]
+    fn answers_that_bring_the_total_to_exactly_the_budget_are_kept() {
+        let (thumbs, keys) = two_rows_with_budget(0);
+        let calls = Calls::default();
+        for _ in 0..2 {
+            assert_eq!(
+                thumbs.answer(&uri(&keys[0]), calls.png()),
+                png_response(png_of(&path("a.png")))
+            );
+            assert_eq!(
+                thumbs.answer(&uri(&keys[1]), calls.png()),
+                png_response(png_of(&path("b.png")))
+            );
+        }
+        // Asked twice, each made once.
+        assert_eq!(calls.taken(), [path("a.png"), path("b.png")]);
+    }
+
+    #[test]
+    fn an_answer_one_byte_over_the_budget_is_served_but_not_kept() {
+        let (thumbs, keys) = two_rows_with_budget(-1);
+        let calls = Calls::default();
+        for _ in 0..2 {
+            assert_eq!(
+                thumbs.answer(&uri(&keys[0]), calls.png()),
+                png_response(png_of(&path("a.png")))
+            );
+            // Served all the same, with its type and bytes.
+            assert_eq!(
+                thumbs.answer(&uri(&keys[1]), calls.png()),
+                png_response(png_of(&path("b.png")))
+            );
+        }
+        // `a.png` was kept, `b.png` did not fit and was made again.
+        assert_eq!(calls.taken(), [path("a.png"), path("b.png"), path("b.png")]);
+    }
+
+    #[test]
+    fn after_new_list_an_answer_that_was_over_the_budget_is_kept() {
+        let (thumbs, keys) = two_rows_with_budget(-1);
+        let calls = Calls::default();
+        thumbs.answer(&uri(&keys[0]), calls.png());
+        thumbs.answer(&uri(&keys[1]), calls.png());
+        thumbs.answer(&uri(&keys[1]), calls.png());
+        assert_eq!(calls.taken(), [path("a.png"), path("b.png"), path("b.png")]);
+        thumbs.new_list();
+        let keys = thumbs.snapshot(&[Some(path("a.png")), Some(path("b.png"))]);
+        // `b.png` first: alone it fits the budget of the new list.
+        for _ in 0..2 {
+            assert_eq!(
+                thumbs.answer(&uri(&keys[1]), calls.png()),
+                png_response(png_of(&path("b.png")))
+            );
+        }
+        assert_eq!(calls.taken(), [path("b.png")]);
+    }
+
+    #[test]
+    fn cannot_show_is_kept_when_the_budget_is_used_up() {
+        let budget = png_of(&path("a.png")).len();
+        let thumbs = Thumbs::with_budget(budget);
+        let keys = thumbs.snapshot(&[Some(path("a.png")), Some(path("broken.png"))]);
+        let calls = Calls::default();
+        let make = calls.make(|path| {
+            if path.ends_with("broken.png") {
+                ThumbAnswer::CannotShow
+            } else {
+                ThumbAnswer::Png(png_of(path))
+            }
+        });
+        // The budget is used up exactly.
+        assert_eq!(thumbs.answer(&uri(&keys[0]), &make).status, 200);
+        for _ in 0..2 {
+            assert_eq!(thumbs.answer(&uri(&keys[1]), &make), not_found());
+        }
+        assert_eq!(calls.taken(), [path("a.png"), path("broken.png")]);
     }
 
     // --- the pool -------------------------------------------------------------
