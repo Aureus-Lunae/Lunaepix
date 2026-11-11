@@ -82,6 +82,15 @@ fn add(session: &Session, paths: Vec<PathBuf>) {
         .unwrap();
 }
 
+fn listing(dir: &Path) -> Vec<std::ffi::OsString> {
+    let mut names: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    names.sort();
+    names
+}
+
 fn done_rows(events: &[Event]) -> Vec<(Status, Option<String>)> {
     events
         .iter()
@@ -118,7 +127,7 @@ fn a_lossy_run_into_an_output_folder_through_the_real_worker_numbers_a_taken_nam
     assert_eq!(done_rows(&events), [(Status::Done, None)]);
     // Nothing in the output folder is replaced; the output takes a number.
     assert_eq!(fs::read(out.join("a.png")).unwrap(), b"keep me");
-    let (width, height, _) = decoded(&out.join("a-2.png"));
+    let (width, height, _) = decoded(&out.join("a-1.png"));
     assert_eq!((width, height), (64, 64));
     // The original is untouched, and nothing is written beside it.
     assert_eq!(fs::read(&src).unwrap(), original);
@@ -132,9 +141,6 @@ fn a_lossless_run_through_the_real_worker_writes_next_to_the_original() {
     let src = dir.path().join("a.png");
     let original = gradient_png();
     fs::write(&src, &original).unwrap();
-    // An earlier output next to the original is replaced, as always.
-    let dest = dir.path().join("optimized-a.png");
-    fs::write(&dest, b"an earlier output").unwrap();
 
     let session = Session::new();
     add(&session, vec![src.clone()]);
@@ -151,7 +157,76 @@ fn a_lossless_run_through_the_real_worker_writes_next_to_the_original() {
     });
     assert_eq!(note, Some(None));
     // Not a pixel changed, and the original is untouched.
+    let dest = dir.path().join("optimized-a.png");
     assert_eq!(decoded(&dest), decoded(&src));
+    assert_eq!(fs::read(&src).unwrap(), original);
+    assert_eq!(listing(dir.path()), ["a.png", "optimized-a.png"]);
+}
+
+#[test]
+fn a_lossless_run_through_the_real_worker_keeps_an_earlier_output_next_to_the_original() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("a.png");
+    let original = gradient_png();
+    fs::write(&src, &original).unwrap();
+    let earlier = dir.path().join("optimized-a.png");
+    fs::write(&earlier, b"an earlier output").unwrap();
+
+    let session = Session::new();
+    add(&session, vec![src.clone()]);
+    let events = run(&session, &json!({ "mode": "lossless", "quality": 75 }));
+
+    assert_eq!(done_rows(&events), [(Status::Done, None)]);
+    assert_eq!(fs::read(&earlier).unwrap(), b"an earlier output");
+    assert_eq!(
+        decoded(&dir.path().join("optimized-a-1.png")),
+        decoded(&src)
+    );
+    assert_eq!(fs::read(&src).unwrap(), original);
+    assert_eq!(
+        listing(dir.path()),
+        ["a.png", "optimized-a-1.png", "optimized-a.png"]
+    );
+}
+
+#[test]
+fn two_runs_on_a_png_with_no_output_folder_leave_optimized_a_and_optimized_a_1() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("a.png");
+    let original = gradient_png();
+    fs::write(&src, &original).unwrap();
+    let first = dir.path().join("optimized-a.png");
+    let second = dir.path().join("optimized-a-1.png");
+
+    // The first run is lossless, the second lossy: the bytes tell them apart.
+    let session = Session::new();
+    add(&session, vec![src.clone()]);
+    let events = run(&session, &json!({ "mode": "lossless", "quality": 75 }));
+    assert_eq!(done_rows(&events), [(Status::Done, None)]);
+    let first_bytes = fs::read(&first).unwrap();
+    assert_eq!(listing(dir.path()), ["a.png", "optimized-a.png"]);
+
+    let session = Session::new();
+    add(&session, vec![src.clone()]);
+    let events = run(&session, &json!({ "mode": "lossy", "quality": 40 }));
+    assert_eq!(done_rows(&events), [(Status::Done, None)]);
+
+    // The first run's output is as it was, the second run's is beside it.
+    assert_eq!(fs::read(&first).unwrap(), first_bytes);
+    assert_eq!(decoded(&first), decoded(&src));
+    assert_ne!(decoded(&second), decoded(&src));
+    assert_eq!(
+        listing(dir.path()),
+        ["a.png", "optimized-a-1.png", "optimized-a.png"]
+    );
+
+    // A third run takes the next number.
+    let session = Session::new();
+    add(&session, vec![src.clone()]);
+    run(&session, &json!({ "mode": "lossless", "quality": 75 }));
+    assert_eq!(fs::read(&first).unwrap(), first_bytes);
+    assert!(dir.path().join("optimized-a-2.png").exists());
+    assert!(!dir.path().join("optimized-a-0.png").exists());
     assert_eq!(fs::read(&src).unwrap(), original);
 }
 

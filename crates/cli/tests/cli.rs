@@ -745,10 +745,10 @@ fn out_never_overwrites_an_existing_file() {
         fs::read(out_dir.join("a.png")).unwrap(),
         b"an earlier result"
     );
-    assert_eq!(listing(&out_dir), names(&["a-2.png", "a.png"]));
+    assert_eq!(listing(&out_dir), names(&["a-1.png", "a.png"]));
     assert_eq!(
         blocks(&text(&output.stdout)),
-        vec![expected_block("a.png", &src, &out_dir.join("a-2.png"))]
+        vec![expected_block("a.png", &src, &out_dir.join("a-1.png"))]
     );
 }
 
@@ -1009,6 +1009,30 @@ fn without_out_a_rerun_replaces_the_earlier_output() {
         fs::read(&earlier).unwrap(),
         core_bytes(&src, Compression::Lossless)
     );
+    assert_eq!(listing(tmp.path()), names(&["a.png", "optimized-a.png"]));
+}
+
+#[test]
+fn the_cli_without_out_still_replaces() {
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &gradient_png());
+
+    // The first run is lossy, the second lossless: the bytes tell them apart.
+    let first = run_with(
+        tmp.path(),
+        &["--lossy", "--quality", "30", src.to_str().unwrap()],
+    );
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first.stderr));
+    let after_first = fs::read(tmp.path().join("optimized-a.png")).unwrap();
+    assert_eq!(after_first, core_bytes(&src, lossy_at(30)));
+
+    let second = run_on(tmp.path(), &[&src]);
+
+    assert_eq!(second.status.code(), Some(0), "{}", text(&second.stderr));
+    assert_eq!(text(&second.stderr), "");
+    let after_second = fs::read(tmp.path().join("optimized-a.png")).unwrap();
+    assert_eq!(after_second, core_bytes(&src, Compression::Lossless));
+    assert_ne!(after_second, after_first);
     assert_eq!(listing(tmp.path()), names(&["a.png", "optimized-a.png"]));
 }
 

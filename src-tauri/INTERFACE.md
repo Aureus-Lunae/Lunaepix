@@ -37,7 +37,7 @@ takes an argument.
 | `clear_list` | none | Empties the list. | `"busy"` |
 | `choose_output_folder` | none | Opens a native folder dialog; the folder picked becomes the output folder. Resolves as soon as the dialog is open. | `"busy"` |
 | `clear_output_folder` | none | Back to "next to the originals". | `"busy"` |
-| `start_run` | `{ "settings": { "mode": "lossy", "quality": 75 } }` | Runs the list with these settings and the output setting. Resolves once the run has started; its progress arrives as events. | `"busy"`, `"invalid-settings"`, `"empty-list"`, `"output-missing"` |
+| `start_run` | `{ "settings": { "mode": "lossy", "quality": 75 } }` | Runs the list with these settings and the output setting. It writes next to the originals or into the chosen folder, and never replaces an existing output: a taken name gets a number before the extension, from `-1` (`optimized-a-1.png`). Resolves once the run has started; its progress arrives as events. | `"busy"`, `"invalid-settings"`, `"empty-list"`, `"output-missing"` |
 | `open_output_folder` | none | Opens the output folder of the last completed run in the file manager: the chosen output folder, or, with none, the folder of the first file written. | `"no-output"`, `"open-failed"` |
 
 ```js

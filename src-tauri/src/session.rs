@@ -281,7 +281,6 @@ pub struct PreparedRun {
     ticket: RunTicket,
     jobs: Vec<Job>,
     compression: Compression,
-    out: Option<PathBuf>,
 }
 
 impl PreparedRun {
@@ -294,14 +293,9 @@ impl PreparedRun {
     pub fn options(&self) -> Options {
         Options {
             compression: self.compression,
-            // A chosen output folder is never replaced into: a taken name
-            // gets a number. Next to the originals, an earlier
-            // `optimized-<name>` is replaced, as always.
-            write: if self.out.is_some() {
-                WriteMode::NoReplace
-            } else {
-                WriteMode::Replace
-            },
+            // The app never replaces an output, in a chosen folder or next
+            // to the originals: a taken name gets a number (`-1`, `-2`, …).
+            write: WriteMode::NoReplace,
         }
     }
 }
@@ -464,7 +458,6 @@ impl Session {
             ticket,
             jobs,
             compression,
-            out,
         });
         Ok(())
     }
@@ -481,7 +474,6 @@ impl Session {
             ticket,
             jobs,
             compression,
-            ..
         } = prepared;
         run_session_with(
             ticket,
@@ -507,7 +499,6 @@ impl Session {
             ticket,
             jobs,
             compression,
-            ..
         } = prepared;
         run_session(
             ticket,
@@ -2642,7 +2633,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_worker_gets_neither_flag_for_lossless_next_to_the_originals() {
+    fn the_worker_gets_no_replace_for_lossless_next_to_the_originals() {
         let (dir, paths) = files(&[("a.png", b"png")]);
         let logs = TempDir::new().unwrap();
         let log = logs.path().join("args");
@@ -2658,7 +2649,7 @@ mod tests {
         );
         let args = fs::read_to_string(&log).unwrap();
         let expected = format!(
-            "{}\n{}\n",
+            "--no-replace\n{}\n{}\n",
             paths[0].display(),
             dir.path().join("optimized-a.png").display()
         );
@@ -2909,7 +2900,7 @@ mod tests {
     }
 
     #[test]
-    fn a_run_into_an_output_folder_replaces_nothing() {
+    fn the_app_never_replaces_in_an_output_folder() {
         let (dir, paths) = files(&[("a.png", b"png")]);
         let out = dir.path().join("exports");
         fs::create_dir(&out).unwrap();
@@ -2933,27 +2924,33 @@ mod tests {
     }
 
     #[test]
-    fn a_run_next_to_the_originals_replaces_an_earlier_output() {
+    fn the_app_never_replaces_next_to_the_originals() {
         let (dir, paths) = files(&[("a.png", b"png")]);
         let out = dir.path().join("exports");
         fs::create_dir(&out).unwrap();
         let session = Session::new();
         let window = Window::default();
         pick(&session, &window, &paths);
-        let replace = |compression| Options {
+        let no_replace = |compression| Options {
             compression,
-            write: WriteMode::Replace,
+            write: WriteMode::NoReplace,
         };
         let prepared = started(&session, &window, &lossless());
-        assert_eq!(prepared.options(), replace(Compression::Lossless));
+        assert_eq!(prepared.options(), no_replace(Compression::Lossless));
         drop(prepared);
-        // Chosen and cleared again: back to replacing.
+        let prepared = started(&session, &window, &lossy(30));
+        assert_eq!(
+            prepared.options(),
+            no_replace(Compression::Lossy(Quality::new(30).unwrap()))
+        );
+        drop(prepared);
+        // Chosen and cleared again: still no replacing.
         choose_output(&session, &window, &out);
         assert_eq!(session.clear_output_folder(&mut window.emit()), Ok(()));
         let prepared = started(&session, &window, &lossy(30));
         assert_eq!(
             prepared.options(),
-            replace(Compression::Lossy(Quality::new(30).unwrap()))
+            no_replace(Compression::Lossy(Quality::new(30).unwrap()))
         );
     }
 
@@ -3053,11 +3050,11 @@ mod tests {
             [
                 Job::Optimize {
                     src: first[0].clone(),
-                    dest: out.join("a-2.png"),
+                    dest: out.join("a-1.png"),
                 },
                 Job::Optimize {
                     src: second[0].clone(),
-                    dest: out.join("a-3.png"),
+                    dest: out.join("a-2.png"),
                 },
             ]
         );

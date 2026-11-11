@@ -173,7 +173,7 @@ impl OptimizeError {
 /// [`WriteMode::NoReplace`] `dest` may be in any folder: the output is
 /// written as a new file and nothing existing is replaced. When `dest` is
 /// taken by then (a file appeared after planning), the first free numbered
-/// name beside it is used (`logo-2.png`, up to `logo-9999.png`), and past
+/// name beside it is used (`logo-1.png`, up to `logo-9999.png`), and past
 /// that the file fails with "no free name in the output folder". A source of
 /// more than [`MAX_FILE_BYTES`] when it is
 /// read (it grew after planning) is refused with the planner's size reason,
@@ -824,7 +824,7 @@ mod tests {
             let outcome = result.unwrap();
             assert_eq!(dest, existing);
             assert_eq!(fs::read(&dest).unwrap(), b"an earlier output");
-            let numbered = tmp.path().join("optimized-a-2.png");
+            let numbered = tmp.path().join("optimized-a-1.png");
             assert_eq!(fs::read(&numbered).unwrap(), expected, "{compression:?}");
             assert_eq!(outcome.after, expected.len() as u64);
             assert_eq!(fs::read(&src).unwrap(), original);
@@ -833,7 +833,7 @@ mod tests {
                 .map(|e| e.unwrap().file_name())
                 .collect();
             names.sort();
-            assert_eq!(names, ["a.png", "optimized-a-2.png", "optimized-a.png"]);
+            assert_eq!(names, ["a.png", "optimized-a-1.png", "optimized-a.png"]);
         }
     }
 

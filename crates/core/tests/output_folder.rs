@@ -162,7 +162,7 @@ fn no_optimized_prefix_in_the_output_folder() {
 // --- a clash with an existing file ------------------------------------------
 
 #[test]
-fn an_existing_logo_png_makes_logo_2_and_stays_byte_identical() {
+fn an_existing_logo_png_makes_logo_1_and_stays_byte_identical() {
     let tmp = TempDir::new().unwrap();
     let originals = folder(tmp.path(), "originals");
     let out = folder(tmp.path(), "exports");
@@ -170,15 +170,15 @@ fn an_existing_logo_png_makes_logo_2_and_stays_byte_identical() {
     write(&out, "logo.png", b"an existing logo");
 
     let jobs = plan_files_to(&[src], Some(&out));
-    assert_eq!(dests(&jobs), [out.join("logo-2.png")]);
+    assert_eq!(dests(&jobs), [out.join("logo-1.png")]);
     run_all(&jobs, &NO_REPLACE);
 
     assert_eq!(fs::read(out.join("logo.png")).unwrap(), b"an existing logo");
     assert_eq!(
-        fs::read(out.join("logo-2.png")).unwrap(),
+        fs::read(out.join("logo-1.png")).unwrap(),
         lossless("logo.png", &png(1))
     );
-    assert_eq!(listing(&out), ["logo-2.png", "logo.png"]);
+    assert_eq!(listing(&out), ["logo-1.png", "logo.png"]);
 }
 
 #[test]
@@ -199,27 +199,45 @@ fn no_clash_no_number() {
 // --- a clash within a run ---------------------------------------------------
 
 #[test]
-fn two_sources_named_logo_png_give_logo_and_logo_2() {
+fn two_inputs_named_a_png_give_a_png_and_a_1_png() {
     let tmp = TempDir::new().unwrap();
     let one = folder(tmp.path(), "one");
     let two = folder(tmp.path(), "two");
     let out = folder(tmp.path(), "exports");
-    let first = write(&one, "logo.png", &png(1));
-    let second = write(&two, "logo.png", &png(2));
+    let first = write(&one, "a.png", &png(1));
+    let second = write(&two, "a.png", &png(2));
 
     let jobs = plan_files_to(&[first, second], Some(&out));
-    assert_eq!(dests(&jobs), [out.join("logo.png"), out.join("logo-2.png")]);
+    assert_eq!(dests(&jobs), [out.join("a.png"), out.join("a-1.png")]);
     run_all(&jobs, &NO_REPLACE);
 
     assert_eq!(
-        fs::read(out.join("logo.png")).unwrap(),
-        lossless("logo.png", &png(1))
+        fs::read(out.join("a.png")).unwrap(),
+        lossless("a.png", &png(1))
     );
     assert_eq!(
-        fs::read(out.join("logo-2.png")).unwrap(),
-        lossless("logo.png", &png(2))
+        fs::read(out.join("a-1.png")).unwrap(),
+        lossless("a.png", &png(2))
     );
-    assert_eq!(listing(&out), ["logo-2.png", "logo.png"]);
+    assert_eq!(listing(&out), ["a-1.png", "a.png"]);
+}
+
+#[test]
+fn three_inputs_named_a_png_give_a_png_a_1_png_and_a_2_png() {
+    let tmp = TempDir::new().unwrap();
+    let out = folder(tmp.path(), "exports");
+    let inputs: Vec<PathBuf> = ["one", "two", "three"]
+        .iter()
+        .enumerate()
+        .map(|(n, name)| write(&folder(tmp.path(), name), "a.png", &png(n as u32)))
+        .collect();
+
+    let jobs = plan_files_to(&inputs, Some(&out));
+
+    assert_eq!(
+        dests(&jobs),
+        [out.join("a.png"), out.join("a-1.png"), out.join("a-2.png")]
+    );
 }
 
 #[test]
@@ -242,7 +260,7 @@ fn different_names_get_no_number() {
 
 #[allow(non_snake_case)]
 #[test]
-fn an_existing_Logo_PNG_makes_logo_png_become_logo_2() {
+fn an_existing_Logo_PNG_makes_logo_png_become_logo_1() {
     let tmp = TempDir::new().unwrap();
     let originals = folder(tmp.path(), "originals");
     let out = folder(tmp.path(), "exports");
@@ -250,11 +268,11 @@ fn an_existing_Logo_PNG_makes_logo_png_become_logo_2() {
     write(&out, "Logo.PNG", b"an existing logo");
 
     let jobs = plan_files_to(&[src], Some(&out));
-    assert_eq!(dests(&jobs), [out.join("logo-2.png")]);
+    assert_eq!(dests(&jobs), [out.join("logo-1.png")]);
     run_all(&jobs, &NO_REPLACE);
 
     assert_eq!(fs::read(out.join("Logo.PNG")).unwrap(), b"an existing logo");
-    assert_eq!(listing(&out), ["Logo.PNG", "logo-2.png"]);
+    assert_eq!(listing(&out), ["Logo.PNG", "logo-1.png"]);
 }
 
 #[test]
@@ -293,7 +311,7 @@ fn non_ascii_names_clash_case_insensitively_and_keep_their_bytes() {
     write(&out, "MOBILIS LOGO – ZWART É.PNG", b"an existing logo");
 
     let jobs = plan_files_to(&[src], Some(&out));
-    assert_eq!(dests(&jobs), [out.join("Mobilis Logo – zwart é-2.png")]);
+    assert_eq!(dests(&jobs), [out.join("Mobilis Logo – zwart é-1.png")]);
     run_all(&jobs, &NO_REPLACE);
 
     assert_eq!(
@@ -302,7 +320,7 @@ fn non_ascii_names_clash_case_insensitively_and_keep_their_bytes() {
     );
     assert_eq!(
         listing(&out),
-        ["MOBILIS LOGO – ZWART É.PNG", "Mobilis Logo – zwart é-2.png"]
+        ["MOBILIS LOGO – ZWART É.PNG", "Mobilis Logo – zwart é-1.png"]
     );
 
     // Within a run: `Ä.png` and `ä.png` clash too.
@@ -312,7 +330,7 @@ fn non_ascii_names_clash_case_insensitively_and_keep_their_bytes() {
     let upper = write(&one, "Ä.png", &png(1));
     let lower = write(&two, "ä.png", &png(2));
     let jobs = plan_files_to(&[upper, lower], Some(&fresh));
-    assert_eq!(dests(&jobs), [fresh.join("Ä.png"), fresh.join("ä-2.png")]);
+    assert_eq!(dests(&jobs), [fresh.join("Ä.png"), fresh.join("ä-1.png")]);
 }
 
 #[test]
@@ -347,7 +365,7 @@ fn a_non_utf8_name_gets_its_number_with_its_bytes_intact() {
     let jobs = plan_files_to(&[src], Some(&out));
     let dest = dests(&jobs).remove(0);
     assert_eq!(dest.parent().unwrap(), out);
-    assert_eq!(dest.file_name().unwrap().as_bytes(), b"caf\xE9-2.png");
+    assert_eq!(dest.file_name().unwrap().as_bytes(), b"caf\xE9-1.png");
     run_all(&jobs, &NO_REPLACE);
 
     assert_eq!(fs::read(&existing).unwrap(), b"an existing file");
@@ -392,10 +410,10 @@ fn a_file_appearing_before_the_write_is_not_overwritten_and_the_next_number_is_u
         fs::read(out.join("logo.png")).unwrap(),
         b"appeared after planning"
     );
-    let written = fs::read(out.join("logo-2.png")).unwrap();
+    let written = fs::read(out.join("logo-1.png")).unwrap();
     assert_eq!(written, lossless("logo.png", &png(1)));
     assert_eq!(outcome.after, written.len() as u64);
-    assert_eq!(listing(&out), ["logo-2.png", "logo.png"]);
+    assert_eq!(listing(&out), ["logo-1.png", "logo.png"]);
 }
 
 #[test]
@@ -418,7 +436,7 @@ fn with_nothing_appearing_the_planned_name_is_used() {
 // --- the originals' own folder -----------------------------------------------
 
 #[test]
-fn the_originals_own_folder_writes_photo_2_and_leaves_photo_unchanged() {
+fn the_originals_own_folder_writes_photo_1_and_leaves_photo_unchanged() {
     for through_folder in [false, true] {
         let tmp = TempDir::new().unwrap();
         let src = write(tmp.path(), "photo.jpg", &jpg());
@@ -428,15 +446,15 @@ fn the_originals_own_folder_writes_photo_2_and_leaves_photo_unchanged() {
         } else {
             plan_files_to(std::slice::from_ref(&src), Some(tmp.path()))
         };
-        assert_eq!(dests(&jobs), [tmp.path().join("photo-2.jpg")]);
+        assert_eq!(dests(&jobs), [tmp.path().join("photo-1.jpg")]);
         run_all(&jobs, &NO_REPLACE);
 
         assert_eq!(fs::read(&src).unwrap(), jpg());
         assert_eq!(
-            fs::read(tmp.path().join("photo-2.jpg")).unwrap(),
+            fs::read(tmp.path().join("photo-1.jpg")).unwrap(),
             lossless("photo.jpg", &jpg())
         );
-        assert_eq!(listing(tmp.path()), ["photo-2.jpg", "photo.jpg"]);
+        assert_eq!(listing(tmp.path()), ["photo-1.jpg", "photo.jpg"]);
     }
 }
 
@@ -456,10 +474,10 @@ fn another_folder_writes_photo_without_number() {
 
 // --- the numbering bound ------------------------------------------------------
 
-/// An output folder holding `logo.png` and `logo-2.png` … `logo-<last>.png`.
+/// An output folder holding `logo.png` and `logo-1.png` … `logo-<last>.png`.
 fn taken_up_to(out: &Path, last: u32) {
     fs::write(out.join("logo.png"), b"").unwrap();
-    for n in 2..=last {
+    for n in 1..=last {
         fs::write(out.join(format!("logo-{n}.png")), b"").unwrap();
     }
 }
@@ -482,7 +500,7 @@ fn an_output_folder_with_every_number_taken_fails_the_file_with_the_reason() {
     }
     assert_eq!(error.reason(), "no free name in the output folder");
     let names = listing(&out);
-    assert_eq!(names.len(), 9999);
+    assert_eq!(names.len(), 10000);
     assert!(
         names
             .iter()
@@ -508,6 +526,28 @@ fn the_last_number_is_used_when_only_it_is_free() {
         fs::read(out.join("logo-9999.png")).unwrap(),
         lossless("logo.png", &png(1))
     );
+}
+
+#[test]
+fn minus_one_is_used_when_every_higher_number_is_taken() {
+    let tmp = TempDir::new().unwrap();
+    let originals = folder(tmp.path(), "originals");
+    let out = folder(tmp.path(), "exports");
+    let src = write(&originals, "logo.png", &png(1));
+    fs::write(out.join("logo.png"), b"").unwrap();
+    for n in 2..=9999 {
+        fs::write(out.join(format!("logo-{n}.png")), b"").unwrap();
+    }
+
+    let jobs = plan_files_to(&[src], Some(&out));
+    assert_eq!(dests(&jobs), [out.join("logo-1.png")]);
+    run_all(&jobs, &NO_REPLACE);
+
+    assert_eq!(
+        fs::read(out.join("logo-1.png")).unwrap(),
+        lossless("logo.png", &png(1))
+    );
+    assert!(!out.join("logo-0.png").exists());
 }
 
 // --- next to the originals ------------------------------------------------------
