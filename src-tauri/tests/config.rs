@@ -1,5 +1,5 @@
 //! Guards on the window's security settings, so a later change cannot widen
-//! them silently: the capability grants the seven app commands and event
+//! them silently: the capability grants the twelve app commands and event
 //! listening only, and the content security policy stays strict (only
 //! `img-src` names the `thumb` scheme).
 
@@ -23,6 +23,11 @@ const ALLOWED: &[&str] = &[
     "allow-clear-output-folder",
     "allow-start-run",
     "allow-open-output-folder",
+    "allow-set-view",
+    "allow-choose-image",
+    "allow-preview-image",
+    "allow-save-image",
+    "allow-move-drop-to-batch",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
 ];
@@ -169,7 +174,7 @@ fn granted(capability: &Value) -> Vec<&str> {
 
 /// What is wrong with a capability's permissions: one that is not in
 /// [`ALLOWED`], one of [`ALLOWED`] that is missing or given twice, and any
-/// count of `allow-` commands other than seven.
+/// count of `allow-` commands other than twelve.
 fn capability_problems(capability: &Value) -> Vec<String> {
     let mut problems: Vec<String> = unexpected_permissions(capability)
         .into_iter()
@@ -184,51 +189,54 @@ fn capability_problems(capability: &Value) -> Vec<String> {
         }
     }
     let commands = granted.iter().filter(|p| p.starts_with("allow-")).count();
-    if commands != 7 {
-        problems.push(format!("{commands} app commands, not seven"));
+    if commands != 12 {
+        problems.push(format!("{commands} app commands, not twelve"));
     }
     problems
 }
 
 #[test]
-fn a_capability_with_six_or_eight_commands_is_flagged_in_a_fixture() {
+fn a_capability_with_eleven_or_thirteen_commands_is_flagged_in_a_fixture() {
     let all: Vec<Value> = ALLOWED.iter().map(|p| Value::from(*p)).collect();
     // The control: the full list has nothing to report.
     assert_eq!(
         capability_problems(&serde_json::json!({ "permissions": all })),
         Vec::<String>::new()
     );
-    // Six: no `allow-readd-list`.
-    let six: Vec<Value> = all
+    // Eleven: no `allow-move-drop-to-batch`.
+    let eleven: Vec<Value> = all
         .iter()
-        .filter(|p| p.as_str() != Some("allow-readd-list"))
+        .filter(|p| p.as_str() != Some("allow-move-drop-to-batch"))
         .cloned()
         .collect();
     assert_eq!(
-        capability_problems(&serde_json::json!({ "permissions": six })),
-        ["missing allow-readd-list", "6 app commands, not seven"]
+        capability_problems(&serde_json::json!({ "permissions": eleven })),
+        [
+            "missing allow-move-drop-to-batch",
+            "11 app commands, not twelve"
+        ]
     );
-    // Eight: an extra command.
-    let mut eight = all.clone();
-    eight.push(Value::from("allow-delete-everything"));
+    // Thirteen: an extra command.
+    let mut thirteen = all.clone();
+    thirteen.push(Value::from("allow-delete-everything"));
     assert_eq!(
-        capability_problems(&serde_json::json!({ "permissions": eight })),
+        capability_problems(&serde_json::json!({ "permissions": thirteen })),
         [
             r#"unexpected "allow-delete-everything""#,
-            "8 app commands, not seven"
+            "13 app commands, not twelve"
         ]
     );
     // A permission given twice.
     let mut twice = all;
-    twice.push(Value::from("allow-readd-list"));
+    twice.push(Value::from("allow-set-view"));
     assert!(
         capability_problems(&serde_json::json!({ "permissions": twice }))
-            .contains(&"allow-readd-list given more than once".to_owned())
+            .contains(&"allow-set-view given more than once".to_owned())
     );
 }
 
 #[test]
-fn the_capability_grants_exactly_the_seven_commands_and_event_listening() {
+fn the_capability_grants_exactly_the_twelve_commands_and_event_listening() {
     let capability = read_json("capabilities/default.json");
     assert_eq!(capability_problems(&capability), Vec::<String>::new());
     assert_eq!(

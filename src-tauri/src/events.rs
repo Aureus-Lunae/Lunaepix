@@ -149,6 +149,50 @@ pub struct DragState {
     pub over: bool,
 }
 
+/// The image Single image mode shows, as the window may know it: names,
+/// numbers and its key, never a path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImageInfo {
+    /// The original's file name alone, lossily decoded.
+    pub name: String,
+    /// The size of the copy taken at load, in bytes.
+    pub size: u64,
+    /// The size it is shown at, in pixels; `null` for an SVG.
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// The image's key, a whole number as text (`"7"`); a new key is a new
+    /// image.
+    pub key: String,
+    /// The name Save as starts with, without the extension.
+    pub suggested: String,
+    /// The original's extension with its dot (`".jpg"`), as it is spelled.
+    pub extension: String,
+}
+
+/// The outcome of a load attempt in Single image mode: a choice, or a drop
+/// while Single image shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImageChanged {
+    /// The image that shows now: the new one, or the one that was there
+    /// when nothing was loaded; `null` when there is none.
+    pub image: Option<ImageInfo>,
+    /// How many dropped items were left out that Batch can take; above 0,
+    /// Switch to Batch is offered.
+    pub left_out: usize,
+    /// A sentence for the status line, or `null`.
+    pub notice: Option<String>,
+}
+
+/// The output setting changed while an image is loaded: the name Save as
+/// starts with for it now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NameSuggested {
+    /// The image's key.
+    pub image: String,
+    /// The name, without the extension.
+    pub suggested: String,
+}
+
 /// One event for the window: its name ([`Event::name`]) and its payload
 /// (the `Serialize` output; the two unit events have `null`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -165,6 +209,8 @@ pub enum Event {
     /// A file or folder dialog was closed without a choice.
     RunCancelled,
     DragState(DragState),
+    ImageChanged(ImageChanged),
+    NameSuggested(NameSuggested),
 }
 
 impl Event {
@@ -180,6 +226,8 @@ impl Event {
             Event::RunBusy => "run-busy",
             Event::RunCancelled => "run-cancelled",
             Event::DragState(_) => "drag-state",
+            Event::ImageChanged(_) => "image-changed",
+            Event::NameSuggested(_) => "name-suggested",
         }
     }
 }
@@ -504,5 +552,95 @@ mod tests {
             assert_eq!(event.name(), *name);
             assert_eq!(value(event), parsed(payload));
         }
+    }
+
+    // --- Single image ---------------------------------------------------------
+
+    fn holiday(key: &str) -> ImageInfo {
+        ImageInfo {
+            name: "holiday.jpg".to_owned(),
+            size: 2_400_000,
+            width: Some(4032),
+            height: Some(3024),
+            key: key.to_owned(),
+            suggested: "optimized-holiday".to_owned(),
+            extension: ".jpg".to_owned(),
+        }
+    }
+
+    #[test]
+    fn image_changed_serialises_exactly_as_the_spec_examples() {
+        let events = [
+            (
+                Event::ImageChanged(ImageChanged {
+                    image: Some(holiday("7")),
+                    left_out: 0,
+                    notice: None,
+                }),
+                r#"{ "image": { "name": "holiday.jpg", "size": 2400000, "width": 4032, "height": 3024,
+                     "key": "7", "suggested": "optimized-holiday", "extension": ".jpg" },
+                     "left_out": 0, "notice": null }"#,
+            ),
+            (
+                Event::ImageChanged(ImageChanged {
+                    image: Some(holiday("8")),
+                    left_out: 3,
+                    notice: Some(
+                        "Single image mode takes one image; 3 others were left out.".to_owned(),
+                    ),
+                }),
+                r#"{ "image": { "name": "holiday.jpg", "size": 2400000, "width": 4032, "height": 3024,
+                     "key": "8", "suggested": "optimized-holiday", "extension": ".jpg" },
+                     "left_out": 3, "notice": "Single image mode takes one image; 3 others were left out." }"#,
+            ),
+            (
+                Event::ImageChanged(ImageChanged {
+                    image: None,
+                    left_out: 1,
+                    notice: Some("Folders go in Batch.".to_owned()),
+                }),
+                r#"{ "image": null, "left_out": 1, "notice": "Folders go in Batch." }"#,
+            ),
+            (
+                Event::ImageChanged(ImageChanged {
+                    image: Some(ImageInfo {
+                        name: "logo.svg".to_owned(),
+                        size: 4100,
+                        width: None,
+                        height: None,
+                        key: "9".to_owned(),
+                        suggested: "optimized-logo".to_owned(),
+                        extension: ".svg".to_owned(),
+                    }),
+                    left_out: 0,
+                    notice: None,
+                }),
+                r#"{ "image": { "name": "logo.svg", "size": 4100, "width": null, "height": null,
+                     "key": "9", "suggested": "optimized-logo", "extension": ".svg" },
+                     "left_out": 0, "notice": null }"#,
+            ),
+        ];
+        for (event, payload) in &events {
+            assert_eq!(event.name(), "image-changed");
+            assert_eq!(value(event), parsed(payload));
+        }
+    }
+
+    #[test]
+    fn name_suggested_serialises_as_image_and_suggested_only() {
+        let event = Event::NameSuggested(NameSuggested {
+            image: "7".to_owned(),
+            suggested: "holiday".to_owned(),
+        });
+        assert_eq!(event.name(), "name-suggested");
+        assert_eq!(
+            value(&event),
+            parsed(r#"{ "image": "7", "suggested": "holiday" }"#)
+        );
+        // Not the image-changed shape: no other key, and not a nested image.
+        assert_ne!(
+            value(&event),
+            parsed(r#"{ "image": { "key": "7" }, "suggested": "holiday" }"#)
+        );
     }
 }

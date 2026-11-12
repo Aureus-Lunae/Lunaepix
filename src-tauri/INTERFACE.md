@@ -2,9 +2,14 @@
 
 The contract between the window (`ui/`, vanilla JS) and the Rust backend
 (`src-tauri/src/lib.rs`, with the logic in `session.rs` and the payloads in
-`events.rs`; the thumbnails in `thumbs.rs`). The window never sends a path,
-and it never receives one: it gets file names, the output folder's name,
-numbers and thumbnail keys.
+`events.rs`; Single image mode's state in `single.rs`; the thumbnails in
+`thumbs.rs`). The window never sends a path, and it never receives one: it
+gets file names, the output folder's name, numbers, thumbnail keys and image
+keys.
+
+The window has two modes, Single image and Batch, and opens in Single image
+at every launch. The backend is told which one shows (`set_view`), because a
+drop goes to the mode that shows.
 
 Use the global API (`app.withGlobalTauri` is on):
 
@@ -30,7 +35,7 @@ Nothing is remembered between launches.
 ## Commands
 
 Each resolves to `null` or rejects with one bare string. Only `start_run`
-takes an argument.
+and `set_view` take an argument.
 
 | Command | Argument | Does | Rejects with |
 |---|---|---|---|
@@ -41,13 +46,23 @@ takes an argument.
 | `clear_output_folder` | none | Back to "next to the originals". | `"busy"` |
 | `start_run` | `{ "settings": { "mode": "lossy", "quality": 75 } }` | Runs the list with these settings and the output setting. It writes next to the originals (`optimized-a.png`) or into the chosen folder (`a.png`), and never replaces an existing output: a taken name gets a number before the extension, from `-1` (`optimized-a-1.png`, `a-1.png`), then `-2`, up to `-9999`; when all of those are taken the file fails ("no free name in the output folder"). Resolves once the run has started; its progress arrives as events. | `"busy"`, `"invalid-settings"`, `"empty-list"`, `"output-missing"` |
 | `open_output_folder` | none | Opens the output folder of the last completed run in the file manager: the chosen output folder, or, with none, the folder of the first file written. | `"no-output"`, `"open-failed"` |
+| `set_view` | `{ "view": "single" }` or `{ "view": "batch" }` | Tells the backend which mode shows, so a drop goes there. Ends the Switch to Batch offer (see [Single image mode](#single-image-mode)). Sends no event. | `"busy"`, `"invalid-view"` |
+| `choose_image` | none | Opens a native one-file dialog with the same filters as `choose_files`; the file picked is loaded in Single image mode. Resolves as soon as the dialog is open; the outcome arrives as `image-changed`. | `"busy"` |
+| `move_drop_to_batch` | none | Switch to Batch: the view becomes Batch and every item of the last Single image drop that left items out is added to the list, exactly as a drop on Batch adds them (`list-changed`). | `"busy"`, `"nothing-to-move"` |
 
 ```js
 await invoke('start_run', { settings: { mode: 'lossy', quality: 75 } });
+await invoke('set_view', { view: 'batch' });
 ```
 
-- `"busy"`: a run is active, or a dialog for one is open. A `run-busy` event
-  goes out as well. Every command but `open_output_folder` can be busy.
+- `"busy"`: a run is active, a dialog for one is open, or an image is being
+  loaded. A `run-busy` event goes out as well. Every command but
+  `open_output_folder` can be busy.
+- `"invalid-view"`: the argument is not exactly `{ "view": "single" }` or
+  `{ "view": "batch" }`: another spelling (`"Single"`), another type, `null`,
+  a missing or an extra key is refused, and the view stays as it was.
+- `"nothing-to-move"`: there is no drop to move: the last Single image drop
+  left nothing out, or its offer has ended.
 - `"invalid-settings"`: `settings` is missing or `null`, or is not exactly
   an object with the two
   keys `mode` (`"lossless"` or `"lossy"`) and `quality` (a whole JSON number
@@ -74,11 +89,13 @@ images, drop the folder again. Nothing runs when it rejects.
 
 A dialog closed without a choice changes nothing and sends `run-cancelled`.
 
-Drag and drop needs no command. A drop on the window adds to the list,
+Drag and drop needs no command. A drop goes to the mode that shows (the
+last `set_view`; Single image at launch). In Batch it adds to the list,
 exactly like `choose_files` with those paths. A dropped folder adds the PNG,
 JPG, SVG and WebP files directly inside it (not its subfolders), earlier
-`optimized-*` outputs included. While a run is going, a drop is refused with
-`run-busy`.
+`optimized-*` outputs included. In Single image it loads an image (see
+[Single image mode](#single-image-mode)). While a run is going, a drop is
+refused with `run-busy`.
 
 A file is listed once, however often it is added. When a run has finished,
 the list is marked finished: the first add after that starts a fresh list
@@ -92,6 +109,46 @@ list those too, a re-add does not. The list is planned again at that moment,
 so a file deleted since the run is a skipped row ("Not a readable file"), as
 in `start_run`. Called with an empty list, it sends an empty list. The
 window's settings (mode, quality) and the output folder are not touched.
+
+## Single image mode
+
+**Loading.** A choice (`choose_image`) or a drop while Single image shows is
+a load attempt. The backend copies the file into a private folder (only
+this user can read it; at most 100 MiB, Batch's limit, checked before the
+copy) and a worker process reads the copy's header: Batch's limits, and the
+size the picture is shown at. Everything later works from that copy, so a
+file that changes or goes away on disk afterwards changes nothing until it
+is loaded again. A loaded image gets a new key: `"1"` for the first of a
+launch, then one more each time. The old image's copy is removed then.
+
+**What a drop loads.** The first dropped item that is a file with a PNG,
+JPG, SVG or WebP extension (any case). The other folders and image files
+are left out and counted in `left_out`; other files are not counted (Batch
+cannot use them either). Nothing else is tried when the first image is
+refused.
+
+| Dropped | Loads | `left_out` | `notice` |
+|---|---|---|---|
+| one image | it | 0 | `null` |
+| an image and a text file | the image | 0 | `null` |
+| a text file, then an image | the image | 0 | `null` |
+| two images | the first | 1 | "Single image mode takes one image; 1 other was left out." |
+| three images | the first | 2 | "Single image mode takes one image; 2 others were left out." |
+| a folder (and text files) | nothing | the folders | "Folders go in Batch." |
+| only text files | nothing | 0 | "Not a PNG, JPG, SVG or WebP file." |
+
+A load that is refused (Batch's reason for the file: too large, over the
+pixel limit, damaged, not a readable file; or "the optimiser crashed on
+this file (it gave no valid result)" when the worker gave no answer) keeps
+the current image, and the reason is the `notice`. A choice of a file that
+is not a PNG, JPG, SVG or WebP gives "Not a PNG, JPG, SVG or WebP file."
+
+**Switch to Batch.** After a drop with `left_out` above 0, the backend
+keeps that drop for `move_drop_to_batch`: all its items, the loaded image
+included. The offer ends at the next load attempt (a drop while Single image
+shows, a file picked in the image dialog) and at every `set_view`; after
+that `move_drop_to_batch` rejects with `"nothing-to-move"`. A closed image
+dialog does not end it. The image stays loaded when Batch shows.
 
 ## Events
 
@@ -162,6 +219,52 @@ for next to the originals.
 ```json
 { "folder": "exports" }
 { "folder": null }
+```
+
+With an image loaded in Single image mode, a `name-suggested` follows.
+
+### `image-changed`
+
+After every load attempt in Single image mode (a file picked in the image
+dialog, or a drop while Single image shows), and only then. `image` is the
+image that shows now: the new one, or, when nothing was loaded, the one that
+was there (same `key`), or `null` when there is none. A new `key` means a new
+image. `left_out` above 0 means Switch to Batch is offered. The shape is the
+same in every case; only the values differ.
+
+- `name`: the original's file name alone. `size`: bytes of the copy taken
+  at load. `width`, `height`: the size it is shown at (an EXIF-rotated JPG
+  gives its upright size, an animation its canvas); `null` for an SVG.
+- `key`: the image's key, a whole number as text.
+- `suggested`: the name Save as starts with, without the extension: Batch's
+  output name (`optimized-holiday` next to the original, `holiday` in a
+  chosen folder), or its first free numbered form when that is taken
+  (`optimized-holiday-1`). A name that is not valid text is shown with
+  `�` in place of the bytes it cannot show.
+- `extension`: the original's extension with its dot, as it is spelled.
+- `notice`: a sentence for the status line, or `null`.
+
+```json
+{ "image": { "name": "holiday.jpg", "size": 2400000, "width": 4032, "height": 3024,
+             "key": "7", "suggested": "optimized-holiday", "extension": ".jpg" },
+  "left_out": 0, "notice": null }
+{ "image": { "name": "holiday.jpg", "size": 2400000, "width": 4032, "height": 3024,
+             "key": "8", "suggested": "optimized-holiday", "extension": ".jpg" },
+  "left_out": 3, "notice": "Single image mode takes one image; 3 others were left out." }
+{ "image": null, "left_out": 1, "notice": "Folders go in Batch." }
+{ "image": { "name": "logo.svg", "size": 4100, "width": null, "height": null,
+             "key": "9", "suggested": "optimized-logo", "extension": ".svg" },
+  "left_out": 0, "notice": null }
+```
+
+### `name-suggested`
+
+After `output-changed` while an image is loaded (none without one): the
+name Save as starts with for that image in the new output place. The image
+and its key stay as they are.
+
+```json
+{ "image": "7", "suggested": "holiday" }
 ```
 
 ### `run-started`
@@ -248,7 +351,7 @@ Payload `null`.
 
 Files are being dragged over the window, or not any more. It is sent only
 when the value changes. A drop also sends `{ "over": false }`, just before
-its `list-changed`.
+its `list-changed` (Batch) or `image-changed` (Single image).
 
 ```json
 { "over": true }
@@ -312,10 +415,13 @@ The scheme needs no permission: it is not a command.
   `tauri://drag-enter`, `tauri://drag-over` or `tauri://drag-drop`: Tauri
   puts the dropped paths in them, and they reach the page only when a
   listener asks for them. `drag-state` is the replacement.
-- **Permissions:** the seven commands (`allow-choose-files`,
+- **Permissions:** the twelve commands (`allow-choose-files`,
   `allow-clear-list`, `allow-readd-list`, `allow-choose-output-folder`,
   `allow-clear-output-folder`, `allow-start-run`,
-  `allow-open-output-folder`), `core:event:allow-listen` and
+  `allow-open-output-folder`, `allow-set-view`, `allow-choose-image`,
+  `allow-preview-image`, `allow-save-image`, `allow-move-drop-to-batch`;
+  `preview_image` and `save_image` are documented here once they are
+  built), `core:event:allow-listen` and
   `core:event:allow-unlisten`, nothing more (`capabilities/default.json`; a
   test guards it). There is no `emit`, no window API and no plugin API, and
   `alert()` and `confirm()` do not work (the dialog plugin overrides them,
