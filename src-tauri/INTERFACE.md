@@ -35,7 +35,7 @@ Nothing is remembered between launches.
 ## Commands
 
 Each resolves to `null` or rejects with one bare string. Only `start_run`,
-`preview_image` and `set_view` take an argument.
+`preview_image`, `save_image` and `set_view` take an argument.
 
 | Command | Argument | Does | Rejects with |
 |---|---|---|---|
@@ -45,20 +45,22 @@ Each resolves to `null` or rejects with one bare string. Only `start_run`,
 | `choose_output_folder` | none | Opens a native folder dialog; the folder picked becomes the output folder. Resolves as soon as the dialog is open. | `"busy"` |
 | `clear_output_folder` | none | Back to "next to the originals". | `"busy"` |
 | `start_run` | `{ "settings": { "mode": "lossy", "quality": 75 } }` | Runs the list with these settings and the output setting. It writes next to the originals (`optimized-a.png`) or into the chosen folder (`a.png`), and never replaces an existing output: a taken name gets a number before the extension, from `-1` (`optimized-a-1.png`, `a-1.png`), then `-2`, up to `-9999`; when all of those are taken the file fails ("no free name in the output folder"). Resolves once the run has started; its progress arrives as events. | `"busy"`, `"invalid-settings"`, `"empty-list"`, `"output-missing"` |
-| `open_output_folder` | none | Opens the output folder of the last completed run in the file manager: the chosen output folder, or, with none, the folder of the first file written. | `"no-output"`, `"open-failed"` |
+| `open_output_folder` | none | Opens, in the file manager, the folder of the last save or the output folder of the last completed run, whichever came last. For a run that is the chosen output folder, or, with none, the folder of the first file written; for a save, the folder it wrote to. | `"no-output"`, `"open-failed"` |
 | `set_view` | `{ "view": "single" }` or `{ "view": "batch" }` | Tells the backend which mode shows, so a drop goes there. Ends the Switch to Batch offer (see [Single image mode](#single-image-mode)). Sends no event of its own; when it answers `"busy"`, `run-busy` goes out as for every command. | `"busy"`, `"invalid-view"` |
 | `choose_image` | none | Opens a native one-file dialog with the same filters as `choose_files`; the file picked is loaded in Single image mode. Resolves as soon as the dialog is open; the outcome arrives as `image-changed`. | `"busy"` |
 | `preview_image` | `{ "settings": { "mode": "lossy", "quality": 75 } }` | Makes the compressed version of the loaded image with these settings, in a worker, as Batch would write it (see [Previews](#previews-the-preview-scheme)). A request still going is stopped first; only the latest request's outcome arrives, as `preview-ready` or `preview-failed`. Resolves once `preview-started` has gone out. | `"busy"`, `"invalid-settings"`, `"no-image"` |
+| `save_image` | `{ "name": "optimized-holiday", "preview": "7-3" }` | Writes the kept compressed version with that key (the one the window shows) as `name` + the original's extension, in the chosen output folder or, with none, next to the original. Never replaces a file and never numbers the name. Resolves once the file is written and `image-saved` has gone out (see [Single image mode](#single-image-mode)). | `"busy"`, `"invalid-name"`, `"no-image"`, `"not-ready"`, `"output-missing"`, `"name-taken"`, `"save-failed"` |
 | `move_drop_to_batch` | none | Switch to Batch: the view becomes Batch and every item of the last Single image drop that left items out is added to the list, exactly as a drop on Batch adds them (`list-changed`). | `"busy"`, `"nothing-to-move"` |
 
 ```js
 await invoke('start_run', { settings: { mode: 'lossy', quality: 75 } });
 await invoke('set_view', { view: 'batch' });
 await invoke('preview_image', { settings: { mode: 'lossless', quality: 75 } });
+await invoke('save_image', { name: 'optimized-holiday', preview: '7-3' });
 ```
 
-- `"busy"`: a run is active, a dialog for one is open, or an image is being
-  loaded. A `run-busy` event goes out as well. Every command but
+- `"busy"`: a run is active, a dialog for one is open, an image is being
+  loaded, or an image is being saved. A `run-busy` event goes out as well. Every command but
   `open_output_folder` can be busy. Accepting a `preview_image` request
   also holds the guard for a moment (through stopping the previous
   request's worker and sending `preview-started`), so a command in that
@@ -66,7 +68,26 @@ await invoke('preview_image', { settings: { mode: 'lossless', quality: 75 } });
 - `"invalid-view"`: the argument is not exactly `{ "view": "single" }` or
   `{ "view": "batch" }`: another spelling (`"Single"`), another type, `null`,
   a missing or an extra key is refused, and the view stays as it was.
-- `"no-image"`: `preview_image` was called while no image is loaded.
+- `"no-image"`: `preview_image` or `save_image` was called while no image
+  is loaded.
+- `"not-ready"`: `save_image`'s `preview` is not the key of the version
+  kept for the current image: none is ready yet, the last attempt failed
+  and none was ready before, a newer version has become ready, or the key
+  is another image's. It is compared as text with the `key` of the last
+  `preview-ready` (so `"07-3"` is refused). Also when a newer version
+  became ready, or the window closed, while the save was reading the
+  version. Nothing is written.
+- `"invalid-name"`: `save_image`'s `name` breaks a name rule (see
+  [Single image mode](#single-image-mode)), or the argument is not exactly
+  an object with the two string keys `name` and `preview` (a missing or an
+  extra key, another type, `null`).
+- `"name-taken"`: a file or a folder named `name` + the extension already
+  exists in the folder `save_image` would write to (the original itself
+  included). Nothing is written, nothing is replaced, and the name is not
+  numbered: choose another.
+- `"save-failed"`: the file could not be written for another reason (a
+  full disk, a folder that refused the write, a folder removed at that
+  very moment). Nothing is written.
 - `"nothing-to-move"`: there is no drop to move: the last Single image drop
   left nothing out, or its offer has ended.
 - `"invalid-settings"`: `settings` is missing or `null`, or is not exactly
@@ -77,12 +98,15 @@ await invoke('preview_image', { settings: { mode: 'lossless', quality: 75 } });
   also for a lossless run (the current value, 75 unless changed); it is
   ignored there.
 - `"output-missing"`: the chosen output folder is gone, is no longer a
-  folder, or cannot be written to. `start_run` does not create it again.
+  folder, or cannot be written to; for `save_image` with no chosen folder,
+  the same for the original's own folder. `start_run` and `save_image` do
+  not create it again.
   A folder deleted once the run has started is created again by the next
   file written into it.
 - `"empty-list"`: no file in the list can be compressed (the list is
   empty, or every row is skipped).
-- `"no-output"`: no completed run wrote anything yet. `"open-failed"`: the
+- `"no-output"`: nothing was saved and no completed run wrote anything
+  yet, or the last completed run (after any save) wrote nothing. `"open-failed"`: the
   system could not open the folder, for example because it was removed.
 
 `start_run` checks, in this order: busy, the settings, the output folder,
@@ -95,6 +119,12 @@ images, drop the folder again. Nothing runs when it rejects.
 
 `preview_image` checks, in this order: busy, the settings, then the image.
 Nothing starts when it rejects.
+
+`save_image` checks, in this order: busy, the argument's shape
+(`"invalid-name"`), the image, `preview` (`"not-ready"`), the name rules
+(`"invalid-name"`), then the folder (`"output-missing"`); the write itself
+can then give `"name-taken"` or `"save-failed"`. Nothing is written when it
+rejects.
 
 A dialog closed without a choice changes nothing and sends `run-cancelled`.
 
@@ -178,6 +208,24 @@ order too; the window still checks each outcome (see
 nothing does not stop it. The
 backend keeps one version per image: the last that succeeded. A failure
 keeps the version kept before; a new image forgets it.
+
+**Saving.** `save_image` writes the kept version named by `preview` (the
+`key` of the `preview-ready` the window shows), byte for byte, as `name` +
+the original's extension as it is spelled (`.JPG` stays `.JPG`), with the
+original's permissions. It goes to the chosen output folder, or with none
+to the original's folder. It never replaces anything: a name that is taken
+is `"name-taken"`, also when a file appears there at the last moment, and
+the name is never numbered. The name rules are the window's (`ui/names.js`),
+checked again here: not empty or only spaces; none of `/ \ : * ? " < > |`
+and no control character; not ending in a space or a dot; not a name
+Windows reserves (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`,
+any case, with or without an extension); at most 200 characters and 255
+bytes (UTF-8) with the extension. The name is written exactly as typed
+(`vakantie-café` is not normalised). Saving is busy: the guard is held
+until `image-saved` has gone out, so no other command, drop or run starts
+meanwhile; a version still being made goes on and may become ready. After a
+save, `open_output_folder` opens the folder written to, until a later save
+or completed run.
 
 ## Events
 
@@ -341,6 +389,21 @@ and is still served.
 
 ```json
 { "image": "7", "version": 6, "reason": "the optimiser crashed on this file (it gave no valid result)" }
+```
+
+### `image-saved`
+
+`save_image` wrote a file. `name` is the saved file's name with its
+extension; `folder` is the chosen output folder's name (as in
+`output-changed`), or `null` when it went next to the original. `suggested`
+is the name for the Save as box now, without the extension: the first free
+numbered form of the saved name in that folder (`beach` → `beach-1`, or
+`beach-2` when `beach-1` is taken; `beach-2` → `beach-2-1`), so pressing
+Save again does not hit `"name-taken"`.
+
+```json
+{ "name": "optimized-holiday.jpg", "folder": null, "suggested": "optimized-holiday-1" }
+{ "name": "holiday.jpg", "folder": "exports", "suggested": "holiday-1" }
 ```
 
 ### `run-started`
@@ -543,8 +606,7 @@ The scheme needs no permission: it is not a command.
   `allow-clear-list`, `allow-readd-list`, `allow-choose-output-folder`,
   `allow-clear-output-folder`, `allow-start-run`,
   `allow-open-output-folder`, `allow-set-view`, `allow-choose-image`,
-  `allow-preview-image`, `allow-save-image`, `allow-move-drop-to-batch`;
-  `save_image` is documented here once it is built),
+  `allow-preview-image`, `allow-save-image`, `allow-move-drop-to-batch`),
   `core:event:allow-listen` and
   `core:event:allow-unlisten`, nothing more (`capabilities/default.json`; a
   test guards it). There is no `emit`, no window API and no plugin API, and

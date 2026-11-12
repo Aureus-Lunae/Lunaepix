@@ -237,6 +237,18 @@ pub struct PreviewFailed {
     pub reason: String,
 }
 
+/// A save in Single image mode wrote a file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImageSaved {
+    /// The saved file's name with its extension (`"optimized-holiday.jpg"`).
+    pub name: String,
+    /// The chosen output folder's name, or `null` for next to the original.
+    pub folder: Option<String>,
+    /// The name Save as offers next, without the extension: the first free
+    /// numbered form of the saved name (`"optimized-holiday-1"`).
+    pub suggested: String,
+}
+
 /// The `preview-ready` payload for version `version` of image `key`, made
 /// with `compression`, whose worker gave `outcome`.
 pub fn preview_ready(
@@ -280,6 +292,7 @@ pub enum Event {
     PreviewStarted(PreviewStarted),
     PreviewReady(PreviewReady),
     PreviewFailed(PreviewFailed),
+    ImageSaved(ImageSaved),
 }
 
 impl Event {
@@ -300,6 +313,7 @@ impl Event {
             Event::PreviewStarted(_) => "preview-started",
             Event::PreviewReady(_) => "preview-ready",
             Event::PreviewFailed(_) => "preview-failed",
+            Event::ImageSaved(_) => "image-saved",
         }
     }
 }
@@ -714,6 +728,39 @@ mod tests {
             value(&event),
             parsed(r#"{ "image": { "key": "7" }, "suggested": "holiday" }"#)
         );
+    }
+
+    #[test]
+    fn image_saved_serialises_exactly_as_the_spec_examples() {
+        let next_to = Event::ImageSaved(ImageSaved {
+            name: "optimized-holiday.jpg".to_owned(),
+            folder: None,
+            suggested: "optimized-holiday-1".to_owned(),
+        });
+        let chosen = Event::ImageSaved(ImageSaved {
+            name: "holiday.jpg".to_owned(),
+            folder: Some("exports".to_owned()),
+            suggested: "holiday-1".to_owned(),
+        });
+        assert_eq!(next_to.name(), "image-saved");
+        assert_eq!(chosen.name(), "image-saved");
+        assert_eq!(
+            value(&next_to),
+            parsed(
+                r#"{ "name": "optimized-holiday.jpg", "folder": null,
+                     "suggested": "optimized-holiday-1" }"#
+            )
+        );
+        assert_eq!(
+            value(&chosen),
+            parsed(r#"{ "name": "holiday.jpg", "folder": "exports", "suggested": "holiday-1" }"#)
+        );
+        // Exactly those keys: not the `image-changed` shape, nothing more.
+        assert_ne!(
+            value(&chosen),
+            parsed(r#"{ "image": { "name": "holiday.jpg" }, "folder": "exports" }"#)
+        );
+        assert_eq!(value(&chosen).as_object().unwrap().len(), 3);
     }
 
     // --- the preview's events -------------------------------------------------
