@@ -475,6 +475,8 @@ impl Single {
                 stop,
             };
             // Sent before the lock is let go (see `settle_preview_with`).
+            // Safe only while tauri's `tracing` feature is off: with it,
+            // `eval_script` blocks until the main thread answers.
             emit(Event::PreviewStarted(PreviewStarted {
                 image: key.to_string(),
                 version,
@@ -555,9 +557,13 @@ impl Single {
                     }
                 };
                 // Sent before the lock is let go, so nothing that makes this
-                // job stale can come between the decision and the event.
-                // `emit` only hands the event to the window; it never calls
-                // back into this state, which would deadlock.
+                // job stale can be sent between the decision and the event
+                // (the order of the `emit` calls; the window's own check on
+                // `image` and `version` covers delivery). `emit` only queues
+                // the event for the window; it never calls back into this
+                // state, which would deadlock.
+                // Safe only while tauri's `tracing` feature is off: with it,
+                // `eval_script` blocks until the main thread answers.
                 emit(event);
                 clean_up
             } else {
@@ -1939,6 +1945,11 @@ mod tests {
         assert!(lines.is_empty(), "{lines:?}");
     }
 
+    // Unix only: listing a file as a folder is `ENOTDIR` there. Windows
+    // does not document which error it gives (it could be "path not found",
+    // which counts as a removed folder); the code under test is the same on
+    // both.
+    #[cfg(unix)]
     #[test]
     fn an_image_folder_that_cannot_be_listed_is_logged() {
         let dir = TempDir::new().unwrap();
@@ -1954,7 +1965,9 @@ mod tests {
 
     // A path that is not a regular file when it is opened.
 
-    /// `run` on a thread of its own: its answer, or a panic after 5 s.
+    /// `run` on a thread of its own: its answer, or a panic after 5 s. Only
+    /// the FIFO tests use it, so it is Unix-only as they are.
+    #[cfg(unix)]
     fn within_5s<T: Send + 'static>(run: impl FnOnce() -> T + Send + 'static) -> T {
         let (answer_tx, answer_rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -1993,10 +2006,14 @@ mod tests {
         let src = dir.path().join("a.png");
         fs::create_dir(&src).unwrap();
         let dest = dir.path().join("copy.png");
-        assert_eq!(
-            copy_capped(&src, &dest, 5),
-            Err("Not a readable file".to_owned())
-        );
+        // Unix opens a folder for reading, and the check on the open file
+        // refuses it. Windows refuses to open a folder as a file at all
+        // (`ERROR_ACCESS_DENIED`), so its own text is the reason there.
+        #[cfg(unix)]
+        let reason = "Not a readable file".to_owned();
+        #[cfg(windows)]
+        let reason = io::Error::from_raw_os_error(5).to_string();
+        assert_eq!(copy_capped(&src, &dest, 5), Err(reason));
         assert!(!dest.exists());
     }
 

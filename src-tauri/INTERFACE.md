@@ -164,14 +164,18 @@ loaded image from its copy, with the settings given, exactly as a Batch run
 would write that file (same mode, quality, notes and reasons). Each request
 gets a version number: `1` for the first of a launch, then one more for each
 request, whatever the image. Only the latest request counts: a new
-`preview_image` stops the worker of the one before, and the one before
-sends nothing after the new `preview-started`. Making a version is not
-busy: other commands and drops work meanwhile. These stop it: `set_view`
-to Batch, `move_drop_to_batch`, `start_run`, a new image loaded, and the
-window closing. From that moment the request sends nothing. Its outcome
-may have gone out just before; it then arrives before the stopping call's
-own event (`image-changed`, `list-changed`, `run-started`), never after it.
-A load attempt that loads nothing does not stop it. The
+`preview_image` stops the worker of the one before, and the backend sends
+nothing for the one before after it has sent the new `preview-started`.
+Making a version is not busy: other commands and drops work meanwhile.
+These stop it: `set_view` to Batch, `move_drop_to_batch`, `start_run`, a
+new image loaded, and the window closing. From that moment the backend
+sends nothing for the request. Its outcome may have been sent just before;
+then it was sent before the stopping call's own event (`image-changed`,
+`list-changed`, `run-started`). All of these events are sent off the main
+thread, through Tauri's one event queue, so they normally arrive in that
+order too; the window still checks each outcome (see
+[Rules for the window](#rules-for-the-window)). A load attempt that loads
+nothing does not stop it. The
 backend keeps one version per image: the last that succeeded. A failure
 keeps the version kept before; a new image forgets it.
 
@@ -311,10 +315,13 @@ image. `key` is its key for the `preview` scheme, `<image>-<version>`.
 lossless. `before` is the copy's size and `after` the version's, in bytes;
 `after` can be larger than `before` in lossless mode. `note` is Batch's note
 (the same sentences as `file-done`'s, for example "original kept: lossy was
-not smaller") or `null`; the key is always there. Only the latest request's
-outcome is sent, and it never arrives after a newer request's
-`preview-started`: a `preview-ready` or `preview-failed` always belongs to
-the last `preview-started` before it.
+not smaller") or `null`; the key is always there. The backend sends only
+the latest request's outcome, and never sends it after a newer request's
+`preview-started` or a new image's `image-changed`. Show it only when it
+passes the window's check (see
+[Rules for the window](#rules-for-the-window)): its `image` is the key of
+the current `image-changed`, and its `version` is the last
+`preview-started`'s. Otherwise drop it.
 
 ```json
 { "image": "7", "version": 4, "key": "7-4", "mode": "lossy", "quality": 75,
@@ -521,6 +528,13 @@ The scheme needs no permission: it is not a command.
   `run-finished`, and all of them come before any event of run N+1. A
   `run-finished` always belongs to the last `run-started`, so no run number
   is needed.
+- **Check every preview outcome before showing it.** Show a
+  `preview-ready` or `preview-failed` only when its `image` equals the key
+  of the current `image-changed` and its `version` equals the version of
+  the last `preview-started`; drop any other. The backend already sends no
+  outcome after a newer request or a new image (see
+  [Single image mode](#single-image-mode)). This check is a second guard,
+  so that the window never relies on how events are delivered.
 - **Listen only to the events above.** Do not listen to Tauri's own
   `tauri://drag-enter`, `tauri://drag-over` or `tauri://drag-drop`: Tauri
   puts the dropped paths in them, and they reach the page only when a

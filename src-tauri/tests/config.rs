@@ -3145,3 +3145,99 @@ fn a_summary_without_readd_or_with_it_misplaced_is_flagged_in_a_fixture() {
         assert!(!readd_button_problems(&html).is_empty(), "{what}: {html}");
     }
 }
+
+// --- which commands run on the main thread ------------------------------------
+
+/// The commands that run on the main thread (a plain `#[tauri::command]`).
+/// An event sent from the main thread is shown at once, while one sent from
+/// any other thread waits in the event loop's queue, so a main-thread event
+/// can overtake an earlier one. These commands send nothing but `run-busy`,
+/// whose place among other events the window does not depend on; their
+/// real answers come later from the dialog plugin's thread, or not at all.
+/// Every other command is `async`, so all its events go through the one
+/// queue in the order they were sent.
+const MAIN_THREAD_COMMANDS: &[&str] = &[
+    "choose_files",
+    "choose_output_folder",
+    "set_view",
+    "choose_image",
+    "open_output_folder",
+];
+
+/// Whether `path` is exactly `tauri::command`.
+fn is_tauri_command(path: &syn::Path) -> bool {
+    let segments: Vec<String> = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    segments == ["tauri", "command"]
+}
+
+/// The functions in the Rust `source` marked `#[tauri::command]` without
+/// `async` among the attribute's arguments: the commands Tauri runs on the
+/// main thread.
+fn main_thread_commands(source: &str) -> HashSet<String> {
+    let file = syn::parse_file(source).expect("valid Rust");
+    file.items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Fn(function) => Some(function),
+            _ => None,
+        })
+        .filter_map(|function| {
+            let attribute = function
+                .attrs
+                .iter()
+                .find(|attribute| is_tauri_command(attribute.path()))?;
+            let is_async = match &attribute.meta {
+                syn::Meta::List(list) => list
+                    .tokens
+                    .clone()
+                    .into_iter()
+                    .any(|token| token.to_string() == "async"),
+                _ => false,
+            };
+            (!is_async).then(|| function.sig.ident.to_string())
+        })
+        .collect()
+}
+
+fn name_set(list: &[&str]) -> HashSet<String> {
+    list.iter().map(|name| (*name).to_owned()).collect()
+}
+
+#[test]
+fn only_commands_that_send_nothing_but_run_busy_run_on_the_main_thread() {
+    let lib = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let source = fs::read_to_string(lib).unwrap();
+    assert_eq!(
+        main_thread_commands(&source),
+        name_set(MAIN_THREAD_COMMANDS)
+    );
+}
+
+#[test]
+fn a_command_without_async_is_found_in_a_fixture() {
+    let fixture = r#"
+        #[tauri::command]
+        fn preview_image() {}
+        #[tauri::command(async)]
+        fn start_run() {}
+        #[tauri::command(rename_all = "snake_case")]
+        fn clear_list() {}
+        #[tauri::command(async, rename_all = "snake_case")]
+        fn readd_list() {}
+        #[tauri::command(rename_all = "async")]
+        fn renamed() {}
+        #[other::command]
+        fn set_view() {}
+        fn not_a_command() {}
+        /// A doc comment that says #[tauri::command] is not an attribute.
+        fn documented() {}
+    "#;
+    assert_eq!(
+        main_thread_commands(fixture),
+        name_set(&["preview_image", "clear_list", "renamed"])
+    );
+}

@@ -50,3 +50,7 @@ toml = "1.2.0"
 # config checks, never as text. The version already in Cargo.lock (tauri-utils
 # uses it), so no new package.
 html5ever = "0.39.0"
+# Reads src/lib.rs as Rust in the config checks (which commands run on the
+# main thread), never as text. The version already in Cargo.lock (tauri's
+# macros use it), so no new package.
+syn = { version = "2.0.119", features = ["full"] }

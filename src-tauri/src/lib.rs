@@ -200,7 +200,11 @@ fn image_dialog(app: &AppHandle, title: &str) -> FileDialogBuilder<Wry> {
 }
 
 /// Open a native multi-file dialog; the files picked are added to the list.
-/// Returns at once; the outcome arrives as events.
+/// Returns at once; the outcome arrives as events, from the dialog
+/// plugin's thread.
+/// Runs on the main thread: it sends nothing but `run-busy`, whose place
+/// among other events does not matter (see `MAIN_THREAD_COMMANDS` in
+/// `tests/config.rs`).
 #[tauri::command]
 fn choose_files(app: AppHandle) -> Result<(), CommandError> {
     session(&app).choose_files(&mut |event| emit(&app, event), |ticket| {
@@ -217,13 +221,20 @@ fn choose_files(app: AppHandle) -> Result<(), CommandError> {
 /// Tell the backend which mode shows, so a drop goes there. Takes the whole
 /// argument object, `{ "view": "single" }` or `{ "view": "batch" }`, so an
 /// extra key is refused too.
+/// Runs on the main thread: it sends nothing but `run-busy`, whose place
+/// among other events does not matter (see `MAIN_THREAD_COMMANDS` in
+/// `tests/config.rs`).
 #[tauri::command]
 fn set_view(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<(), CommandError> {
     session(&app).set_view(json_body(request.body()), &mut |event| emit(&app, event))
 }
 
 /// Open a native one-file dialog; the file picked is loaded in Single image
-/// mode. Returns at once; the outcome arrives as `image-changed`.
+/// mode. Returns at once; the outcome arrives as `image-changed`, from the
+/// dialog plugin's thread.
+/// Runs on the main thread: it sends nothing but `run-busy`, whose place
+/// among other events does not matter (see `MAIN_THREAD_COMMANDS` in
+/// `tests/config.rs`).
 #[tauri::command]
 fn choose_image(app: AppHandle) -> Result<(), CommandError> {
     session(&app).choose_image(&mut |event| emit(&app, event), |ticket| {
@@ -246,8 +257,12 @@ fn choose_image(app: AppHandle) -> Result<(), CommandError> {
 /// `settings` (checked by [`session::parse_settings`]), replacing any
 /// request still going. Returns once it has started; the outcome arrives as
 /// `preview-ready` or `preview-failed`. The worker runs on a thread of its
-/// own.
-#[tauri::command]
+/// own. Not on the main thread (`async`): an event sent from the main
+/// thread is shown at once, while the worker's outcome waits in the event
+/// loop's queue, so a `preview-started` sent from here could overtake the
+/// older request's outcome. Off the main thread, every preview event goes
+/// through that one queue in the order it was sent.
+#[tauri::command(async)]
 fn preview_image(app: AppHandle, settings: Option<serde_json::Value>) -> Result<(), CommandError> {
     session(&app).preview_image(settings.as_ref(), &mut |event| emit(&app, event), |job| {
         let app = app.clone();
@@ -268,21 +283,28 @@ fn move_drop_to_batch(app: AppHandle) -> Result<(), CommandError> {
     session(&app).move_drop_to_batch(&mut |event| emit(&app, event))
 }
 
-/// Empty the list.
-#[tauri::command]
+/// Empty the list. Not on the main thread (`async`), so its `list-changed`
+/// queues behind a run's `run-finished` instead of overtaking it (see
+/// `preview_image`).
+#[tauri::command(async)]
 fn clear_list(app: AppHandle) -> Result<(), CommandError> {
     session(&app).clear_list(&mut |event| emit(&app, event))
 }
 
 /// Bring the list of the last run back, so it can run again with other
-/// settings. Sends the list as `list-changed`.
-#[tauri::command]
+/// settings. Sends the list as `list-changed`. Not on the main thread
+/// (`async`), for the same reason as `clear_list`.
+#[tauri::command(async)]
 fn readd_list(app: AppHandle) -> Result<(), CommandError> {
     session(&app).readd_list(&mut |event| emit(&app, event))
 }
 
 /// Open a native folder dialog; the folder picked becomes the output folder.
-/// Returns at once; the outcome arrives as events.
+/// Returns at once; the outcome arrives as events, from the dialog
+/// plugin's thread.
+/// Runs on the main thread: it sends nothing but `run-busy`, whose place
+/// among other events does not matter (see `MAIN_THREAD_COMMANDS` in
+/// `tests/config.rs`).
 #[tauri::command]
 fn choose_output_folder(app: AppHandle) -> Result<(), CommandError> {
     session(&app).choose_output_folder(&mut |event| emit(&app, event), |ticket| {
@@ -330,6 +352,7 @@ fn start_run(app: AppHandle, settings: Option<serde_json::Value>) -> Result<(), 
 }
 
 /// Open the output folder of the last completed run in the file manager.
+/// Runs on the main thread: it sends no event.
 #[tauri::command]
 fn open_output_folder(app: AppHandle) -> Result<(), CommandError> {
     session(&app).open_output_folder(|folder| tauri_plugin_opener::open_path(folder, None::<&str>))
@@ -352,7 +375,10 @@ fn stop_on_close(event: &WindowEvent, stop: impl FnOnce()) {
 
 /// Drag and drop, handled here so that no path reaches the window: the
 /// window hears `drag-state`, then `list-changed` (Batch) or `image-changed`
-/// (Single image), and a drop goes to the mode that shows.
+/// (Single image), and a drop goes to the mode that shows. This runs on the
+/// main thread, so `drag-state` and a refused drop's `run-busy` are shown
+/// at once, ahead of events still queued; neither depends on its place
+/// among them. The drop's own events come from the thread it is handed to.
 fn on_window_event(window: &Window, event: &WindowEvent) {
     stop_on_close(event, || {
         let state = window.app_handle().state::<AppState>();
