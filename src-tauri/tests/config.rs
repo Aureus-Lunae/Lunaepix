@@ -954,7 +954,7 @@ fn every_element_the_scripts_ask_for_is_in_the_page() {
             "in ui/{name}"
         );
     }
-    // Not vacuous: app.js does ask for elements.
+    // Not vacuous: window.js does ask for elements.
     assert!(asked >= 10, "only {asked} getElementById calls were found");
 }
 
@@ -1305,11 +1305,17 @@ fn only_a_real_html_lang_and_real_column_headers_satisfy_the_structure() {
 
 // --- the run settings (Task 11) ---------------------------------------------
 
+/// The id of Single image's compare divider: a range input of its own, which
+/// the Quality checks below leave out (it is checked by
+/// [`single_screen_problems`]).
+const DIVIDER_ID: &str = "divider";
+
 /// Problems with the settings controls the accessibility rules need, read as
 /// tokens: the "Compression" choice is a `<fieldset>` whose `<legend>` says
 /// "Compression" and that holds two radio inputs, and the quality range and
 /// number inputs each have a `<label for>` and the bounds min 0, max 100,
-/// step 1.
+/// step 1. The page has one range input besides the compare divider (id
+/// [`DIVIDER_ID`]), and that one is Quality's.
 fn settings_problems(html: &str) -> Vec<String> {
     let pieces = pieces(html);
     let mut problems = Vec::new();
@@ -1375,6 +1381,7 @@ fn settings_problems(html: &str) -> Vec<String> {
             .iter()
             .filter(|tag| {
                 tag.name == "input"
+                    && tag.attr("id") != Some(DIVIDER_ID)
                     && tag
                         .attr("type")
                         .is_some_and(|value| value.eq_ignore_ascii_case(kind))
@@ -1501,8 +1508,9 @@ fn a_settings_fixture_without_a_legend_a_label_or_a_bound_is_flagged() {
 /// `chooseOutput` says "Choose folder"; `clearOutput` says "Clear" and has the
 /// `aria-label` "Clear output folder" (the visible text is inside the
 /// accessible name); and an element with the id `qualityRow` holds the range
-/// input, the number input and the `qualityError` line, so one `hidden` on the
-/// row hides the whole Quality row.
+/// input (every one but the compare divider, id [`DIVIDER_ID`]), the number
+/// input and the `qualityError` line, so one `hidden` on the row hides the
+/// whole Quality row.
 fn output_and_quality_problems(html: &str) -> Vec<String> {
     const VOID: &[&str] = &["input", "br", "img", "hr", "meta", "link"];
     const ROW: &str = "qualityRow";
@@ -1525,7 +1533,10 @@ fn output_and_quality_problems(html: &str) -> Vec<String> {
                 row_seen |= id == Some(ROW);
                 let kind = tag.attr("type").map(str::to_ascii_lowercase);
                 if tag.name == "input" && kind.as_deref() == Some("range") {
-                    ranges.push(inside);
+                    // The compare divider is Single image's own range input.
+                    if id != Some(DIVIDER_ID) {
+                        ranges.push(inside);
+                    }
                 } else if tag.name == "input" && kind.as_deref() == Some("number") {
                     numbers.push(inside);
                 } else if id == Some("qualityError") {
@@ -1680,6 +1691,318 @@ fn an_output_and_quality_fixture_with_old_texts_no_label_or_a_misplaced_input_is
     for (html, problems) in cases {
         let expected: Vec<String> = problems.into_iter().map(str::to_owned).collect();
         assert_eq!(output_and_quality_problems(&html), expected, "{html}");
+    }
+}
+
+// --- the compare divider is the page's second range input (Task 9) ----------
+
+/// The Single image compare divider: a range input that is not Quality's.
+const DIVIDER: &str = "<input id=\"divider\" type=\"range\" min=\"0\" max=\"100\" step=\"1\">";
+
+#[test]
+fn a_settings_fixture_with_the_divider_still_passes() {
+    for html in [
+        format!("{SETTINGS_FIXTURE}{DIVIDER}"),
+        format!("{DIVIDER}{SETTINGS_FIXTURE}"),
+    ] {
+        assert_eq!(settings_problems(&html), Vec::<String>::new(), "{html}");
+    }
+}
+
+#[test]
+fn an_output_fixture_with_the_divider_outside_the_row_still_passes() {
+    assert_eq!(
+        output_and_quality_problems(&format!("{OUTPUT_FIXTURE}{DIVIDER}")),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_second_range_input_that_is_not_the_divider_is_still_flagged() {
+    let other = "<input id=\"other\" type=\"range\" min=\"0\" max=\"100\" step=\"1\">";
+    assert_eq!(
+        settings_problems(&format!("{SETTINGS_FIXTURE}{other}")),
+        vec!["one range input".to_owned()]
+    );
+    assert_eq!(
+        output_and_quality_problems(&format!("{OUTPUT_FIXTURE}{other}")),
+        vec!["the range input inside qualityRow".to_owned()]
+    );
+    // `data-id` or a comment is not the divider's id.
+    let spoofed = "<input data-id=\"divider\" type=\"range\">";
+    assert_eq!(
+        settings_problems(&format!("{SETTINGS_FIXTURE}{spoofed}")),
+        vec!["one range input".to_owned()]
+    );
+}
+
+// --- the Single image screen (Task 9) ----------------------------------------
+
+/// Each `<fieldset>` of `html`, as (its legend's text on one line, the
+/// `value`s of the radio inputs inside it, in order). Read as tokens, so a
+/// legend or an input in a comment does not count.
+fn fieldsets_with_radios(html: &str) -> Vec<(String, Vec<String>)> {
+    let mut done = Vec::new();
+    let mut open: Vec<(String, Vec<String>)> = Vec::new();
+    let mut in_legend = 0usize;
+    for piece in pieces(html) {
+        match piece {
+            Piece::Start(tag) if tag.name == "fieldset" => open.push((String::new(), Vec::new())),
+            Piece::End(name) if name == "fieldset" => {
+                if let Some(closed) = open.pop() {
+                    done.push(closed);
+                }
+            }
+            Piece::Start(tag) if tag.name == "legend" && !open.is_empty() => in_legend += 1,
+            Piece::End(name) if name == "legend" => in_legend = in_legend.saturating_sub(1),
+            Piece::Text(text) if in_legend > 0 => {
+                if let Some(current) = open.last_mut() {
+                    current.0.push_str(&text);
+                }
+            }
+            Piece::Start(tag)
+                if tag.name == "input"
+                    && tag
+                        .attr("type")
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("radio")) =>
+            {
+                if let Some(current) = open.last_mut() {
+                    current
+                        .1
+                        .push(tag.attr("value").unwrap_or_default().to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    done.extend(open);
+    done.into_iter()
+        .map(|(legend, radios)| (one_line(&legend), radios))
+        .collect()
+}
+
+/// The text of each `<label for>` of `html`, as (the `for` value, the text on
+/// one line).
+fn label_texts(html: &str) -> Vec<(String, String)> {
+    let mut labels: Vec<(String, String)> = Vec::new();
+    let mut in_label = false;
+    for piece in pieces(html) {
+        match piece {
+            Piece::Start(tag) if tag.name == "label" => {
+                in_label = true;
+                labels.push((
+                    tag.attr("for").unwrap_or_default().to_owned(),
+                    String::new(),
+                ));
+            }
+            Piece::End(name) if name == "label" => in_label = false,
+            Piece::Text(text) if in_label => {
+                if let Some(last) = labels.last_mut() {
+                    last.1.push_str(&text);
+                }
+            }
+            _ => {}
+        }
+    }
+    labels
+        .into_iter()
+        .map(|(target, text)| (target, one_line(&text)))
+        .collect()
+}
+
+/// What the Single image screen needs for the accessibility rules, read as
+/// tokens: the Single image / Batch switch and the layout switch are each a
+/// `<fieldset>` with its legend ("Work on", "Settings") and exactly its two
+/// radios; the picture area is `role="region"` with `aria-label="Picture"`
+/// and `tabindex="0"`; and the compare divider is a range input (id
+/// `divider`, 0 to 100, step 1) named by a `<label for>` and sitting inside
+/// that region.
+fn single_screen_problems(html: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let fieldsets = fieldsets_with_radios(html);
+    for (legend, radios, what) in [
+        (
+            "Work on",
+            ["single", "batch"],
+            "a fieldset with the legend \"Work on\" and the radios single, batch",
+        ),
+        (
+            "Settings",
+            ["under", "beside"],
+            "a fieldset with the legend \"Settings\" and the radios under, beside",
+        ),
+    ] {
+        let found = fieldsets
+            .iter()
+            .any(|(text, values)| text == legend && values.as_slice() == radios);
+        if !found {
+            problems.push(what.to_owned());
+        }
+    }
+
+    // The region, and whether the divider is inside it.
+    let mut region: Option<StartTag> = None;
+    let mut depth = 0usize;
+    let mut divider: Option<(StartTag, bool)> = None;
+    for piece in pieces(html) {
+        match piece {
+            Piece::Start(tag) => {
+                let void = VOID_ELEMENTS.contains(&tag.name.as_str());
+                let is_region = region.is_none()
+                    && tag.attr("role") == Some("region")
+                    && tag.attr("aria-label") == Some("Picture");
+                if tag.name == "input" && tag.attr("id") == Some("divider") {
+                    divider = Some((tag, depth > 0));
+                    continue;
+                }
+                if is_region && !void {
+                    region = Some(tag);
+                    depth = 1;
+                } else if depth > 0 && !void {
+                    depth += 1;
+                }
+            }
+            Piece::End(_) if depth > 0 => depth -= 1,
+            _ => {}
+        }
+    }
+    match &region {
+        None => {
+            problems.push("an element with role=\"region\" and aria-label=\"Picture\"".to_owned())
+        }
+        Some(tag) if tag.attr("tabindex") != Some("0") => {
+            problems.push("tabindex=\"0\" on the Picture region".to_owned());
+        }
+        Some(_) => {}
+    }
+    let labelled = label_texts(html)
+        .iter()
+        .any(|(target, text)| target == "divider" && text == "Compare original and compressed");
+    if !labelled {
+        problems.push(
+            "a <label for=\"divider\"> saying \"Compare original and compressed\"".to_owned(),
+        );
+    }
+    let range_ok = divider.as_ref().is_some_and(|(tag, _)| {
+        tag.attr("type")
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("range"))
+            && tag.attr("min") == Some("0")
+            && tag.attr("max") == Some("100")
+            && tag.attr("step") == Some("1")
+    });
+    if !range_ok {
+        problems.push("a range input with the id divider, min 0, max 100, step 1".to_owned());
+    }
+    if !divider.as_ref().is_some_and(|(_, inside)| *inside) {
+        problems.push("the divider inside the Picture region".to_owned());
+    }
+    problems
+}
+
+/// Markup with everything [`single_screen_problems`] asks for.
+const SINGLE_FIXTURE: &str = "<header><fieldset><legend>Work on</legend>\
+     <label><input type=\"radio\" name=\"view\" value=\"single\" checked> Single image</label>\
+     <label><input type=\"radio\" name=\"view\" value=\"batch\"> Batch</label></fieldset></header>\
+     <fieldset><legend>Settings</legend>\
+     <label><input type=\"radio\" name=\"layout\" value=\"under\" checked> Settings under</label>\
+     <label><input type=\"radio\" name=\"layout\" value=\"beside\"> Settings beside</label></fieldset>\
+     <div id=\"picture\" role=\"region\" aria-label=\"Picture\" tabindex=\"0\">\
+     <div><img alt=\"Original\"></div>\
+     <label for=\"divider\">Compare original and compressed</label>\
+     <input id=\"divider\" type=\"range\" min=\"0\" max=\"100\" step=\"1\" value=\"50\"></div>";
+
+#[test]
+fn index_html_has_both_switches_as_fieldsets_with_legends_the_region_and_the_labelled_divider() {
+    assert_eq!(single_screen_problems(&index_html()), Vec::<String>::new());
+}
+
+#[test]
+fn a_single_screen_fixture_with_everything_passes_in_any_spelling() {
+    assert_eq!(single_screen_problems(SINGLE_FIXTURE), Vec::<String>::new());
+    let spelled = SINGLE_FIXTURE
+        .replace(
+            "<legend>Work on</legend>",
+            "<LEGEND>\n  Work\n  on\n</LEGEND>",
+        )
+        .replace("type=\"radio\"", "TYPE='Radio'")
+        .replace(
+            "<label for=\"divider\">Compare original and compressed</label>",
+            "<LABEL FOR='divider'>\n Compare original\n and compressed </LABEL>",
+        )
+        .replace("role=\"region\"", "ROLE='region'");
+    assert_eq!(single_screen_problems(&spelled), Vec::<String>::new());
+}
+
+#[test]
+fn a_single_screen_fixture_without_a_divider_label_a_legend_or_the_region_is_flagged() {
+    const VIEWS: &str = "a fieldset with the legend \"Work on\" and the radios single, batch";
+    const LAYOUTS: &str = "a fieldset with the legend \"Settings\" and the radios under, beside";
+    const REGION: &str = "an element with role=\"region\" and aria-label=\"Picture\"";
+    const TABINDEX: &str = "tabindex=\"0\" on the Picture region";
+    const LABEL: &str = "a <label for=\"divider\"> saying \"Compare original and compressed\"";
+    const RANGE: &str = "a range input with the id divider, min 0, max 100, step 1";
+    const INSIDE: &str = "the divider inside the Picture region";
+    let label = "<label for=\"divider\">Compare original and compressed</label>";
+    let divider =
+        "<input id=\"divider\" type=\"range\" min=\"0\" max=\"100\" step=\"1\" value=\"50\">";
+    let cases: Vec<(String, Vec<&str>)> = vec![
+        (SINGLE_FIXTURE.replace(label, ""), vec![LABEL]),
+        (
+            SINGLE_FIXTURE.replace(label, &format!("<!-- {label} -->")),
+            vec![LABEL],
+        ),
+        (
+            SINGLE_FIXTURE.replace(">Compare original and compressed<", ">Compare<"),
+            vec![LABEL],
+        ),
+        (
+            SINGLE_FIXTURE.replace("<label for=\"divider\">", "<label for=\"other\">"),
+            vec![LABEL],
+        ),
+        (
+            SINGLE_FIXTURE.replace("<legend>Work on</legend>", "<!-- <legend>Work on</legend> -->"),
+            vec![VIEWS],
+        ),
+        (
+            SINGLE_FIXTURE.replace(
+                "Batch</label></fieldset>",
+                "Batch</label><label><input type=\"radio\" name=\"view\" value=\"both\"></label></fieldset>",
+            ),
+            vec![VIEWS],
+        ),
+        (
+            SINGLE_FIXTURE.replace("value=\"batch\"", "value=\"Batch\""),
+            vec![VIEWS],
+        ),
+        (
+            SINGLE_FIXTURE.replace("<legend>Settings</legend>", "<legend>Layout</legend>"),
+            vec![LAYOUTS],
+        ),
+        (
+            SINGLE_FIXTURE.replace(" tabindex=\"0\"", ""),
+            vec![TABINDEX],
+        ),
+        (
+            SINGLE_FIXTURE.replace("tabindex=\"0\"", "tabindex=\"-1\""),
+            vec![TABINDEX],
+        ),
+        (
+            SINGLE_FIXTURE.replace("aria-label=\"Picture\"", "aria-label=\"Image\""),
+            vec![REGION, INSIDE],
+        ),
+        (
+            SINGLE_FIXTURE.replace(divider, "") + "</div>" + divider,
+            vec![INSIDE],
+        ),
+        (
+            SINGLE_FIXTURE.replace(" step=\"1\" value=\"50\"", " value=\"50\""),
+            vec![RANGE],
+        ),
+        (SINGLE_FIXTURE.replace(divider, ""), vec![RANGE, INSIDE]),
+    ];
+    for (html, problems) in cases {
+        let expected: Vec<String> = problems.into_iter().map(str::to_owned).collect();
+        assert_eq!(single_screen_problems(&html), expected, "{html}");
     }
 }
 
@@ -2822,18 +3145,31 @@ fn a_page_without_webp_in_its_text_does_not_say_it_in_a_fixture() {
 // ---------------------------------------------------------------------
 // The moon logo in the window header: one decorative image, loaded from the
 // window folder (the CSP allows images from the window folder and the
-// `thumb` scheme only), made from the same SVG as the app icon.
+// `thumb` and `preview` schemes only), made from the same SVG as the app icon.
 // ---------------------------------------------------------------------
 
-/// Problems with the images in `html`. The page must hold exactly one `<img>`;
-/// it must be decorative (`alt` present and empty) and its `src` must be a
-/// relative path inside the window folder: no scheme, no leading slash, no
-/// `..` or backslash, and naming a file in `window_files`. Read as tokens.
+/// Problems with the images in `html`. Besides Single image's two compare
+/// pictures (class `lunaepixSingle__image`), which get their address from the
+/// `preview` scheme at run time and so carry no `src` in the page, the page
+/// must hold exactly one `<img>`, the logo; it must be decorative (`alt`
+/// present and empty) and its `src` must be a relative path inside the window
+/// folder: no scheme, no leading slash, no `..` or backslash, and naming a
+/// file in `window_files`. Read as tokens.
 fn logo_problems(html: &str, window_files: &[String]) -> Vec<String> {
-    let images: Vec<StartTag> = start_tags(html)
+    let is_compare = |tag: &StartTag| {
+        tag.attr("class").is_some_and(|class| {
+            class
+                .split_whitespace()
+                .any(|name| name == "lunaepixSingle__image")
+        })
+    };
+    let (compare, images): (Vec<StartTag>, Vec<StartTag>) = start_tags(html)
         .into_iter()
         .filter(|tag| tag.name == "img")
-        .collect();
+        .partition(is_compare);
+    if compare.iter().any(|tag| tag.attr("src").is_some()) {
+        return vec!["a compare picture has a src in the page".to_owned()];
+    }
     if images.len() != 1 {
         return vec![format!(
             "exactly one <img> expected, found {}",
@@ -2931,6 +3267,43 @@ fn a_logo_without_alt_or_from_outside_the_window_folder_is_caught_in_a_fixture()
         ),
     ] {
         assert!(!logo_problems(html, &files).is_empty(), "{bad}: {html}");
+    }
+}
+
+#[test]
+fn the_compare_pictures_without_a_src_do_not_count_as_logos() {
+    let files = vec!["lunaepix-logo.svg".to_owned()];
+    let logo = "<img class=\"lunaepixHeader__logo\" src=\"lunaepix-logo.svg\" alt=\"\">";
+    let compare = "<img class=\"lunaepixSingle__image -original\" alt=\"Original\" hidden>\
+                   <img class=\"lunaepixSingle__image -compressed\" alt=\"Compressed\" hidden>";
+    assert_eq!(
+        logo_problems(&format!("{logo}{compare}"), &files),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_compare_picture_with_a_src_or_a_second_logo_is_caught_in_a_fixture() {
+    let files = vec!["lunaepix-logo.svg".to_owned()];
+    let logo = "<img class=\"lunaepixHeader__logo\" src=\"lunaepix-logo.svg\" alt=\"\">";
+    for (bad, extra) in [
+        (
+            "a compare picture with a src",
+            "<img class=\"lunaepixSingle__image -original\" src=\"lunaepix-logo.svg\" alt=\"Original\">",
+        ),
+        (
+            "a compare picture from elsewhere",
+            "<img class=\"lunaepixSingle__image\" src=\"https://example.com/a.png\" alt=\"\">",
+        ),
+        (
+            "an image whose class only contains the name",
+            "<img class=\"lunaepixSingle__imageX\" alt=\"\">",
+        ),
+    ] {
+        assert!(
+            !logo_problems(&format!("{logo}{extra}"), &files).is_empty(),
+            "{bad}"
+        );
     }
 }
 

@@ -26,8 +26,8 @@ function isPositive(value) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0;
 }
 
-/** A `{ width, height }` that can be divided by and shown at. */
-function isUsableSize(size) {
+/** A `{ width, height }` that can be divided by and shown at (also single-view.js's test for "something to fit"). */
+export function isUsableSize(size) {
   return size !== null && typeof size === 'object' && isPositive(size.width) && isPositive(size.height);
 }
 

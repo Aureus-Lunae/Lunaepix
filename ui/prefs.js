@@ -1,6 +1,8 @@
 // The window's one stored choice: where the settings sit in Single image mode.
-// Pure functions that take the storage as an argument (the window passes
-// `localStorage`), so the node tests can use a fake one. No DOM here.
+// Pure functions that take the storage as an argument (the window passes a
+// wrapper whose methods reach `window.localStorage` only when called, so even
+// that access happens inside the try below), so the node tests can use a fake
+// one. No DOM here.
 //
 // Storage can be missing, full or blocked. Nothing here throws because of it:
 // a read that fails gives the default, a write that fails is dropped.

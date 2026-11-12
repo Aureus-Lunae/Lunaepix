@@ -89,8 +89,9 @@ One run handles at most 2000 files, and each file has its own limits (100 MiB,
    - Without Re-add, the next drop or pick starts a new list.
    - "Clear" empties the list, before or after a run.
 
-Nothing is remembered between launches: every start is Lossless, quality 75,
-next to the originals.
+Nothing is remembered between launches but one choice, where Single image mode
+shows the settings: every start is Lossless, quality 75, next to the
+originals.
 
 ### Thumbnails
 

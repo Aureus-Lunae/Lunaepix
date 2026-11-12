@@ -11,10 +11,21 @@
   <header class="lunaepixHeader">
     <img class="lunaepixHeader__logo" src="lunaepix-logo.svg" alt="" width="32" height="32">
     <h1 class="lunaepixHeader__title">Lunaepix</h1>
+    <fieldset class="lunaepixHeader__views">
+      <legend class="lunaepixHeader__hiddenText">Work on</legend>
+      <label class="lunaepixHeader__view">
+        <input class="lunaepixHeader__viewRadio" id="viewSingle" type="radio" name="view" value="single" checked>
+        Single image
+      </label>
+      <label class="lunaepixHeader__view">
+        <input class="lunaepixHeader__viewRadio" id="viewBatch" type="radio" name="view" value="batch">
+        Batch
+      </label>
+    </fieldset>
   </header>
 
   <main class="lunaepixMain">
-    <section class="lunaepixDrop" id="drop" aria-labelledby="dropTitle">
+    <section class="lunaepixDrop" id="drop" aria-labelledby="dropTitle" hidden>
       <h2 class="lunaepixDrop__title" id="dropTitle">Drop images or a folder here</h2>
       <p class="lunaepixDrop__hint">PNG · JPG · SVG · WebP</p>
       <div class="lunaepixDrop__actions">
@@ -23,6 +34,117 @@
     </section>
 
     <p class="lunaepixStatus" id="status" role="status"></p>
+    <button class="lunaepixStatus__action" id="switchToBatch" type="button" hidden>Switch to Batch</button>
+
+    <section class="lunaepixSingle" id="single" aria-label="Single image">
+      <div class="lunaepixSingle__file" id="singleFile" hidden>
+        <h2 class="lunaepixSingle__fileName" id="singleFileName"></h2>
+        <span class="lunaepixSingle__fileSize" id="singleFileSize"></span>
+        <button class="lunaepixSingle__toolButton" id="chooseOther" type="button">Choose other</button>
+      </div>
+
+      <div class="lunaepixSingle__tools" id="singleTools" hidden>
+        <fieldset class="lunaepixSingle__layouts">
+          <legend class="lunaepixSingle__hiddenText">Settings</legend>
+          <label class="lunaepixSingle__layout">
+            <input class="lunaepixSingle__layoutRadio" id="layoutUnder" type="radio" name="layout" value="under" checked>
+            Settings under
+          </label>
+          <label class="lunaepixSingle__layout">
+            <input class="lunaepixSingle__layoutRadio" id="layoutBeside" type="radio" name="layout" value="beside">
+            Settings beside
+          </label>
+        </fieldset>
+        <div class="lunaepixSingle__zoom">
+          <button class="lunaepixSingle__toolButton" id="zoomOut" type="button">Zoom out</button>
+          <button class="lunaepixSingle__toolButton" id="zoomIn" type="button">Zoom in</button>
+          <button class="lunaepixSingle__toolButton" id="zoomActual" type="button">100%</button>
+          <button class="lunaepixSingle__toolButton" id="zoomFit" type="button">Fit</button>
+        </div>
+      </div>
+
+      <div class="lunaepixSingle__body -under" id="singleBody">
+        <section class="lunaepixDrop lunaepixSingle__drop" id="singleDrop" aria-labelledby="singleDropHeading">
+          <h2 class="lunaepixDrop__title" id="singleDropHeading">Drop an image here</h2>
+          <p class="lunaepixDrop__hint">PNG · JPG · SVG · WebP</p>
+          <div class="lunaepixDrop__actions">
+            <button class="lunaepixDrop__button" id="chooseImage" type="button">Choose image</button>
+          </div>
+        </section>
+
+        <div class="lunaepixSingle__picture" id="picture" role="region" aria-label="Picture" tabindex="0" hidden>
+          <div class="lunaepixSingle__stage -original" id="stageOriginal">
+            <img class="lunaepixSingle__image -original" id="imageOriginal" alt="Original" hidden>
+          </div>
+          <div class="lunaepixSingle__layer -compressed">
+            <div class="lunaepixSingle__stage -compressed" id="stageCompressed">
+              <img class="lunaepixSingle__image -compressed" id="imageCompressed" alt="Compressed" hidden>
+            </div>
+          </div>
+          <span class="lunaepixSingle__label -original" aria-hidden="true">Original</span>
+          <span class="lunaepixSingle__label -compressed" aria-hidden="true">Compressed</span>
+          <label class="lunaepixSingle__hiddenText" for="divider">Compare original and compressed</label>
+          <input class="lunaepixSingle__divider" id="divider" type="range" min="0" max="100" step="1" value="50">
+          <div class="lunaepixSingle__handle" id="handle" aria-hidden="true"></div>
+          <p class="lunaepixSingle__busy" id="pictureBusy" hidden></p>
+        </div>
+
+        <div class="lunaepixSingle__settingsSlot" id="singleSettingsSlot">
+          <div class="lunaepixSettings" id="settings">
+            <fieldset class="lunaepixSettings__row">
+              <legend class="lunaepixSettings__label">Compression</legend>
+              <label class="lunaepixSettings__choice">
+                <input class="lunaepixSettings__radio" id="modeLossless" type="radio" name="mode" value="lossless" checked>
+                Lossless
+              </label>
+              <label class="lunaepixSettings__choice">
+                <input class="lunaepixSettings__radio" id="modeLossy" type="radio" name="mode" value="lossy">
+                Lossy
+              </label>
+            </fieldset>
+
+            <div class="lunaepixSettings__row" id="qualityRow" hidden>
+              <label class="lunaepixSettings__label" for="qualityRange">Quality</label>
+              <input class="lunaepixSettings__range" id="qualityRange" type="range" min="0" max="100" step="1" value="75" disabled>
+              <label class="lunaepixSettings__hiddenText" for="qualityNumber">Quality, a whole number from 0 to 100</label>
+              <input class="lunaepixSettings__number" id="qualityNumber" type="number" min="0" max="100" step="1" value="75" inputmode="numeric" disabled>
+              <p class="lunaepixSettings__error" id="qualityError" hidden>Enter a whole number from 0 to 100.</p>
+            </div>
+
+            <div class="lunaepixSettings__row" role="group" aria-labelledby="saveToLabel">
+              <span class="lunaepixSettings__label" id="saveToLabel">Save to</span>
+              <span class="lunaepixSettings__value" id="saveTo">Next to the originals</span>
+              <button class="lunaepixSettings__button" id="chooseOutput" type="button">Choose folder</button>
+              <button class="lunaepixSettings__button" id="clearOutput" type="button" aria-label="Clear output folder" hidden>Clear</button>
+            </div>
+          </div>
+
+          <div class="lunaepixSingle__saveAs" id="saveAs" hidden>
+            <label class="lunaepixSingle__saveAsLabel" for="saveName">Save as</label>
+            <input class="lunaepixSingle__name" id="saveName" type="text" autocomplete="off" spellcheck="false">
+            <span class="lunaepixSingle__extension" id="saveExtension"></span>
+            <p class="lunaepixSingle__nameError" id="nameError" hidden></p>
+          </div>
+        </div>
+
+        <div class="lunaepixSingle__sizes" id="sizes" hidden>
+          <dl class="lunaepixSingle__sizeList">
+            <dt class="lunaepixSingle__sizeTerm">Original</dt>
+            <dd class="lunaepixSingle__sizeValue" id="sizeOriginal"></dd>
+            <dt class="lunaepixSingle__sizeTerm">Compressed</dt>
+            <dd class="lunaepixSingle__sizeValue" id="sizeCompressed"></dd>
+            <dt class="lunaepixSingle__sizeTerm">Saves</dt>
+            <dd class="lunaepixSingle__sizeValue -saves" id="sizeSaves"></dd>
+          </dl>
+          <p class="lunaepixSingle__note" id="sizeNote" hidden></p>
+        </div>
+
+        <div class="lunaepixSingle__foot" id="singleFoot" hidden>
+          <button class="lunaepixSingle__openFolder" id="singleOpenFolder" type="button" aria-disabled="true">Open folder</button>
+          <button class="lunaepixSingle__save" id="save" type="button" aria-disabled="true">Save</button>
+        </div>
+      </div>
+    </section>
 
     <section class="lunaepixPanel" id="panel" aria-labelledby="panelHeading" hidden>
       <div class="lunaepixPanel__head">
@@ -52,34 +174,7 @@
         </div>
       </div>
 
-      <div class="lunaepixSettings" id="settings">
-        <fieldset class="lunaepixSettings__row">
-          <legend class="lunaepixSettings__label">Compression</legend>
-          <label class="lunaepixSettings__choice">
-            <input class="lunaepixSettings__radio" id="modeLossless" type="radio" name="mode" value="lossless" checked>
-            Lossless
-          </label>
-          <label class="lunaepixSettings__choice">
-            <input class="lunaepixSettings__radio" id="modeLossy" type="radio" name="mode" value="lossy">
-            Lossy
-          </label>
-        </fieldset>
-
-        <div class="lunaepixSettings__row" id="qualityRow" hidden>
-          <label class="lunaepixSettings__label" for="qualityRange">Quality</label>
-          <input class="lunaepixSettings__range" id="qualityRange" type="range" min="0" max="100" step="1" value="75" disabled>
-          <label class="lunaepixSettings__hiddenText" for="qualityNumber">Quality, a whole number from 0 to 100</label>
-          <input class="lunaepixSettings__number" id="qualityNumber" type="number" min="0" max="100" step="1" value="75" inputmode="numeric" disabled>
-          <p class="lunaepixSettings__error" id="qualityError" hidden>Enter a whole number from 0 to 100.</p>
-        </div>
-
-        <div class="lunaepixSettings__row" role="group" aria-labelledby="saveToLabel">
-          <span class="lunaepixSettings__label" id="saveToLabel">Save to</span>
-          <span class="lunaepixSettings__value" id="saveTo">Next to the originals</span>
-          <button class="lunaepixSettings__button" id="chooseOutput" type="button">Choose folder</button>
-          <button class="lunaepixSettings__button" id="clearOutput" type="button" aria-label="Clear output folder" hidden>Clear</button>
-        </div>
-      </div>
+      <div id="batchSettingsSlot"></div>
 
       <div class="lunaepixPanel__foot" id="runRow">
         <button class="lunaepixPanel__run" id="run" type="button" aria-disabled="true">Run</button>

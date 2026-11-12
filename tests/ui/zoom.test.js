@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { divider, pan, step, toActual, toFit, zoomAt, zoomLimits } from '../../ui/zoom.js';
+import { divider, isUsableSize, pan, step, toActual, toFit, zoomAt, zoomLimits } from '../../ui/zoom.js';
 
 // Positions are computed with floating point; they are compared within this.
 const EPSILON = 1e-9;
@@ -75,6 +75,30 @@ test('limits are neutral for an unusable image or area', () => {
   assert.deepEqual(zoomLimits({ width: null, height: null, svg: true }, AREA), { fit: 1, max: 8 });
   // A usable pair does not.
   assert.notDeepEqual(zoomLimits(BIG, AREA), { fit: 1, max: 8 });
+});
+
+test('isUsableSize accepts a positive finite width and height', () => {
+  assert.equal(isUsableSize(BIG), true);
+  assert.equal(isUsableSize({ width: 0.5, height: 1, svg: true }), true);
+});
+
+test('isUsableSize rejects a zero, negative, missing or non-number side, and no size', () => {
+  const bad = [
+    { width: 0, height: 10 },
+    { width: 10, height: 0 },
+    { width: null, height: null },
+    { width: NaN, height: 5 },
+    { width: -5, height: 5 },
+    { width: Infinity, height: 5 },
+    { width: '800', height: '600' },
+    { height: 5 },
+    null,
+    undefined,
+    800,
+  ];
+  for (const value of bad) {
+    assert.equal(isUsableSize(value), false, JSON.stringify(value));
+  }
 });
 
 // zoomAt

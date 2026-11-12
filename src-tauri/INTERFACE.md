@@ -30,7 +30,10 @@ list and the output folder.
 | Quality | integer 0–100 | 75 (used only when mode is `"lossy"`) |
 | Output | next to the originals, or one chosen folder | next to the originals |
 
-Nothing is remembered between launches.
+Nothing is remembered between launches, except one choice the window keeps
+itself: where Single image mode shows the settings (under or beside the
+picture), in the window's own storage (`localStorage`, key
+`lunaepix.layout`). The backend stores nothing.
 
 ## Commands
 
