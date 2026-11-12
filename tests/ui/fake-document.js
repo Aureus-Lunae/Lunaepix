@@ -1,9 +1,13 @@
 // A recording stand-in for `document`, shared by the node tests of the
-// window's DOM helpers (table.js, single-view.js). It creates plain objects,
+// window's DOM helpers (table.js, single-view.js) and of the window itself
+// (window.js, through fake-window.js's page). It creates plain objects,
 // records every element it creates, and records any write that would put
 // markup into the page. Node has no DOM, so this is what lets the tests see
-// which elements are made, which were rebuilt or moved, where focus went and
-// which style properties were written.
+// which elements are made, which were rebuilt or moved, where focus went,
+// which style properties were written, which pointer was captured and
+// whether an event was prevented. Where the DOM has a default that matters
+// (an image is draggable, `valueAsNumber` is NaN for an empty field), the
+// fake has the same one.
 
 /**
  * A style object that records every write: plain properties
@@ -68,6 +72,15 @@ export function fakeDocument() {
       this.valueText = '';
       this.valueWrites = 0;
       this.style = fakeStyle();
+      // As in the DOM, an image can be dragged out of the page until told otherwise.
+      this.draggable = tagName === 'img';
+      // The layout box a test gives the element (the DOM measures it).
+      this.rect = { left: 0, top: 0, width: 0, height: 0 };
+      this.clientWidth = 0;
+      this.clientHeight = 0;
+      // The pointer ids captured with `setPointerCapture`.
+      this.captured = [];
+      this.type = '';
       const classes = this.classes;
       this.classList = {
         add: (...names) => {
@@ -118,6 +131,23 @@ export function fakeDocument() {
     set value(text) {
       this.valueText = String(text);
       this.valueWrites += 1;
+    }
+
+    // As in the DOM: the number a range or number input holds, NaN for an
+    // empty one and for any other kind of element.
+    get valueAsNumber() {
+      if ((this.type !== 'range' && this.type !== 'number') || this.valueText.trim() === '') {
+        return Number.NaN;
+      }
+      return Number(this.valueText);
+    }
+
+    getBoundingClientRect() {
+      return { ...this.rect };
+    }
+
+    setPointerCapture(pointerId) {
+      this.captured.push(pointerId);
     }
 
     // As in the DOM, a node that is put somewhere else leaves its old parent.
@@ -189,13 +219,26 @@ export function fakeDocument() {
       this.listeners.push([type, handler]);
     }
 
-    // Runs the handlers added for `type`, with `event` (a plain object).
+    // Runs the handlers added for `type` with one event: `event`'s fields, the
+    // element as its target unless `event` names another, and a
+    // `preventDefault()` that records itself in `defaultPrevented`. Returns
+    // that event, so a test can see whether a handler prevented it.
     fire(type, event = {}) {
+      const full = {
+        type,
+        target: this,
+        defaultPrevented: false,
+        preventDefault() {
+          full.defaultPrevented = true;
+        },
+        ...event,
+      };
       for (const [listened, handler] of this.listeners) {
         if (listened === type) {
-          handler({ target: this, ...event });
+          handler(full);
         }
       }
+      return full;
     }
 
     // What a click on the element runs: the handlers added for 'click'.

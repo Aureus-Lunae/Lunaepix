@@ -48,6 +48,7 @@ import { sizeView } from '../../ui/single.js';
 import { LAYOUT_KEY } from '../../ui/prefs.js';
 import { step, toActual, toFit, zoomAt, zoomLimits } from '../../ui/zoom.js';
 import { fakeDocument } from './fake-document.js';
+import { strictTimers } from './fake-window.js';
 
 // --- shared helpers -----------------------------------------------------------
 
@@ -171,6 +172,21 @@ function stageWithImage(doc, classes = ['lunaepixSingle__image', '-compressed'])
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
+test('a_fake_img_is_draggable_until_told_otherwise', () => {
+  // The fake has the DOM's default, so the draggable checks cannot pass by default.
+  const doc = fakeDocument();
+  assert.equal(doc.createElement('img').draggable, true);
+  assert.equal(doc.createElement('div').draggable, false);
+});
+
+test('pictureSlot_turns_off_the_native_image_drag', () => {
+  const doc = fakeDocument();
+  const image = doc.createElement('img');
+  const slot = pictureSlot(image);
+  assert.equal(slot.image, image);
+  assert.equal(image.draggable, false);
+});
+
 test('swapPicture_keeps_the_old_image_until_the_new_one_decodes', async () => {
   const doc = fakeDocument();
   const { stage, slot } = stageWithImage(doc);
@@ -190,6 +206,8 @@ test('swapPicture_keeps_the_old_image_until_the_new_one_decodes', async () => {
   assert.notEqual(fresh, old);
   assert.equal(fresh.src, 'preview://localhost/7-3');
   assert.deepEqual([...fresh.classList], ['lunaepixSingle__image', '-compressed']);
+  // A pointer down on the picture pans; the browser's own image drag would cancel it.
+  assert.equal(fresh.draggable, false);
   assert.equal(slot.image, fresh);
   assert.equal(slot.url, 'preview://localhost/7-3');
   assert.equal(slot.pending, null);
@@ -674,6 +692,25 @@ test('zoomReduce_refit_follows_fit_only_while_at_fit', () => {
   assert.equal(kept.view.x, (4000 * 2 - 800) / 2);
 });
 
+test('zoomReduce_refit_with_no_image_or_a_zero_area_keeps_the_view', () => {
+  // Zoomed in and panned, and at Fit with a scale below 1: a refit while the
+  // picture is hidden (area 0) or before a size is known changes neither.
+  const zoomed = { view: { scale: 2, x: 120, y: -40 }, atFit: false };
+  const fitted = zoomReduce(initialZoom(), { type: 'reset' }, BIG, AREA);
+  for (const zoom of [zoomed, fitted]) {
+    assert.equal(zoomReduce(zoom, { type: 'refit' }, null, AREA), zoom);
+    assert.equal(zoomReduce(zoom, { type: 'refit' }, BIG, { width: 0, height: 0 }), zoom);
+    assert.equal(zoomReduce(zoom, { type: 'refit' }, BIG, { width: 800, height: 0 }), zoom);
+    assert.equal(zoomReduce(zoom, { type: 'refit' }, { width: 0, height: 3000 }, AREA), zoom);
+  }
+  // A usable area still refits.
+  assert.deepEqual(zoomReduce(fitted, { type: 'refit' }, BIG, { width: 1600, height: 1200 }).view, {
+    scale: 0.4,
+    x: 0,
+    y: 0,
+  });
+});
+
 test('zoomReduce_ignores_an_unknown_action_and_a_zero_wheel', () => {
   const zoomed = { view: { scale: 2, x: 10, y: 0 }, atFit: false };
   assert.equal(zoomReduce(zoomed, { type: 'spin' }, BIG, AREA), zoomed);
@@ -733,11 +770,11 @@ test('a_drag_that_starts_on_the_handle_moves_the_divider_and_elsewhere_pans', ()
   picture.append(handle);
   const rect = { left: 0, width: 200 };
 
-  const onHandle = dragStart(handle, knob, 50, 10);
+  const onHandle = dragStart(handle, knob, 50, 10, 0);
   assert.equal(onHandle.mode, 'divider');
   assert.deepEqual(dragMove(onHandle, 150, 20, rect).result, { divider: 75 });
 
-  const elsewhere = dragStart(handle, picture, 50, 10);
+  const elsewhere = dragStart(handle, picture, 50, 10, 0);
   assert.equal(elsewhere.mode, 'pan');
   const moved = dragMove(elsewhere, 60, 4, rect);
   assert.deepEqual(moved.result, { dx: 10, dy: -6 });
@@ -745,6 +782,34 @@ test('a_drag_that_starts_on_the_handle_moves_the_divider_and_elsewhere_pans', ()
   assert.deepEqual(dragMove(moved.drag, 61, 4, rect).result, { dx: 1, dy: 0 });
   // No drag going: a move does nothing.
   assert.deepEqual(dragMove(null, 61, 4, rect), { drag: null, result: null });
+});
+
+test('a_middle_or_right_button_starts_no_drag', () => {
+  const doc = fakeDocument();
+  const picture = doc.createElement('div');
+  const handle = doc.createElement('div');
+  picture.append(handle);
+  // 1 is the middle button, 2 the right one: on the handle or elsewhere, no drag.
+  for (const button of [1, 2, undefined, '0']) {
+    assert.equal(dragStart(handle, handle, 50, 10, button), null, String(button));
+    assert.equal(dragStart(handle, picture, 50, 10, button), null, String(button));
+  }
+});
+
+test('a_divider_drag_over_an_area_without_width_moves_nothing', () => {
+  const doc = fakeDocument();
+  const handle = doc.createElement('div');
+  const drag = dragStart(handle, handle, 50, 10, 0);
+  for (const rect of [
+    { left: 0, width: 0 },
+    { left: 0, width: Number.NaN },
+  ]) {
+    const next = dragMove(drag, 150, 20, rect);
+    // No position to move to; the drag goes on, so the next move can still move the divider.
+    assert.equal(next.result, null);
+    assert.equal(next.drag, drag);
+  }
+  assert.deepEqual(dragMove(drag, 150, 20, { left: 0, width: 200 }).result, { divider: 75 });
 });
 
 test('wheelAction_zooms_about_the_pointer_inside_the_area', () => {
@@ -1048,19 +1113,20 @@ test('the_same_image_key_only_renders', () => {
   assert.deepEqual(log, ['render', 'render', 'render']);
 });
 
-function fakeTimers() {
-  const set = [];
-  const cleared = [];
-  return {
-    set,
-    cleared,
-    setTimer: (fn, delay) => {
-      set.push({ fn, delay });
-      return set.length;
-    },
-    clearTimer: (id) => cleared.push(id),
-  };
-}
+// The timers are strict as a webview's: called as a method of the timers
+// object, they throw (see fake-window.js).
+const fakeTimers = strictTimers;
+
+test('strict_timers_refuse_a_call_with_the_timers_object_as_this', () => {
+  const timers = strictTimers();
+  assert.throws(() => timers.setTimer(() => {}, 400), { name: 'TypeError', message: 'Illegal invocation' });
+  assert.throws(() => timers.clearTimer(1), { name: 'TypeError', message: 'Illegal invocation' });
+  // Called unbound, as setTimeout is in a page, they work.
+  const { setTimer, clearTimer } = timers;
+  assert.equal(setTimer(() => {}, 400), 1);
+  clearTimer(1);
+  assert.deepEqual(timers.cleared, [1]);
+});
 
 test('debounce_runs_once_after_the_last_trigger', () => {
   const timers = fakeTimers();

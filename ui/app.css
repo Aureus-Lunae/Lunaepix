@@ -720,9 +720,13 @@ body {
   clip-path: inset(0 0 0 var(--split));
 }
 
+/* A pointer down on the picture pans: the browser's own image drag and text
+   selection would cancel that pointer (the `<img>`s are also not draggable). */
 .lunaepixSingle__image {
   display: block;
   max-width: none;
+  -webkit-user-drag: none;
+  user-select: none;
 }
 
 /* "Original" and "Compressed" in the top corners. */

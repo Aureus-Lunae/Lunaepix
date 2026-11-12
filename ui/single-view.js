@@ -4,16 +4,17 @@
 // hand them recording stand-ins (tests/ui/fake-document.js). Every text goes
 // in through textContent; names, reasons and notes are data, never markup.
 //
-// The picture is drawn as two layers (INTERFACE.md, "Previews"): the
+// The picture is drawn as two layers (app.css, "The compare picture"): the
 // original's stage, and over it an area-sized layer, clipped at the divider
 // (`clip-path: inset(0 0 0 var(--split))`, never transformed), that holds the
 // compressed version's stage. Both stages get the same transform, so both
 // sides show the same spot at the same zoom, and the seam stays under the
 // divider's handle whatever the zoom and pan.
 //
-// app.js only looks up the elements and hands events to these functions:
-// every choice about what is sent or shown is made here or in the pure
-// modules (state.js, single.js, zoom.js, prefs.js).
+// window.js looks up the elements and hands events to these functions; its
+// own wiring is tested through its start function (tests/ui/window.test.js).
+// Every choice about what is sent or shown is made here, in window.js or in
+// the pure modules (state.js, single.js, zoom.js, prefs.js).
 
 import { writeLayout } from './prefs.js';
 import {
@@ -28,7 +29,7 @@ import {
 } from './single.js';
 import { afterRejection, panelView } from './state.js';
 import { markInvalid, syncNumber } from './table.js';
-import { divider, pan, step, toActual, toFit, zoomAt, zoomLimits } from './zoom.js';
+import { divider, isUsableSize, pan, step, toActual, toFit, zoomAt, zoomLimits } from './zoom.js';
 
 /** The window's key pattern for the `preview` scheme (INTERFACE.md). */
 const PREVIEW_KEY = /^\d{1,10}(-\d{1,10})?$/;
@@ -122,14 +123,20 @@ export function busyText(sizes, loading) {
 
 // --- page writes ------------------------------------------------------------
 
-/** A picture's record: the `<img>` shown, its address, and the swap going or failed. */
+/**
+ * A picture's record: the `<img>` shown, its address, and the swap going or
+ * failed. The `<img>` is made not draggable: a pointer down on the picture
+ * pans, and the browser's own image drag would cancel that pointer.
+ */
 export function pictureSlot(image) {
+  image.draggable = false;
   return { image, url: null, pending: null, failed: null, seq: 0 };
 }
 
 /**
  * Shows `url` in `slot` without a blank moment: a new `<img>` (with the old
- * one's classes and alt) is decoded off the main thread, and only then takes
+ * one's classes and alt, and not draggable, as `pictureSlot` makes the
+ * first one) is decoded off the main thread, and only then takes
  * the old one's place. The old one stays until then. A newer swap makes an
  * older one stale: whichever finishes first, a stale one changes nothing and
  * reports nothing. A failed decode keeps the old picture, remembers `url` as
@@ -142,6 +149,7 @@ export function swapPicture(doc, slot, url, onReady, onFail) {
   const image = doc.createElement('img');
   image.classList.add(...slot.image.classList);
   image.alt = slot.image.alt;
+  image.draggable = false;
   image.decoding = 'async';
   image.src = url;
   return image.decode().then(
@@ -339,7 +347,9 @@ function moved(view, limits) {
  * The next zoom (`{ view, atFit }`) for an action:
  * - `reset` (a new image) and `fit` (the Fit button): the whole picture;
  * - `refit` (the area or the decoded size changed): Fit again while at Fit,
- *   otherwise the same scale, kept within the new limits and pan bounds;
+ *   otherwise the same scale, kept within the new limits and pan bounds.
+ *   Without a usable area (the picture is hidden) or picture size, nothing
+ *   changes: the view stays as it was until there is something to fit;
  * - `wheel` ({ deltaY, point }): zoom about the pointer;
  * - `step` ({ direction }), `actual`: the buttons, about the centre;
  * - `pan` ({ dx, dy }): a drag or an arrow key.
@@ -353,6 +363,9 @@ export function zoomReduce(zoom, action, image, area) {
     case 'fit':
       return { view: toFit(limits), atFit: true };
     case 'refit':
+      if (!isUsableSize(image) || !isUsableSize(area)) {
+        return zoom;
+      }
       return zoom.atFit
         ? { view: toFit(limits), atFit: true }
         : moved(zoomAt(zoom.view, 1, null, limits, image, area), limits);
@@ -435,8 +448,15 @@ export function dividerFromPointer(clientX, rect) {
   return Math.round(divider(((clientX - rect.left) / rect.width) * 100));
 }
 
-/** A pointer drag starting at (x, y) on `target`: on the handle it moves the divider, anywhere else it pans. */
-export function dragStart(handle, target, x, y) {
+/**
+ * A pointer drag starting at (x, y) on `target` with `button`: on the handle
+ * it moves the divider, anywhere else it pans. Only the primary button (0)
+ * drags; any other button gives null (no drag).
+ */
+export function dragStart(handle, target, x, y, button) {
+  if (button !== 0) {
+    return null;
+  }
   return { mode: handle.contains(target) ? 'divider' : 'pan', x, y };
 }
 
@@ -613,12 +633,15 @@ export function makeDispatch(deps) {
  * `clearTimer` (the window's setTimeout and clearTimeout).
  */
 export function debounce(timers, delay, fn) {
+  // Called on their own, never as `timers.setTimer(…)`: a webview's
+  // setTimeout and clearTimeout throw when `this` is another object.
+  const { setTimer, clearTimer } = timers;
   let timer = null;
   return () => {
     if (timer !== null) {
-      timers.clearTimer(timer);
+      clearTimer(timer);
     }
-    timer = timers.setTimer(() => {
+    timer = setTimer(() => {
       timer = null;
       fn();
     }, delay);

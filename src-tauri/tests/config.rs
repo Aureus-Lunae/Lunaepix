@@ -954,7 +954,7 @@ fn every_element_the_scripts_ask_for_is_in_the_page() {
             "in ui/{name}"
         );
     }
-    // Not vacuous: app.js does ask for elements.
+    // Not vacuous: window.js does ask for elements.
     assert!(asked >= 10, "only {asked} getElementById calls were found");
 }
 
