@@ -14,9 +14,8 @@
 // area, counted from its top-left corner.
 //
 // Every function that moves the view returns a new view, except a call that
-// changes nothing (a
-// factor, direction or scale that cannot be used), which may return the view
-// it was given; none changes the view it is given.
+// changes nothing (a factor, direction or scale that cannot be used), which
+// may return the view it was given; none changes the view it is given.
 
 const MAX_ZOOM = 8;
 const STEP_FACTOR = 1.25;

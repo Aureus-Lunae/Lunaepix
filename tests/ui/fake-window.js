@@ -23,6 +23,7 @@ const PAGE = [
   ['chooseFiles', 'button', 'drop'],
   ['batchStatusSlot', 'div', 'main'],
   ['single', 'section', 'main', { classes: ['lunaepixSingle'] }],
+  ['floatStatusSlot', 'div', 'single', { classes: ['lunaepixSingle__statusFloat', '-empty'] }],
   ['singleDrop', 'section', 'single'],
   ['singleDropHeading', 'h2', 'singleDrop'],
   ['chooseImage', 'button', 'singleDrop'],

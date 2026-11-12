@@ -613,6 +613,144 @@ test('with_an_image_loaded_the_column_shows_the_file_save_as_sizes_and_save', as
   assert.equal(w.el('picture').hidden, false);
 });
 
+// --- the status line while the column is folded ("Folded note") -------------------
+
+const FOLDER_NOTE = 'Folders go in Batch.';
+
+/** Whether `element` and every element around it are not hidden. */
+function nothingAboveHidden(element) {
+  for (let current = element; current; current = current.parent) {
+    if (current.hidden) {
+      return false;
+    }
+  }
+  return true;
+}
+
+test('folding_moves_the_status_line_over_the_picture', async () => {
+  const w = start();
+  await load(w);
+  w.el('columnToggle').click();
+  assert.equal(w.el('statusLine').parent, w.el('floatStatusSlot'));
+  // Over the picture's place: beside the picture, not in the folded column.
+  assert.equal(w.el('floatStatusSlot').parent, w.el('single'));
+  assert.equal(w.el('columnFoot').contains(w.el('statusLine')), false);
+  assert.equal(nothingAboveHidden(w.el('status')), true);
+  // One status line: no copy.
+  assert.equal(w.doc.created.filter((element) => element.id === 'status').length, 1);
+});
+
+test('unfolding_moves_it_back_to_the_column', async () => {
+  const w = start();
+  await load(w);
+  w.el('columnToggle').click();
+  w.el('columnToggle').click();
+  assert.equal(w.el('statusLine').parent, w.el('singleStatusSlot'));
+  assert.equal(w.el('floatStatusSlot').children.length, 0);
+});
+
+test('a_note_while_folded_shows_over_the_picture_and_is_not_hidden', async () => {
+  const w = start();
+  await load(w);
+  w.el('columnToggle').click();
+  await load(w, '7', 1, FOLDER_NOTE);
+  assert.equal(columnShown(w), false);
+  assert.equal(w.el('status').textContent, FOLDER_NOTE);
+  assert.equal(w.el('statusLine').parent, w.el('floatStatusSlot'));
+  assert.equal(nothingAboveHidden(w.el('status')), true);
+  assert.equal(nothingAboveHidden(w.el('switchToBatch')), true);
+});
+
+test('with_the_column_shown_the_note_stays_in_the_column', async () => {
+  const w = start();
+  await load(w);
+  await load(w, '7', 1, FOLDER_NOTE);
+  assert.equal(w.el('status').textContent, FOLDER_NOTE);
+  assert.equal(w.el('statusLine').parent, w.el('singleStatusSlot'));
+  assert.equal(w.el('floatStatusSlot').children.length, 0);
+  assert.equal(w.el('floatStatusSlot').classList.contains('-empty'), true);
+});
+
+test('in_batch_the_status_line_is_in_batchs_place_even_when_the_column_was_folded', async () => {
+  const w = start();
+  await load(w);
+  w.el('columnToggle').click();
+  await pick(w.el('viewBatch'));
+  assert.equal(w.el('statusLine').parent, w.el('batchStatusSlot'));
+  assert.equal(nothingAboveHidden(w.el('status')), true);
+  // Back in Single image the column is still folded, so the line floats again.
+  await pick(w.el('viewSingle'));
+  assert.equal(columnShown(w), false);
+  assert.equal(w.el('statusLine').parent, w.el('floatStatusSlot'));
+});
+
+test('folded_in_the_empty_state_the_status_line_floats_over_the_drop_area', async () => {
+  const w = start();
+  w.el('columnToggle').click();
+  w.tauri.emit('image-changed', { image: null, left_out: 1, notice: FOLDER_NOTE });
+  await settle();
+  assert.equal(w.el('singleDrop').hidden, false);
+  assert.equal(w.el('picture').hidden, true);
+  assert.equal(w.el('statusLine').parent, w.el('floatStatusSlot'));
+  // The drop area's neighbour, so the hidden picture does not hide it.
+  assert.equal(w.el('floatStatusSlot').parent, w.el('singleDrop').parent);
+  assert.equal(w.el('status').textContent, FOLDER_NOTE);
+  assert.equal(nothingAboveHidden(w.el('switchToBatch')), true);
+});
+
+test('folded_with_an_image_the_status_line_floats_over_the_picture', async () => {
+  const w = start();
+  w.el('columnToggle').click();
+  await load(w, '7', 2, LEFT_OUT_TWO);
+  assert.equal(w.el('singleDrop').hidden, true);
+  assert.equal(w.el('picture').hidden, false);
+  assert.equal(w.el('statusLine').parent, w.el('floatStatusSlot'));
+  assert.equal(w.el('floatStatusSlot').parent, w.el('picture').parent);
+  assert.equal(nothingAboveHidden(w.el('switchToBatch')), true);
+});
+
+test('folding_with_focus_on_switch_to_batch_keeps_focus_on_it', async () => {
+  const w = start();
+  await load(w, '7', 2, LEFT_OUT_TWO);
+  w.doc.strictFocus = true;
+  w.el('switchToBatch').focus();
+  w.el('columnToggle').click();
+  assert.equal(w.el('statusLine').parent, w.el('floatStatusSlot'));
+  assert.deepEqual(w.doc.refusedFocus, []);
+  assert.equal(w.doc.activeElement, w.el('switchToBatch'));
+});
+
+test('folding_with_focus_in_the_column_body_moves_focus_to_show_settings', async () => {
+  const w = start();
+  await load(w, '7', 2, LEFT_OUT_TWO);
+  w.doc.strictFocus = true;
+  w.el('modeLossy').focus();
+  w.el('columnToggle').click();
+  assert.equal(w.doc.activeElement, w.el('columnToggle'));
+});
+
+test('the_floating_status_line_has_its_surface_with_a_note', async () => {
+  const w = start();
+  await load(w);
+  w.el('columnToggle').click();
+  await load(w, '7', 1, FOLDER_NOTE);
+  assert.equal(w.el('floatStatusSlot').classList.contains('-empty'), false);
+});
+
+test('the_floating_status_line_has_no_surface_while_it_is_empty', async () => {
+  const w = start();
+  await load(w);
+  w.el('columnToggle').click();
+  assert.equal(w.el('status').textContent, '');
+  assert.equal(w.el('floatStatusSlot').classList.contains('-empty'), true);
+  // Never hidden: the live region stays in the page for the next note.
+  assert.equal(nothingAboveHidden(w.el('status')), true);
+  // A note, then unfolding: the line leaves, and the empty slot has no surface.
+  await load(w, '7', 1, FOLDER_NOTE);
+  w.el('columnToggle').click();
+  assert.equal(w.el('floatStatusSlot').classList.contains('-empty'), true);
+});
+
 test('single_image_marks_the_main_area_single', () => {
   const w = start();
   assert.equal(w.el('main').classList.contains('-single'), true);

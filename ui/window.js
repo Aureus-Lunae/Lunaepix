@@ -120,13 +120,16 @@ export function startWindow(env) {
 
   // The header, the main area and the status line. The status line is one
   // block (the live region and Switch to Batch), moved into the place of the
-  // mode that shows, as the settings are.
+  // mode that shows, as the settings are; in Single image with the column
+  // folded, its place is the slot floating at the top of the picture.
   const header = doc.getElementById('header');
   const main = doc.getElementById('main');
   const viewRadios = [doc.getElementById('viewSingle'), doc.getElementById('viewBatch')];
   const statusLine = doc.getElementById('statusLine');
+  const floatStatusSlot = doc.getElementById('floatStatusSlot');
   const statusSlots = {
     single: doc.getElementById('singleStatusSlot'),
+    float: floatStatusSlot,
     batch: doc.getElementById('batchStatusSlot'),
   };
   const status = doc.getElementById('status');
@@ -286,7 +289,8 @@ export function startWindow(env) {
   }
 
   // The view on both stages, and its percentage on the zoom controls
-  // (written only when it changes, as it is a polite live region).
+  // (written only when it changes). The percentage is not a live region:
+  // every wheel step would be read out; it is read as part of the Zoom group.
   function zoomBy(action) {
     zoom = zoomReduce(zoom, action, zoomImage(), area());
     applyView(pictureParts, zoom.view);
@@ -443,9 +447,16 @@ export function startWindow(env) {
     // Full width in Single image, Batch's 48rem in Batch (app.css).
     syncModifier(main, ['single', 'batch'], screen.view);
     // The one settings block and the one status line go into the places of
-    // the mode that shows: Single image's column, or Batch's.
+    // the mode that shows: Single image's column, or Batch's; the status line
+    // floats over the picture while the column is folded. This comes before
+    // the column's parts are hidden (renderSingle), so focus on Switch to
+    // Batch leaves the column with it instead of falling back to the toggle.
+    // The floating slot has no surface while it has nothing to show (no
+    // empty box over the picture); it is never hidden, so the live region
+    // stays in the page.
     moveBlock(doc, settings, settingsSlots[screen.settingsSlot]);
     moveBlock(doc, statusLine, statusSlots[screen.statusSlot]);
+    floatStatusSlot.classList.toggle('-empty', screen.floatEmpty);
 
     renderBatch(screen);
     renderSingle(screen);

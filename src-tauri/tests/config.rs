@@ -2055,6 +2055,9 @@ const COLUMN_TOGGLE: &str = "a \"Hide settings\" button in the Settings aside wi
 const ZOOM_GROUP: &str = "a role=\"group\" with aria-label=\"Zoom\" inside the Picture region";
 const ZOOM_OUT: &str = "a button with aria-label=\"Zoom out\" in the zoom group";
 const ZOOM_IN: &str = "a button with aria-label=\"Zoom in\" in the zoom group";
+const ZOOM_QUIET: &str = "no aria-live in or on the zoom group";
+const FLOAT_SLOT: &str = "an element with id=\"floatStatusSlot\" beside the Picture region \
+     (the same parent) and before it";
 const NO_LAYOUT: &str = "no input with name=\"layout\" (the layout switch is gone)";
 
 /// What Task 11's layout needs in the page, read as tokens: the column is an
@@ -2062,7 +2065,12 @@ const NO_LAYOUT: &str = "no input with name=\"layout\" (the layout switch is gon
 /// (`role="region"`, a non-empty `aria-label`, `tabindex="0"`) and the "Hide
 /// settings" button, which starts expanded and controls elements that exist;
 /// inside the Picture region a `role="group"` named "Zoom" with the buttons
-/// named "Zoom out" and "Zoom in"; and no input named `layout` anywhere.
+/// named "Zoom out" and "Zoom in", and no `aria-live` in it (every wheel step
+/// would be read out); the slot the status line floats in while the column
+/// is folded, `#floatStatusSlot`, beside the Picture region and before it (so
+/// neither the hidden picture of the empty state nor the folded column hides
+/// it, and it comes first in focus order, as it is at the top); and no input
+/// named `layout` anywhere.
 fn column_problems(html: &str) -> Vec<String> {
     let all = elements(html);
     let ids: HashSet<&str> = all
@@ -2132,6 +2140,21 @@ fn column_problems(html: &str) -> Vec<String> {
             problems.push(what.to_owned());
         }
     }
+    let live = find(&|index, element| {
+        (Some(index) == group || inside(index, group)) && element.tag.attr("aria-live").is_some()
+    });
+    if live.is_some() {
+        problems.push(ZOOM_QUIET.to_owned());
+    }
+
+    let float = find(&|_, element| element.tag.attr("id") == Some("floatStatusSlot"));
+    let float_placed = match (float, picture) {
+        (Some(slot), Some(region)) => slot < region && all[slot].parent == all[region].parent,
+        _ => false,
+    };
+    if !float_placed {
+        problems.push(FLOAT_SLOT.to_owned());
+    }
 
     if find(&|_, element| element.tag.name == "input" && element.tag.attr("name") == Some("layout"))
         .is_some()
@@ -2151,10 +2174,14 @@ const COLUMN_TOP: &str = "<div><button type=\"button\" aria-expanded=\"true\" \
 const COLUMN_BODY: &str = "<div id=\"columnBody\" role=\"region\" aria-label=\"Image settings\" \
      tabindex=\"0\"><h2>holiday.jpg</h2><input type=\"text\" id=\"saveName\"></div>";
 const COLUMN_FOOT: &str = "<div id=\"columnFoot\"><button type=\"button\">Save</button></div>";
+const COLUMN_FLOAT: &str = "<div id=\"floatStatusSlot\"></div>";
 
-/// Markup with everything [`column_problems`] asks for, from its parts.
+/// Markup with everything [`column_problems`] asks for, from its parts, in
+/// one work area: the float slot, the picture, the aside.
 fn column_fixture(picture: &str, top: &str, body: &str, foot: &str) -> String {
-    format!("{picture}<aside aria-label=\"Settings\">{top}{body}{foot}</aside>")
+    format!(
+        "<section>{COLUMN_FLOAT}{picture}<aside aria-label=\"Settings\">{top}{body}{foot}</aside></section>"
+    )
 }
 
 fn full_column_fixture() -> String {
@@ -2184,6 +2211,10 @@ fn a_column_fixture_with_everything_passes_in_any_spelling() {
         .replace(
             "<button type=\"button\" aria-label=\"Zoom in\"",
             "<BUTTON aria-label='Zoom in'",
+        )
+        .replace(
+            COLUMN_FLOAT,
+            "<DIV class=\"lunaepixSingle__statusFloat -empty\" ID='floatStatusSlot'></DIV>",
         );
     assert_eq!(column_problems(&spelled), Vec::<String>::new());
     // A layout radio only in a comment is not an input.
@@ -2317,6 +2348,46 @@ fn a_column_fixture_with_each_part_missing_or_misplaced_is_flagged() {
                 "",
             ),
             vec![ZOOM_IN],
+        ),
+        // A live region in the zoom group: on the percentage, on the group.
+        (
+            full.replace("<span>28%</span>", "<span aria-live=\"polite\">28%</span>"),
+            vec![ZOOM_QUIET],
+        ),
+        (
+            full.replace(
+                "role=\"group\" aria-label=\"Zoom\"",
+                "role=\"group\" aria-label=\"Zoom\" ARIA-LIVE='off'",
+            ),
+            vec![ZOOM_QUIET],
+        ),
+        // The float slot: missing, in a comment, inside the Picture region,
+        // inside the aside, after the picture, wrapped in another element.
+        (full.replace(COLUMN_FLOAT, ""), vec![FLOAT_SLOT]),
+        (
+            full.replace(COLUMN_FLOAT, &format!("<!-- {COLUMN_FLOAT} -->")),
+            vec![FLOAT_SLOT],
+        ),
+        (
+            full.replace(COLUMN_FLOAT, "").replace(
+                "tabindex=\"0\"><div role=\"group\"",
+                &format!("tabindex=\"0\">{COLUMN_FLOAT}<div role=\"group\""),
+            ),
+            vec![FLOAT_SLOT],
+        ),
+        (
+            full.replace(COLUMN_FLOAT, "")
+                .replace(COLUMN_FOOT, &format!("{COLUMN_FOOT}{COLUMN_FLOAT}")),
+            vec![FLOAT_SLOT],
+        ),
+        (
+            full.replace(COLUMN_FLOAT, "")
+                .replace("<aside ", &format!("{COLUMN_FLOAT}<aside ")),
+            vec![FLOAT_SLOT],
+        ),
+        (
+            full.replace(COLUMN_FLOAT, &format!("<div>{COLUMN_FLOAT}</div>")),
+            vec![FLOAT_SLOT],
         ),
         // The layout switch still there, inside or outside the column.
         (format!("{layout}{full}"), vec![NO_LAYOUT]),

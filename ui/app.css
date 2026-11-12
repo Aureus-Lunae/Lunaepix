@@ -282,7 +282,8 @@ body {
 
 /* Status: the live region and, while it is offered, Switch to Batch. One
    block, moved by window.js: in Batch under the drop area, in Single image
-   in the column above Save. */
+   in the column above Save, and floating at the top of the picture while
+   the column is folded (`.lunaepixSingle__statusFloat`). */
 
 .lunaepixStatus__text {
   margin: 1rem 0 0;
@@ -796,6 +797,49 @@ body {
   text-align: center;
 }
 
+/* The status line while the column is folded (window.js moves it here): it
+   floats at the top of the picture, or of the drop area, centred on the
+   corner labels' line, on an opaque surface like the zoom controls. It keeps
+   clear of "Original" and "Compressed" (7.5rem on each side), so a long note
+   wraps instead of covering them. With nothing to show (`-empty`, set by
+   window.js) it has no surface; it is never hidden, so the live region stays
+   in the page and a new note is read out. */
+.lunaepixSingle__statusFloat {
+  grid-area: picture;
+  align-self: start;
+  justify-self: center;
+  position: relative;
+  z-index: 3;
+  max-width: calc(100% - 15rem);
+  margin-top: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--rowLine);
+  border-radius: 0.75rem;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.35);
+}
+
+.lunaepixSingle__statusFloat.-empty {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  box-shadow: none;
+}
+
+.lunaepixSingle__statusFloat .lunaepixStatus__text {
+  margin: 0;
+  color: var(--text);
+}
+
+/* While a note floats at the top, "Compressing…" or "Loading picture…" moves
+   to the bottom right, above the zoom controls, so the two never overlap. */
+.lunaepixSingle__statusFloat:not(.-empty) ~ .lunaepixSingle__picture .lunaepixSingle__busy {
+  top: auto;
+  bottom: 4.75rem;
+}
+
 /* The column: the full height, a line on its left. */
 .lunaepixSingle__column {
   grid-area: column;
@@ -1051,6 +1095,13 @@ body {
   .lunaepixSingle__columnBody {
     overflow: visible;
   }
+
+  /* A column folded on a wider window: the floating status line is too wide
+     for the label line here, so it sits under it, almost the full width. */
+  .lunaepixSingle__statusFloat {
+    max-width: calc(100% - 1.5rem);
+    margin-top: 2.75rem;
+  }
 }
 
 /* Narrow windows: tighter cells, no horizontal scroll at 320 px. Long names
@@ -1214,17 +1265,20 @@ body {
   }
 
   /* The header's line, the column's edge and its bottom part's line, the
-     zoom controls' surface and the size box stay visible. */
+     zoom controls' and the floating status line's surfaces and the size box
+     stay visible. */
   .lunaepixHeader,
   .lunaepixSingle__column,
   .lunaepixSingle__columnFoot,
   .lunaepixSingle__zoom,
+  .lunaepixSingle__statusFloat,
   .lunaepixSingle__sizes,
   .lunaepixSingle__name {
     border-color: CanvasText;
   }
 
-  .lunaepixSingle__zoom {
+  .lunaepixSingle__zoom,
+  .lunaepixSingle__statusFloat {
     background: Canvas;
     color: CanvasText;
   }

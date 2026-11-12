@@ -130,7 +130,10 @@ settings and "Save as" (this part scrolls when it does not fit), and at the
 bottom the sizes, the status line, "Open folder" and **Save**. Before a
 picture is loaded the column shows only the settings. **Hide settings** at
 the top of the column folds it to a narrow strip, so the picture gets the
-whole width; **Show settings** brings it back. The column starts shown at
+whole width; **Show settings** brings it back. While it is folded, the
+status line (with "Switch to Batch" when it is offered) floats over the top
+of the picture, or of the drop area, so a note is still seen and read out;
+it shows only when there is something to say. The column starts shown at
 every launch. In a window narrower than about 640 pixels (at the normal text
 size) the picture comes first and the column sits under it, and the page
 scrolls. Changing mode and coming back leaves the picture, the settings and

@@ -620,6 +620,48 @@ test('screenView_says_hide_settings_while_the_column_shows_and_show_settings_whi
   assert.equal(next.columnHidden, true);
 });
 
+const fold = { type: 'set-column-hidden', payload: true };
+const toBatch = { type: 'set-view', payload: 'batch' };
+
+test('screenView_puts_the_status_line_over_the_picture_while_folded', () => {
+  // With an image, and in the empty state (over the drop area).
+  assert.equal(screenView(apply(initialState(), loaded('7'), fold)).statusSlot, 'float');
+  assert.equal(screenView(apply(initialState(), fold)).statusSlot, 'float');
+});
+
+test('screenView_keeps_the_status_line_in_the_column_or_in_batch_otherwise', () => {
+  assert.equal(screenView(apply(initialState(), loaded('7'))).statusSlot, 'single');
+  assert.equal(screenView(initialState()).statusSlot, 'single');
+  // Batch keeps its own place, whether the column was folded or not.
+  assert.equal(screenView(apply(initialState(), loaded('7'), fold, toBatch)).statusSlot, 'batch');
+  assert.equal(screenView(apply(initialState(), toBatch)).statusSlot, 'batch');
+});
+
+test('screenView_shows_the_floating_surface_with_a_note_or_an_offer', () => {
+  const folded = apply(initialState(), loaded('7'), fold);
+  assert.equal(screenView({ ...folded, message: 'The file could not be saved.' }).floatEmpty, false);
+  const offered = apply(
+    initialState(),
+    fold,
+    loaded('7', 2, 'Single image mode takes one image; 2 others were left out.'),
+  );
+  assert.equal(screenView(offered).showMove, true);
+  assert.equal(screenView(offered).floatEmpty, false);
+  // An offer whose note was replaced by an empty message still needs its button.
+  assert.equal(screenView({ ...offered, message: '' }).floatEmpty, false);
+});
+
+test('screenView_hides_the_floating_surface_without_a_note_and_offer_or_when_not_floating', () => {
+  const folded = apply(initialState(), loaded('7'), fold);
+  assert.equal(folded.message, '');
+  assert.equal(screenView(folded).floatEmpty, true);
+  // A note while the line is in the column or in Batch: nothing floats.
+  const shown = { ...apply(initialState(), loaded('7')), message: 'The file could not be saved.' };
+  assert.equal(screenView(shown).floatEmpty, true);
+  const batch = { ...apply(initialState(), loaded('7'), fold, toBatch), message: 'The file could not be saved.' };
+  assert.equal(screenView(batch).floatEmpty, true);
+});
+
 test('the_drag_highlight_goes_to_the_drop_area_that_shows_or_the_picture', () => {
   const over = { type: 'drag-state', payload: { over: true } };
   const pick = (state) => {
@@ -1544,17 +1586,17 @@ test('syncRadios_checks_the_radio_with_the_value_and_sets_aria_disabled', () => 
 
 test('bindRadios_calls_back_only_for_the_radio_that_became_checked', () => {
   const doc = fakeDocument();
-  const under = doc.createElement('input');
-  under.value = 'under';
-  const beside = doc.createElement('input');
-  beside.value = 'beside';
+  const single = doc.createElement('input');
+  single.value = 'single';
+  const batch = doc.createElement('input');
+  batch.value = 'batch';
   const picked = [];
-  bindRadios([under, beside], (value) => picked.push(value));
-  beside.checked = true;
-  beside.fire('change');
-  under.checked = false;
-  under.fire('change');
-  assert.deepEqual(picked, ['beside']);
+  bindRadios([single, batch], (value) => picked.push(value));
+  batch.checked = true;
+  batch.fire('change');
+  single.checked = false;
+  single.fire('change');
+  assert.deepEqual(picked, ['batch']);
 });
 
 test('syncModifier_sets_exactly_the_chosen_modifier', () => {

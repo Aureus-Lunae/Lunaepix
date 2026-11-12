@@ -85,7 +85,11 @@ export function pictureView(state, src) {
  *   Batch, and Batch's summary in place of the settings only in Batch (in
  *   Single image the one settings block is in Single image's slot);
  * - where the one settings block and the one status line go: Single image's
- *   column or Batch's places (`settingsSlot`, `statusSlot`);
+ *   column or Batch's places (`settingsSlot`, `statusSlot`); while the column
+ *   is folded, Single image's status line floats at the top of the picture
+ *   (or of the drop area) instead (`statusSlot` 'float'), and `floatEmpty`
+ *   says whether that floating line has nothing to show (no message and no
+ *   offer, or it is not floating), so it gets no surface;
  * - in Single image, the drop area until an image is loaded, then the
  *   picture with its zoom controls, and in the column the file, Save as, the
  *   size box and Save (the settings and the status line show in both);
@@ -100,6 +104,8 @@ export function screenView(state) {
   const image = state.single.image;
   const panel = panelView(state);
   const columnHidden = state.single.columnHidden;
+  const statusSlot = single ? (columnHidden ? 'float' : 'single') : 'batch';
+  const showMove = state.single.offer !== null;
   return {
     view: state.view,
     single,
@@ -109,7 +115,8 @@ export function screenView(state) {
     showSingleDrop: image === null,
     showLoaded: image !== null,
     settingsSlot: single ? 'single' : 'batch',
-    statusSlot: single ? 'single' : 'batch',
+    statusSlot,
+    floatEmpty: statusSlot !== 'float' || (state.message === '' && !showMove),
     columnHidden,
     columnToggleText: columnHidden ? SHOW_SETTINGS_TEXT : HIDE_SETTINGS_TEXT,
     fileName: image === null ? '' : image.name,
@@ -119,7 +126,7 @@ export function screenView(state) {
     dragSingleDrop: single && image === null && state.dragOver,
     dragPicture: single && image !== null && state.dragOver,
     canSwitch: canSwitchView(state),
-    showMove: state.single.offer !== null,
+    showMove,
     canMove: offerView(state).canMove,
   };
 }

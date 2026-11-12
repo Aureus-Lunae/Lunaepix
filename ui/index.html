@@ -37,6 +37,10 @@
     <div class="lunaepixMain__statusSlot" id="batchStatusSlot"></div>
 
     <section class="lunaepixSingle" id="single" aria-label="Single image">
+      <!-- While the column is folded the status line floats here, at the top
+           of the picture (or of the drop area); window.js moves it in. -->
+      <div class="lunaepixSingle__statusFloat -empty" id="floatStatusSlot"></div>
+
       <section class="lunaepixDrop lunaepixSingle__drop" id="singleDrop" aria-labelledby="singleDropHeading">
         <h2 class="lunaepixDrop__title" id="singleDropHeading">Drop an image here</h2>
         <p class="lunaepixDrop__hint">PNG · JPG · SVG · WebP</p>
@@ -62,7 +66,7 @@
         <p class="lunaepixSingle__busy" id="pictureBusy" hidden></p>
         <div class="lunaepixSingle__zoom" id="zoomControls" role="group" aria-label="Zoom">
           <button class="lunaepixSingle__zoomButton -sign" id="zoomOut" type="button" aria-label="Zoom out">&minus;</button>
-          <span class="lunaepixSingle__zoomValue" id="zoomValue" aria-live="polite"></span>
+          <span class="lunaepixSingle__zoomValue" id="zoomValue"></span>
           <button class="lunaepixSingle__zoomButton -sign" id="zoomIn" type="button" aria-label="Zoom in">+</button>
           <button class="lunaepixSingle__zoomButton" id="zoomActual" type="button">100%</button>
           <button class="lunaepixSingle__zoomButton" id="zoomFit" type="button">Fit</button>

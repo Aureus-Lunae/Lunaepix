@@ -20,9 +20,10 @@ at every launch. The backend is told which one shows (`set_view`), because a
 drop goes to the mode that shows. In Single image the picture fills the
 window and the settings sit in a column on its right; the status line (the
 sentences the backend's `notice` fields carry, and the window's own) sits in
-that column above Save. In Batch it sits under the drop area. It is one
-element that moves between the two places, so what it says survives a mode
-change.
+that column above Save, and while the column is folded ("Hide settings") it
+floats over the top of the picture, or of the drop area. In Batch it sits
+under the drop area, folded column or not. It is one element that moves
+between these places, so what it says survives a mode change or a fold.
 
 Use the global API (`app.withGlobalTauri` is on):
 
