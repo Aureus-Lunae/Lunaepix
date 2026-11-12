@@ -21,7 +21,9 @@
 //   records nothing either: one for an image that is no longer the current
 //   one, one that arrives while Batch shows, and one sent before a switch
 //   (the switch to Batch stopped that request in the backend).
-// - `layout-changed` ('under' or 'beside').
+// - `set-column-hidden` (true or false): "Hide settings" or "Show settings"
+//   was pressed. Not remembered between launches: every start shows the
+//   column.
 // - `picture-shown` ({ side, key }): the page now shows the picture of `key`
 //   on `side` ('original' or 'compressed'), decoded. `picture-failed` (the
 //   same payload): the window could not decode it; the picture shown before
@@ -57,7 +59,6 @@ import {
 export { canSwitchView };
 
 const VIEWS = Object.freeze(['single', 'batch']);
-const LAYOUTS = Object.freeze(['under', 'beside']);
 // The two pictures of the compare view.
 const SIDES = Object.freeze(['original', 'compressed']);
 // An image key (`image-changed`) and a version key (`preview-ready`): the
@@ -96,7 +97,8 @@ export function initialSingle() {
     saving: null,
     // The last `name-taken`: { name, text }, shown while the box holds `name`.
     refused: null,
-    layout: 'under',
+    // Whether the settings column is folded ("Hide settings").
+    columnHidden: false,
     // How many `set-view`s there have been this launch; a `preview-requested`
     // counts only with the number of its moment.
     viewChanges: 0,
@@ -217,11 +219,12 @@ function imageChanged(state, payload) {
     ? { ...state, single: { ...single, offer } }
     : {
         ...state,
-        // A new image starts over; the layout is the user's, not the image's,
-        // and the count of switches belongs to the launch.
+        // A new image starts over; whether the column is folded is the
+        // user's, not the image's, and the count of switches belongs to the
+        // launch.
         single: {
           ...initialSingle(),
-          layout: single.layout,
+          columnHidden: single.columnHidden,
           viewChanges: single.viewChanges,
           image,
           nameText: image?.suggested ?? '',
@@ -307,8 +310,8 @@ export function reduceSingle(state, action) {
       return current && settings !== null ? withSingle(state, { requested: settings }) : state;
     }
 
-    case 'layout-changed':
-      return LAYOUTS.includes(payload) ? withSingle(state, { layout: payload }) : state;
+    case 'set-column-hidden':
+      return typeof payload === 'boolean' ? withSingle(state, { columnHidden: payload }) : state;
 
     case 'save-started':
       return isObject(payload) && typeof payload.name === 'string'

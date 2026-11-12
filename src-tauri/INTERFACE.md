@@ -9,15 +9,21 @@ receives one: it gets file names, the output folder's name, numbers,
 thumbnail keys and image keys.
 
 In the window, `ui/app.js` is only the entry: it hands the real page, Tauri
-API, timers, storage, `ResizeObserver` and log to `startWindow` in
-`ui/window.js`, which is the wiring (every listener, every command sent, every
-event handled). `state.js` and `single.js` turn events and actions into the
-next state, `table.js` and `single-view.js` write it into the page, and
-`zoom.js`, `prefs.js`, `names.js` and `format.js` are the small pure helpers.
+API, timers, `ResizeObserver` and log to `startWindow` in `ui/window.js`,
+which is the wiring (every listener, every command sent, every event
+handled). `state.js` and `single.js` turn events and actions into the next
+state, `table.js` and `single-view.js` write it into the page, and `zoom.js`,
+`names.js` and `format.js` are the small pure helpers.
 
 The window has two modes, Single image and Batch, and opens in Single image
 at every launch. The backend is told which one shows (`set_view`), because a
-drop goes to the mode that shows.
+drop goes to the mode that shows. In Single image the picture fills the
+window and the settings sit in a column on its right; the status line (the
+sentences the backend's `notice` fields carry, and the window's own) sits in
+that column above Save, and while the column is folded ("Hide settings") it
+floats over the top of the picture, or of the drop area. In Batch it sits
+under the drop area, folded column or not. It is one element that moves
+between these places, so what it says survives a mode change or a fold.
 
 Use the global API (`app.withGlobalTauri` is on):
 
@@ -38,11 +44,11 @@ list and the output folder.
 | Quality | integer 0–100 | 75 (used only when mode is `"lossy"`) |
 | Output | next to the originals, or one chosen folder | next to the originals |
 
-Only one choice is remembered between launches: where Single image mode
-shows the settings (under or beside the picture). The window keeps it itself,
-in its own storage (`localStorage`, key `lunaepix.layout`, value `"under"` or
-`"beside"`); a storage that is missing or blocked gives `"under"`. The
-backend stores nothing.
+Nothing is remembered between launches: the window stores nothing, and the
+backend stores nothing. Whether the settings column is folded ("Hide
+settings") lasts until the window closes. Version 0.1.2 kept a layout choice
+in the window's own storage (`localStorage`, key `lunaepix.layout`); a value
+already stored there is left alone and never read.
 
 ## Commands
 

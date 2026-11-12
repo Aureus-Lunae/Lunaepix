@@ -1,5 +1,6 @@
-// Zoom and pan maths for the compare picture, as pure functions. No DOM here,
-// so the node tests can load it; the window writes the result into the page.
+// Zoom and pan maths for the compare picture, and the zoom's percentage text,
+// as pure functions. No DOM here, so the node tests can load it; the window
+// writes the result into the page.
 //
 // A view is `{ scale, x, y }`. `x` and `y` are how far the picture is moved
 // from the centred position in the area, in pixels, so `{ scale: fit, x: 0,
@@ -12,9 +13,9 @@
 // `area` is `{ width, height }` in pixels. `point` is a position inside the
 // area, counted from its top-left corner.
 //
-// Every function returns a new view, except a call that changes nothing (a
-// factor, direction or scale that cannot be used), which may return the view
-// it was given; none changes the view it is given.
+// Every function that moves the view returns a new view, except a call that
+// changes nothing (a factor, direction or scale that cannot be used), which
+// may return the view it was given; none changes the view it is given.
 
 const MAX_ZOOM = 8;
 const STEP_FACTOR = 1.25;
@@ -167,4 +168,14 @@ export function divider(value) {
     return DIVIDER_START;
   }
   return clamp(value, 0, 100);
+}
+
+/**
+ * The zoom shown on the zoom controls: the view's scale as a whole
+ * percentage ("28%" for 0.276, "100%" at the picture's own size). '' for a
+ * view without a positive, finite scale.
+ */
+export function zoomText(view) {
+  const scale = view?.scale;
+  return isPositive(scale) ? `${Math.round(scale * 100)}%` : '';
 }

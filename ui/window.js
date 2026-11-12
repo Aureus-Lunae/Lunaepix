@@ -3,15 +3,15 @@
 // local action into the next state and decide what shows, `table.js` and
 // `single-view.js` write it into the page and make the window's own choices
 // (which trigger asks for a preview, what a drag or a key does), and
-// `zoom.js` and `prefs.js` do the zoom maths and keep the layout choice.
+// `zoom.js` does the zoom maths and the zoom's percentage text.
 //
 // `startWindow` looks up the elements, draws the page and hands every event
-// to those functions. It is given the page, the Tauri API, the timers, the
-// storage, ResizeObserver and a log, so the node tests drive it with
-// stand-ins (tests/ui/fake-window.js); app.js calls it with the real ones.
-// File and folder names, reasons and notes are written with textContent only.
+// to those functions. It is given the page, the Tauri API, the timers,
+// ResizeObserver and a log, so the node tests drive it with stand-ins
+// (tests/ui/fake-window.js); app.js calls it with the real ones. Nothing is
+// stored between launches. File and folder names, reasons and notes are
+// written with textContent only.
 
-import { readLayout } from './prefs.js';
 import {
   canChoose,
   canOpenFolder,
@@ -36,14 +36,15 @@ import {
   bindPreviewTriggers,
   bindRadios,
   busyText,
-  chooseLayout,
   debounce,
   dragMove,
   dragStart,
   initialZoom,
+  isOnControls,
   makeDispatch,
-  moveSettings,
+  moveBlock,
   moveToBatch,
+  observeSize,
   onRegionKey,
   pictureSize,
   pictureSlot,
@@ -57,6 +58,7 @@ import {
   send,
   showText,
   switchView,
+  syncHeaderHeight,
   syncModifier,
   syncName,
   syncPicture,
@@ -76,7 +78,7 @@ import {
   syncStatus,
   thumbSource,
 } from './table.js';
-import { divider } from './zoom.js';
+import { divider, zoomText } from './zoom.js';
 
 // Every event the backend sends that the window acts on. The tests compare
 // this list with tests/fixtures/contract-names.json, as the backend's tests
@@ -105,19 +107,31 @@ const EVENTS = [
  * - `doc`: the page;
  * - `tauri`: the Tauri API (`core.invoke`, `core.convertFileSrc`, `event.listen`);
  * - `timers`: `setTimer` and `clearTimer` (setTimeout and clearTimeout);
- * - `storage`: where the layout choice is kept (`getItem`, `setItem`);
- * - `ResizeObserver`: the class;
+ * - `ResizeObserver`: the class (without it nothing is observed: the header's
+ *   height is not measured and the picture is not fitted again on a resize);
  * - `log(...values)`: where the unexpected goes.
  * Returns `{ listening }`, which settles once every event subscription has
  * been answered (a refused one is reported in the status line).
  */
 export function startWindow(env) {
-  const { doc, tauri, timers, storage, log } = env;
+  const { doc, tauri, timers, log } = env;
   const { convertFileSrc, invoke } = tauri.core;
   const { listen } = tauri.event;
 
-  // The header and the status line.
+  // The header, the main area and the status line. The status line is one
+  // block (the live region and Switch to Batch), moved into the place of the
+  // mode that shows, as the settings are; in Single image with the column
+  // folded, its place is the slot floating at the top of the picture.
+  const header = doc.getElementById('header');
+  const main = doc.getElementById('main');
   const viewRadios = [doc.getElementById('viewSingle'), doc.getElementById('viewBatch')];
+  const statusLine = doc.getElementById('statusLine');
+  const floatStatusSlot = doc.getElementById('floatStatusSlot');
+  const statusSlots = {
+    single: doc.getElementById('singleStatusSlot'),
+    float: floatStatusSlot,
+    batch: doc.getElementById('batchStatusSlot'),
+  };
   const status = doc.getElementById('status');
   const switchToBatch = doc.getElementById('switchToBatch');
 
@@ -160,19 +174,22 @@ export function startWindow(env) {
   const chooseOutput = doc.getElementById('chooseOutput');
   const clearOutput = doc.getElementById('clearOutput');
 
-  // Single image.
+  // Single image: the work area (the picture, or the drop area, and the
+  // column of settings beside it).
   const single = doc.getElementById('single');
+  const columnToggle = doc.getElementById('columnToggle');
+  const columnBody = doc.getElementById('columnBody');
+  const columnFoot = doc.getElementById('columnFoot');
   const singleFile = doc.getElementById('singleFile');
   const singleFileName = doc.getElementById('singleFileName');
   const singleFileSize = doc.getElementById('singleFileSize');
   const chooseOther = doc.getElementById('chooseOther');
-  const singleTools = doc.getElementById('singleTools');
-  const layoutRadios = [doc.getElementById('layoutUnder'), doc.getElementById('layoutBeside')];
+  const zoomControls = doc.getElementById('zoomControls');
   const zoomOut = doc.getElementById('zoomOut');
+  const zoomValue = doc.getElementById('zoomValue');
   const zoomIn = doc.getElementById('zoomIn');
   const zoomActual = doc.getElementById('zoomActual');
   const zoomFit = doc.getElementById('zoomFit');
-  const singleBody = doc.getElementById('singleBody');
   const singleDrop = doc.getElementById('singleDrop');
   const chooseImage = doc.getElementById('chooseImage');
   const picture = doc.getElementById('picture');
@@ -271,9 +288,13 @@ export function startWindow(env) {
     return { width: picture.clientWidth, height: picture.clientHeight };
   }
 
+  // The view on both stages, and its percentage on the zoom controls
+  // (written only when it changes). The percentage is not a live region:
+  // every wheel step would be read out; it is read as part of the Zoom group.
   function zoomBy(action) {
     zoom = zoomReduce(zoom, action, zoomImage(), area());
     applyView(pictureParts, zoom.view);
+    showText(zoomValue, zoomText(zoom.view));
   }
 
   function setDivider(value) {
@@ -366,12 +387,22 @@ export function startWindow(env) {
   function renderSingle(screen) {
     single.hidden = !screen.single;
 
+    // The column: "Hide settings" folds it to a strip with only its button;
+    // everything else in it is hidden then, so nothing invisible can take
+    // focus, and focus inside it goes to the button.
+    single.classList.toggle('-folded', screen.columnHidden);
+    showText(columnToggle, screen.columnToggleText);
+    columnToggle.setAttribute('aria-expanded', String(!screen.columnHidden));
+    hideKeepingFocus(doc, columnBody, screen.columnHidden, columnToggle);
+    hideKeepingFocus(doc, columnFoot, screen.columnHidden, columnToggle);
+
     // The loaded blocks show before the drop area goes, so focus on Choose
-    // image has Choose other to go to.
-    for (const block of [singleFile, singleTools, picture, saveAs, sizes, singleFoot]) {
+    // image has somewhere visible to go: Choose other, or the picture that
+    // took the drop area's place while the column (and Choose other) is folded.
+    for (const block of [singleFile, picture, saveAs, sizes, singleFoot]) {
       block.hidden = !screen.showLoaded;
     }
-    hideKeepingFocus(doc, singleDrop, !screen.showSingleDrop, chooseOther);
+    hideKeepingFocus(doc, singleDrop, !screen.showSingleDrop, screen.columnHidden ? picture : chooseOther);
     singleDrop.classList.toggle('-over', screen.dragSingleDrop);
     picture.classList.toggle('-over', screen.dragPicture);
     setDisabled(chooseImage, !canChoose(state));
@@ -380,8 +411,6 @@ export function startWindow(env) {
     singleFileName.textContent = screen.fileName;
     singleFileSize.textContent = screen.pixelSize;
     saveExtension.textContent = screen.extension;
-    syncRadios(layoutRadios, screen.layout, false);
-    syncModifier(singleBody, ['under', 'beside'], screen.layout);
 
     const pictures = pictureView(state, previewSrc);
     const { originalKey, compressedKey } = pictures;
@@ -415,8 +444,19 @@ export function startWindow(env) {
     const screen = screenView(state);
 
     syncRadios(viewRadios, screen.view, !screen.canSwitch);
-    // The one settings block goes into the slot of the mode that shows.
-    moveSettings(doc, settings, settingsSlots[screen.settingsSlot]);
+    // Full width in Single image, Batch's 48rem in Batch (app.css).
+    syncModifier(main, ['single', 'batch'], screen.view);
+    // The one settings block and the one status line go into the places of
+    // the mode that shows: Single image's column, or Batch's; the status line
+    // floats over the picture while the column is folded. This comes before
+    // the column's parts are hidden (renderSingle), so focus on Switch to
+    // Batch leaves the column with it instead of falling back to the toggle.
+    // The floating slot has no surface while it has nothing to show (no
+    // empty box over the picture); it is never hidden, so the live region
+    // stays in the page.
+    moveBlock(doc, settings, settingsSlots[screen.settingsSlot]);
+    moveBlock(doc, statusLine, statusSlots[screen.statusSlot]);
+    floatStatusSlot.classList.toggle('-empty', screen.floatEmpty);
 
     renderBatch(screen);
     renderSingle(screen);
@@ -457,7 +497,11 @@ export function startWindow(env) {
   save.addEventListener('click', () => saveImage(commandDeps));
   switchToBatch.addEventListener('click', () => moveToBatch(commandDeps));
   bindRadios(viewRadios, (view) => switchView(commandDeps, view));
-  bindRadios(layoutRadios, (layout) => chooseLayout({ storage, dispatch }, layout));
+
+  // Hide settings / Show settings: folds or unfolds the column. Not stored.
+  columnToggle.addEventListener('click', () => {
+    dispatch({ type: 'set-column-hidden', payload: !state.single.columnHidden });
+  });
 
   // Mode, the Quality slider and the number field: the settings, and when a
   // new compressed version is asked for (see `bindPreviewTriggers`).
@@ -481,10 +525,14 @@ export function startWindow(env) {
   zoomActual.addEventListener('click', () => zoomBy({ type: 'actual' }));
   zoomFit.addEventListener('click', () => zoomBy({ type: 'fit' }));
 
-  // The wheel zooms the picture, not the page.
+  // The wheel zooms the picture, not the page; over the zoom controls it does
+  // neither (and is left to the page).
   picture.addEventListener(
     'wheel',
     (event) => {
+      if (isOnControls(zoomControls, event.target)) {
+        return;
+      }
       event.preventDefault();
       zoomBy(wheelAction(event.deltaY, event.clientX, event.clientY, picture.getBoundingClientRect()));
     },
@@ -493,9 +541,10 @@ export function startWindow(env) {
 
   picture.addEventListener('keydown', (event) => onRegionKey(picture, event, zoomBy));
 
-  // Only a drag that starts (the primary button, see `dragStart`) takes the pointer.
+  // Only a drag that starts (the primary button, not on the zoom controls,
+  // see `dragStart`) takes the pointer.
   picture.addEventListener('pointerdown', (event) => {
-    drag = dragStart(handle, event.target, event.clientX, event.clientY, event.button);
+    drag = dragStart({ handle, controls: zoomControls }, event.target, event.clientX, event.clientY, event.button);
     if (drag !== null) {
       picture.setPointerCapture(event.pointerId);
     }
@@ -517,8 +566,15 @@ export function startWindow(env) {
     applyDivider(pictureParts, divider(dividerInput.valueAsNumber));
   });
 
-  // The area changes with the window and when the picture first shows.
-  new env.ResizeObserver(() => zoomBy({ type: 'refit' })).observe(picture);
+  // The area changes with the window, when the picture first shows and when
+  // the column folds or unfolds.
+  observeSize(env.ResizeObserver, picture, () => zoomBy({ type: 'refit' }));
+
+  // The header wraps on a narrow window, so its height is measured: the CSS
+  // sizes the work area and the scroll padding with it.
+  observeSize(env.ResizeObserver, header, () => {
+    syncHeaderHeight(doc.documentElement, header.getBoundingClientRect().height);
+  });
 
   // --- events -------------------------------------------------------------------
 
@@ -539,7 +595,7 @@ export function startWindow(env) {
     }
   });
 
-  dispatch({ type: 'layout-changed', payload: readLayout(storage) });
+  render();
 
   return { listening };
 }

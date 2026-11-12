@@ -54,6 +54,7 @@ const setView = (view) => ({ type: 'set-view', payload: view });
 const setMode = (mode) => ({ type: 'set-mode', payload: mode });
 const setQuality = (text) => ({ type: 'set-quality-text', payload: text });
 const typed = (text) => ({ type: 'set-name-text', payload: text });
+const hideColumn = (hidden) => ({ type: 'set-column-hidden', payload: hidden });
 // `viewChanges`: how many switches the state had seen when the request was sent.
 const requested = (mode = 'lossless', quality = 75, image = '7', viewChanges = 0) => ({
   type: 'preview-requested',
@@ -252,7 +253,7 @@ test('a_new_key_sets_the_image_the_suggested_name_and_resets_typing_and_the_vers
   assert.equal(nameText(first), 'optimized-holiday');
   assert.equal(first.single.nameTyped, false);
 
-  const before = apply(withVersion('7'), typed('mine'), { type: 'layout-changed', payload: 'beside' });
+  const before = apply(withVersion('7'), typed('mine'), hideColumn(true));
   assert.equal(before.single.nameTyped, true);
   const next = reduce(before, imageChanged(logo('8')));
   assert.equal(next.single.image.key, '8');
@@ -262,8 +263,8 @@ test('a_new_key_sets_the_image_the_suggested_name_and_resets_typing_and_the_vers
   assert.equal(next.single.requested, null);
   assert.equal(next.single.started, null);
   assert.equal(next.single.compressing, false);
-  // The layout is the user's choice, not the image's.
-  assert.equal(next.single.layout, 'beside');
+  // Whether the column is folded is the user's choice, not the image's.
+  assert.equal(next.single.columnHidden, true);
 });
 
 test('the_same_key_with_a_notice_keeps_everything_and_only_sets_the_message', () => {
@@ -916,23 +917,25 @@ test('open_folder_is_not_usable_before_a_save_or_a_run', () => {
   assert.equal(canOpenFolder(reduce(savedFirst, runStarted)), false);
 });
 
-// layout
+// the column (Hide settings / Show settings)
 
-test('layout_is_under_at_start_and_layout_changed_sets_it', () => {
-  assert.equal(initialSingle().layout, 'under');
-  assert.equal(initialState().single.layout, 'under');
-  const beside = reduce(initialState(), { type: 'layout-changed', payload: 'beside' });
-  assert.equal(beside.single.layout, 'beside');
-  assert.equal(reduce(beside, { type: 'layout-changed', payload: 'under' }).single.layout, 'under');
+test('set_column_hidden_folds_and_unfolds_the_column', () => {
+  assert.equal(initialSingle().columnHidden, false);
+  assert.equal(initialState().single.columnHidden, false);
+  const folded = reduce(initialState(), hideColumn(true));
+  assert.equal(folded.single.columnHidden, true);
+  assert.equal(reduce(folded, hideColumn(false)).single.columnHidden, false);
+  // Folding changes nothing else.
+  assert.deepEqual({ ...folded.single, columnHidden: false }, initialState().single);
 });
 
-test('layout_changed_with_another_value_changes_nothing', () => {
+test('set_column_hidden_with_another_value_changes_nothing', () => {
   const state = initialState();
-  for (const payload of ['Beside', null, 'left', undefined]) {
-    assert.equal(reduce(state, { type: 'layout-changed', payload }), state, String(payload));
+  for (const payload of ['true', 1, null, undefined, {}]) {
+    assert.equal(reduce(state, { type: 'set-column-hidden', payload }), state, String(payload));
   }
-  // Control: the exact spelling is taken.
-  assert.equal(reduce(state, { type: 'layout-changed', payload: 'beside' }).single.layout, 'beside');
+  // Control: a boolean is taken.
+  assert.equal(reduce(state, hideColumn(true)).single.columnHidden, true);
 });
 
 // purity
@@ -951,7 +954,7 @@ test('reduce_never_changes_the_state_it_was_given_for_the_single_actions', () =>
     [base, setView('batch')],
     [base, typed('x')],
     [base, requested('lossy', 50)],
-    [base, { type: 'layout-changed', payload: 'beside' }],
+    [base, hideColumn(true)],
     [base, loaded('8')],
     [base, suggested('7', 'holiday')],
     [base, started('7', 2)],

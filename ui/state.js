@@ -384,7 +384,7 @@ export function reduce(state, action) {
     case 'set-view':
     case 'set-name-text':
     case 'preview-requested':
-    case 'layout-changed':
+    case 'set-column-hidden':
     case 'save-started':
     case 'save-ended':
     case 'image-changed':

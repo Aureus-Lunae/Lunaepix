@@ -1,7 +1,10 @@
 /* Lunaepix window. BBEM class names, shared with index.html and with the
    scripts that add or toggle them: table.js (the results rows), single-view.js
    and window.js (the modifier classes).
-   Sizes are in rem so the layout follows the user's text size. */
+   Sizes are in rem so the layout follows the user's text size.
+   `--headerHeight` is the header's measured height: window.js writes it on
+   the root element whenever the header changes height (it wraps on a narrow
+   window); the value here is the start until it is measured. */
 
 :root {
   color-scheme: light dark;
@@ -17,6 +20,12 @@
   --focus: #1b4fc4;
   --danger: #a1111b;
   --over: #e1e9fd;
+  /* The neutral dark area around the compare picture. */
+  --stage: #2a2d33;
+
+  --headerHeight: 3.75rem;
+  --columnWidth: 21rem;
+  --foldedWidth: 3.5rem;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -32,6 +41,7 @@
     --focus: #bcd2ff;
     --danger: #ffc2c6;
     --over: #243255;
+    --stage: #0b0c0f;
   }
 }
 
@@ -46,13 +56,15 @@
   display: none !important;
 }
 
+/* Nothing focused while the page scrolls (a narrow window) hides under the
+   fixed header. */
 html {
   font-size: 100%;
+  scroll-padding-top: var(--headerHeight);
 }
 
 body {
   margin: 0;
-  padding: 1rem;
   background: var(--bg);
   color: var(--text);
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -67,22 +79,31 @@ body {
 
 /* Header and main */
 
-.lunaepixHeader,
-.lunaepixMain {
-  max-width: 48rem;
-  margin-inline: auto;
-}
-
-/* The moon logo sits to the left of the heading, centred on its line, and the
-   Single image / Batch switch on the right. The row is on the header; the
-   heading keeps its own margin-free box. On a narrow window the switch wraps
-   under the title. */
+/* The header: the full window width, fixed at the top while anything
+   scrolls, on an opaque surface with a line under it. The moon logo sits to
+   the left of the heading, centred on its line, and the Single image / Batch
+   switch on the right. The row is on the header; the heading keeps its own
+   margin-free box. On a narrow window the switch wraps under the title (the
+   header grows, and window.js measures it). */
 .lunaepixHeader {
+  position: sticky;
+  top: 0;
+  z-index: 10;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 0.75rem;
-  margin-bottom: 1rem;
+  gap: 0.5rem 0.75rem;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--rowLine);
+  background: var(--surface);
+}
+
+/* Batch: at most 48rem wide and centred under the header, as before. Single
+   image: the full width (window.js sets the modifier for the mode). */
+.lunaepixMain.-batch {
+  max-width: 48rem;
+  margin-inline: auto;
+  padding: 1rem;
 }
 
 /* The Single image / Batch switch: a radio group drawn as two joined
@@ -214,6 +235,7 @@ body {
 .lunaepixSettings__button,
 .lunaepixStatus__action,
 .lunaepixSingle__toolButton,
+.lunaepixSingle__columnToggle,
 .lunaepixSingle__openFolder,
 .lunaepixSingle__save {
   min-width: 2.75rem;
@@ -230,12 +252,13 @@ body {
 }
 
 /* The secondary buttons (Clear, the output folder, and in Single image Choose
-   other, the zoom buttons, Open folder and Switch to Batch): outlined, so Run
-   and Save stay the one filled button of their view. */
+   other, Hide / Show settings, Open folder and Switch to Batch): outlined, so
+   Run and Save stay the one filled button of their view. */
 .lunaepixPanel__button,
 .lunaepixSettings__button,
 .lunaepixStatus__action,
 .lunaepixSingle__toolButton,
+.lunaepixSingle__columnToggle,
 .lunaepixSingle__openFolder {
   background: var(--surface);
   color: var(--accent);
@@ -257,16 +280,19 @@ body {
   cursor: not-allowed;
 }
 
-/* Status */
+/* Status: the live region and, while it is offered, Switch to Batch. One
+   block, moved by window.js: in Batch under the drop area, in Single image
+   in the column above Save, and floating at the top of the picture while
+   the column is folded (`.lunaepixSingle__statusFloat`). */
 
-.lunaepixStatus {
+.lunaepixStatus__text {
   margin: 1rem 0 0;
   color: var(--muted);
 }
 
 /* An empty live region takes no room, but stays in the page so a screen
    reader notices when text arrives. */
-.lunaepixStatus:empty {
+.lunaepixStatus__text:empty {
   margin: 0;
 }
 
@@ -535,173 +561,77 @@ body {
 }
 
 /* Single image mode. The mock-up
-   (docs/in-progress/specs/2026-11-11-lunaepix-single-image-mockup.html) sets
-   the arrangement: the file row, the tools row, then the body. */
+   (docs/in-progress/specs/2026-11-12-lunaepix-single-image-layout-mockup.html,
+   Option 1, "docked column") sets the arrangement: the work area fills the
+   window under the header and the page does not scroll; the picture (or the
+   drop area) takes the remaining width and the full height, and the column
+   of settings sits on its right. The column's middle part scrolls on its
+   own; its top (Hide settings) and bottom (sizes, status line, Save) stay. */
 
 .lunaepixSingle {
   display: grid;
-  gap: 0.75rem;
-  margin-top: 1rem;
+  grid-template-columns: minmax(0, 1fr) var(--columnWidth);
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-areas: "picture column";
+  height: calc(100vh - var(--headerHeight));
 }
 
-/* The loaded file: its name (it wraps, however long), its pixel size and
-   Choose other. */
-.lunaepixSingle__file {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.25rem 0.75rem;
+/* Folded ("Hide settings"): the column is a slim strip with only "Show
+   settings"; the picture takes the rest (window.js hides the column's other
+   parts, so nothing invisible can take focus). */
+.lunaepixSingle.-folded {
+  grid-template-columns: minmax(0, 1fr) var(--foldedWidth);
 }
 
-.lunaepixSingle__fileName {
-  flex: 1 1 12rem;
-  min-width: 0;
-  margin: 0;
-  font-size: 1.125rem;
-  line-height: 1.3;
-  overflow-wrap: anywhere;
-}
-
-.lunaepixSingle__fileSize {
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-}
-
-/* The layout switch on the left, the zoom buttons on the right; both wrap. */
-.lunaepixSingle__tools {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem 1rem;
-}
-
-/* The layout switch looks like the Compression choice. */
-.lunaepixSingle__layouts {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0 1rem;
-  min-width: 0;
-  margin: 0;
-  padding: 0;
-  border: 0;
-}
-
-.lunaepixSingle__layout {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.375rem;
-  min-height: 2.75rem;
-  cursor: pointer;
-}
-
-.lunaepixSingle__layoutRadio {
-  width: 1.25rem;
-  height: 1.25rem;
-  margin: 0;
-  accent-color: var(--accent);
-}
-
-.lunaepixSingle__zoom {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-}
-
-.lunaepixSingle__toolButton {
-  padding-inline: 0.75rem;
-}
-
-/* The body. Layout B (-under, the default): the picture (or the drop area)
-   at full width; under it the settings with Save as on the left and the size
-   box on the right; Save at the bottom right, under both. */
-.lunaepixSingle__body {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  grid-template-areas:
-    "picture picture"
-    "settings sizes"
-    "foot foot";
-  align-items: start;
-  gap: 1rem;
+/* The fold is the only movement, and only for people who did not ask for
+   less motion. */
+@media (prefers-reduced-motion: no-preference) {
+  .lunaepixSingle {
+    transition: grid-template-columns 0.15s ease;
+  }
 }
 
 .lunaepixSingle__drop,
 .lunaepixSingle__picture {
   grid-area: picture;
-}
-
-.lunaepixSingle__settingsSlot {
-  grid-area: settings;
-  display: grid;
-  gap: 0.75rem;
   min-width: 0;
+  min-height: 0;
 }
 
-.lunaepixSingle__sizes {
-  grid-area: sizes;
+/* No image yet: the drop area takes the picture's place, its content in the
+   middle. */
+.lunaepixSingle__drop {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  margin: 1rem;
 }
 
-.lunaepixSingle__foot {
-  grid-area: foot;
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 0.75rem;
-}
-
-/* In Single image the settings sit in their own column; Batch's line above
-   them (between the table and the settings) has no place here. */
-.lunaepixSingle__settingsSlot .lunaepixSettings {
-  margin-top: 0;
-  padding-top: 0;
-  border-top: 0;
-}
-
-/* Layout A (-beside): the picture on the left takes the remaining width; a
-   column of about 16rem on the right holds the settings with Save as, then
-   the size box; Save at the bottom right. Below 40rem the picture would get
-   less room than the column, so A shows as B (the choice itself is kept). */
-@media (min-width: 40rem) {
-  .lunaepixSingle__body.-beside {
-    grid-template-columns: minmax(0, 1fr) 16rem;
-    grid-template-rows: auto 1fr auto;
-    grid-template-areas:
-      "picture settings"
-      "picture sizes"
-      "foot foot";
-  }
-
-  .lunaepixSingle__body.-beside .lunaepixSingle__picture {
-    max-height: max(12rem, 100vh - 14rem);
-  }
-}
-
-/* The compare picture: the image's proportions, never so tall that the
-   settings under it (layout B) leave the window. Two layers: the original's
-   stage, and over it an area-sized layer clipped at the divider (--split)
-   that holds the compressed version's stage. Only the stages are zoomed, by
-   the same transform, so the seam stays under the handle. */
+/* The compare picture: the whole area, a neutral dark colour around the
+   image. Two layers: the original's stage, and over it an area-sized layer
+   clipped at the divider (--split) that holds the compressed version's
+   stage. Only the stages are zoomed, by the same transform, so the seam stays
+   under the handle. */
 .lunaepixSingle__picture {
   --split: 50%;
   position: relative;
-  width: 100%;
-  aspect-ratio: var(--ratio, 4 / 3);
-  max-height: max(12rem, 100vh - 30rem);
   overflow: hidden;
-  border: 1px solid var(--border);
-  border-radius: 0.5rem;
-  background: var(--surface);
+  background: var(--stage);
   cursor: grab;
   touch-action: none;
   user-select: none;
 }
 
-/* Files are being dragged over the window: a thicker, accent border, so the
-   change is not colour alone. */
+/* Its focus ring sits inside it, so the column and the header never cover it. */
+.lunaepixSingle__picture:focus-visible {
+  outline-offset: -3px;
+}
+
+/* Files are being dragged over the window: a thick accent ring inside the
+   area, dashed, so the change is not colour alone. */
 .lunaepixSingle__picture.-over {
-  border-width: 3px;
-  border-color: var(--accent);
+  outline: 4px dashed var(--accent);
+  outline-offset: -4px;
 }
 
 /* A stage is the picture at its own size, centred in the area by the
@@ -731,7 +661,7 @@ body {
   user-select: none;
 }
 
-/* "Original" and "Compressed" in the top corners. */
+/* "Original" and "Compressed" in the top corners, at least 14 px. */
 .lunaepixSingle__label,
 .lunaepixSingle__busy {
   position: absolute;
@@ -741,29 +671,31 @@ body {
   background: rgb(0 0 0 / 0.75);
   color: #ffffff;
   font-size: 0.875rem;
+  font-weight: 600;
   pointer-events: none;
 }
 
 .lunaepixSingle__label {
-  top: 0.5rem;
+  top: 0.75rem;
 }
 
 .lunaepixSingle__label.-original {
-  left: 0.5rem;
+  left: 0.75rem;
 }
 
 .lunaepixSingle__label.-compressed {
-  right: 0.5rem;
+  right: 0.75rem;
 }
 
-/* "Compressing…" or "Loading picture…", over the compressed side. */
+/* "Compressing…" or "Loading picture…", over the compressed side under its
+   label (the zoom controls hold the bottom). */
 .lunaepixSingle__busy {
-  right: 0.5rem;
-  bottom: 0.5rem;
+  top: 2.75rem;
+  right: 0.75rem;
 }
 
-/* The handle: a line at the divider with a round grip in the middle. The
-   strip is 28 px wide, so it is easy to grab. */
+/* The handle: a line at the divider, the full height of the area, with a
+   round grip in the middle. The strip is 28 px wide, so it is easy to grab. */
 .lunaepixSingle__handle {
   position: absolute;
   top: 0;
@@ -809,6 +741,226 @@ body {
   outline-offset: 3px;
 }
 
+/* The zoom controls float over the picture at the bottom centre, on an
+   opaque rounded surface, so their text never sits on the photo: "−", the
+   zoom as a percentage, "+", "100%" and "Fit". A press or the wheel on them
+   is theirs, not the picture's (window.js). */
+.lunaepixSingle__zoom {
+  position: absolute;
+  z-index: 2;
+  left: 50%;
+  bottom: 1rem;
+  translate: -50% 0;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  max-width: calc(100% - 1rem);
+  padding: 0.25rem;
+  border: 1px solid var(--rowLine);
+  border-radius: 0.75rem;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.35);
+  cursor: auto;
+}
+
+/* At least 44 × 44 px, with 4 px between them. */
+.lunaepixSingle__zoomButton {
+  min-width: 2.75rem;
+  min-height: 2.75rem;
+  padding: 0.25rem 0.75rem;
+  border: 2px solid transparent;
+  border-radius: 0.5rem;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+/* "−" and "+" are single signs: larger, so they read as easily as the words. */
+.lunaepixSingle__zoomButton.-sign {
+  font-size: 1.375rem;
+  line-height: 1;
+}
+
+.lunaepixSingle__zoomButton:hover {
+  background: var(--over);
+}
+
+.lunaepixSingle__zoomValue {
+  min-width: 3.5rem;
+  font-size: 1rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+/* The status line while the column is folded (window.js moves it here): it
+   floats at the top of the picture, or of the drop area, centred on the
+   corner labels' line, on an opaque surface like the zoom controls. It keeps
+   clear of "Original" and "Compressed" (7.5rem on each side), so a long note
+   wraps instead of covering them. With nothing to show (`-empty`, set by
+   window.js) it has no surface; it is never hidden, so the live region stays
+   in the page and a new note is read out. */
+.lunaepixSingle__statusFloat {
+  grid-area: picture;
+  align-self: start;
+  justify-self: center;
+  position: relative;
+  z-index: 3;
+  max-width: calc(100% - 15rem);
+  margin-top: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--rowLine);
+  border-radius: 0.75rem;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.35);
+}
+
+.lunaepixSingle__statusFloat.-empty {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  box-shadow: none;
+}
+
+.lunaepixSingle__statusFloat .lunaepixStatus__text {
+  margin: 0;
+  color: var(--text);
+}
+
+/* While a note floats at the top, "Compressing…" or "Loading picture…" moves
+   to the bottom right, above the zoom controls, so the two never overlap. */
+.lunaepixSingle__statusFloat:not(.-empty) ~ .lunaepixSingle__picture .lunaepixSingle__busy {
+  top: auto;
+  bottom: 4.75rem;
+}
+
+/* The column: the full height, a line on its left. */
+.lunaepixSingle__column {
+  grid-area: column;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid var(--rowLine);
+  background: var(--surface);
+}
+
+.lunaepixSingle__columnTop {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0.5rem 0.5rem 0;
+}
+
+.lunaepixSingle__columnToggle {
+  padding-inline: 0.75rem;
+}
+
+/* Folded: "Show settings" runs down the strip. */
+.lunaepixSingle.-folded .lunaepixSingle__columnTop {
+  justify-content: center;
+  padding: 0.5rem 0.25rem;
+}
+
+.lunaepixSingle.-folded .lunaepixSingle__columnToggle {
+  padding: 0.75rem 0.25rem;
+  writing-mode: vertical-rl;
+}
+
+/* The middle part: the file, the settings and Save as. It scrolls on its own
+   on a short window (a focusable region, so the keyboard can scroll it). */
+.lunaepixSingle__columnBody {
+  flex: 1 1 auto;
+  display: grid;
+  align-content: start;
+  gap: 1rem;
+  min-height: 0;
+  padding: 1rem;
+  overflow: auto;
+}
+
+.lunaepixSingle__columnBody:focus-visible {
+  outline-offset: -3px;
+}
+
+/* The bottom part, always visible: the size box, the status line, then Open
+   folder and Save. With nothing in it (no image and no message) it takes no
+   room. */
+.lunaepixSingle__columnFoot {
+  flex: none;
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border-top: 1px solid var(--rowLine);
+}
+
+.lunaepixSingle__columnFoot:not(
+    :has(
+      .lunaepixSingle__sizes:not([hidden]),
+      .lunaepixSingle__foot:not([hidden]),
+      .lunaepixStatus__text:not(:empty),
+      .lunaepixStatus__action:not([hidden])
+    )
+  ) {
+  padding: 0;
+  border-top: 0;
+}
+
+/* The loaded file: its name (it wraps, however long), its pixel size and
+   Choose other. */
+.lunaepixSingle__file {
+  display: grid;
+  justify-items: start;
+  gap: 0.25rem;
+}
+
+.lunaepixSingle__fileName {
+  max-width: 100%;
+  margin: 0;
+  font-size: 1.125rem;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.lunaepixSingle__fileSize {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.lunaepixSingle__toolButton {
+  margin-top: 0.25rem;
+  padding-inline: 0.75rem;
+}
+
+.lunaepixSingle__settingsSlot {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+}
+
+/* In Single image the settings sit in the column; Batch's line above them
+   (between the table and the settings) has no place here. */
+.lunaepixSingle__settingsSlot .lunaepixSettings {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+/* The column is narrow: a label takes only its own width, so Quality fits
+   its slider and number on one line; Save as goes above its box. */
+.lunaepixSingle__settingsSlot .lunaepixSettings__label {
+  min-width: 0;
+}
+
+.lunaepixSingle__saveAsLabel {
+  flex-basis: 100%;
+}
+
 /* Save as: the label, the name box and the extension after it; the problem
    under them, in words, tied to the box with aria-describedby. */
 .lunaepixSingle__saveAs {
@@ -819,7 +971,6 @@ body {
 }
 
 .lunaepixSingle__saveAsLabel {
-  min-width: 6.5rem;
   font-weight: 600;
 }
 
@@ -887,15 +1038,82 @@ body {
   font-size: 0.875rem;
 }
 
+/* The status line in the column: no gap of its own above it. */
+.lunaepixSingle__statusSlot .lunaepixStatus__text {
+  margin: 0;
+}
+
+/* Open folder and Save on the right. */
+.lunaepixSingle__foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.5rem 0.75rem;
+}
+
+/* A narrow window (about 40rem and less): one column, and the page scrolls.
+   The picture first, with the image's proportions and never taller than the
+   window under the header (the zoom controls still float over it); then
+   everything from the column. "Hide settings" does not show; a column folded
+   on a wider window keeps "Show settings", so the settings can come back. */
+@media (max-width: 40rem) {
+  .lunaepixSingle,
+  .lunaepixSingle.-folded {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    grid-template-areas:
+      "picture"
+      "column";
+    height: auto;
+  }
+
+  .lunaepixSingle__picture {
+    align-self: start;
+    aspect-ratio: var(--ratio, 4 / 3);
+    max-height: calc(100vh - var(--headerHeight));
+  }
+
+  .lunaepixSingle__column {
+    border-top: 1px solid var(--rowLine);
+    border-left: 0;
+  }
+
+  .lunaepixSingle:not(.-folded) .lunaepixSingle__columnTop {
+    display: none;
+  }
+
+  .lunaepixSingle.-folded .lunaepixSingle__columnTop {
+    justify-content: flex-start;
+    padding: 0.5rem 1rem;
+  }
+
+  .lunaepixSingle.-folded .lunaepixSingle__columnToggle {
+    padding: 0.5rem 0.75rem;
+    writing-mode: horizontal-tb;
+  }
+
+  .lunaepixSingle__columnBody {
+    overflow: visible;
+  }
+
+  /* A column folded on a wider window: the floating status line is too wide
+     for the label line here, so it sits under it, almost the full width. */
+  .lunaepixSingle__statusFloat {
+    max-width: calc(100% - 1.5rem);
+    margin-top: 2.75rem;
+  }
+}
+
 /* Narrow windows: tighter cells, no horizontal scroll at 320 px. Long names
    and values wrap instead. */
 @media (max-width: 30rem) {
-  body {
+  .lunaepixHeader {
+    gap: 0.5rem;
     padding: 0.5rem;
   }
 
-  .lunaepixHeader {
-    gap: 0.5rem;
+  .lunaepixMain.-batch {
+    padding: 0.5rem;
   }
 
   .lunaepixHeader__logo {
@@ -937,19 +1155,27 @@ body {
     flex-basis: 100%;
   }
 
-  /* Layout B: the size box goes under the settings. */
-  .lunaepixSingle__body {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-areas:
-      "picture"
-      "settings"
-      "sizes"
-      "foot";
+  /* The zoom controls fit a 320 px window: 36 px buttons, still well over
+     24 px, with space between. */
+  .lunaepixSingle__zoomButton {
+    min-width: 2.25rem;
+    min-height: 2.25rem;
+    padding-inline: 0.5rem;
+  }
+
+  .lunaepixSingle__zoomValue {
+    min-width: 3rem;
+  }
+
+  .lunaepixSingle__columnBody,
+  .lunaepixSingle__columnFoot {
+    padding-inline: 0.5rem;
   }
 }
 
 /* No transitions for people who ask for less motion. The picture never
-   animates its zoom or pan: the transform is set at once. */
+   animates its zoom or pan: the transform is set at once; folding the column
+   does not animate either. */
 @media (prefers-reduced-motion: reduce) {
   .lunaepixDrop,
   .lunaepixDrop__button,
@@ -959,9 +1185,12 @@ body {
   .lunaepixSettings__button,
   .lunaepixStatus__action,
   .lunaepixSingle__toolButton,
+  .lunaepixSingle__columnToggle,
+  .lunaepixSingle__zoomButton,
   .lunaepixSingle__openFolder,
   .lunaepixSingle__save,
   .lunaepixHeader__view,
+  .lunaepixSingle,
   .lunaepixSingle__stage {
     transition: none;
   }
@@ -988,6 +1217,8 @@ body {
   .lunaepixSettings__button,
   .lunaepixStatus__action,
   .lunaepixSingle__toolButton,
+  .lunaepixSingle__columnToggle,
+  .lunaepixSingle__zoomButton,
   .lunaepixSingle__openFolder,
   .lunaepixSingle__save,
   .lunaepixHeader__view {
@@ -1033,14 +1264,27 @@ body {
     border-color: Highlight;
   }
 
-  .lunaepixSingle__picture,
+  /* The header's line, the column's edge and its bottom part's line, the
+     zoom controls' and the floating status line's surfaces and the size box
+     stay visible. */
+  .lunaepixHeader,
+  .lunaepixSingle__column,
+  .lunaepixSingle__columnFoot,
+  .lunaepixSingle__zoom,
+  .lunaepixSingle__statusFloat,
   .lunaepixSingle__sizes,
   .lunaepixSingle__name {
     border-color: CanvasText;
   }
 
+  .lunaepixSingle__zoom,
+  .lunaepixSingle__statusFloat {
+    background: Canvas;
+    color: CanvasText;
+  }
+
   .lunaepixSingle__picture.-over {
-    border-color: Highlight;
+    outline-color: Highlight;
   }
 
   .lunaepixSingle__label,
@@ -1064,3 +1308,4 @@ body {
     outline-color: Highlight;
   }
 }
+
