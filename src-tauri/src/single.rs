@@ -208,6 +208,8 @@ pub(crate) fn io_reason(error: &io::Error) -> String {
 /// and `src`'s permissions. What is opened must be a regular file, checked
 /// on the open file itself: something else put at `src` since the caller
 /// checked it (a FIFO, a folder) is refused as "Not a readable file". On
+/// Windows a folder cannot be opened as a file at all, so there the open
+/// itself fails and the reason is the OS's own access-denied text. On
 /// Unix it is opened with `O_NONBLOCK`, so a FIFO does not block the open
 /// waiting for a writer (the flag changes nothing for a regular file). A
 /// file that grew past `limit` since its size was checked is refused with

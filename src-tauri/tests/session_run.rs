@@ -246,8 +246,8 @@ fn lock(folder: &Path) -> bool {
 }
 
 /// `reason` names no part of `path` and no temporary file: the window never
-/// receives a path.
-#[cfg(unix)]
+/// receives a path. Used on every platform: the probe test that is not
+/// Unix-only calls it too.
 fn assert_no_path(reason: &str, path: &Path) {
     assert!(!reason.contains("at path"), "{reason:?}");
     assert!(!reason.contains(".tmp"), "{reason:?}");
@@ -377,6 +377,9 @@ fn a_choice_loads_through_the_real_probe_worker_and_a_damaged_png_is_refused() {
 // --- Single image mode: the preview through the real worker -----------------
 
 use std::sync::Mutex;
+// Only `shell` and its tests (Unix) and `mod running` (Linux) use it, so on
+// Windows it would be an unused import.
+#[cfg(unix)]
 use std::time::Duration;
 
 use lunaepix_app_lib::events::{FileDone, PreviewFailed, PreviewReady};
