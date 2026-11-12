@@ -44,7 +44,7 @@ pub mod worker;
 #[path = "../tests/common/jpeg_fixtures.rs"]
 mod jpeg_fixtures;
 
-pub use atomic::save_new;
+pub use atomic::{is_staging_name, save_new};
 use lossy::Lossy;
 pub use lossy::{DEFAULT_QUALITY, Note, Quality};
 pub use plan::{

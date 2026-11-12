@@ -53,6 +53,25 @@ pub(crate) fn write_atomically(
     Ok(())
 }
 
+/// What every staging file's name starts with.
+const STAGING_PREFIX: &str = ".tmp";
+
+/// How many random letters and digits follow [`STAGING_PREFIX`].
+const STAGING_RANDOM: usize = 6;
+
+/// Whether `name` is the name of a staging file [`save_new`] and the other
+/// writers make: `.tmp` and six ASCII letters or digits, nothing else. A
+/// worker killed while writing leaves such a file behind; a caller that
+/// knows no worker is writing in a folder may remove them.
+pub fn is_staging_name(name: &OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_prefix(STAGING_PREFIX))
+        .is_some_and(|random| {
+            random.len() == STAGING_RANDOM
+                && random.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+}
+
 /// A new, empty temporary file in `folder` (`.tmp` and six random
 /// characters), deleted again when it is dropped.
 ///
@@ -68,6 +87,8 @@ pub(crate) fn write_atomically(
 /// rename error as it is; the file they hand back is not part of the error.
 fn new_temp_file(folder: &Path) -> io::Result<NamedTempFile> {
     tempfile::Builder::new()
+        .prefix(STAGING_PREFIX)
+        .rand_bytes(STAGING_RANDOM)
         .make_in(folder, |path| {
             let mut options = fs::OpenOptions::new();
             options.read(true).write(true).create_new(true);
@@ -255,6 +276,45 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn staging_names_match_the_files_staging_makes() {
+        let dir = TempDir::new().unwrap();
+        // The file every writer stages in, and the one `save_new` stages.
+        let temp = new_temp_file(dir.path()).unwrap();
+        assert!(is_staging_name(temp.path().file_name().unwrap()));
+        let staged = stage(dir.path(), b"x", perms(dir.path())).unwrap();
+        assert!(is_staging_name(staged.path().file_name().unwrap()));
+        for name in [".tmpabcdef", ".tmpABCDEF", ".tmp012345", ".tmpA1b2C3"] {
+            assert!(is_staging_name(OsStr::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn other_names_are_not_staging_names() {
+        for name in [
+            ".tmp",
+            ".tmpabcde",
+            ".tmpabcdefg",
+            ".tmpabc-ef",
+            ".tmpabc.ef",
+            ".tmpabcd\u{e9}",
+            "tmpabcdef",
+            ".TMPabcdef",
+            ".tmpabcdef.png",
+            "x.tmpabcdef",
+            "v1.png",
+            "original.png",
+            "",
+        ] {
+            assert!(!is_staging_name(OsStr::new(name)), "{name}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(!is_staging_name(OsStr::from_bytes(b".tmpabcd\xff")));
+        }
+    }
 
     /// Some permissions to hand in; the tests that care build their own.
     fn perms(dir: &Path) -> fs::Permissions {

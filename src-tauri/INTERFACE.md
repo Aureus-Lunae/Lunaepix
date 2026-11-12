@@ -34,8 +34,8 @@ Nothing is remembered between launches.
 
 ## Commands
 
-Each resolves to `null` or rejects with one bare string. Only `start_run`
-and `set_view` take an argument.
+Each resolves to `null` or rejects with one bare string. Only `start_run`,
+`preview_image` and `set_view` take an argument.
 
 | Command | Argument | Does | Rejects with |
 |---|---|---|---|
@@ -46,21 +46,27 @@ and `set_view` take an argument.
 | `clear_output_folder` | none | Back to "next to the originals". | `"busy"` |
 | `start_run` | `{ "settings": { "mode": "lossy", "quality": 75 } }` | Runs the list with these settings and the output setting. It writes next to the originals (`optimized-a.png`) or into the chosen folder (`a.png`), and never replaces an existing output: a taken name gets a number before the extension, from `-1` (`optimized-a-1.png`, `a-1.png`), then `-2`, up to `-9999`; when all of those are taken the file fails ("no free name in the output folder"). Resolves once the run has started; its progress arrives as events. | `"busy"`, `"invalid-settings"`, `"empty-list"`, `"output-missing"` |
 | `open_output_folder` | none | Opens the output folder of the last completed run in the file manager: the chosen output folder, or, with none, the folder of the first file written. | `"no-output"`, `"open-failed"` |
-| `set_view` | `{ "view": "single" }` or `{ "view": "batch" }` | Tells the backend which mode shows, so a drop goes there. Ends the Switch to Batch offer (see [Single image mode](#single-image-mode)). Sends no event. | `"busy"`, `"invalid-view"` |
+| `set_view` | `{ "view": "single" }` or `{ "view": "batch" }` | Tells the backend which mode shows, so a drop goes there. Ends the Switch to Batch offer (see [Single image mode](#single-image-mode)). Sends no event of its own; when it answers `"busy"`, `run-busy` goes out as for every command. | `"busy"`, `"invalid-view"` |
 | `choose_image` | none | Opens a native one-file dialog with the same filters as `choose_files`; the file picked is loaded in Single image mode. Resolves as soon as the dialog is open; the outcome arrives as `image-changed`. | `"busy"` |
+| `preview_image` | `{ "settings": { "mode": "lossy", "quality": 75 } }` | Makes the compressed version of the loaded image with these settings, in a worker, as Batch would write it (see [Previews](#previews-the-preview-scheme)). A request still going is stopped first; only the latest request's outcome arrives, as `preview-ready` or `preview-failed`. Resolves once `preview-started` has gone out. | `"busy"`, `"invalid-settings"`, `"no-image"` |
 | `move_drop_to_batch` | none | Switch to Batch: the view becomes Batch and every item of the last Single image drop that left items out is added to the list, exactly as a drop on Batch adds them (`list-changed`). | `"busy"`, `"nothing-to-move"` |
 
 ```js
 await invoke('start_run', { settings: { mode: 'lossy', quality: 75 } });
 await invoke('set_view', { view: 'batch' });
+await invoke('preview_image', { settings: { mode: 'lossless', quality: 75 } });
 ```
 
 - `"busy"`: a run is active, a dialog for one is open, or an image is being
   loaded. A `run-busy` event goes out as well. Every command but
-  `open_output_folder` can be busy.
+  `open_output_folder` can be busy. Accepting a `preview_image` request
+  also holds the guard for a moment (through stopping the previous
+  request's worker and sending `preview-started`), so a command in that
+  moment answers `"busy"` too; a retry works.
 - `"invalid-view"`: the argument is not exactly `{ "view": "single" }` or
   `{ "view": "batch" }`: another spelling (`"Single"`), another type, `null`,
   a missing or an extra key is refused, and the view stays as it was.
+- `"no-image"`: `preview_image` was called while no image is loaded.
 - `"nothing-to-move"`: there is no drop to move: the last Single image drop
   left nothing out, or its offer has ended.
 - `"invalid-settings"`: `settings` is missing or `null`, or is not exactly
@@ -86,6 +92,9 @@ rest still runs. A row that is a folder by then (a dropped folder that
 could not be read, or a path that did not exist when it was added) stays
 one "Not a readable file" row: the run never looks inside it. To add its
 images, drop the folder again. Nothing runs when it rejects.
+
+`preview_image` checks, in this order: busy, the settings, then the image.
+Nothing starts when it rejects.
 
 A dialog closed without a choice changes nothing and sends `run-cancelled`.
 
@@ -149,6 +158,26 @@ included. The offer ends at the next load attempt (a drop while Single image
 shows, a file picked in the image dialog) and at every `set_view`; after
 that `move_drop_to_batch` rejects with `"nothing-to-move"`. A closed image
 dialog does not end it. The image stays loaded when Batch shows.
+
+**Making a version.** `preview_image` makes the compressed version of the
+loaded image from its copy, with the settings given, exactly as a Batch run
+would write that file (same mode, quality, notes and reasons). Each request
+gets a version number: `1` for the first of a launch, then one more for each
+request, whatever the image. Only the latest request counts: a new
+`preview_image` stops the worker of the one before, and the backend sends
+nothing for the one before after it has sent the new `preview-started`.
+Making a version is not busy: other commands and drops work meanwhile.
+These stop it: `set_view` to Batch, `move_drop_to_batch`, `start_run`, a
+new image loaded, and the window closing. From that moment the backend
+sends nothing for the request. Its outcome may have been sent just before;
+then it was sent before the stopping call's own event (`image-changed`,
+`list-changed`, `run-started`). All of these events are sent off the main
+thread, through Tauri's one event queue, so they normally arrive in that
+order too; the window still checks each outcome (see
+[Rules for the window](#rules-for-the-window)). A load attempt that loads
+nothing does not stop it. The
+backend keeps one version per image: the last that succeeded. A failure
+keeps the version kept before; a new image forgets it.
 
 ## Events
 
@@ -267,6 +296,53 @@ and its key stay as they are.
 { "image": "7", "suggested": "holiday" }
 ```
 
+### `preview-started`
+
+`preview_image` was accepted: version `version` of image `image` is being
+made, and is now the latest request. Exactly one `preview-ready` or
+`preview-failed` follows for it, unless it is stopped (see
+[Single image mode](#single-image-mode)) or a newer request starts.
+
+```json
+{ "image": "7", "version": 4 }
+```
+
+### `preview-ready`
+
+The latest request's version is ready and is the version kept for the
+image. `key` is its key for the `preview` scheme, `<image>-<version>`.
+`mode` and `quality` are the request's settings; `quality` is `null` for
+lossless. `before` is the copy's size and `after` the version's, in bytes;
+`after` can be larger than `before` in lossless mode. `note` is Batch's note
+(the same sentences as `file-done`'s, for example "original kept: lossy was
+not smaller") or `null`; the key is always there. The backend sends only
+the latest request's outcome, and never sends it after a newer request's
+`preview-started` or a new image's `image-changed`. Show it only when it
+passes the window's check (see
+[Rules for the window](#rules-for-the-window)): its `image` is the key of
+the current `image-changed`, and its `version` is the last
+`preview-started`'s. Otherwise drop it.
+
+```json
+{ "image": "7", "version": 4, "key": "7-4", "mode": "lossy", "quality": 75,
+  "before": 2400000, "after": 610000, "note": null }
+{ "image": "7", "version": 5, "key": "7-5", "mode": "lossy", "quality": 60,
+  "before": 512000, "after": 498000, "note": "kept lossless: animated PNG" }
+{ "image": "7", "version": 6, "key": "7-6", "mode": "lossless", "quality": null,
+  "before": 512000, "after": 498000, "note": null }
+```
+
+### `preview-failed`
+
+The latest request gave no version. `reason` is Batch's reason for that
+file, a sentence for the user (for example "the optimiser crashed on this
+file (it gave no valid result)"). The version kept before, if any, stays
+and is still served.
+
+```json
+{ "image": "7", "version": 6, "reason": "the optimiser crashed on this file (it gave no valid result)" }
+```
+
 ### `run-started`
 
 A run starts. `total` is the number of `file-done` events that follow,
@@ -381,7 +457,9 @@ anything else as `null`, so no other text reaches an image address.
   `200` with `Content-Type: image/svg+xml` and the file's own bytes. Anything
   else, and a thumbnail that cannot be made (not an image, damaged, too
   large, the worker failed or timed out), is `404` with an empty body. Show
-  an empty square then; nothing goes to the status line.
+  an empty square then; nothing goes to the status line. Every answer,
+  `200` or `404`, also carries `Content-Security-Policy: default-src
+  'none'; style-src 'unsafe-inline'` and `X-Content-Type-Options: nosniff`.
 - **How:** a worker process makes each thumbnail (the window process never
   opens the file), at most two at a time; other requests wait their turn.
   Thumbnails and "cannot be shown" are kept for the current list and dropped
@@ -402,6 +480,45 @@ GET thumb://localhost/3-0?x=1 → 404 (a query)
 
 The scheme needs no permission: it is not a command.
 
+## Previews: the `preview` scheme
+
+Single image mode shows the loaded image and its kept version from the
+custom URI scheme `preview`. Build the address with
+`window.__TAURI__.core.convertFileSrc(key, 'preview')`: that gives
+`preview://localhost/7` on Linux and macOS and `http://preview.localhost/7`
+on Windows. Accept only a key matching `^\d{1,10}(-\d{1,10})?$` and treat
+anything else as `null`, so no other text reaches an image address.
+
+- **The keys:** `<image>` (the `key` of `image-changed`) is the copy taken
+  at load; `<image>-<version>` (the `key` of `preview-ready`) is the
+  version kept for that image.
+- **The answer:** the address must have no query (not even an empty `?`),
+  and its path must be exactly `/<image>` or `/<image>-<version>` as
+  received (not percent-decoded), for the current image, and for its kept
+  version only. Then `200` with the file's bytes and the `Content-Type` of
+  its format: `image/png`, `image/jpeg`, `image/webp` or `image/svg+xml`.
+  Anything else (another image, an older or a newer version, a version that
+  failed or was stopped, a file that can no longer be read) is `404` with
+  an empty body. Leading zeros are accepted: `/07-04` is `/7-4`. Every
+  answer carries the same two headers as the `thumb` scheme's
+  (`Content-Security-Policy: default-src 'none'; style-src
+  'unsafe-inline'`, `X-Content-Type-Options: nosniff`), so an SVG opened by
+  itself runs no script.
+- **How:** the window process reads the file and never decodes it; the
+  webview does. The file is read on a thread of its own.
+
+```text
+GET preview://localhost/7       → 200, image/jpeg (the copy)
+GET preview://localhost/7-4     → 200, image/jpeg (the kept version)
+GET preview://localhost/7-3     → 404 (not the kept version)
+GET preview://localhost/6       → 404 (not the current image)
+GET preview://localhost/7%2D4   → 404 (encoded; not a key as received)
+GET preview://localhost/7-x     → 404 (not a key)
+GET preview://localhost/7?x=1   → 404 (a query)
+```
+
+The scheme needs no permission: it is not a command.
+
 ## Rules for the window
 
 - **Runs never overlap, so events are strictly ordered.** Handle them in the
@@ -411,6 +528,13 @@ The scheme needs no permission: it is not a command.
   `run-finished`, and all of them come before any event of run N+1. A
   `run-finished` always belongs to the last `run-started`, so no run number
   is needed.
+- **Check every preview outcome before showing it.** Show a
+  `preview-ready` or `preview-failed` only when its `image` equals the key
+  of the current `image-changed` and its `version` equals the version of
+  the last `preview-started`; drop any other. The backend already sends no
+  outcome after a newer request or a new image (see
+  [Single image mode](#single-image-mode)). This check is a second guard,
+  so that the window never relies on how events are delivered.
 - **Listen only to the events above.** Do not listen to Tauri's own
   `tauri://drag-enter`, `tauri://drag-over` or `tauri://drag-drop`: Tauri
   puts the dropped paths in them, and they reach the page only when a
@@ -420,21 +544,23 @@ The scheme needs no permission: it is not a command.
   `allow-clear-output-folder`, `allow-start-run`,
   `allow-open-output-folder`, `allow-set-view`, `allow-choose-image`,
   `allow-preview-image`, `allow-save-image`, `allow-move-drop-to-batch`;
-  `preview_image` and `save_image` are documented here once they are
-  built), `core:event:allow-listen` and
+  `save_image` is documented here once it is built),
+  `core:event:allow-listen` and
   `core:event:allow-unlisten`, nothing more (`capabilities/default.json`; a
   test guards it). There is no `emit`, no window API and no plugin API, and
   `alert()` and `confirm()` do not work (the dialog plugin overrides them,
   and the window has no dialog permission). Show messages in the page.
 - **CSP** (`tauri.conf.json`): `default-src 'self'; script-src 'self';
-  style-src 'self'; img-src 'self' thumb: http://thumb.localhost; font-src
-  'self'; connect-src ipc: http://ipc.localhost; object-src 'none';
+  style-src 'self'; img-src 'self' thumb: http://thumb.localhost preview:
+  http://preview.localhost; font-src 'self'; connect-src ipc:
+  http://ipc.localhost; object-src 'none';
   base-uri 'none'; form-action 'none'; frame-src 'none'`. So: scripts and
   styles come from files in `ui/` only. No inline `<script>`, no `on…=`
   attributes, no `style="…"` attributes, no `eval` or `new Function`,
-  nothing remote, no `data:` images; images come from `ui/` or from the
+  nothing remote, no `data:` images; images come from `ui/`, from the
   `thumb` scheme (`thumb:` on Linux and macOS, `http://thumb.localhost` on
-  Windows). Setting `element.style.foo` from JS is allowed; `setAttribute('style', …)`
+  Windows) or from the `preview` scheme (`preview:`,
+  `http://preview.localhost`). Setting `element.style.foo` from JS is allowed; `setAttribute('style', …)`
   is not.
 - **Do not lock the buttons while a dialog is open** in the page's own state.
   The backend refuses a second request with `"busy"`, and the page can say

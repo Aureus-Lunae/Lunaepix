@@ -30,9 +30,18 @@ serde_json = "1.0.154"
 # removing a temporary file in it. Already shipped (lunaepix-core uses it).
 tempfile = "3.27.0"
 
+[target.'cfg(unix)'.dependencies]
+# Single image mode opens the image to load with O_NONBLOCK, so a FIFO put
+# in its place after the check cannot block the load. Already shipped
+# (lunaepix-core and tauri use it), so no new package.
+libc = "0.2.191"
+
 [dev-dependencies]
 # Test fixtures for the worker-mode smoke test, as in the CLI's tests.
 png = "0.17.16"
+# Encodes the JPEG fixture of the preview's EXIF orientation test. The
+# version the core's tests already use (in Cargo.lock), so no new package.
+image = { version = "=0.25.10", default-features = false, features = ["jpeg"] }
 yaml-rust2 = "0.13.0"
 # Reads about.toml (the licence policy) as TOML in the config checks. The
 # version already in Cargo.lock (tauri's build tools use it), so no new package.
@@ -41,3 +50,7 @@ toml = "1.2.0"
 # config checks, never as text. The version already in Cargo.lock (tauri-utils
 # uses it), so no new package.
 html5ever = "0.39.0"
+# Reads src/lib.rs as Rust in the config checks (which commands run on the
+# main thread), never as text. The version already in Cargo.lock (tauri's
+# macros use it), so no new package.
+syn = { version = "2.0.119", features = ["full"] }

@@ -1,7 +1,7 @@
 //! Guards on the window's security settings, so a later change cannot widen
 //! them silently: the capability grants the twelve app commands and event
 //! listening only, and the content security policy stays strict (only
-//! `img-src` names the `thumb` scheme).
+//! `img-src` names the `thumb` and `preview` schemes).
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -53,7 +53,7 @@ fn unexpected_permissions(capability: &Value) -> Vec<String> {
 /// What makes a content security policy weaker than we allow: inline code,
 /// `eval`, wildcards, `data:`/`blob:`, and any remote source. The only
 /// network origins allowed are Tauri's IPC endpoint on Windows, and the
-/// `thumb` scheme's origin on Windows in `img-src` only. Also missing
+/// `thumb` and `preview` schemes' origins on Windows in `img-src` only. Also missing
 /// `default-src 'self'` or `script-src 'self'`.
 fn csp_problems(csp: &str) -> Vec<String> {
     let mut problems = Vec::new();
@@ -66,8 +66,9 @@ fn csp_problems(csp: &str) -> Vec<String> {
         let img_src = tokens[0].eq_ignore_ascii_case("img-src");
         for source in &tokens[1..] {
             let lower = source.to_ascii_lowercase();
-            let allowed_origin =
-                lower == "http://ipc.localhost" || (img_src && lower == "http://thumb.localhost");
+            let allowed_origin = lower == "http://ipc.localhost"
+                || (img_src
+                    && (lower == "http://thumb.localhost" || lower == "http://preview.localhost"));
             let weak = lower.starts_with("'unsafe-")
                 || lower == "*"
                 || lower.contains("*.")
@@ -94,13 +95,23 @@ fn csp_problems(csp: &str) -> Vec<String> {
 }
 
 /// The policy as it must be, directive by directive. Only `img-src` differs
-/// from the policy before thumbnails: the `thumb` scheme, as Linux and macOS
-/// name it (`thumb:`) and as Windows serves it (`http://thumb.localhost`).
+/// from the policy before thumbnails: the `thumb` and `preview` schemes, as
+/// Linux and macOS name them (`thumb:`, `preview:`) and as Windows serves
+/// them (`http://thumb.localhost`, `http://preview.localhost`).
 const EXPECTED_CSP: &[(&str, &[&str])] = &[
     ("default-src", &["'self'"]),
     ("script-src", &["'self'"]),
     ("style-src", &["'self'"]),
-    ("img-src", &["'self'", "thumb:", "http://thumb.localhost"]),
+    (
+        "img-src",
+        &[
+            "'self'",
+            "thumb:",
+            "http://thumb.localhost",
+            "preview:",
+            "http://preview.localhost",
+        ],
+    ),
     ("font-src", &["'self'"]),
     ("connect-src", &["ipc:", "http://ipc.localhost"]),
     ("object-src", &["'none'"]),
@@ -158,9 +169,13 @@ fn all_csp_problems(csp: &str) -> Vec<String> {
 
 /// The policy the window must have, written out as a fixture.
 const GOOD_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
-    img-src 'self' thumb: http://thumb.localhost; font-src 'self'; \
-    connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; \
-    form-action 'none'; frame-src 'none'";
+    img-src 'self' thumb: http://thumb.localhost preview: http://preview.localhost; \
+    font-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; \
+    base-uri 'none'; form-action 'none'; frame-src 'none'";
+
+/// The `img-src` directive of [`GOOD_CSP`].
+const GOOD_IMG_SRC: &str =
+    "img-src 'self' thumb: http://thumb.localhost preview: http://preview.localhost";
 
 /// The permissions a capability grants that are plain names, in order.
 fn granted(capability: &Value) -> Vec<&str> {
@@ -291,12 +306,12 @@ fn an_img_src_with_anything_more_or_another_changed_directive_is_flagged() {
     // The control: the policy as it must be, also in another spelling.
     assert_eq!(all_csp_problems(GOOD_CSP), Vec::<String>::new());
     let respelled = GOOD_CSP.replace(
-        "img-src 'self' thumb: http://thumb.localhost",
-        "IMG-SRC http://THUMB.localhost 'SELF'  thumb:",
+        GOOD_IMG_SRC,
+        "IMG-SRC http://PREVIEW.localhost Preview: http://THUMB.localhost 'SELF'  thumb:",
     );
     assert_eq!(all_csp_problems(&respelled), Vec::<String>::new());
 
-    let img_src = "img-src 'self' thumb: http://thumb.localhost";
+    let img_src = GOOD_IMG_SRC;
     for extra in [
         "data:",
         "blob:",
@@ -306,7 +321,9 @@ fn an_img_src_with_anything_more_or_another_changed_directive_is_flagged() {
         "http://evil.localhost",
         "http://*.localhost",
         "https://thumb.localhost",
+        "https://preview.localhost",
         "thumbs:",
+        "previews:",
         "'unsafe-inline'",
     ] {
         let widened = GOOD_CSP.replace(img_src, &format!("{img_src} {extra}"));
@@ -325,7 +342,7 @@ fn an_img_src_with_anything_more_or_another_changed_directive_is_flagged() {
             "connect-src ipc: http://ipc.localhost thumb:",
         ),
         // `img-src` narrowed, given twice, or dropped.
-        GOOD_CSP.replace(img_src, "img-src 'self' thumb:"),
+        GOOD_CSP.replace(img_src, "img-src 'self' thumb: http://thumb.localhost"),
         GOOD_CSP.replace(img_src, &format!("{img_src}; img-src 'self'")),
         GOOD_CSP.replace(&format!("{img_src}; "), ""),
         // Another directive changed or added.
@@ -333,6 +350,38 @@ fn an_img_src_with_anything_more_or_another_changed_directive_is_flagged() {
         format!("{GOOD_CSP}; worker-src 'self'"),
     ];
     for csp in &changed {
+        assert_ne!(csp, GOOD_CSP);
+        assert!(!all_csp_problems(csp).is_empty(), "{csp}");
+    }
+}
+
+/// The policy after Single image mode, exactly (Global Constraints).
+const NEW_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' thumb: http://thumb.localhost preview: http://preview.localhost; font-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'";
+
+#[test]
+fn the_csp_is_exactly_the_new_string() {
+    let config = read_json("tauri.conf.json");
+    assert_eq!(config["app"]["security"]["csp"].as_str(), Some(NEW_CSP));
+    // The fixture the other checks use is the same policy.
+    assert_eq!(GOOD_CSP, NEW_CSP);
+    assert_eq!(all_csp_problems(NEW_CSP), Vec::<String>::new());
+}
+
+#[test]
+fn a_csp_without_the_preview_scheme_is_flagged_in_a_fixture() {
+    let without = [
+        // The policy before this work.
+        GOOD_CSP.replace(" preview: http://preview.localhost", ""),
+        GOOD_CSP.replace(" preview:", ""),
+        GOOD_CSP.replace(" http://preview.localhost", ""),
+        // The scheme moved out of `img-src` or spelled for another origin.
+        GOOD_CSP
+            .replace(" preview: http://preview.localhost", "")
+            .replace("connect-src ipc:", "connect-src preview: ipc:"),
+        GOOD_CSP.replace("http://preview.localhost", "https://preview.localhost"),
+        GOOD_CSP.replace("preview:", "previews:"),
+    ];
+    for csp in &without {
         assert_ne!(csp, GOOD_CSP);
         assert!(!all_csp_problems(csp).is_empty(), "{csp}");
     }
@@ -3095,4 +3144,100 @@ fn a_summary_without_readd_or_with_it_misplaced_is_flagged_in_a_fixture() {
     ] {
         assert!(!readd_button_problems(&html).is_empty(), "{what}: {html}");
     }
+}
+
+// --- which commands run on the main thread ------------------------------------
+
+/// The commands that run on the main thread (a plain `#[tauri::command]`).
+/// An event sent from the main thread is shown at once, while one sent from
+/// any other thread waits in the event loop's queue, so a main-thread event
+/// can overtake an earlier one. These commands send nothing but `run-busy`,
+/// whose place among other events the window does not depend on; their
+/// real answers come later from the dialog plugin's thread, or not at all.
+/// Every other command is `async`, so all its events go through the one
+/// queue in the order they were sent.
+const MAIN_THREAD_COMMANDS: &[&str] = &[
+    "choose_files",
+    "choose_output_folder",
+    "set_view",
+    "choose_image",
+    "open_output_folder",
+];
+
+/// Whether `path` is exactly `tauri::command`.
+fn is_tauri_command(path: &syn::Path) -> bool {
+    let segments: Vec<String> = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    segments == ["tauri", "command"]
+}
+
+/// The functions in the Rust `source` marked `#[tauri::command]` without
+/// `async` among the attribute's arguments: the commands Tauri runs on the
+/// main thread.
+fn main_thread_commands(source: &str) -> HashSet<String> {
+    let file = syn::parse_file(source).expect("valid Rust");
+    file.items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Fn(function) => Some(function),
+            _ => None,
+        })
+        .filter_map(|function| {
+            let attribute = function
+                .attrs
+                .iter()
+                .find(|attribute| is_tauri_command(attribute.path()))?;
+            let is_async = match &attribute.meta {
+                syn::Meta::List(list) => list
+                    .tokens
+                    .clone()
+                    .into_iter()
+                    .any(|token| token.to_string() == "async"),
+                _ => false,
+            };
+            (!is_async).then(|| function.sig.ident.to_string())
+        })
+        .collect()
+}
+
+fn name_set(list: &[&str]) -> HashSet<String> {
+    list.iter().map(|name| (*name).to_owned()).collect()
+}
+
+#[test]
+fn only_commands_that_send_nothing_but_run_busy_run_on_the_main_thread() {
+    let lib = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let source = fs::read_to_string(lib).unwrap();
+    assert_eq!(
+        main_thread_commands(&source),
+        name_set(MAIN_THREAD_COMMANDS)
+    );
+}
+
+#[test]
+fn a_command_without_async_is_found_in_a_fixture() {
+    let fixture = r#"
+        #[tauri::command]
+        fn preview_image() {}
+        #[tauri::command(async)]
+        fn start_run() {}
+        #[tauri::command(rename_all = "snake_case")]
+        fn clear_list() {}
+        #[tauri::command(async, rename_all = "snake_case")]
+        fn readd_list() {}
+        #[tauri::command(rename_all = "async")]
+        fn renamed() {}
+        #[other::command]
+        fn set_view() {}
+        fn not_a_command() {}
+        /// A doc comment that says #[tauri::command] is not an attribute.
+        fn documented() {}
+    "#;
+    assert_eq!(
+        main_thread_commands(fixture),
+        name_set(&["preview_image", "clear_list", "renamed"])
+    );
 }

@@ -2488,10 +2488,13 @@ name = "lunaepix-app"
 version = "0.1.1"
 dependencies = [
  "html5ever",
+ "image",
+ "libc",
  "lunaepix-core",
  "png 0.17.16",
  "serde",
  "serde_json",
+ "syn 2.0.119",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
