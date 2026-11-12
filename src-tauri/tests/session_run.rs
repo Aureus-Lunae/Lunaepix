@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use lunaepix_app_lib::events::{Event, Status};
-use lunaepix_app_lib::session::{PreparedRun, Session};
+use lunaepix_app_lib::session::{PreparedRun, Session, worker_prober};
 use lunaepix_core::{StopHandle, Worker};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -323,4 +323,53 @@ fn a_run_into_an_output_folder_made_read_only_fails_with_a_reason_without_a_path
     let reason = rows[0].1.clone().expect("a reason");
     assert_eq!(reason, permission_denied());
     assert_no_path(&reason, &out.join("a.png"));
+}
+
+// --- Single image mode: loading through the real probe worker ---------------
+
+/// `choose_image` answered with `path`, probed by the real worker: the
+/// `image-changed` payload, as JSON.
+fn choose_image(session: &Session, worker: &Worker, path: &Path) -> Value {
+    let events = RefCell::new(Vec::new());
+    session
+        .choose_image(&mut |event| events.borrow_mut().push(event), |ticket| {
+            session.load_image(
+                ticket,
+                Some(path.to_path_buf()),
+                worker_prober(worker),
+                &mut |event| events.borrow_mut().push(event),
+            );
+        })
+        .unwrap();
+    let events = events.into_inner();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].name(), "image-changed");
+    serde_json::to_value(&events[0]).unwrap()
+}
+
+#[test]
+fn a_choice_loads_through_the_real_probe_worker_and_a_damaged_png_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let good = dir.path().join("a.png");
+    let bytes = gradient_png();
+    fs::write(&good, &bytes).unwrap();
+    let damaged = dir.path().join("b.png");
+    fs::write(&damaged, b"\x89PNG\r\n\x1a\nnot a png after all").unwrap();
+    let worker = worker();
+    let session = Session::new();
+
+    let changed = choose_image(&session, &worker, &good);
+    assert_eq!(
+        changed,
+        json!({ "image": { "name": "a.png", "size": bytes.len(), "width": 64, "height": 64,
+                           "key": "1", "suggested": "optimized-a", "extension": ".png" },
+                "left_out": 0, "notice": null })
+    );
+
+    // The worker's refusal is the core's own reason for that file.
+    let reason = lunaepix_core::probe(&damaged).expect_err("a damaged PNG is refused");
+    let changed = choose_image(&session, &worker, &damaged);
+    assert_eq!(changed["image"]["key"], json!("1"), "the image stays");
+    assert_eq!(changed["notice"], json!(reason));
+    assert_no_path(&reason, &damaged);
 }

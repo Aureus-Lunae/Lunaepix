@@ -363,7 +363,10 @@ pub(crate) fn format_of(path: &Path) -> Option<Format> {
     }
 }
 
-fn has_supported_extension(path: &Path) -> bool {
+/// Whether `path` has a PNG, JPG, SVG or WebP extension, in any case: the
+/// planner's test for a file it can optimise, also used by Single image mode
+/// to pick the image out of a drop.
+pub fn has_supported_extension(path: &Path) -> bool {
     format_of(path).is_some()
 }
 

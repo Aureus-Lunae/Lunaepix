@@ -1,7 +1,8 @@
-//! Thin Tauri shell over `lunaepix-core`: seven commands, the window's drag
+//! Thin Tauri shell over `lunaepix-core`: the commands, the window's drag
 //! and drop, events back to the window, and the `thumb` scheme that serves
 //! the list's thumbnails. `INTERFACE.md` is the contract for the window;
-//! `session` holds what the commands do, `thumbs` what the scheme answers.
+//! `session` holds what the commands do, `single` Single image mode's state,
+//! `thumbs` what the scheme answers.
 //!
 //! The window never hands the backend a path. Paths come only from a native
 //! dialog opened here, or from a drop that Tauri delivers here as a window
@@ -11,6 +12,7 @@
 pub mod events;
 pub mod names;
 pub mod session;
+pub mod single;
 pub mod thumbs;
 
 use std::path::{Path, PathBuf};
@@ -18,6 +20,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lunaepix_core::{StopHandle, Worker};
+use tauri::ipc::InvokeBody;
 use tauri::{
     AppHandle, DragDropEvent, Emitter, Manager, UriSchemeContext, UriSchemeResponder, Window,
     WindowEvent, Wry,
@@ -40,11 +43,12 @@ const IMAGE_FILTER_NAME: &str = "PNG, JPG, SVG and WebP images";
 
 /// Everything the backend keeps between calls.
 struct AppState {
-    /// The list, the output setting, the busy guard, the last output and
-    /// the list's thumbnails.
+    /// The list, the output setting, the busy guard, the last output, the
+    /// list's thumbnails and Single image mode's state.
     session: Session,
     /// The worker [`choose_worker`] chose: its program optimises each file
-    /// of a run and makes each thumbnail.
+    /// of a run, makes each thumbnail and probes each image Single image
+    /// mode loads.
     worker: Worker,
     /// Stops the active run when the window closes.
     stop: StopHandle,
@@ -109,6 +113,29 @@ fn thumb_protocol(
     );
 }
 
+/// The JSON a command was invoked with: its whole argument object, for a
+/// command that checks the shape itself (an extra key included). `None` for
+/// a raw body, which no command here takes.
+fn json_body(body: &InvokeBody) -> Option<&serde_json::Value> {
+    match body {
+        InvokeBody::Json(value) => Some(value),
+        InvokeBody::Raw(_) => None,
+    }
+}
+
+/// A one-file dialog's answer as a path: `None` for a closed dialog, and for
+/// an entry that is not a file path (desktop dialogs give paths only).
+fn one_path(picked: Option<FilePath>) -> Option<PathBuf> {
+    picked.and_then(|path| path.into_path().ok())
+}
+
+/// What the window closing does: stop the run, then stop the preview and
+/// remove Single image mode's private folder.
+fn close_down(stop: &StopHandle, session: &Session) {
+    stop.stop();
+    session.shutdown();
+}
+
 /// Dialog paths as plain paths. On desktop every entry is a path.
 fn into_paths(picked: Vec<FilePath>) -> Vec<PathBuf> {
     picked
@@ -126,23 +153,63 @@ fn file_dialog(app: &AppHandle) -> FileDialogBuilder<Wry> {
     }
 }
 
+/// [`file_dialog`] titled `title`, with the image filter first and "All
+/// files" second: the filters of both image dialogs.
+fn image_dialog(app: &AppHandle, title: &str) -> FileDialogBuilder<Wry> {
+    file_dialog(app)
+        .set_title(title)
+        .add_filter(IMAGE_FILTER_NAME, IMAGE_EXTENSIONS)
+        .add_filter("All files", &["*"])
+}
+
 /// Open a native multi-file dialog; the files picked are added to the list.
 /// Returns at once; the outcome arrives as events.
 #[tauri::command]
 fn choose_files(app: AppHandle) -> Result<(), CommandError> {
     session(&app).choose_files(&mut |event| emit(&app, event), |ticket| {
         let answer = app.clone();
-        file_dialog(&app)
-            .set_title("Choose images")
-            .add_filter(IMAGE_FILTER_NAME, IMAGE_EXTENSIONS)
-            .add_filter("All files", &["*"])
-            .pick_files(move |picked| {
-                // The plugin calls this on a thread of its own.
-                session(&answer).add_paths(ticket, picked.map(into_paths), &mut |event| {
-                    emit(&answer, event)
-                });
+        image_dialog(&app, "Choose images").pick_files(move |picked| {
+            // The plugin calls this on a thread of its own.
+            session(&answer).add_paths(ticket, picked.map(into_paths), &mut |event| {
+                emit(&answer, event)
             });
+        });
     })
+}
+
+/// Tell the backend which mode shows, so a drop goes there. Takes the whole
+/// argument object, `{ "view": "single" }` or `{ "view": "batch" }`, so an
+/// extra key is refused too.
+#[tauri::command]
+fn set_view(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<(), CommandError> {
+    session(&app).set_view(json_body(request.body()), &mut |event| emit(&app, event))
+}
+
+/// Open a native one-file dialog; the file picked is loaded in Single image
+/// mode. Returns at once; the outcome arrives as `image-changed`.
+#[tauri::command]
+fn choose_image(app: AppHandle) -> Result<(), CommandError> {
+    session(&app).choose_image(&mut |event| emit(&app, event), |ticket| {
+        let answer = app.clone();
+        image_dialog(&app, "Choose an image").pick_file(move |picked| {
+            // The plugin calls this on a thread of its own, so the copy and
+            // the probe do not block the main thread.
+            let state = answer.state::<AppState>();
+            state.session.load_image(
+                ticket,
+                one_path(picked),
+                session::worker_prober(&state.worker),
+                &mut |event| emit(&answer, event),
+            );
+        });
+    })
+}
+
+/// Switch to Batch and add every item of the last Single image drop that
+/// left items out. Not on the main thread (`async`): adding reads folders.
+#[tauri::command(async)]
+fn move_drop_to_batch(app: AppHandle) -> Result<(), CommandError> {
+    session(&app).move_drop_to_batch(&mut |event| emit(&app, event))
 }
 
 /// Empty the list.
@@ -167,8 +234,8 @@ fn choose_output_folder(app: AppHandle) -> Result<(), CommandError> {
         file_dialog(&app)
             .set_title("Choose the output folder")
             .pick_folder(move |picked| {
-                let folder = picked.and_then(|folder| folder.into_path().ok());
-                session(&answer).set_output(ticket, folder, &mut |event| emit(&answer, event));
+                session(&answer)
+                    .set_output(ticket, one_path(picked), &mut |event| emit(&answer, event));
             });
     })
 }
@@ -210,8 +277,9 @@ fn open_output_folder(app: AppHandle) -> Result<(), CommandError> {
 }
 
 /// Call `stop` when `event` is the window closing. The app ends with its one
-/// window, so the run ends too: `stop` kills the running worker and starts no
-/// other, before the process exits. Asking to close and the window going
+/// window, so the run ends too: `stop` ([`close_down`]) kills the running
+/// worker and starts no other, and removes Single image mode's private
+/// folder, before the process exits. Asking to close and the window going
 /// away both count (stopping twice is harmless), so that a close that skips
 /// the request is covered as well.
 fn stop_on_close(event: &WindowEvent, stop: impl FnOnce()) {
@@ -224,11 +292,12 @@ fn stop_on_close(event: &WindowEvent, stop: impl FnOnce()) {
 }
 
 /// Drag and drop, handled here so that no path reaches the window: the
-/// window hears `drag-state` and `list-changed` only, and a drop adds to the
-/// list.
+/// window hears `drag-state`, then `list-changed` (Batch) or `image-changed`
+/// (Single image), and a drop goes to the mode that shows.
 fn on_window_event(window: &Window, event: &WindowEvent) {
     stop_on_close(event, || {
-        window.app_handle().state::<AppState>().stop.stop()
+        let state = window.app_handle().state::<AppState>();
+        close_down(&state.stop, &state.session);
     });
     let WindowEvent::DragDrop(drag) = event else {
         return;
@@ -250,12 +319,19 @@ fn on_window_event(window: &Window, event: &WindowEvent) {
     state
         .session
         .drop_paths(paths, &mut |event| emit(app, event), |ticket, paths| {
-            // Adding reads folders, so it runs off the main thread.
+            // Adding reads folders, and loading copies and probes a file, so
+            // either runs off the main thread.
             let app = app.clone();
-            let add = move |(ticket, paths)| {
-                session(&app).add_paths(ticket, Some(paths), &mut |event| emit(&app, event));
+            let receive = move |(ticket, paths)| {
+                let state = app.state::<AppState>();
+                state.session.receive_drop(
+                    ticket,
+                    paths,
+                    session::worker_prober(&state.worker),
+                    &mut |event| emit(&app, event),
+                );
             };
-            session::on_own_thread_or_here((ticket, paths), add, spawn_work_thread);
+            session::on_own_thread_or_here((ticket, paths), receive, spawn_work_thread);
         });
 }
 
@@ -308,8 +384,9 @@ pub fn run() -> ExitCode {
     if let Some(warning) = warning {
         eprintln!("{warning}");
     }
-    // Every launch starts on Lossless (the window's choice), with an empty
-    // list and the output next to the originals.
+    // Every launch starts in Single image with no image, on Lossless (the
+    // window's choice), with an empty list and the output next to the
+    // originals.
     let state = AppState {
         session: Session::new(),
         worker,
@@ -324,7 +401,12 @@ pub fn run() -> ExitCode {
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .register_asynchronous_uri_scheme_protocol("thumb", thumb_protocol)
+        // `preview_image` and `save_image` are declared in `build.rs` and
+        // granted already; their handlers come with the preview and the save.
         .invoke_handler(tauri::generate_handler![
+            set_view,
+            choose_image,
+            move_drop_to_batch,
             choose_files,
             clear_list,
             readd_list,
@@ -370,6 +452,88 @@ mod tests {
             stop_on_close(&event, || stops.set(stops.get() + 1));
         }
         assert_eq!(stops.get(), 0);
+    }
+
+    // --- the window closing: Single image mode's clean-up ---------------------
+
+    /// A session with an image loaded through a probe double: the session
+    /// and the image's private folder.
+    fn session_with_an_image() -> (tempfile::TempDir, Session, PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let png = dir.path().join("a.png");
+        std::fs::write(&png, b"png").unwrap();
+        let session = Session::new();
+        let prober = |_: &Path| {
+            lunaepix_core::ProbeAnswer::Size(lunaepix_core::Probe {
+                width: Some(1),
+                height: Some(1),
+            })
+        };
+        session
+            .choose_image(&mut |_| {}, |ticket| {
+                session.load_image(ticket, Some(png.clone()), prober, &mut |_| {});
+            })
+            .unwrap();
+        let copy = session.single().current().expect("loaded").copy;
+        let private = copy.parent().unwrap().parent().unwrap().to_path_buf();
+        (dir, session, private)
+    }
+
+    #[test]
+    fn the_close_handler_calls_shutdown() {
+        let (_dir, session, private) = session_with_an_image();
+        assert!(private.is_dir());
+        let stop = StopHandle::new();
+        stop_on_close(&WindowEvent::Destroyed, || close_down(&stop, &session));
+        assert!(!private.exists(), "the private folder is removed");
+        assert_eq!(session.single().current(), None);
+        assert!(stop.is_stopped(), "the run is stopped too");
+    }
+
+    #[test]
+    fn other_window_events_do_not_shut_down() {
+        let (_dir, session, private) = session_with_an_image();
+        let stop = StopHandle::new();
+        for event in [
+            WindowEvent::Focused(false),
+            WindowEvent::Resized(PhysicalSize::new(800, 600)),
+        ] {
+            stop_on_close(&event, || close_down(&stop, &session));
+        }
+        assert!(private.is_dir());
+        assert!(session.single().current().is_some());
+        assert!(!stop.is_stopped());
+    }
+
+    // --- what the commands take from Tauri --------------------------------------
+
+    #[test]
+    fn json_body_gives_the_json_of_a_json_body() {
+        let args = serde_json::json!({ "view": "single", "extra": 1 });
+        let body = InvokeBody::Json(args.clone());
+        // The whole object, extra key and all: the session checks the shape.
+        assert_eq!(json_body(&body), Some(&args));
+    }
+
+    #[test]
+    fn json_body_is_none_for_a_raw_body() {
+        assert_eq!(
+            json_body(&InvokeBody::Raw(b"{\"view\":\"single\"}".to_vec())),
+            None
+        );
+    }
+
+    #[test]
+    fn one_picked_path_is_that_path() {
+        let path = PathBuf::from("/srv/in/holiday.jpg");
+        assert_eq!(one_path(Some(FilePath::Path(path.clone()))), Some(path));
+    }
+
+    #[test]
+    fn no_pick_or_a_non_file_url_is_none() {
+        assert_eq!(one_path(None), None);
+        let web = tauri::Url::parse("https://example.com/holiday.jpg").unwrap();
+        assert_eq!(one_path(Some(FilePath::Url(web))), None);
     }
 
     // --- the file dialog's filter ---------------------------------------------
