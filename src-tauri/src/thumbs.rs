@@ -25,12 +25,12 @@ use tauri::http::header::{
 };
 use tauri::http::{Request, Response, StatusCode};
 
+use crate::session::lock;
+
 /// The policy of every `thumb` and `preview` answer: nothing loads or runs
 /// from it (no scripts, no fetches, no frames); inline styles stay, so an SVG
 /// opened by itself still draws as it should.
 const POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'";
-
-use crate::session::lock;
 
 /// At most this many thumbnail workers run at a time; other requests wait.
 pub const MAX_THUMB_WORKERS: usize = 2;

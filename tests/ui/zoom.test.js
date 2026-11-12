@@ -211,16 +211,41 @@ test('pan with an unusable image or area gives no offset', () => {
 
 // step
 
-test('step in then out returns to the same scale', () => {
+test('step in then out returns to the same scale and offsets', () => {
   const mid = { scale: 2, x: 100, y: -40 };
   const inOne = step(mid, 1, BIG_LIMITS, BIG, AREA);
   near(inOne.scale, 2.5, 'one step in is 1.25 times');
-  near(step(inOne, -1, BIG_LIMITS, BIG, AREA).scale, 2, 'back from mid');
+  // One step alone moves the offsets (about the centre, they scale too).
+  near(inOne.x, 125, 'one step in x');
+  near(inOne.y, -50, 'one step in y');
+  const back = step(inOne, -1, BIG_LIMITS, BIG, AREA);
+  near(back.scale, 2, 'back from mid');
+  near(back.x, 100, 'back from mid x');
+  near(back.y, -40, 'back from mid y');
 
   const atFit = toFit(BIG_LIMITS);
   const fitIn = step(atFit, 1, BIG_LIMITS, BIG, AREA);
   near(fitIn.scale, 0.25, 'one step in from Fit');
-  near(step(fitIn, -1, BIG_LIMITS, BIG, AREA).scale, 0.2, 'back at Fit');
+  const fitBack = step(fitIn, -1, BIG_LIMITS, BIG, AREA);
+  near(fitBack.scale, 0.2, 'back at Fit');
+  near(fitBack.x, 0, 'back at Fit x');
+  near(fitBack.y, 0, 'back at Fit y');
+});
+
+test('a clamped zoom at an off-centre point keeps that spot under it', () => {
+  // 4 x 10 would be 40; it stops at 8. The view is panned and the point is
+  // off the centre, so the offsets follow the clamped ratio (2), not 10.
+  const view = { scale: 4, x: 300, y: -200 };
+  const point = { x: 100, y: 80 };
+  const zoomed = zoomAt(view, 10, point, BIG_LIMITS, BIG, AREA);
+  near(zoomed.scale, 8, 'clamped scale');
+  near(zoomed.x, 900, 'x');
+  near(zoomed.y, -180, 'y');
+  assertSameSpot(spotUnder(view, point, AREA), spotUnder(zoomed, point, AREA), 'clamped');
+  // Clamped at Fit on the way out: the offsets bound to 0 as the picture fits.
+  assert.deepEqual(zoomAt(view, 0.001, point, BIG_LIMITS, BIG, AREA), { scale: 0.2, x: 0, y: 0 });
+  // Unclamped, the same factor would give another scale.
+  assert.notEqual(zoomAt(view, 1.5, point, BIG_LIMITS, BIG, AREA).scale, 8);
 });
 
 test('a step keeps the centre of the area fixed', () => {
@@ -267,6 +292,24 @@ test('100 percent gives scale 1 for a raster', () => {
   const svg = { width: 100, height: 50, svg: true };
   const svgLimits = zoomLimits(svg, AREA);
   assert.deepEqual(toActual({ scale: 32, x: 10, y: 10 }, svgLimits, svg, AREA), { scale: 8, x: 0, y: 0 });
+});
+
+test('100 percent gives exactly scale 1 for a raster', () => {
+  // 0.203 * (1 / 0.203) is 0.9999999999999999 in floating point.
+  assert.notEqual(0.203 * (1 / 0.203), 1);
+  for (const scale of [0.203, 0.2, 2, 7.3, 8]) {
+    const actual = toActual({ scale, x: 40, y: -30 }, BIG_LIMITS, BIG, AREA);
+    assert.equal(actual.scale, 1, `from ${scale}`);
+  }
+  // The spot at the centre stays there.
+  const from = { scale: 0.203, x: 40, y: -30 };
+  assertSameSpot(spotUnder(from, CENTRE, AREA), spotUnder(toActual(from, BIG_LIMITS, BIG, AREA), CENTRE, AREA), '0.203');
+  // A view without a usable scale is left as it is.
+  const broken = { scale: 0, x: 0, y: 0 };
+  assert.deepEqual(toActual(broken, BIG_LIMITS, BIG, AREA), broken);
+  // An SVG still goes to Fit, not 1.
+  const svg = { width: 100, height: 50, svg: true };
+  assert.notEqual(toActual({ scale: 0.203, x: 0, y: 0 }, zoomLimits(svg, AREA), svg, AREA).scale, 1);
 });
 
 test('fit returns the fit view', () => {

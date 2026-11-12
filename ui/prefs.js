@@ -11,10 +11,14 @@ export const LAYOUT_KEY = 'lunaepix.layout';
 
 const LAYOUTS = Object.freeze(['under', 'beside']);
 
-/** "under" (the default) or "beside". A missing, junk or unreadable value gives "under". */
+/**
+ * One of `LAYOUTS`, "under" (the default) or "beside", exactly as stored. A
+ * missing, junk or unreadable value gives "under".
+ */
 export function readLayout(storage) {
   try {
-    return storage.getItem(LAYOUT_KEY) === 'beside' ? 'beside' : 'under';
+    const value = storage.getItem(LAYOUT_KEY);
+    return LAYOUTS.includes(value) ? value : 'under';
   } catch {
     return 'under';
   }

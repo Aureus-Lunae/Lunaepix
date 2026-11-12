@@ -12,7 +12,9 @@
 // `area` is `{ width, height }` in pixels. `point` is a position inside the
 // area, counted from its top-left corner.
 //
-// Every function returns a new view and never changes the one it is given.
+// Every function returns a new view, except a call that changes nothing (a
+// factor, direction or scale that cannot be used), which may return the view
+// it was given; none changes the view it is given.
 
 const MAX_ZOOM = 8;
 const STEP_FACTOR = 1.25;
@@ -98,7 +100,19 @@ export function zoomAt(view, factor, point, limits, image, area) {
   if (!isPositive(factor)) {
     return view;
   }
-  const scale = clamp(view.scale * factor, limits.fit, limits.max);
+  return zoomTo(view, view.scale * factor, point, limits, image, area);
+}
+
+/**
+ * Zoom to `target` (clamped to `[fit, max]`) around `point`, as `zoomAt`
+ * does. The scale is the target itself, not a product, so 1 stays exactly 1.
+ * A target or a view scale that is not a positive number changes nothing.
+ */
+function zoomTo(view, target, point, limits, image, area) {
+  if (!isPositive(target) || !isPositive(view.scale)) {
+    return view;
+  }
+  const scale = clamp(target, limits.fit, limits.max);
   const ratio = scale / view.scale;
   const at = fromCentre(point, area);
   return bound(scale, at.x - (at.x - view.x) * ratio, at.y - (at.y - view.y) * ratio, image, area);
@@ -122,14 +136,15 @@ export function step(view, direction, limits, image, area) {
 }
 
 /**
- * The "100%" button: one image pixel per screen pixel, about the centre of
- * the area. An SVG has no 100%, so it goes to Fit.
+ * The "100%" button: one image pixel per screen pixel (a scale of exactly 1),
+ * about the centre of the area. An SVG has no 100%, so it goes to Fit. A
+ * view whose scale is not a positive number is returned as it is.
  */
 export function toActual(view, limits, image, area) {
   if (image !== null && typeof image === 'object' && image.svg === true) {
     return toFit(limits);
   }
-  return zoomAt(view, 1 / view.scale, centreOf(area), limits, image, area);
+  return zoomTo(view, 1, centreOf(area), limits, image, area);
 }
 
 /** The "Fit" button: the whole picture, centred. */

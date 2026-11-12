@@ -27,13 +27,12 @@ import {
   startRunArgs,
   summaryLine,
 } from './state.js';
-import { canSave, nameProblemText, nameText, sizeView } from './single.js';
+import { canSave, nameProblemText, nameText, pictureLoading, sizeView } from './single.js';
 import {
   QUALITY_SETTLE_MS,
   applyDivider,
   applyRatio,
   applyView,
-  askPreview,
   bindPreviewTriggers,
   bindRadios,
   busyText,
@@ -49,7 +48,7 @@ import {
   pictureSize,
   pictureSlot,
   pictureView,
-  picturesLoading,
+  previewAsker,
   previewSource,
   rejectionHandler,
   routeDrag,
@@ -79,7 +78,9 @@ import {
 } from './table.js';
 import { divider } from './zoom.js';
 
-// Every event the backend sends that the window acts on.
+// Every event the backend sends that the window acts on. The tests compare
+// this list with tests/fixtures/contract-names.json, as the backend's tests
+// compare its own.
 const EVENTS = [
   'list-changed',
   'output-changed',
@@ -224,13 +225,25 @@ export function startWindow(env) {
     log: (command, reason) => log(command, reason),
   });
 
+  // Every preview request goes through the one asker: one at a time, busy
+  // retried (see `previewAsker`). It also takes the backend's `run-busy`.
+  const previews = previewAsker({
+    getState,
+    invoke,
+    reject,
+    dispatch: (action) => dispatch(action),
+    showBusy: () => dispatch({ type: 'run-busy', payload: null }),
+    timers,
+  });
+  const askPreview = () => previews.ask();
+
   const commandDeps = {
     getState,
     invoke,
     reject,
     dispatch: (action) => dispatch(action),
     render: () => render(),
-    askPreview: () => askPreview(commandDeps),
+    askPreview,
   };
 
   const dispatch = makeDispatch({
@@ -241,7 +254,7 @@ export function startWindow(env) {
     },
     render: () => render(),
     onNewImage,
-    askPreview: () => askPreview(commandDeps),
+    askPreview,
   });
 
   function call(command, args) {
@@ -275,15 +288,26 @@ export function startWindow(env) {
     setDivider(divider(Number.NaN));
   }
 
-  function onPictureFailed(error) {
-    log('picture', error);
-    dispatch({ type: 'picture-failed', payload: null });
+  // A picture decoded or failed: recorded with the key it was swapped in for,
+  // so one replaced since changes nothing (single.js, `picture-shown`).
+  function onPictureShown(side, key) {
+    return () => dispatch({ type: 'picture-shown', payload: { side, key } });
+  }
+
+  function onPictureFailed(side, key) {
+    return (error) => {
+      log('picture', error);
+      dispatch({ type: 'picture-failed', payload: { side, key } });
+    };
   }
 
   // The original decoded: an SVG's size is known only now.
-  function onOriginalShown() {
-    zoomBy({ type: 'refit' });
-    render();
+  function onOriginalShown(key) {
+    const shown = onPictureShown('original', key);
+    return () => {
+      zoomBy({ type: 'refit' });
+      shown();
+    };
   }
 
   // --- render -------------------------------------------------------------------
@@ -360,12 +384,27 @@ export function startWindow(env) {
     syncModifier(singleBody, ['under', 'beside'], screen.layout);
 
     const pictures = pictureView(state, previewSrc);
-    syncPicture(doc, originalSlot, pictures.original, 'Original', onOriginalShown, onPictureFailed);
-    syncPicture(doc, compressedSlot, pictures.compressed, pictures.alt, () => render(), onPictureFailed);
+    const { originalKey, compressedKey } = pictures;
+    syncPicture(
+      doc,
+      originalSlot,
+      pictures.original,
+      'Original',
+      onOriginalShown(originalKey),
+      onPictureFailed('original', originalKey),
+    );
+    syncPicture(
+      doc,
+      compressedSlot,
+      pictures.compressed,
+      pictures.alt,
+      onPictureShown('compressed', compressedKey),
+      onPictureFailed('compressed', compressedKey),
+    );
     applyRatio(picture, zoomImage());
 
     const view = sizeView(state);
-    showText(pictureBusy, busyText(view, picturesLoading([originalSlot, compressedSlot])));
+    showText(pictureBusy, busyText(view, pictureLoading(state)));
     syncSizes(doc, sizeBox, view);
     syncName(saveName, nameError, nameText(state), nameProblemText(state));
     setDisabled(save, !canSave(state));
@@ -426,8 +465,8 @@ export function startWindow(env) {
     { modeRadios, range: qualityRange, number: qualityNumber },
     {
       dispatch,
-      ask: () => askPreview(commandDeps),
-      later: debounce(timers, QUALITY_SETTLE_MS, () => askPreview(commandDeps)),
+      ask: askPreview,
+      later: debounce(timers, QUALITY_SETTLE_MS, askPreview),
     },
   );
 
@@ -483,9 +522,15 @@ export function startWindow(env) {
 
   // --- events -------------------------------------------------------------------
 
+  // `run-busy` goes to the preview asker, which holds back the one that
+  // comes with a busy preview it retries; every other event is dispatched.
   // If listening fails, say so once, not once per event.
   const listening = Promise.allSettled(
-    EVENTS.map((type) => listen(type, (event) => dispatch({ type, payload: event.payload }))),
+    EVENTS.map((type) =>
+      listen(type, (event) =>
+        type === 'run-busy' ? previews.runBusy() : dispatch({ type, payload: event.payload }),
+      ),
+    ),
   ).then((settled) => {
     const failures = settledFailures(settled);
     if (failures.length > 0) {

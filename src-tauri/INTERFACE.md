@@ -173,6 +173,11 @@ size the picture is shown at. Everything later works from that copy, so a
 file that changes or goes away on disk afterwards changes nothing until it
 is loaded again. A loaded image gets a new key: `"1"` for the first of a
 launch, then one more each time. The old image's copy is removed then.
+Closing the window removes the private folder. A close while a load is
+still going can leave it behind in the user's temp folder, with the copy in
+it: the app exits before the load's thread has ended, and on Windows the
+worker still reading the copy keeps it open. The system's own clean-up of
+the temp folder removes it later; the app does not look for it.
 
 **What a drop loads.** The first dropped item that is a file with a PNG,
 JPG, SVG or WebP extension (any case). The other folders and image files
@@ -235,8 +240,8 @@ and no control character; not ending in a space or a dot; not a name
 Windows reserves (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`
 and the same with `¹ ² ³` for the digit, any case, with or without an
 extension); at most 200 characters and 255 bytes (UTF-8) with the extension.
-The name is written exactly as typed
-(`vakantie-café` is not normalised). Saving is busy: the guard is held
+The name is written exactly as typed (`vakantie-café` is not normalised).
+Saving is busy: the guard is held
 until `image-saved` has gone out, so no other command, drop or run starts
 meanwhile; a version still being made goes on and may become ready. After a
 save, `open_output_folder` opens the folder written to, until a later save
@@ -618,6 +623,11 @@ The scheme needs no permission: it is not a command.
   outcome after a newer request or a new image (see
   [Single image mode](#single-image-mode)). This check is a second guard,
   so that the window never relies on how events are delivered.
+- **Send one `preview_image` at a time.** A setting changed while one is on
+  its way is sent once it has been answered, with the settings of that
+  moment. A `"busy"` refusal of it is sent again a little later (the window
+  tries three more times, 200 ms apart) before it says so; the `run-busy`
+  that came with a refusal it sends again is not shown.
 - **Listen only to the events above.** Do not listen to Tauri's own
   `tauri://drag-enter`, `tauri://drag-over` or `tauri://drag-drop`: Tauri
   puts the dropped paths in them, and they reach the page only when a

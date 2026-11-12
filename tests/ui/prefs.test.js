@@ -46,7 +46,9 @@ test('a throwing read a throwing write and a junk value give under without throw
   assert.equal(readLayout(throwingRead), 'under');
   assert.equal(readLayout(null), 'under');
   assert.equal(readLayout(undefined), 'under');
-  for (const junk of ['Beside', 'sideways', '', 5]) {
+  // An object that reads as "beside" is not the text "beside" (storage gives text only, but
+  // a loose comparison would let it through).
+  for (const junk of ['Beside', 'sideways', '', 5, { toString: () => 'beside' }]) {
     assert.equal(readLayout(fakeStorage({ [KEY]: junk })), 'under', `junk ${JSON.stringify(junk)}`);
   }
   // A valid value is still read.

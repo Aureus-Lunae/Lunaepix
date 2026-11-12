@@ -7,8 +7,8 @@
 //!
 //! The window never hands the backend a path. Paths come only from a native
 //! dialog opened here, or from a drop that Tauri delivers here as a window
-//! event; the window hears file names, folder names, numbers and thumbnail
-//! keys, never paths.
+//! event; the window hears file names, folder names, numbers, thumbnail
+//! keys and Single image mode's image and version keys, never paths.
 
 pub mod events;
 pub mod names;
@@ -167,8 +167,10 @@ fn one_path(picked: Option<FilePath>) -> Option<PathBuf> {
 }
 
 /// What the window closing does: stop the run, then stop the preview and
-/// remove Single image mode's private folder. It waits for neither the run
-/// nor a save (see [`Session::save_image`]).
+/// remove Single image mode's private folder. Stopping kills the worker that
+/// is running (the run's file, or the preview) and waits for it to end
+/// ([`StopHandle::stop`]); it does not wait for the run's thread to finish
+/// its loop, nor for a save (see [`Session::save_image`]).
 fn close_down(stop: &StopHandle, session: &Session) {
     stop.stop();
     session.shutdown();

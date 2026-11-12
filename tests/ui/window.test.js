@@ -5,6 +5,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import { startWindow } from '../../ui/window.js';
 import { LAYOUT_KEY } from '../../ui/prefs.js';
@@ -12,23 +13,50 @@ import { MESSAGES, initialState, reduce } from '../../ui/state.js';
 import { pan, step, toActual, toFit, zoomAt, zoomLimits } from '../../ui/zoom.js';
 import { fakePage, fakeResizeObservers, fakeStorage, fakeTauri, settle, strictTimers } from './fake-window.js';
 
-const EVENTS = [
-  'drag-state',
-  'file-done',
-  'file-started',
-  'image-changed',
-  'image-saved',
-  'list-changed',
-  'name-suggested',
-  'output-changed',
-  'preview-failed',
-  'preview-ready',
-  'preview-started',
-  'run-busy',
-  'run-cancelled',
-  'run-finished',
-  'run-started',
-];
+/**
+ * The fixture's `events` and `commands`, read strictly: exactly those two
+ * keys, each a list of distinct, non-empty strings. Anything else throws, so
+ * a broken fixture fails the tests instead of checking nothing.
+ */
+function contractNames(text) {
+  const value = JSON.parse(text);
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('the fixture is not an object');
+  }
+  const keys = Object.keys(value).sort();
+  if (keys.join(',') !== 'commands,events') {
+    throw new Error(`the fixture's keys are ${keys.join(', ')}, not commands and events`);
+  }
+  for (const key of keys) {
+    const list = value[key];
+    if (!Array.isArray(list) || list.some((name) => typeof name !== 'string' || name === '')) {
+      throw new Error(`${key} is not a list of names`);
+    }
+    if (new Set(list).size !== list.length) {
+      throw new Error(`${key} has a name twice`);
+    }
+  }
+  return value;
+}
+
+/**
+ * The event and command names the window and the backend are both tested
+ * against (tests/fixtures/contract-names.json; the Rust side reads it in
+ * src-tauri/tests/common/contract_names.rs).
+ */
+function readContract() {
+  return contractNames(readFileSync(new URL('../fixtures/contract-names.json', import.meta.url), 'utf8'));
+}
+
+/** What differs between the names expected and the names found: "missing x" and "extra y". */
+function nameProblems(expected, found) {
+  const have = new Set(found);
+  const want = new Set(expected);
+  return [
+    ...expected.filter((name) => !have.has(name)).map((name) => `missing ${name}`),
+    ...[...have].filter((name) => !want.has(name)).map((name) => `extra ${name}`),
+  ];
+}
 
 const AREA = { width: 800, height: 600 };
 const RECT = { left: 10, top: 20, width: 800, height: 600 };
@@ -37,13 +65,13 @@ const LIMITS = zoomLimits(BIG, AREA);
 const FIT = toFit(LIMITS);
 
 /** Starts the window on a fresh fake page; every fake is returned for the test. */
-function start({ stored = {}, storageThrows = false, refuse = {}, refuseListen = [] } = {}) {
+function start({ stored = {}, storageThrows = false, refuse = {}, refuseListen = [], hold = [] } = {}) {
   const doc = fakePage();
   const picture = doc.byId('picture');
   picture.clientWidth = AREA.width;
   picture.clientHeight = AREA.height;
   picture.rect = { ...RECT };
-  const tauri = fakeTauri({ refuse, refuseListen });
+  const tauri = fakeTauri({ refuse, refuseListen, hold });
   const timers = strictTimers();
   const storage = fakeStorage(stored, storageThrows);
   const observers = fakeResizeObservers();
@@ -75,20 +103,36 @@ async function load(w, key = '7', leftOut = 0, notice = null) {
   await settle();
 }
 
-/** Image 7 loaded and its lossless version 7-1 shown. */
+/** The `preview-ready` of image 7's version `version`, lossless unless `fields` say otherwise. */
+const readyOf = (version, fields = {}) => ({
+  image: '7',
+  version,
+  key: `7-${version}`,
+  mode: 'lossless',
+  quality: null,
+  before: 2400000,
+  after: 610000,
+  note: null,
+  ...fields,
+});
+
+/** Version `version` of image 7 started and ready (its picture not decoded yet). */
+async function versionReady(w, version, fields = {}) {
+  w.tauri.emit('preview-started', { image: '7', version });
+  w.tauri.emit('preview-ready', readyOf(version, fields));
+  await settle();
+}
+
+/** Image 7 loaded and its lossless version 7-1 ready; its picture is still decoding. */
 async function loadReady(w) {
   await load(w);
-  w.tauri.emit('preview-started', { image: '7', version: 1 });
-  w.tauri.emit('preview-ready', {
-    image: '7',
-    version: 1,
-    key: '7-1',
-    mode: 'lossless',
-    quality: null,
-    before: 2400000,
-    after: 610000,
-    note: null,
-  });
+  await versionReady(w, 1);
+}
+
+/** `loadReady`, and the picture of 7-1 decoded: the compressed side shows it. */
+async function loadShown(w) {
+  await loadReady(w);
+  decodeOf(w, 'preview://localhost/7-1').resolve();
   await settle();
 }
 
@@ -131,7 +175,8 @@ test('start_listens_to_every_backend_event', async () => {
   const w = start();
   await w.listening;
   await settle();
-  assert.deepEqual([...w.tauri.handlers.keys()].sort(), EVENTS);
+  assert.deepEqual(nameProblems(readContract().events, [...w.tauri.handlers.keys()]), []);
+  assert.equal(w.tauri.handlers.size, 15);
   assert.equal(w.el('status').textContent, '');
   assert.deepEqual(w.logged, []);
 });
@@ -314,7 +359,7 @@ test('run_sends_nothing_without_a_list', async () => {
 
 test('save_sends_the_typed_name_and_the_shown_version', async () => {
   const w = start();
-  await loadReady(w);
+  await loadShown(w);
   w.el('saveName').value = 'holiday-small';
   w.el('saveName').fire('input');
   w.el('save').click();
@@ -333,7 +378,8 @@ test('save_sends_nothing_without_a_version', async () => {
 
 test('an_invalid_name_shows_its_problem_and_save_sends_nothing', async () => {
   const w = start();
-  await loadReady(w);
+  // Shown, so only the name keeps Save from sending.
+  await loadShown(w);
   w.el('saveName').value = 'a/b';
   w.el('saveName').fire('input');
   assert.equal(w.el('nameError').hidden, false);
@@ -767,4 +813,310 @@ test('no_drag_no_highlight', async () => {
   for (const id of ['drop', 'singleDrop', 'picture']) {
     assert.equal(w.el(id).classList.contains('-over'), false, id);
   }
+});
+
+// --- one preview at a time, busy retried ---------------------------------------------
+
+/** A key press on the Quality slider: the browser fires `input` and `change` for each. */
+function arrowTo(w, value) {
+  w.el('qualityRange').value = value;
+  w.el('qualityRange').fire('input');
+  w.el('qualityRange').fire('change');
+}
+
+/** Answers held call `index` (resolve) and lets it be handled. */
+async function answer(w, index) {
+  w.tauri.held[index].resolve(null);
+  await settle();
+}
+
+/** Refuses held call `index` with `reason`, the backend's `run-busy` first for busy. */
+async function refuseHeld(w, index, reason) {
+  if (reason === 'busy') {
+    w.tauri.emit('run-busy', null);
+  }
+  w.tauri.held[index].reject(reason);
+  await settle();
+}
+
+test('holding_the_quality_arrow_key_during_a_flight_sends_one_more_preview_with_the_last_quality', async () => {
+  const w = start({ hold: ['preview_image'] });
+  await load(w);
+  await answer(w, 0);
+  await pick(w.el('modeLossy'));
+  for (const value of ['74', '73', '72']) {
+    arrowTo(w, value);
+  }
+  await settle();
+  assert.equal(previews(w).length, 2, 'nothing more while lossy 75 is in flight');
+  await answer(w, 1);
+  assert.deepEqual(previews(w).slice(2), [['preview_image', { settings: { mode: 'lossy', quality: 72 } }]]);
+  await answer(w, 2);
+  assert.equal(previews(w).length, 3);
+});
+
+test('a_mode_click_during_a_flight_is_sent_when_the_flight_settles', async () => {
+  const w = start({ hold: ['preview_image'] });
+  await load(w);
+  await pick(w.el('modeLossy'));
+  assert.equal(previews(w).length, 1);
+  await answer(w, 0);
+  assert.deepEqual(previews(w), [
+    ['preview_image', { settings: { mode: 'lossless', quality: 75 } }],
+    ['preview_image', { settings: { mode: 'lossy', quality: 75 } }],
+  ]);
+  // With no flight going, a change is sent at once.
+  await answer(w, 1);
+  arrowTo(w, '60');
+  assert.equal(previews(w).length, 3);
+});
+
+test('a_busy_preview_is_retried_and_the_status_line_stays_quiet', async () => {
+  const w = start({ hold: ['preview_image'] });
+  await load(w);
+  await refuseHeld(w, 0, 'busy');
+  assert.equal(w.el('status').textContent, '');
+  w.timers.advance(200);
+  await settle();
+  assert.equal(previews(w).length, 2);
+  await answer(w, 1);
+  assert.equal(w.el('status').textContent, '');
+  assert.deepEqual(w.logged, []);
+});
+
+test('a_preview_that_stays_busy_stops_after_three_retries_and_says_busy', async () => {
+  const w = start({ hold: ['preview_image'] });
+  await load(w);
+  for (let index = 0; index < 4; index += 1) {
+    await refuseHeld(w, index, 'busy');
+    if (index < 3) {
+      assert.equal(w.el('status').textContent, '', `retry ${index + 1}`);
+    }
+    w.timers.advance(200);
+    await settle();
+  }
+  assert.equal(previews(w).length, 4);
+  assert.equal(w.el('status').textContent, MESSAGES.busy);
+  w.timers.advance(10000);
+  await settle();
+  assert.equal(previews(w).length, 4);
+});
+
+test('an_invalid_settings_refusal_is_not_retried', async () => {
+  const w = start({ refuse: { preview_image: 'invalid-settings' } });
+  await load(w);
+  assert.equal(w.el('status').textContent, MESSAGES.invalidSettings);
+  w.timers.advance(10000);
+  await settle();
+  assert.equal(previews(w).length, 1);
+});
+
+test('a_retry_after_a_new_image_sends_one_request', async () => {
+  const w = start({ hold: ['preview_image'] });
+  await load(w);
+  await refuseHeld(w, 0, 'busy');
+  // Image 8 loads while the retry waits: its own ask adds nothing.
+  await load(w, '8');
+  assert.equal(previews(w).length, 1);
+  w.timers.advance(200);
+  await settle();
+  assert.equal(previews(w).length, 2);
+  await answer(w, 1);
+  w.timers.advance(10000);
+  await settle();
+  assert.equal(previews(w).length, 2);
+});
+
+test('a_preview_accepted_after_a_switch_to_batch_is_asked_again_on_return', async () => {
+  const w = start({ hold: ['preview_image'] });
+  await load(w);
+  await pick(w.el('viewBatch'));
+  // The switch stopped it; its acceptance arrives late.
+  await answer(w, 0);
+  await pick(w.el('viewSingle'));
+  assert.deepEqual(previews(w), [
+    ['preview_image', { settings: { mode: 'lossless', quality: 75 } }],
+    ['preview_image', { settings: { mode: 'lossless', quality: 75 } }],
+  ]);
+});
+
+test('a_preview_whose_version_is_ready_is_not_asked_again_after_batch_and_back', async () => {
+  const w = start({ hold: ['preview_image'] });
+  await load(w);
+  await answer(w, 0);
+  await versionReady(w, 1);
+  await pick(w.el('viewBatch'));
+  await pick(w.el('viewSingle'));
+  assert.equal(previews(w).length, 1);
+});
+
+// --- what the page shows: Save, "Loading picture…", the alt -------------------------
+
+test('save_waits_for_the_ready_picture_to_show', async () => {
+  const w = start();
+  await loadReady(w);
+  assert.equal(w.el('save').getAttribute('aria-disabled'), 'true');
+  w.el('save').click();
+  await settle();
+  assert.deepEqual(sent(w, 'save_image'), []);
+  decodeOf(w, 'preview://localhost/7-1').resolve();
+  await settle();
+  assert.equal(w.el('save').getAttribute('aria-disabled'), 'false');
+  w.el('save').click();
+  await settle();
+  assert.deepEqual(sent(w, 'save_image'), [['save_image', { name: 'optimized-holiday', preview: '7-1' }]]);
+});
+
+test('save_stays_off_after_the_ready_picture_failed_until_a_later_version_shows', async () => {
+  const w = start();
+  await loadReady(w);
+  decodeOf(w, 'preview://localhost/7-1').reject(new Error('EncodingError'));
+  await settle();
+  assert.equal(w.el('status').textContent, MESSAGES.pictureFailed);
+  assert.equal(w.el('save').getAttribute('aria-disabled'), 'true');
+  w.el('save').click();
+  await settle();
+  assert.deepEqual(sent(w, 'save_image'), []);
+  await versionReady(w, 2);
+  assert.equal(w.el('save').getAttribute('aria-disabled'), 'true');
+  decodeOf(w, 'preview://localhost/7-2').resolve();
+  await settle();
+  assert.equal(w.el('save').getAttribute('aria-disabled'), 'false');
+});
+
+test('loading_picture_shows_until_the_ready_picture_decodes', async () => {
+  const w = start();
+  await load(w);
+  assert.equal(w.el('pictureBusy').textContent, 'Loading picture…');
+  decodeOf(w, 'preview://localhost/7').resolve();
+  await settle();
+  assert.equal(w.el('pictureBusy').hidden, true);
+  await versionReady(w, 1);
+  assert.equal(w.el('pictureBusy').textContent, 'Loading picture…');
+  assert.equal(w.el('pictureBusy').hidden, false);
+  decodeOf(w, 'preview://localhost/7-1').resolve();
+  await settle();
+  assert.equal(w.el('pictureBusy').hidden, true);
+  // A version whose picture cannot be decoded is not loading any more.
+  await versionReady(w, 2);
+  decodeOf(w, 'preview://localhost/7-2').reject(new Error('EncodingError'));
+  await settle();
+  assert.equal(w.el('pictureBusy').hidden, true);
+});
+
+test('the_alt_stays_the_shown_versions_while_a_newer_one_decodes', async () => {
+  const w = start();
+  await loadShown(w);
+  const shownImage = () => w.el('stageCompressed').children[0];
+  assert.equal(shownImage().alt, 'Compressed, lossless');
+  await versionReady(w, 2, { mode: 'lossy', quality: 60 });
+  assert.equal(shownImage().alt, 'Compressed, lossless');
+  decodeOf(w, 'preview://localhost/7-2').resolve();
+  await settle();
+  assert.equal(shownImage().alt, 'Compressed, lossy quality 60');
+});
+
+test('an_older_pictures_failure_after_a_newer_version_says_nothing', async () => {
+  const w = start();
+  await loadReady(w);
+  await versionReady(w, 2);
+  decodeOf(w, 'preview://localhost/7-1').reject(new Error('NotFound'));
+  await settle();
+  assert.equal(w.el('status').textContent, '');
+  // Control: the current version's failure does say so.
+  decodeOf(w, 'preview://localhost/7-2').reject(new Error('EncodingError'));
+  await settle();
+  assert.equal(w.el('status').textContent, MESSAGES.pictureFailed);
+});
+
+// --- the save text for the original's folder ----------------------------------------
+
+test('a_save_with_no_folder_that_cannot_write_says_choose_a_folder', async () => {
+  const w = start({ refuse: { save_image: 'output-missing' } });
+  await loadShown(w);
+  w.el('save').click();
+  await settle();
+  assert.equal(w.el('status').textContent, "The original's folder cannot be written to. Choose a folder in Save to.");
+});
+
+test('a_save_to_a_chosen_folder_that_is_gone_keeps_todays_text', async () => {
+  const w = start({ refuse: { save_image: 'output-missing' } });
+  w.tauri.emit('output-changed', { folder: 'Pictures' });
+  await loadShown(w);
+  w.el('save').click();
+  await settle();
+  assert.equal(w.el('status').textContent, MESSAGES.outputMissing);
+  // Batch's run with no folder chosen keeps it too.
+  const b = start({ refuse: { start_run: 'output-missing' } });
+  await pick(b.el('viewBatch'));
+  b.tauri.emit('list-changed', listed(1));
+  b.el('run').click();
+  await settle();
+  assert.equal(b.el('status').textContent, MESSAGES.outputMissing);
+});
+
+// --- the names both sides share -------------------------------------------------------
+
+test('the_window_listens_to_exactly_the_fixtures_events', async () => {
+  const w = start();
+  await w.listening;
+  assert.deepEqual(nameProblems(readContract().events, [...w.tauri.handlers.keys()]), []);
+});
+
+test('the_window_sends_exactly_the_fixtures_commands', async () => {
+  const w = start();
+  w.el('chooseImage').click();
+  await load(w, '7', 2, LEFT_OUT_TWO);
+  await versionReady(w, 1);
+  decodeOf(w, 'preview://localhost/7-1').resolve();
+  await settle();
+  w.el('save').click();
+  await settle();
+  w.el('switchToBatch').click();
+  await settle();
+  w.el('chooseFiles').click();
+  w.tauri.emit('list-changed', listed(1));
+  w.el('chooseOutput').click();
+  w.tauri.emit('output-changed', { folder: 'small' });
+  w.el('clearOutput').click();
+  w.el('run').click();
+  w.tauri.emit('run-started', { total: 1, mode: 'lossless', quality: null });
+  w.tauri.emit('run-finished', finishedWithOutput);
+  w.el('readdList').click();
+  w.el('openFolder').click();
+  w.el('clearList').click();
+  await pick(w.el('viewSingle'));
+  await settle();
+  assert.deepEqual(nameProblems(readContract().commands, w.tauri.commands()), []);
+  assert.equal(new Set(w.tauri.commands()).size, 12);
+});
+
+test('a_names_list_missing_or_adding_a_name_is_flagged', () => {
+  const { events, commands } = readContract();
+  assert.deepEqual(nameProblems(events, events.slice(1)), [`missing ${events[0]}`]);
+  assert.deepEqual(nameProblems(commands, [...commands, 'delete_everything']), ['extra delete_everything']);
+  assert.deepEqual(nameProblems(['a', 'b'], ['b', 'c']), ['missing a', 'extra c']);
+  // Control: the same names in another order and twice are no problem.
+  assert.deepEqual(nameProblems(commands, [...commands].reverse().concat(commands[0])), []);
+});
+
+test('the_contract_fixture_is_read_strictly', () => {
+  const real = readContract();
+  assert.equal(real.events.length, 15);
+  assert.equal(real.commands.length, 12);
+  for (const bad of [
+    'not json',
+    '[]',
+    'null',
+    '{"events": [], "commands": [], "extra": []}',
+    '{"events": []}',
+    '{"events": ["a", 7], "commands": []}',
+    '{"events": ["a", ""], "commands": []}',
+    '{"events": ["a", "a"], "commands": []}',
+    '{"events": "a", "commands": []}',
+  ]) {
+    assert.throws(() => contractNames(bad), undefined, bad);
+  }
+  // Control: a well-formed text is read.
+  assert.deepEqual(contractNames('{"commands": ["x"], "events": ["y"]}'), { commands: ['x'], events: ['y'] });
 });

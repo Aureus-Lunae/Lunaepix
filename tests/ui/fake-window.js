@@ -127,20 +127,29 @@ export function fakePage() {
 
 /**
  * The Tauri API as `window.__TAURI__` has it. `invoke` records each call and
- * resolves, or rejects with `refuse[command]`; `listen` records each
- * subscription, or rejects for a name in `refuseListen`; `emit(type,
- * payload)` runs the handler subscribed to `type`, as the backend's event
- * would, and throws when nobody listens.
+ * resolves, or rejects with `refuse[command]`; a command named in `hold`
+ * waits instead until the test answers it: `held` lists each such call as
+ * { command, args, resolve, reject }. `listen` records each subscription, or
+ * rejects for a name in `refuseListen`; `emit(type, payload)` runs the
+ * handler subscribed to `type`, as the backend's event would, and throws
+ * when nobody listens.
  */
-export function fakeTauri({ refuse = {}, refuseListen = [] } = {}) {
+export function fakeTauri({ refuse = {}, refuseListen = [], hold = [] } = {}) {
   const calls = [];
+  const held = [];
   const handlers = new Map();
   return {
     calls,
+    held,
     handlers,
     core: {
       invoke(command, args) {
         calls.push([command, args]);
+        if (hold.includes(command)) {
+          return new Promise((resolve, reject) => {
+            held.push({ command, args, resolve, reject });
+          });
+        }
         return Object.hasOwn(refuse, command) ? Promise.reject(refuse[command]) : Promise.resolve(null);
       },
       convertFileSrc(key, scheme) {

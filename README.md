@@ -82,7 +82,9 @@ under a name you choose.
    picks one file). It can be a PNG, JPG, SVG or WebP. "Choose other" picks
    another one later. The picture is copied into a private folder when it is
    loaded and the original is never touched; the copy is removed when the
-   window closes. The same limits as in Batch apply (100 MiB, 100
+   window closes. Closing the window while a picture is still loading can
+   leave that folder in your temp folder; the system's own clean-up of temp
+   files removes it later. The same limits as in Batch apply (100 MiB, 100
    megapixels, 10 minutes).
 2. The picture shows the original and the compressed version in one frame,
    split by a divider: the original on the left, the compressed one on the
@@ -95,9 +97,11 @@ under a name you choose.
 3. Choose **Lossless** or **Lossy**, and the quality, as in Batch; "Save to"
    works the same way too. The compressed side updates a moment after you let
    go of the slider (about 0.4 seconds after the last key when you type a
-   number), not while you drag. "Compressing…" shows meanwhile and the old
-   picture stays until the new one is ready. A box next to the picture shows
-   the original size, the compressed size and how much it saves, with a note
+   number), not while you drag. "Compressing…" shows meanwhile, then
+   "Loading picture…" while the window draws it, and the old picture stays
+   until the new one shows; Save waits for it, so it always saves the version
+   you see. A box next to the picture shows the original size, the compressed
+   size and how much it saves for the version that shows, with a note
    when the file was handled differently from the setting (for example
    "original kept: lossy was not smaller").
 4. "Save as" starts with the name Batch would give the file
@@ -109,8 +113,9 @@ under a name you choose.
    next free name (`optimized-holiday-1`), so a second save works. A name may
    not contain `/ \ : * ? " < > |` or control characters, may not end in a
    space or a dot, may not be a name Windows reserves (`CON`, `NUL`, `COM1`,
-   and so on), and is at most 200 characters and 255 bytes. "Open folder"
-   opens the folder of the last save.
+   and so on), and is at most 200 characters and 255 bytes. When the
+   original's folder cannot be written to, Save says so; choose a folder under
+   "Save to" then. "Open folder" opens the folder of the last save.
 5. Drop several files, or a folder, and the first image is loaded. A note says
    how many were left out, and **Switch to Batch** puts all the dropped files
    in the Batch list. A dropped folder loads nothing ("Folders go in Batch.")
@@ -122,7 +127,7 @@ Two layouts are available: **Settings under** the picture (the default) and
 normal text size) "beside" looks like "under"; the choice is kept. The choice
 is the one thing the app remembers between launches. Changing mode and coming
 back leaves the picture, the settings and the preview as they were. The switch
-cannot be used while a Batch run is going.
+cannot be used while a Batch run or a save is going.
 
 ### Batch mode
 
@@ -157,8 +162,9 @@ window's own storage. Every start is in Single image mode, Lossless, quality
 
 ### Thumbnails
 
-Every row of the Batch list starts with a small picture of the file, 32 pixels square (made
-from a 64 pixel image, so it stays sharp on a high-resolution screen). It
+Every row of the Batch list starts with a small picture of the file, 32
+pixels square (made from a 64 pixel image, so it stays sharp on a
+high-resolution screen). It
 shows for a PNG, JPG, WebP and SVG; an animated PNG or WebP shows its first
 picture, and a photo that carries a rotation is shown the right way up. A
 row that is skipped, or whose picture cannot be made (a damaged file, a CMYK
@@ -238,6 +244,9 @@ cargo tauri build --config src-tauri/tauri.bundle.conf.json   # bundles end up i
 cargo test --workspace                                        # the Rust tests
 node --test "tests/ui/*.test.js"                              # the window script tests
 ```
+
+The window script tests need Node 21 or later (one of them reads numbers
+with `JSON.parse`'s source text); the Windows check runs them on Node 22.
 
 The `--config` file adds the small worker program that optimises each file,
 makes each thumbnail and reads the header of each image Single image mode

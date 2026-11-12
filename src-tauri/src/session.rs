@@ -436,8 +436,8 @@ pub struct Session {
     last_output: Mutex<Option<PathBuf>>,
     /// The thumbnail keys of the list sent last, and their thumbnails.
     thumbs: Thumbs,
-    /// Single image mode: the view, the loaded image, the Switch to Batch
-    /// offer.
+    /// Single image mode: the view, the loaded image, the preview state (the
+    /// version being made and the one kept), and the Switch to Batch offer.
     single: Single,
 }
 
