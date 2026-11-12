@@ -531,7 +531,9 @@ impl Single {
             };
             // Sent before the lock is let go (see `settle_preview_with`).
             // Safe only while tauri's `tracing` feature is off: with it,
-            // `eval_script` blocks until the main thread answers.
+            // `eval_script` blocks until the main thread answers. The test
+            // `tauri_never_gets_its_tracing_feature` (tests/config.rs) keeps
+            // it off.
             emit(Event::PreviewStarted(PreviewStarted {
                 image: key.to_string(),
                 version,
@@ -618,7 +620,9 @@ impl Single {
                 // the event for the window; it never calls back into this
                 // state, which would deadlock.
                 // Safe only while tauri's `tracing` feature is off: with it,
-                // `eval_script` blocks until the main thread answers.
+                // `eval_script` blocks until the main thread answers
+                // (`tauri_never_gets_its_tracing_feature` in tests/config.rs
+                // keeps it off).
                 emit(event);
                 clean_up
             } else {

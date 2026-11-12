@@ -12,16 +12,23 @@
 // The actions, besides the six backend events (src-tauri/INTERFACE.md):
 // - `set-view` ('single' or 'batch'): dispatched once `set_view` resolved, or
 //   with 'batch' once `move_drop_to_batch` resolved. A "busy" answer
-//   dispatches nothing, so the view stays.
+//   dispatches nothing, so the view stays. Each one counts in `viewChanges`.
 // - `set-name-text` (a string): the Save as box was typed in.
-// - `preview-requested` ({ image, settings }): build it with
+// - `preview-requested` ({ image, settings, viewChanges }): build it with
 //   `previewRequestedAction` when `preview_image` is sent, and dispatch it
 //   once `preview_image` resolved, i.e. the backend accepted it. A refused
-//   request records nothing, so the next trigger asks again; one for an
-//   image that is no longer the current one records nothing either.
+//   request records nothing, so the next trigger asks again. A late one
+//   records nothing either: one for an image that is no longer the current
+//   one, one that arrives while Batch shows, and one sent before a switch
+//   (the switch to Batch stopped that request in the backend).
 // - `layout-changed` ('under' or 'beside').
-// - `picture-failed` (no payload): the window could not decode a picture it
-//   was served; the picture shown before stays, and the status line says so.
+// - `picture-shown` ({ side, key }): the page now shows the picture of `key`
+//   on `side` ('original' or 'compressed'), decoded. `picture-failed` (the
+//   same payload): the window could not decode it; the picture shown before
+//   stays, and the status line says so. Both count only for the side's
+//   current key (the image's, or the ready version's); a late one for a key
+//   replaced since changes nothing. Save, "Loading picture…" and the size
+//   box read what these recorded, not only what the backend made.
 // - `save-started` (the `saveArgs` sent) and `save-ended` (whatever the
 //   answer): a save is going between the two. When `save_image` rejects,
 //   dispatch the rejection (and call `afterRejection` with the state) BEFORE
@@ -51,6 +58,8 @@ export { canSwitchView };
 
 const VIEWS = Object.freeze(['single', 'batch']);
 const LAYOUTS = Object.freeze(['under', 'beside']);
+// The two pictures of the compare view.
+const SIDES = Object.freeze(['original', 'compressed']);
 // An image key (`image-changed`) and a version key (`preview-ready`): the
 // window's key pattern (`^\d{1,10}(-\d{1,10})?$`) split in its two forms.
 const IMAGE_KEY = /^\d{1,10}$/;
@@ -70,8 +79,15 @@ export function initialSingle() {
     started: null,
     // A version is being made: from its `preview-started` to its outcome.
     compressing: false,
-    // The version shown, from the last `preview-ready` that passed the guard.
+    // The version kept, from the last `preview-ready` that passed the guard.
     ready: null,
+    // What the page shows: the key of the original's picture, and the
+    // version (as `ready` held it) whose picture the compressed side shows;
+    // per side, the key whose picture could not be decoded.
+    shownOriginal: null,
+    shownVersion: null,
+    brokenOriginal: null,
+    brokenVersion: null,
     // The reason of the last attempt when it failed, else null.
     failed: null,
     // The Switch to Batch offer: { notice } after a drop that left items out.
@@ -81,6 +97,9 @@ export function initialSingle() {
     // The last `name-taken`: { name, text }, shown while the box holds `name`.
     refused: null,
     layout: 'under',
+    // How many `set-view`s there have been this launch; a `preview-requested`
+    // counts only with the number of its moment.
+    viewChanges: 0,
   };
 }
 
@@ -149,6 +168,20 @@ function isLatest(single, payload) {
 }
 
 /**
+ * The side of a `picture-shown` or `picture-failed` payload when its key is
+ * that side's current key (the image's for 'original', the ready version's
+ * for 'compressed'), else null: another side, a key replaced since, or no
+ * such picture now.
+ */
+function currentSide(single, payload) {
+  if (!isObject(payload) || !SIDES.includes(payload.side)) {
+    return null;
+  }
+  const current = payload.side === 'original' ? single.image : single.ready;
+  return current !== null && payload.key === current.key ? payload.side : null;
+}
+
+/**
  * Whether the version shown was made with `settings`: the same mode, and for
  * lossy the same quality (a lossless version's quality is null and does not
  * count). False when either is missing.
@@ -184,8 +217,16 @@ function imageChanged(state, payload) {
     ? { ...state, single: { ...single, offer } }
     : {
         ...state,
-        // A new image starts over; the layout is the user's, not the image's.
-        single: { ...initialSingle(), layout: single.layout, image, nameText: image?.suggested ?? '', offer },
+        // A new image starts over; the layout is the user's, not the image's,
+        // and the count of switches belongs to the launch.
+        single: {
+          ...initialSingle(),
+          layout: single.layout,
+          viewChanges: single.viewChanges,
+          image,
+          nameText: image?.suggested ?? '',
+          offer,
+        },
       };
   return notice === null ? next : withMessage(next, notice);
 }
@@ -233,8 +274,9 @@ export function reduceSingle(state, action) {
       if (!canSwitchView(state) || !VIEWS.includes(payload)) {
         return state;
       }
-      // Every set_view ends the Switch to Batch offer.
-      const changes = { offer: null };
+      // Every set_view ends the Switch to Batch offer, and makes any request
+      // sent before it late (see `preview-requested`).
+      const changes = { offer: null, viewChanges: single.viewChanges + 1 };
       if (payload === 'batch') {
         // Batch stops a version being made and nothing more arrives for it,
         // so a request whose version is not the one shown is asked again on
@@ -251,10 +293,17 @@ export function reduceSingle(state, action) {
       return typeof payload === 'string' ? withSingle(state, { nameText: payload, nameTyped: true }) : state;
 
     case 'preview-requested': {
-      // Only for the image it was sent for, if that is still the current one:
-      // a late answer for an image replaced since must not count for the new one.
+      // Only for the image it was sent for, if that is still the current one
+      // (a late answer for an image replaced since must not count for the new
+      // one), while Single image shows and no switch came since it was sent:
+      // the switch to Batch stopped it, so its version never comes.
       const settings = isObject(payload) ? settingsFrom(payload.settings) : null;
-      const current = single.image !== null && isObject(payload) && payload.image === single.image.key;
+      const current =
+        state.view === 'single' &&
+        single.image !== null &&
+        isObject(payload) &&
+        payload.image === single.image.key &&
+        payload.viewChanges === single.viewChanges;
       return current && settings !== null ? withSingle(state, { requested: settings }) : state;
     }
 
@@ -327,8 +376,24 @@ export function reduceSingle(state, action) {
       return name === null ? next : withMessage(next, `Saved as ${name}`);
     }
 
-    case 'picture-failed':
-      return withMessage(state, MESSAGES.pictureFailed);
+    case 'picture-shown': {
+      const side = currentSide(single, payload);
+      if (side === null) {
+        return state;
+      }
+      return withSingle(state, side === 'original' ? { shownOriginal: payload.key } : { shownVersion: single.ready });
+    }
+
+    case 'picture-failed': {
+      // A failure for a key replaced since is not news: its file may be gone
+      // because a newer version or image took its place.
+      const side = currentSide(single, payload);
+      if (side === null) {
+        return state;
+      }
+      const changes = side === 'original' ? { brokenOriginal: payload.key } : { brokenVersion: payload.key };
+      return withMessage(withSingle(state, changes), MESSAGES.pictureFailed);
+    }
 
     case 'command-rejected':
       return payload === 'invalid-name' || payload === 'name-taken' ? nameRejected(state, payload) : state;
@@ -360,27 +425,36 @@ export function previewArgs(state) {
 /**
  * The `preview-requested` action to dispatch once `preview_image` with `args`
  * resolved: built when the request is sent, so it names the image it was sent
- * for. Null when `args` is null or no image is loaded.
+ * for and the count of switches of that moment. Null when `args` is null or
+ * no image is loaded.
  */
 export function previewRequestedAction(state, args) {
   const image = state.single.image;
   if (args === null || image === null) {
     return null;
   }
-  return { type: 'preview-requested', payload: { image: image.key, settings: args.settings } };
+  return {
+    type: 'preview-requested',
+    payload: { image: image.key, settings: args.settings, viewChanges: state.single.viewChanges },
+  };
 }
 
 /**
- * Save needs a version shown that was made with the settings shown now (the
- * mode, and for lossy the quality; so not between a settings change and its
- * version), none being made, no failed last attempt, no save going, and a
- * name that passes the name rules. A name refused as taken may be tried
- * again (the file may have gone since).
+ * Save needs the version kept (`ready`, the one `save_image` writes) to be the
+ * one whose picture the compressed side shows, decoded (`picture-shown`; not
+ * while it decodes or after its decode failed), made with the settings shown
+ * now (the mode, and for lossy the quality; so not between a settings change
+ * and its version), none being made, no failed last attempt, no save going,
+ * and a name that passes the name rules. A name refused as taken may be
+ * tried again (the file may have gone since).
  */
 export function canSave(state) {
-  const { image, ready, compressing, failed, saving, nameText: text } = state.single;
+  const { image, ready, shownVersion, compressing, failed, saving, nameText: text } = state.single;
   return (
     image !== null &&
+    ready !== null &&
+    shownVersion !== null &&
+    shownVersion.key === ready.key &&
     shownMatches(ready, runSettings(state)) &&
     !compressing &&
     failed === null &&
@@ -402,24 +476,47 @@ function savesText(before, after) {
 /**
  * The size box: the sizes as Batch formats them ('' where there is none), the
  * saving as a percentage and bytes (negative for a file that grew), the note
- * and whether a version is being made. While one is, the previous numbers
- * stay. The note is the last attempt's failure reason, except while a new
- * version is being made ("Compressing…" wins); otherwise the shown version's
- * note, or null.
+ * and whether a version is being made. The numbers and the version's note are
+ * those of the version whose picture the compressed side shows
+ * (`shownVersion`): while a new version is made, and while its picture
+ * decodes or after its decode failed, the previous numbers stay. The note is
+ * the last attempt's failure reason, except while a new version is being made
+ * ("Compressing…" wins); otherwise the shown version's note, or null.
  */
 export function sizeView(state) {
-  const { image, ready, failed, compressing } = state.single;
-  const versionNote = ready === null ? null : ready.note;
+  const { image, shownVersion: shown, failed, compressing } = state.single;
+  const versionNote = shown === null ? null : shown.note;
   return {
     original: image === null || image.size === null ? '' : formatSize(image.size),
-    compressed: ready === null ? '' : formatSize(ready.after),
-    saves: ready === null ? '' : savesText(ready.before, ready.after),
+    compressed: shown === null ? '' : formatSize(shown.after),
+    saves: shown === null ? '' : savesText(shown.before, shown.after),
     note: failed !== null && !compressing ? failed : versionNote,
     busy: compressing,
   };
 }
 
-/** The `alt` of the compressed side, from the version shown. */
+/**
+ * Whether a picture is still decoding: a side's current key (the image's on
+ * the original side, the ready version's on the compressed side) is neither
+ * shown (`picture-shown`) nor failed (`picture-failed`). The picture shown
+ * before stays meanwhile. False without an image.
+ */
+export function pictureLoading(state) {
+  const { image, ready, shownOriginal, shownVersion, brokenOriginal, brokenVersion } = state.single;
+  if (image === null) {
+    return false;
+  }
+  const original = image.key !== shownOriginal && image.key !== brokenOriginal;
+  const version = ready !== null && ready.key !== shownVersion?.key && ready.key !== brokenVersion;
+  return original || version;
+}
+
+/**
+ * The `alt` of the ready version's picture. The window gives it to that
+ * picture when the picture takes its place (`syncPicture`), so the picture
+ * on the page always carries its own version's alt, also while a newer one
+ * decodes.
+ */
 export function imageAlt(state) {
   const ready = state.single.ready;
   if (ready === null || ready.mode === null) {

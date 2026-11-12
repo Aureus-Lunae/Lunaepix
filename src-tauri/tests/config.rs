@@ -14,6 +14,9 @@ use html5ever::tokenizer::{
 };
 use serde_json::Value;
 
+#[path = "common/contract_names.rs"]
+mod contract_names;
+
 /// Every permission the window may have.
 const ALLOWED: &[&str] = &[
     "allow-choose-files",
@@ -3612,5 +3615,436 @@ fn a_command_without_async_is_found_in_a_fixture() {
     assert_eq!(
         main_thread_commands(fixture),
         name_set(&["preview_image", "clear_list", "renamed"])
+    );
+}
+
+// --- tauri's `tracing` feature stays off --------------------------------------
+
+/// The dependency tables of a manifest that can name `tauri`: the plain
+/// ones and the target-specific ones, each with the place it sits.
+fn dependency_tables(manifest: &toml::Table) -> Vec<(String, &toml::Table)> {
+    const SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    let mut tables = Vec::new();
+    for section in SECTIONS {
+        if let Some(table) = manifest.get(section).and_then(toml::Value::as_table) {
+            tables.push((section.to_owned(), table));
+        }
+    }
+    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+        for (target, value) in targets {
+            for section in SECTIONS {
+                if let Some(table) = value.get(section).and_then(toml::Value::as_table) {
+                    tables.push((format!("target.{target}.{section}"), table));
+                }
+            }
+        }
+    }
+    tables
+}
+
+/// What would turn tauri's `tracing` feature on, which makes the emits
+/// `single.rs` sends while it holds its state lock block on the main thread
+/// (see `Single::begin_preview` and `Single::settle_preview_with`):
+/// - in `cargo_toml`, `tracing` among the features of a `tauri` dependency
+///   (also one renamed with `package = "tauri"`) in any dependency table;
+/// - in `cargo_lock`, a `tracing` dependency of the `tauri` or the
+///   `tauri-runtime-wry` package, which is where a feature turned on by
+///   another crate shows up.
+///
+/// A lock without either package is a problem too, so the check cannot pass
+/// by finding nothing.
+fn tracing_problems(cargo_toml: &str, cargo_lock: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let manifest: toml::Table = match cargo_toml.parse() {
+        Ok(table) => table,
+        Err(error) => return vec![format!("Cargo.toml: {error}")],
+    };
+    for (place, table) in dependency_tables(&manifest) {
+        for (key, dependency) in table {
+            let is_tauri = key == "tauri"
+                || dependency.get("package").and_then(toml::Value::as_str) == Some("tauri");
+            let traced = dependency
+                .get("features")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|features| {
+                    features
+                        .iter()
+                        .any(|feature| feature.as_str() == Some("tracing"))
+                });
+            if is_tauri && traced {
+                problems.push(format!("{place}: tauri has the tracing feature"));
+            }
+        }
+    }
+    let lock: toml::Table = match cargo_lock.parse() {
+        Ok(table) => table,
+        Err(error) => return vec![format!("Cargo.lock: {error}")],
+    };
+    let packages: Vec<&toml::Table> = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .map(|list| list.iter().filter_map(toml::Value::as_table).collect())
+        .unwrap_or_default();
+    for name in ["tauri", "tauri-runtime-wry"] {
+        let entries: Vec<&&toml::Table> = packages
+            .iter()
+            .filter(|package| package.get("name").and_then(toml::Value::as_str) == Some(name))
+            .collect();
+        if entries.is_empty() {
+            problems.push(format!("Cargo.lock has no {name}"));
+        }
+        for entry in entries {
+            // An entry is "name" or "name version" (with a source when two
+            // versions are locked).
+            let traced = entry
+                .get("dependencies")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|dependencies| {
+                    dependencies
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .any(|dependency| dependency.split(' ').next() == Some("tracing"))
+                });
+            if traced {
+                problems.push(format!("Cargo.lock: {name} depends on tracing"));
+            }
+        }
+    }
+    problems
+}
+
+#[test]
+fn tauri_never_gets_its_tracing_feature() {
+    assert_eq!(
+        tracing_problems(&read_text("Cargo.toml"), &repo_file("Cargo.lock")),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_tracing_feature_or_dependency_is_flagged_in_a_fixture() {
+    const LOCK: &str = r#"
+        [[package]]
+        name = "tauri"
+        version = "2.12.5"
+        dependencies = ["serde", "tauri-runtime-wry"]
+
+        [[package]]
+        name = "tauri-runtime-wry"
+        version = "2.12.3"
+        dependencies = ["wry"]
+    "#;
+    const MANIFEST: &str = "[dependencies]\ntauri = { version = \"2\", features = [] }\n";
+    // Controls: no feature, the version as a plain string, a crate whose
+    // name only starts with "tracing".
+    assert_eq!(tracing_problems(MANIFEST, LOCK), Vec::<String>::new());
+    assert_eq!(
+        tracing_problems("[dependencies]\ntauri = \"2\"\n", LOCK),
+        Vec::<String>::new()
+    );
+    let core_only = LOCK.replace(r#"["wry"]"#, r#"["tracing-core 0.1.33", "wry"]"#);
+    assert_eq!(tracing_problems(MANIFEST, &core_only), Vec::<String>::new());
+
+    // The feature in the manifest: plain, in a target table, renamed.
+    assert_eq!(
+        tracing_problems(
+            "[dependencies]\ntauri = { version = \"2\", features = [\"devtools\", \"tracing\"] }\n",
+            LOCK
+        ),
+        ["dependencies: tauri has the tracing feature"]
+    );
+    assert_eq!(
+        tracing_problems(
+            "[target.'cfg(windows)'.dependencies]\ntauri = { version = \"2\", features = [\"tracing\"] }\n",
+            LOCK
+        ),
+        ["target.cfg(windows).dependencies: tauri has the tracing feature"]
+    );
+    assert_eq!(
+        tracing_problems(
+            "[dependencies.webview]\npackage = \"tauri\"\nversion = \"2\"\nfeatures = [\"tracing\"]\n",
+            LOCK
+        ),
+        ["dependencies: tauri has the tracing feature"]
+    );
+
+    // The dependency in the lock, with and without a version.
+    let wry = LOCK.replace(r#"["wry"]"#, r#"["tracing 0.1.41", "wry"]"#);
+    assert_eq!(
+        tracing_problems(MANIFEST, &wry),
+        ["Cargo.lock: tauri-runtime-wry depends on tracing"]
+    );
+    let tauri = LOCK.replace(
+        r#"["serde", "tauri-runtime-wry"]"#,
+        r#"["serde", "tauri-runtime-wry", "tracing"]"#,
+    );
+    assert_eq!(
+        tracing_problems(MANIFEST, &tauri),
+        ["Cargo.lock: tauri depends on tracing"]
+    );
+
+    // A lock without tauri-runtime-wry checks nothing: flagged.
+    let no_wry = "[[package]]\nname = \"tauri\"\nversion = \"2.12.5\"\n";
+    assert_eq!(
+        tracing_problems(MANIFEST, no_wry),
+        ["Cargo.lock has no tauri-runtime-wry"]
+    );
+}
+
+// --- the command names the window may call ------------------------------------
+
+/// Calls `visit` with every expression in the functions of the Rust
+/// `source`, as deep as `let`s, method chains, calls, references, blocks and
+/// matches go: enough for a builder chain and a list literal. Comments and
+/// string contents are never expressions.
+fn each_expression(source: &str, visit: &mut dyn FnMut(&syn::Expr)) {
+    let file = syn::parse_file(source).expect("valid Rust");
+    for item in &file.items {
+        if let syn::Item::Fn(function) = item {
+            each_in_block(&function.block, visit);
+        }
+    }
+}
+
+fn each_in_block(block: &syn::Block, visit: &mut dyn FnMut(&syn::Expr)) {
+    for statement in &block.stmts {
+        match statement {
+            syn::Stmt::Local(local) => {
+                if let Some(init) = &local.init {
+                    each_in_expr(&init.expr, visit);
+                }
+            }
+            syn::Stmt::Expr(expr, _) => each_in_expr(expr, visit),
+            _ => {}
+        }
+    }
+}
+
+fn each_in_expr(expr: &syn::Expr, visit: &mut dyn FnMut(&syn::Expr)) {
+    visit(expr);
+    match expr {
+        syn::Expr::MethodCall(call) => {
+            each_in_expr(&call.receiver, visit);
+            for arg in &call.args {
+                each_in_expr(arg, visit);
+            }
+        }
+        syn::Expr::Call(call) => {
+            each_in_expr(&call.func, visit);
+            for arg in &call.args {
+                each_in_expr(arg, visit);
+            }
+        }
+        syn::Expr::Reference(reference) => each_in_expr(&reference.expr, visit),
+        syn::Expr::Paren(paren) => each_in_expr(&paren.expr, visit),
+        syn::Expr::Block(block) => each_in_block(&block.block, visit),
+        syn::Expr::Match(matched) => {
+            each_in_expr(&matched.expr, visit);
+            for arm in &matched.arms {
+                each_in_expr(&arm.body, visit);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The names in each `generate_handler![…]` call in the Rust `source` (the
+/// last segment of each path), one list per call.
+fn handler_lists(source: &str) -> Vec<Vec<String>> {
+    let mut lists = Vec::new();
+    each_expression(source, &mut |expr| {
+        if let syn::Expr::Macro(found) = expr
+            && found
+                .mac
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "generate_handler")
+        {
+            let paths = found
+                .mac
+                .parse_body_with(
+                    syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+                )
+                .expect("a list of command paths");
+            lists.push(
+                paths
+                    .iter()
+                    .map(|path| path.segments.last().unwrap().ident.to_string())
+                    .collect(),
+            );
+        }
+    });
+    lists
+}
+
+/// The string literals of each `commands(&[…])` call in the Rust `source`
+/// (the build script's app manifest), one list per call. An element that is
+/// not a string literal reads as `<not a literal>`, so it is flagged.
+fn manifest_lists(source: &str) -> Vec<Vec<String>> {
+    let mut lists = Vec::new();
+    each_expression(source, &mut |expr| {
+        if let syn::Expr::MethodCall(call) = expr
+            && call.method == "commands"
+            && let Some(syn::Expr::Reference(reference)) = call.args.first()
+            && let syn::Expr::Array(array) = &*reference.expr
+        {
+            lists.push(
+                array
+                    .elems
+                    .iter()
+                    .map(|element| match element {
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(text),
+                            ..
+                        }) => text.value(),
+                        _ => "<not a literal>".to_owned(),
+                    })
+                    .collect(),
+            );
+        }
+    });
+    lists
+}
+
+/// The commands a capability grants, as command names (`allow-set-view` is
+/// `set_view`); `core:` permissions are not commands.
+fn capability_commands(capability: &Value) -> Vec<String> {
+    granted(capability)
+        .into_iter()
+        .filter_map(|permission| permission.strip_prefix("allow-"))
+        .map(|command| command.replace('-', "_"))
+        .collect()
+}
+
+/// What is wrong with the command lists found in one place (`place`), next
+/// to the fixture's `expected`: not exactly one list, or a list with a
+/// missing, an extra or a repeated name.
+fn command_list_problems(place: &str, lists: &[Vec<String>], expected: &[String]) -> Vec<String> {
+    match lists {
+        [list] => contract_names::problems(expected, list)
+            .into_iter()
+            .map(|problem| format!("{place}: {problem}"))
+            .collect(),
+        _ => vec![format!("{place}: {} command lists, not one", lists.len())],
+    }
+}
+
+#[test]
+fn the_handler_build_script_and_capability_list_exactly_the_fixtures_commands() {
+    let fixture = contract_names::load();
+    let capability = read_json("capabilities/default.json");
+    let mut problems = command_list_problems(
+        "lib.rs",
+        &handler_lists(&read_text("src/lib.rs")),
+        &fixture.commands,
+    );
+    problems.extend(command_list_problems(
+        "build.rs",
+        &manifest_lists(&read_text("build.rs")),
+        &fixture.commands,
+    ));
+    problems.extend(command_list_problems(
+        "capability",
+        &[capability_commands(&capability)],
+        &fixture.commands,
+    ));
+    assert_eq!(problems, Vec::<String>::new());
+    assert_eq!(fixture.commands.len(), 12);
+}
+
+#[test]
+fn a_command_list_missing_or_adding_a_name_is_flagged_in_a_fixture() {
+    let expected: Vec<String> = vec!["set_view".to_owned(), "save_image".to_owned()];
+    let check =
+        |place: &str, lists: Vec<Vec<String>>| command_list_problems(place, &lists, &expected);
+
+    // The handler: one missing and one extra; none; two; one only in text.
+    let lib = r#"
+        pub fn run() {
+            let result = tauri::Builder::default()
+                .invoke_handler(tauri::generate_handler![set_view, commands::delete_all])
+                .run(tauri::generate_context!());
+        }
+    "#;
+    assert_eq!(
+        check("lib.rs", handler_lists(lib)),
+        ["lib.rs: missing save_image", "lib.rs: extra delete_all"]
+    );
+    let none = "fn run() { tauri::Builder::default().run(context()); }";
+    assert_eq!(
+        check("lib.rs", handler_lists(none)),
+        ["lib.rs: 0 command lists, not one"]
+    );
+    let two = "fn run() { let a = b.invoke_handler(generate_handler![set_view, save_image]); \
+               let c = d.invoke_handler(generate_handler![set_view, save_image]); }";
+    assert_eq!(
+        check("lib.rs", handler_lists(two)),
+        ["lib.rs: 2 command lists, not one"]
+    );
+    let in_text = r#"
+        /// generate_handler![set_view, save_image]
+        fn run() { let text = "generate_handler![set_view, save_image]"; }
+    "#;
+    assert_eq!(handler_lists(in_text), Vec::<Vec<String>>::new());
+
+    // The build script: a name twice, a name that is not a literal.
+    let build = r#"fn main() { let m = tauri_build::AppManifest::new().commands(&["set_view", "save_image", "save_image", NAME]); }"#;
+    assert_eq!(
+        check("build.rs", manifest_lists(build)),
+        [
+            "build.rs: save_image given twice",
+            "build.rs: extra <not a literal>"
+        ]
+    );
+
+    // The capability: one missing and one extra.
+    let capability = serde_json::json!({
+        "permissions": ["allow-set-view", "allow-delete-all", "core:event:allow-listen"]
+    });
+    assert_eq!(
+        check("capability", vec![capability_commands(&capability)]),
+        [
+            "capability: missing save_image",
+            "capability: extra delete_all"
+        ]
+    );
+
+    // Controls: the right lists, in another order, pass.
+    let good_lib = "fn run() { b.invoke_handler(tauri::generate_handler![save_image, set_view]); }";
+    assert_eq!(
+        check("lib.rs", handler_lists(good_lib)),
+        Vec::<String>::new()
+    );
+    let good_build =
+        r#"fn main() { tauri_build::AppManifest::new().commands(&["save_image", "set_view"]); }"#;
+    assert_eq!(
+        check("build.rs", manifest_lists(good_build)),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn the_contract_fixture_is_read_strictly() {
+    let real = contract_names::load();
+    assert_eq!((real.events.len(), real.commands.len()), (15, 12));
+    for bad in [
+        "not json",
+        "[]",
+        "null",
+        r#"{"events": [], "commands": [], "extra": []}"#,
+        r#"{"events": []}"#,
+        r#"{"events": ["a", 7], "commands": []}"#,
+        r#"{"events": ["a", ""], "commands": []}"#,
+        r#"{"events": ["a", "a"], "commands": []}"#,
+        r#"{"events": "a", "commands": []}"#,
+    ] {
+        assert!(contract_names::parse(bad).is_err(), "{bad}");
+    }
+    // Control: a well-formed text is read.
+    let read = contract_names::parse(r#"{"commands": ["x"], "events": ["y"]}"#).unwrap();
+    assert_eq!(
+        (read.commands, read.events),
+        (vec!["x".to_owned()], vec!["y".to_owned()])
     );
 }

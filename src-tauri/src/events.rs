@@ -285,7 +285,8 @@ pub enum Event {
     /// A drop or a command was refused because the busy guard is held (a run,
     /// a dialog, a load, a save, or another command's short checked section).
     RunBusy,
-    /// A file or folder dialog was closed without a choice.
+    /// A file or folder dialog was closed without a choice: Batch's files and
+    /// output folder dialogs, and Single image mode's image dialog.
     RunCancelled,
     DragState(DragState),
     ImageChanged(ImageChanged),
@@ -381,13 +382,154 @@ pub fn file_done(index: usize, src: &Path, result: &FileResult) -> FileDone {
 }
 
 #[cfg(test)]
+#[path = "../tests/common/contract_names.rs"]
+mod contract_names;
+
+#[cfg(test)]
 mod tests {
     use std::io;
     use std::path::PathBuf;
 
     use lunaepix_core::{Crash, OptimizeError, Outcome, RunError, Skip};
 
+    use super::contract_names;
     use super::*;
+
+    /// How many variants [`Event`] has; [`variant_number`] numbers them
+    /// `0..EVENT_VARIANTS`.
+    const EVENT_VARIANTS: usize = 15;
+
+    /// Each variant's own number. The match has no `_` arm, so a new variant
+    /// does not compile until it is numbered here, and then
+    /// `every_event_name_is_in_the_contract_fixture_and_back` fails until
+    /// [`one_of_each_event`] makes one of it.
+    fn variant_number(event: &Event) -> usize {
+        match event {
+            Event::ListChanged(_) => 0,
+            Event::OutputChanged(_) => 1,
+            Event::RunStarted(_) => 2,
+            Event::FileStarted(_) => 3,
+            Event::FileDone(_) => 4,
+            Event::RunFinished(_) => 5,
+            Event::RunBusy => 6,
+            Event::RunCancelled => 7,
+            Event::DragState(_) => 8,
+            Event::ImageChanged(_) => 9,
+            Event::NameSuggested(_) => 10,
+            Event::PreviewStarted(_) => 11,
+            Event::PreviewReady(_) => 12,
+            Event::PreviewFailed(_) => 13,
+            Event::ImageSaved(_) => 14,
+        }
+    }
+
+    /// One event of every variant, with plain payloads.
+    fn one_of_each_event() -> Vec<Event> {
+        vec![
+            Event::ListChanged(ListChanged {
+                files: Vec::new(),
+                notice: None,
+            }),
+            Event::OutputChanged(OutputChanged { folder: None }),
+            Event::RunStarted(RunStarted::new(1, Compression::Lossless)),
+            Event::FileStarted(FileStarted { index: 0 }),
+            Event::FileDone(over_limit_row(0, 1)),
+            Event::RunFinished(RunFinished {
+                optimised: 0,
+                saved_bytes: 0,
+                has_output: false,
+            }),
+            Event::RunBusy,
+            Event::RunCancelled,
+            Event::DragState(DragState { over: false }),
+            Event::ImageChanged(ImageChanged {
+                image: None,
+                left_out: 0,
+                notice: None,
+            }),
+            Event::NameSuggested(NameSuggested {
+                image: "1".to_owned(),
+                suggested: "a".to_owned(),
+            }),
+            Event::PreviewStarted(PreviewStarted {
+                image: "1".to_owned(),
+                version: 1,
+            }),
+            Event::PreviewReady(PreviewReady {
+                image: "1".to_owned(),
+                version: 1,
+                key: "1-1".to_owned(),
+                mode: Mode::Lossless,
+                quality: None,
+                before: 2,
+                after: 1,
+                note: None,
+            }),
+            Event::PreviewFailed(PreviewFailed {
+                image: "1".to_owned(),
+                version: 1,
+                reason: "a reason".to_owned(),
+            }),
+            Event::ImageSaved(ImageSaved {
+                name: "a.png".to_owned(),
+                folder: None,
+                suggested: "a-1".to_owned(),
+            }),
+        ]
+    }
+
+    #[test]
+    fn every_event_name_is_in_the_contract_fixture_and_back() {
+        let events = one_of_each_event();
+        let mut numbers: Vec<usize> = events.iter().map(variant_number).collect();
+        numbers.sort_unstable();
+        assert_eq!(
+            numbers,
+            (0..EVENT_VARIANTS).collect::<Vec<_>>(),
+            "one event of each variant"
+        );
+        let names: Vec<&str> = events.iter().map(Event::name).collect();
+        let fixture = contract_names::load();
+        assert_eq!(
+            contract_names::problems(&fixture.events, &names),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_names_list_missing_or_adding_an_event_is_flagged() {
+        let names: Vec<&str> = one_of_each_event().iter().map(Event::name).collect();
+        let fixture = contract_names::load();
+        // The window listens to one name the backend never sends.
+        let mut with_extra = fixture.events.clone();
+        with_extra.push("preview-progress".to_owned());
+        assert_eq!(
+            contract_names::problems(&with_extra, &names),
+            ["missing preview-progress"]
+        );
+        // The backend sends one name the window does not listen to.
+        let without_busy: Vec<&String> = fixture
+            .events
+            .iter()
+            .filter(|name| *name != "run-busy")
+            .collect();
+        assert_eq!(
+            contract_names::problems(&without_busy, &names),
+            ["extra run-busy"]
+        );
+        // A name sent twice by two variants.
+        assert_eq!(
+            contract_names::problems(&["a", "b"], &["a", "b", "a"]),
+            ["a given twice"]
+        );
+        // Control: the same names in another order are no problem.
+        let mut reversed = names.clone();
+        reversed.reverse();
+        assert_eq!(
+            contract_names::problems(&fixture.events, &reversed),
+            Vec::<String>::new()
+        );
+    }
 
     fn optimized(before: u64, after: u64) -> FileResult {
         FileResult::Optimized(Outcome {

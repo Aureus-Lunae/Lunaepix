@@ -59,15 +59,20 @@ export function previewSource(convertFileSrc) {
 }
 
 /**
- * The two pictures' addresses (`src` is `previewSource`'s function) and the
- * compressed side's `alt`: the copy taken at load, and the version shown
- * (null until one is ready for this image).
+ * The two pictures' addresses (`src` is `previewSource`'s function), their
+ * keys (for the `picture-shown` and `picture-failed` the window dispatches
+ * once a picture decoded or failed), and the `alt` the ready version's
+ * picture takes when it takes its place: the copy taken at load, and the
+ * ready version (null until one is ready for this image).
  */
 export function pictureView(state, src) {
   const { image, ready } = state.single;
+  const compressedKey = image === null || ready === null ? null : ready.key;
   return {
     original: image === null ? null : src(image.key),
-    compressed: image === null || ready === null ? null : src(ready.key),
+    compressed: compressedKey === null ? null : src(compressedKey),
+    originalKey: image === null ? null : image.key,
+    compressedKey,
     alt: imageAlt(state),
   };
 }
@@ -181,6 +186,12 @@ export function swapPicture(doc, slot, url, onReady, onFail) {
  * in (`swapPicture`) and gets `alt` once shown; the address shown, the one
  * decoding and the one that failed are not asked for again. No address
  * hides the picture and drops a swap still going.
+ *
+ * Policies: in flight, a newer address makes the older decode stale and it
+ * reports nothing (`swapPicture`'s `seq`); late, the window's `onDone` and
+ * `onFail` dispatch `picture-shown` and `picture-failed` with the key the
+ * swap was made for, and the reducer drops one whose key is no longer the
+ * side's current key. A decode is never "busy".
  */
 export function syncPicture(doc, slot, url, alt, onDone, onFail) {
   if (url === null) {
@@ -229,7 +240,8 @@ export function moveSettings(doc, settings, slot) {
 /**
  * The size box (`box`: `original`, `compressed`, `saves`, `note`), from
  * `sizeView`. While a version is being made the note says "Compressing…" and
- * the numbers before stay; an empty note hides.
+ * the numbers before stay (they are the version whose picture shows); an
+ * empty note hides.
  */
 export function syncSizes(doc, box, view) {
   box.original.textContent = view.original;
@@ -323,11 +335,6 @@ export function zoomImageOf(image, decoded) {
 /** `zoomImageOf` for the image loaded in `state` and the picture the original's slot shows. */
 export function pictureSize(state, slot) {
   return zoomImageOf(state.single.image, slot.image);
-}
-
-/** Whether either picture is still decoding (`slots`: the slot records). */
-export function picturesLoading(slots) {
-  return slots.some((slot) => slot.pending !== null);
 }
 
 /** The start: centred at scale 1, at Fit (the real Fit follows once the sizes are known). */
@@ -522,25 +529,148 @@ export async function send(deps, command, args) {
   }
 }
 
+/** How often a `preview_image` refused as "busy" is sent again, and how long after each refusal, in ms. */
+export const PREVIEW_BUSY_RETRIES = 3;
+export const PREVIEW_RETRY_MS = 200;
+
+/** Whether `args` asks for the image and settings of the request `last` ({ image, args }). */
+function sameRequest(last, image, args) {
+  return (
+    last !== null &&
+    args !== null &&
+    last.image === image &&
+    last.args.settings.mode === args.settings.mode &&
+    last.args.settings.quality === args.settings.quality
+  );
+}
+
 /**
- * Asks for a compressed version when there is something new to make
- * (`previewArgs`). The `preview-requested` action is built when the request
- * is sent (so it names that image) and dispatched only once the backend
- * accepted it: a refused request records nothing, so the next trigger asks
- * again. `deps`: `getState`, `invoke`, `dispatch`, `reject`.
+ * Asks for compressed versions, one `preview_image` at a time. `ask()` sends
+ * when there is something new to make (`previewArgs`), and `runBusy()` takes
+ * the backend's `run-busy` event in place of the page's dispatch. The
+ * `preview-requested` action is built when a request is sent (so it names
+ * that image and the count of switches of that moment) and dispatched only
+ * once the backend accepted it: a refused request records nothing, so the
+ * next trigger asks again.
+ *
+ * Its policies (common-context, "Async window actions state their policies"):
+ * - In flight: a trigger while a request is on its way sends nothing then; it
+ *   is remembered, and once the request settles the asker asks once more,
+ *   with whatever `previewArgs` gives at that moment (the last settings, the
+ *   current image). Holding a Quality arrow key so sends two requests, not
+ *   one per step. A trigger while a busy retry waits adds nothing: the retry
+ *   asks with the settings of its own moment.
+ * - Late answer: an acceptance always dispatches its action; the reducer
+ *   drops it when the image changed or a switch came since it was sent
+ *   (single.js, `preview-requested`). A busy retry asks with the state of its
+ *   own moment: after a new image it asks for that image, and with nothing
+ *   to ask (Batch shows, or no image) it sends nothing and the count of
+ *   retries starts over.
+ * - Busy: a "busy" refusal is sent again `PREVIEW_RETRY_MS` later, up to
+ *   `PREVIEW_BUSY_RETRIES` times, without a message: the backend's
+ *   `run-busy` that comes with each retried refusal is not shown, in either
+ *   order (one that came first is held while the request is in flight, one
+ *   that comes after is owed). The last refusal is reported (`reject`) and
+ *   its `run-busy` shown. Any other refusal is reported at once and not
+ *   retried; a trigger remembered during it then asks only when its request
+ *   differs from the refused one (another image or other settings).
+ *   A `run-busy` with no request in flight and none owed is shown at once.
+ *
+ * `deps`: `getState`, `invoke`, `dispatch`, `reject(command, reason)`,
+ * `showBusy()` (shows the busy message), `timers` (`setTimer`, `clearTimer`).
+ * `ask()` returns a promise of whether the request it sent was accepted
+ * (false when it sent nothing).
  */
-export async function askPreview(deps) {
-  const state = deps.getState();
-  const args = previewArgs(state);
-  if (args === null) {
-    return false;
+export function previewAsker(deps) {
+  // Called on their own: a webview's setTimeout throws with another `this`.
+  const { setTimer } = deps.timers;
+  let inFlight = false;
+  let again = false;
+  let retries = 0;
+  let retryTimer = null;
+  // `run-busy` events that came while a request was in flight, and those
+  // still to come for a busy refusal that is retried.
+  let held = 0;
+  let owed = 0;
+
+  function release(retried) {
+    if (retried) {
+      if (held > 0) {
+        held -= 1;
+      } else {
+        owed += 1;
+      }
+    }
+    for (; held > 0; held -= 1) {
+      deps.showBusy();
+    }
   }
-  const action = previewRequestedAction(state, args);
-  if (!(await send(deps, 'preview_image', args))) {
-    return false;
+
+  async function ask() {
+    if (inFlight) {
+      again = true;
+      return false;
+    }
+    if (retryTimer !== null) {
+      return false;
+    }
+    const state = deps.getState();
+    const args = previewArgs(state);
+    if (args === null) {
+      retries = 0;
+      return false;
+    }
+    const action = previewRequestedAction(state, args);
+    const sent = { image: state.single.image.key, args };
+    inFlight = true;
+    try {
+      await deps.invoke('preview_image', args);
+    } catch (reason) {
+      inFlight = false;
+      if (reason === 'busy' && retries < PREVIEW_BUSY_RETRIES) {
+        retries += 1;
+        again = false;
+        release(true);
+        retryTimer = setTimer(() => {
+          retryTimer = null;
+          ask();
+        }, PREVIEW_RETRY_MS);
+        return false;
+      }
+      retries = 0;
+      release(false);
+      deps.reject('preview_image', reason);
+      if (again) {
+        again = false;
+        const now = deps.getState();
+        if (!sameRequest(sent, now.single.image?.key, previewArgs(now))) {
+          ask();
+        }
+      }
+      return false;
+    }
+    inFlight = false;
+    retries = 0;
+    deps.dispatch(action);
+    release(false);
+    if (again) {
+      again = false;
+      ask();
+    }
+    return true;
   }
-  deps.dispatch(action);
-  return true;
+
+  function runBusy() {
+    if (owed > 0) {
+      owed -= 1;
+    } else if (inFlight) {
+      held += 1;
+    } else {
+      deps.showBusy();
+    }
+  }
+
+  return { ask, runBusy };
 }
 
 /** The view to send for a picked switch value, or null: an unknown value, the view that shows, or a locked switch. */
@@ -553,6 +683,13 @@ function viewChoice(state, value) {
  * page, and back in Single image a version is asked for again. A switch
  * that cannot be used, or a refused `set_view`, changes nothing; the page is
  * drawn again so the radios show the view that shows.
+ *
+ * Policies: in flight, a second pick is sent at once (the backend runs
+ * `set_view` calls in order on its main thread); late, `set-view` is
+ * dispatched when it resolves and the reducer drops it while the switch is
+ * locked; busy, it is not retried: `run-busy` says so and the radios are
+ * drawn back. The version asked for afterwards goes through the preview
+ * asker (`previewAsker`), which waits for one in flight.
  * `deps`: `getState`, `invoke`, `dispatch`, `reject`, `render`, `askPreview`.
  */
 export async function switchView(deps, value) {
@@ -572,7 +709,13 @@ export async function switchView(deps, value) {
   return true;
 }
 
-/** Switch to Batch: moves the last drop's items to Batch, then shows Batch. Only while the offer can be used. */
+/**
+ * Switch to Batch: moves the last drop's items to Batch, then shows Batch.
+ * Only while the offer can be used. Policies: a second click in flight is
+ * sent at once and answered `nothing-to-move`; a late answer dispatches
+ * `set-view`, which the reducer drops while the switch is locked; busy is
+ * not retried (`run-busy` says so).
+ */
 export async function moveToBatch(deps) {
   if (!offerView(deps.getState()).canMove) {
     return false;
@@ -587,7 +730,12 @@ export async function moveToBatch(deps) {
 /**
  * Save: `save-started` with the arguments sent, `save_image`, and
  * `save-ended` whatever the answer. A rejection is handled before
- * `save-ended`, so a name rejection names the stem that was sent.
+ * `save-ended`, so a name rejection names the stem that was sent, and
+ * `output-missing` knows a save was going.
+ *
+ * Policies: in flight, a second click sends nothing (`canSave` needs no save
+ * going); late, the answer belongs to the save recorded by `save-started`,
+ * which nothing else replaces; busy, it is not retried (`run-busy` says so).
  */
 export async function saveImage(deps) {
   const args = saveArgs(deps.getState());

@@ -32,6 +32,9 @@ export const MESSAGES = Object.freeze({
   emptyList: 'No file in the list can be optimised.',
   outputMissing:
     'The output folder is gone or cannot be written to. Choose it again, or save next to the originals.',
+  // save_image's `output-missing` with no output folder chosen: the save
+  // went to the original's own folder.
+  originalFolderUnwritable: "The original's folder cannot be written to. Choose a folder in Save to.",
   noImage: 'Load an image first.',
   notReady: 'The compressed version is not ready yet.',
   nothingToMove: 'There is nothing to move to Batch any more.',
@@ -42,7 +45,10 @@ export const MESSAGES = Object.freeze({
 });
 
 // `output-missing` is also save_image's (the output folder, or with none the
-// original's own folder); it keeps the same text.
+// original's own folder). For a save with an output folder chosen it keeps
+// this text; for a save with none, `reduce` gives `originalFolderUnwritable`
+// instead, as "Choose it again, or save next to the originals" fits nothing
+// there.
 const REJECTIONS = Object.freeze({
   busy: MESSAGES.busy,
   'no-output': MESSAGES.noOutput,
@@ -387,12 +393,18 @@ export function reduce(state, action) {
     case 'preview-ready':
     case 'preview-failed':
     case 'image-saved':
+    case 'picture-shown':
     case 'picture-failed':
       return reduceSingle(state, action);
 
     case 'command-rejected':
       if (NAME_REJECTIONS.includes(payload)) {
         return reduceSingle(state, action);
+      }
+      // A save going (`save-started`, not yet `save-ended`) with no output
+      // folder wrote to the original's own folder.
+      if (payload === 'output-missing' && state.single.saving !== null && state.folder === null) {
+        return withMessage(state, MESSAGES.originalFolderUnwritable);
       }
       return withMessage(
         state,

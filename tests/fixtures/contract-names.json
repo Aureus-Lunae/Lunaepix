@@ -1,0 +1,33 @@
+{
+  "events": [
+    "list-changed",
+    "output-changed",
+    "run-started",
+    "file-started",
+    "file-done",
+    "run-finished",
+    "run-busy",
+    "run-cancelled",
+    "drag-state",
+    "image-changed",
+    "name-suggested",
+    "preview-started",
+    "preview-ready",
+    "preview-failed",
+    "image-saved"
+  ],
+  "commands": [
+    "choose_files",
+    "clear_list",
+    "readd_list",
+    "choose_output_folder",
+    "clear_output_folder",
+    "start_run",
+    "open_output_folder",
+    "set_view",
+    "choose_image",
+    "preview_image",
+    "save_image",
+    "move_drop_to_batch"
+  ]
+}

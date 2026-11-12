@@ -303,7 +303,9 @@ impl Plan {
 /// The name Batch gives the output for `src`: `optimized-<name>` next to the
 /// original (`in_chosen_folder` false), `<name>` in a chosen output folder
 /// (true). Built from the `OsStr`, so a name that is not valid UTF-8 keeps its
-/// bytes.
+/// bytes. One case does not use it: a file found in a folder given as input,
+/// with no output folder chosen, goes to `<folder>/optimized/<name>` under its
+/// own name ([`plan_folder`]).
 pub fn batch_output_name(src: &Path, in_chosen_folder: bool) -> OsString {
     if in_chosen_folder {
         src.file_name().unwrap_or_default().to_owned()

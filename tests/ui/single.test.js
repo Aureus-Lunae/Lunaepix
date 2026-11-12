@@ -11,6 +11,7 @@ import {
   nameProblemText,
   nameText,
   offerView,
+  pictureLoading,
   pixelSizeText,
   previewArgs,
   previewRequestedAction,
@@ -53,10 +54,14 @@ const setView = (view) => ({ type: 'set-view', payload: view });
 const setMode = (mode) => ({ type: 'set-mode', payload: mode });
 const setQuality = (text) => ({ type: 'set-quality-text', payload: text });
 const typed = (text) => ({ type: 'set-name-text', payload: text });
-const requested = (mode = 'lossless', quality = 75, image = '7') => ({
+// `viewChanges`: how many switches the state had seen when the request was sent.
+const requested = (mode = 'lossless', quality = 75, image = '7', viewChanges = 0) => ({
   type: 'preview-requested',
-  payload: { image, settings: { mode, quality } },
+  payload: { image, settings: { mode, quality }, viewChanges },
 });
+// The page shows the picture of `key` on `side` ('original' or 'compressed'), or could not decode it.
+const pictureShown = (side, key) => ({ type: 'picture-shown', payload: { side, key } });
+const pictureFailed = (side, key) => ({ type: 'picture-failed', payload: { side, key } });
 const started = (image, version) => ({ type: 'preview-started', payload: { image, version } });
 const ready = (image, version, overrides = {}) => ({
   type: 'preview-ready',
@@ -88,7 +93,7 @@ const runStarted = { type: 'run-started', payload: { total: 1, mode: 'lossless',
 const runFinished = { type: 'run-finished', payload: { optimised: 1, saved_bytes: 10, has_output: true } };
 const listed = { type: 'list-changed', payload: { files: [{ name: 'a.png', size: 10, skip: null, thumb: '1-0' }], notice: null } };
 
-/** An image loaded in lossy 75, its version 1 asked for, started and ready. */
+/** An image loaded in lossy 75, its version 1 asked for, started, ready and its picture shown. */
 function withVersion(key = '7') {
   return apply(
     initialState(),
@@ -97,6 +102,7 @@ function withVersion(key = '7') {
     requested('lossy', 75, key),
     started(key, 1),
     ready(key, 1),
+    pictureShown('compressed', `${key}-1`),
   );
 }
 
@@ -117,7 +123,10 @@ test('switching_keeps_each_views_content', () => {
   assert.equal(away.view, 'batch');
   const back = reduce(away, setView('single'));
   assert.equal(back.view, 'single');
-  assert.deepEqual(back.single, single.single);
+  // Everything but the count of switches, which went up by two.
+  const kept = ({ viewChanges, ...rest }) => rest;
+  assert.deepEqual(kept(back.single), kept(single.single));
+  assert.equal(back.single.viewChanges, single.single.viewChanges + 2);
   assert.deepEqual(back.rows, single.rows);
   assert.equal(back.mode, 'lossy');
   assert.equal(nameText(back), 'my-holiday');
@@ -506,7 +515,15 @@ test('a_preview_ready_before_any_image_changes_nothing', () => {
 });
 
 test('the_latest_preview_ready_sets_the_sizes_and_the_key', () => {
-  const state = apply(initialState(), setMode('lossy'), loaded('7'), requested('lossy', 75), started('7', 4), ready('7', 4));
+  const state = apply(
+    initialState(),
+    setMode('lossy'),
+    loaded('7'),
+    requested('lossy', 75),
+    started('7', 4),
+    ready('7', 4),
+    pictureShown('compressed', '7-4'),
+  );
   assert.deepEqual(state.single.ready, {
     key: '7-4',
     mode: 'lossy',
@@ -600,7 +617,14 @@ test('save_is_refused_after_preview_failed_until_a_later_version_works', () => {
   const failed = apply(withVersion('7'), setQuality('60'), requested('lossy', 60), started('7', 2), failedPreview('7', 2));
   assert.equal(canSave(failed), false);
   assert.equal(saveArgs(failed), null);
-  const later = apply(failed, setQuality('50'), requested('lossy', 50), started('7', 3), ready('7', 3, { quality: 50 }));
+  const later = apply(
+    failed,
+    setQuality('50'),
+    requested('lossy', 50),
+    started('7', 3),
+    ready('7', 3, { quality: 50 }),
+    pictureShown('compressed', '7-3'),
+  );
   assert.equal(canSave(later), true);
   assert.deepEqual(saveArgs(later), { name: 'optimized-holiday', preview: '7-3' });
 });
@@ -734,6 +758,7 @@ test('sizes_are_formatted_as_batch_does', () => {
     requested('lossless', 75, '9'),
     started('9', 1),
     ready('9', 1, { mode: 'lossless', quality: null, before: 4100, after: 3000 }),
+    pictureShown('compressed', '9-1'),
   );
   assert.equal(sizeView(small).compressed, '2.9 KiB');
   assert.equal(sizeView(small).saves, '26.8% · 1.1 KiB');
@@ -752,6 +777,7 @@ test('a_file_that_grew_shows_a_negative_saving', () => {
     requested(),
     started('7', 1),
     ready('7', 1, { mode: 'lossless', quality: null, before: 1000, after: 1027 }),
+    pictureShown('compressed', '7-1'),
   );
   assert.equal(sizeView(grew).saves, '-2.7% · -27 B');
 });
@@ -763,15 +789,16 @@ test('a_zero_byte_original_saves_nothing', () => {
     requested(),
     started('7', 1),
     ready('7', 1, { mode: 'lossless', quality: null, before: 0, after: 0 }),
+    pictureShown('compressed', '7-1'),
   );
   assert.equal(sizeView(empty).saves, '0.0% · 0 B');
 });
 
 test('a_note_shows_when_present_and_not_otherwise', () => {
   const base = apply(initialState(), loaded('7'), requested(), started('7', 1));
-  const noted = reduce(base, ready('7', 1, { note: 'original kept: lossy was not smaller' }));
+  const noted = apply(base, ready('7', 1, { note: 'original kept: lossy was not smaller' }), pictureShown('compressed', '7-1'));
   assert.equal(sizeView(noted).note, 'original kept: lossy was not smaller');
-  assert.equal(sizeView(reduce(base, ready('7', 1))).note, null);
+  assert.equal(sizeView(apply(base, ready('7', 1), pictureShown('compressed', '7-1'))).note, null);
 });
 
 test('compressing_keeps_the_previous_numbers', () => {
@@ -934,6 +961,8 @@ test('reduce_never_changes_the_state_it_was_given_for_the_single_actions', () =>
     [base, saveStarted('optimized-holiday', '7-1')],
     [reduce(base, saveStarted('optimized-holiday', '7-1')), saveEnded],
     [base, rejected('name-taken')],
+    [base, pictureShown('original', '7')],
+    [base, pictureFailed('compressed', '7-1')],
   ];
   for (const [state, action] of actions) {
     const copy = structuredClone(state);
@@ -972,7 +1001,7 @@ test('save_is_refused_after_a_mode_change_until_the_matching_version_is_ready', 
   assert.equal(saveArgs(changed), null);
   const asked = apply(changed, requested('lossless', 75), started('7', 2));
   assert.equal(canSave(asked), false);
-  const done = reduce(asked, ready('7', 2, { mode: 'lossless', quality: null }));
+  const done = apply(asked, ready('7', 2, { mode: 'lossless', quality: null }), pictureShown('compressed', '7-2'));
   assert.equal(canSave(done), true);
   assert.deepEqual(saveArgs(done), { name: 'optimized-holiday', preview: '7-2' });
 });
@@ -981,7 +1010,13 @@ test('save_is_refused_after_a_quality_change_until_the_matching_version_is_ready
   const changed = reduce(withVersion('7'), setQuality('60'));
   assert.equal(canSave(changed), false);
   assert.equal(saveArgs(changed), null);
-  const done = apply(changed, requested('lossy', 60), started('7', 2), ready('7', 2, { quality: 60 }));
+  const done = apply(
+    changed,
+    requested('lossy', 60),
+    started('7', 2),
+    ready('7', 2, { quality: 60 }),
+    pictureShown('compressed', '7-2'),
+  );
   assert.equal(canSave(done), true);
   // A lossless version matches whatever quality the hidden field holds.
   const lossless = apply(
@@ -990,6 +1025,7 @@ test('save_is_refused_after_a_quality_change_until_the_matching_version_is_ready
     requested('lossless', 75),
     started('7', 1),
     ready('7', 1, { mode: 'lossless', quality: null }),
+    pictureShown('compressed', '7-1'),
   );
   assert.equal(canSave(lossless), true);
 });
@@ -1022,8 +1058,11 @@ test('preview_requested_action_carries_the_image_key_from_when_it_was_sent', () 
   const args = previewArgs(state);
   assert.deepEqual(previewRequestedAction(state, args), {
     type: 'preview-requested',
-    payload: { image: '7', settings: { mode: 'lossless', quality: 75 } },
+    payload: { image: '7', settings: { mode: 'lossless', quality: 75 }, viewChanges: 0 },
   });
+  // After two switches the action carries the count of that moment.
+  const twice = apply(state, setView('batch'), setView('single'));
+  assert.equal(previewRequestedAction(twice, args).payload.viewChanges, 2);
   // Built before the send, it stays image 7's even after image 8 loads.
   const action = previewRequestedAction(state, args);
   const after = apply(state, loaded('8'), action);
@@ -1071,6 +1110,7 @@ test('compressing_hides_a_previous_failure_note', () => {
     requested('lossless', 75),
     started('7', 1),
     ready('7', 1, { mode: 'lossless', quality: null, note: 'kept lossless: animated PNG' }),
+    pictureShown('compressed', '7-1'),
     setMode('lossy'),
     requested('lossy', 75),
     started('7', 2),
@@ -1088,4 +1128,210 @@ test('a_failure_after_compressing_shows_its_note', () => {
   const failed = reduce(busy, failedPreview('7', 2));
   assert.equal(sizeView(failed).busy, false);
   assert.equal(sizeView(failed).note, 'the optimiser crashed on this file (it gave no valid result)');
+});
+
+// final fix round: what the page shows, late answers, the save text
+
+/** Image 7 lossy 75, version 7-1 ready and its picture still decoding. */
+function decodingVersion() {
+  return apply(initialState(), setMode('lossy'), loaded('7'), requested('lossy', 75), started('7', 1), ready('7', 1));
+}
+
+/** `withVersion('7')` (7-1 shown), then lossy 60 made as 7-2, ready and not shown yet. */
+function newerReady() {
+  return apply(withVersion('7'), setQuality('60'), requested('lossy', 60), started('7', 2), ready('7', 2, { quality: 60 }));
+}
+
+test('picture_shown_records_the_key_each_side_shows', () => {
+  const base = decodingVersion();
+  const original = reduce(base, pictureShown('original', '7'));
+  assert.equal(original.single.shownOriginal, '7');
+  assert.equal(original.single.shownVersion, null);
+  const both = reduce(original, pictureShown('compressed', '7-1'));
+  assert.deepEqual(both.single.shownVersion, base.single.ready);
+  assert.equal(both.single.shownOriginal, '7');
+});
+
+test('picture_shown_for_an_old_key_or_the_wrong_side_changes_nothing', () => {
+  const base = newerReady();
+  // 7-1 shows and 7-2 is ready. A late report for 7-1, the image key on the
+  // compressed side, a version key on the original side, another image's
+  // key, a side spelled otherwise or no payload: nothing changes.
+  for (const action of [
+    pictureShown('compressed', '7-1'),
+    pictureShown('compressed', '7'),
+    pictureShown('original', '7-2'),
+    pictureShown('original', '6'),
+    pictureShown('Compressed', '7-2'),
+    { type: 'picture-shown', payload: null },
+  ]) {
+    assert.equal(reduce(base, action), base, JSON.stringify(action.payload));
+  }
+  const none = initialState();
+  assert.equal(reduce(none, pictureShown('original', '7')), none);
+  assert.equal(base.single.shownVersion.key, '7-1');
+  // Control: the ready key on the compressed side is taken.
+  assert.equal(reduce(base, pictureShown('compressed', '7-2')).single.shownVersion.key, '7-2');
+});
+
+test('save_is_allowed_once_the_ready_versions_picture_shows', () => {
+  const shown = reduce(decodingVersion(), pictureShown('compressed', '7-1'));
+  assert.equal(canSave(shown), true);
+  assert.deepEqual(saveArgs(shown), { name: 'optimized-holiday', preview: '7-1' });
+});
+
+test('save_is_refused_while_the_ready_picture_decodes', () => {
+  const decoding = decodingVersion();
+  assert.equal(canSave(decoding), false);
+  assert.equal(saveArgs(decoding), null);
+  // The original showing does not count for the compressed side.
+  assert.equal(canSave(reduce(decoding, pictureShown('original', '7'))), false);
+  // A newer version ready while the older one shows: Save would write the newer.
+  assert.equal(canSave(newerReady()), false);
+});
+
+test('save_is_refused_after_the_ready_picture_failed_to_decode', () => {
+  const failed = reduce(decodingVersion(), pictureFailed('compressed', '7-1'));
+  assert.equal(failed.single.brokenVersion, '7-1');
+  assert.equal(canSave(failed), false);
+  // An older version still shown does not make it savable.
+  const olderShown = reduce(newerReady(), pictureFailed('compressed', '7-2'));
+  assert.equal(olderShown.single.shownVersion.key, '7-1');
+  assert.equal(canSave(olderShown), false);
+});
+
+test('save_is_allowed_again_once_a_later_version_shows', () => {
+  const failed = reduce(newerReady(), pictureFailed('compressed', '7-2'));
+  const later = apply(failed, setQuality('50'), requested('lossy', 50), started('7', 3), ready('7', 3, { quality: 50 }));
+  assert.equal(canSave(later), false);
+  const shown = reduce(later, pictureShown('compressed', '7-3'));
+  assert.equal(canSave(shown), true);
+  assert.deepEqual(saveArgs(shown), { name: 'optimized-holiday', preview: '7-3' });
+});
+
+test('picture_failed_for_the_current_key_says_so_and_records_it', () => {
+  const base = decodingVersion();
+  const version = reduce(base, pictureFailed('compressed', '7-1'));
+  assert.equal(version.message, MESSAGES.pictureFailed);
+  assert.equal(version.messageSeq, base.messageSeq + 1);
+  assert.equal(version.single.brokenVersion, '7-1');
+  const original = reduce(base, pictureFailed('original', '7'));
+  assert.equal(original.message, MESSAGES.pictureFailed);
+  assert.equal(original.single.brokenOriginal, '7');
+});
+
+test('picture_failed_for_a_superseded_key_changes_nothing', () => {
+  // 7-1 shows and 7-2 is ready, so 7-1's file is gone: its late failure is
+  // not news. Image 8 replaced 7: 7's failures are not either.
+  const newer = newerReady();
+  const later = reduce(newer, loaded('8'));
+  for (const [state, action] of [
+    [newer, pictureFailed('compressed', '7-1')],
+    [newer, pictureFailed('original', '7-2')],
+    [later, pictureFailed('original', '7')],
+    [later, pictureFailed('compressed', '7-2')],
+    [newer, { type: 'picture-failed', payload: null }],
+    [initialState(), pictureFailed('original', '7')],
+  ]) {
+    assert.equal(reduce(state, action), state, JSON.stringify(action.payload));
+  }
+});
+
+test('picture_loading_while_a_sides_current_key_is_not_shown_yet', () => {
+  const loadedOnly = reduce(initialState(), loaded('7'));
+  assert.equal(pictureLoading(loadedOnly), true, 'the original decoding');
+  const originalShown = reduce(loadedOnly, pictureShown('original', '7'));
+  assert.equal(pictureLoading(originalShown), false);
+  assert.equal(pictureLoading(apply(originalShown, requested(), started('7', 1), ready('7', 1))), true, 'the version');
+  // A new image: its original decodes while the old picture still shows.
+  assert.equal(pictureLoading(apply(withVersion('7'), pictureShown('original', '7'), loaded('8'))), true, 'a new image');
+});
+
+test('no_picture_loading_once_shown_or_failed_or_without_an_image', () => {
+  assert.equal(pictureLoading(initialState()), false);
+  assert.equal(pictureLoading(apply(withVersion('7'), pictureShown('original', '7'))), false);
+  assert.equal(pictureLoading(apply(initialState(), loaded('7'), pictureFailed('original', '7'))), false);
+  const brokenVersion = apply(newerReady(), pictureShown('original', '7'), pictureFailed('compressed', '7-2'));
+  assert.equal(pictureLoading(brokenVersion), false);
+});
+
+test('the_size_box_shows_a_version_once_its_picture_shows', () => {
+  const decoding = apply(
+    initialState(),
+    loaded('7'),
+    requested(),
+    started('7', 1),
+    ready('7', 1, { mode: 'lossless', quality: null, note: 'original kept: lossless was not smaller' }),
+  );
+  assert.deepEqual(sizeView(decoding), { original: '2.3 MiB', compressed: '', saves: '', note: null, busy: false });
+  const shown = reduce(decoding, pictureShown('compressed', '7-1'));
+  assert.equal(sizeView(shown).compressed, formatSize(610000));
+  assert.equal(sizeView(shown).note, 'original kept: lossless was not smaller');
+});
+
+test('the_size_box_keeps_the_shown_versions_numbers_while_a_newer_one_decodes', () => {
+  const before = withVersion('7');
+  const newer = apply(
+    before,
+    setQuality('60'),
+    requested('lossy', 60),
+    started('7', 2),
+    ready('7', 2, { quality: 60, after: 300000, note: 'a note of the newer version' }),
+  );
+  assert.deepEqual(sizeView(newer), sizeView(before));
+  // Also after the newer one failed to decode.
+  assert.deepEqual(sizeView(reduce(newer, pictureFailed('compressed', '7-2'))), sizeView(before));
+  // Once it shows: its numbers.
+  assert.equal(sizeView(reduce(newer, pictureShown('compressed', '7-2'))).compressed, formatSize(300000));
+});
+
+test('a_late_preview_requested_after_a_view_switch_records_nothing', () => {
+  const state = reduce(initialState(), loaded('7'));
+  const action = previewRequestedAction(state, previewArgs(state));
+  // Batch shows when the answer arrives.
+  assert.equal(apply(state, setView('batch'), action).single.requested, null);
+  // Batch and back: the switch to Batch stopped that request.
+  const back = apply(state, setView('batch'), setView('single'), action);
+  assert.equal(back.single.requested, null);
+  assert.deepEqual(previewArgs(back), { settings: { mode: 'lossless', quality: 75 } });
+  // An action without the count, or with it as text, is not recorded either.
+  const settings = { mode: 'lossless', quality: 75 };
+  for (const payload of [{ image: '7', settings }, { image: '7', settings, viewChanges: '0' }]) {
+    assert.equal(reduce(state, { type: 'preview-requested', payload }), state, JSON.stringify(payload));
+  }
+});
+
+test('a_preview_requested_with_no_switch_since_is_recorded', () => {
+  const state = reduce(initialState(), loaded('7'));
+  const recorded = reduce(state, previewRequestedAction(state, previewArgs(state)));
+  assert.deepEqual(recorded.single.requested, { mode: 'lossless', quality: 75 });
+  // Sent after a switch and back: recorded too.
+  const back = apply(state, setView('batch'), setView('single'));
+  const sentAfter = reduce(back, previewRequestedAction(back, previewArgs(back)));
+  assert.deepEqual(sentAfter.single.requested, { mode: 'lossless', quality: 75 });
+});
+
+const ORIGINALS_FOLDER_TEXT = "The original's folder cannot be written to. Choose a folder in Save to.";
+
+test('output_missing_during_a_save_with_no_folder_names_the_originals_folder', () => {
+  const saving = reduce(withVersion('7'), saveStarted('optimized-holiday', '7-1'));
+  const refused = reduce(saving, rejected('output-missing'));
+  assert.equal(refused.message, ORIGINALS_FOLDER_TEXT);
+  assert.equal(MESSAGES.originalFolderUnwritable, ORIGINALS_FOLDER_TEXT);
+  assert.equal(afterRejection('output-missing', saving).log, false);
+});
+
+test('output_missing_with_a_chosen_folder_or_in_batch_keeps_todays_text', () => {
+  const folder = { type: 'output-changed', payload: { folder: 'Pictures' } };
+  const chosen = apply(withVersion('7'), folder, saveStarted('optimized-holiday', '7-1'), rejected('output-missing'));
+  assert.equal(chosen.message, MESSAGES.outputMissing);
+  // Batch's start_run: no save going.
+  assert.equal(apply(initialState(), setView('batch'), listed, rejected('output-missing')).message, MESSAGES.outputMissing);
+  // Once the save has ended, no save is going either.
+  const after = apply(withVersion('7'), saveStarted('optimized-holiday', '7-1'), saveEnded, rejected('output-missing'));
+  assert.equal(after.message, MESSAGES.outputMissing);
+  assert.equal(
+    MESSAGES.outputMissing,
+    'The output folder is gone or cannot be written to. Choose it again, or save next to the originals.',
+  );
 });

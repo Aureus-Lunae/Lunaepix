@@ -2,11 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  PREVIEW_BUSY_RETRIES,
+  PREVIEW_RETRY_MS,
   QUALITY_SETTLE_MS,
   applyDivider,
   applyRatio,
   applyView,
-  askPreview,
   bindPreviewTriggers,
   bindRadios,
   busyText,
@@ -23,7 +24,7 @@ import {
   pictureSize,
   pictureSlot,
   pictureView,
-  picturesLoading,
+  previewAsker,
   previewSource,
   regionKey,
   rejectionHandler,
@@ -94,7 +95,14 @@ const listed = {
 
 /** A state with image 7 loaded and lossy 75 shown as version 7-3, ready to save. */
 function readyToSave() {
-  return apply(initialState(), loaded('7'), lossy, started('7', 3), ready('7', 3));
+  return apply(
+    initialState(),
+    loaded('7'),
+    lossy,
+    started('7', 3),
+    ready('7', 3),
+    { type: 'picture-shown', payload: { side: 'compressed', key: '7-3' } },
+  );
 }
 
 /** An invoke double: records every call; a command whose answer is `{ reject: reason }` rejects, any other resolves. */
@@ -384,7 +392,13 @@ function sizeBox(doc) {
 test('syncSizes_writes_text_only', () => {
   const doc = fakeDocument();
   const box = sizeBox(doc);
-  const view = sizeView(apply(readyToSave(), ready('7', 3, { note: '<b>kept</b>' })));
+  // The size box follows the version whose picture shows.
+  const view = sizeView(
+    apply(readyToSave(), ready('7', 3, { note: '<b>kept</b>' }), {
+      type: 'picture-shown',
+      payload: { side: 'compressed', key: '7-3' },
+    }),
+  );
   syncSizes(doc, box, view);
   assert.equal(box.original.textContent, view.original);
   assert.equal(box.compressed.textContent, view.compressed);
@@ -615,7 +629,13 @@ test('the_number_field_settles_after_400_ms', () => {
 test('pictureView_gives_the_original_and_the_shown_versions_addresses', () => {
   const src = (key) => `p/${key}`;
   const view = pictureView(readyToSave(), src);
-  assert.deepEqual(view, { original: 'p/7', compressed: 'p/7-3', alt: 'Compressed, lossy quality 75' });
+  assert.deepEqual(view, {
+    original: 'p/7',
+    compressed: 'p/7-3',
+    originalKey: '7',
+    compressedKey: '7-3',
+    alt: 'Compressed, lossy quality 75',
+  });
 });
 
 test('pictureView_gives_no_address_without_an_image_or_a_ready_version', () => {
@@ -624,10 +644,18 @@ test('pictureView_gives_no_address_without_an_image_or_a_ready_version', () => {
     asked.push(key);
     return `p/${key}`;
   };
-  assert.deepEqual(pictureView(initialState(), src), { original: null, compressed: null, alt: 'Compressed' });
+  assert.deepEqual(pictureView(initialState(), src), {
+    original: null,
+    compressed: null,
+    originalKey: null,
+    compressedKey: null,
+    alt: 'Compressed',
+  });
   assert.deepEqual(pictureView(apply(initialState(), loaded('8')), src), {
     original: 'p/8',
     compressed: null,
+    originalKey: '8',
+    compressedKey: null,
     alt: 'Compressed',
   });
   assert.deepEqual(asked, ['8']);
@@ -866,18 +894,6 @@ test('onRegionKey_leaves_other_keys_and_the_dividers_keys_alone', () => {
   assert.equal(prevented, 0);
 });
 
-test('picturesLoading_is_true_while_either_picture_decodes', () => {
-  const idle = { pending: null };
-  const busy = { pending: 'u/7' };
-  assert.equal(picturesLoading([busy, idle]), true);
-  assert.equal(picturesLoading([idle, busy]), true);
-});
-
-test('picturesLoading_is_false_when_neither_decodes', () => {
-  assert.equal(picturesLoading([{ pending: null }, { pending: null }]), false);
-  assert.equal(picturesLoading([]), false);
-});
-
 test('pictureSize_reads_the_loaded_image_and_the_original_slots_picture', () => {
   const svg = { ...holiday('9'), width: null, height: null };
   const state = apply(initialState(), { type: 'image-changed', payload: { image: svg, left_out: 0, notice: null } });
@@ -923,48 +939,268 @@ test('busy_dispatches_nothing_and_an_unknown_one_is_logged', () => {
   assert.equal(dispatched.length, 2);
 });
 
-test('askPreview_sends_preview_args_and_records_them_only_once_resolved', async () => {
-  const { box, calls, deps, log } = harness(apply(initialState(), loaded('7')));
-  const sent = askPreview(deps);
-  // Sent, not recorded yet.
-  assert.deepEqual(calls, [['preview_image', { settings: { mode: 'lossless', quality: 75 } }]]);
-  assert.equal(box.state.single.requested, null);
-  assert.equal(await sent, true);
-  assert.deepEqual(log, [
-    ['invoke', 'preview_image'],
-    ['dispatch', 'preview-requested'],
-  ]);
-  assert.deepEqual(box.state.single.requested, { mode: 'lossless', quality: 75 });
-  // The same settings again: nothing new to make.
-  assert.equal(await askPreview(deps), false);
-  assert.equal(calls.length, 1);
+// --- the preview asker: one request at a time, busy retried ---------------------
+
+/**
+ * The asker on a state box, with an invoke double whose every call waits
+ * until the test answers it (`calls[i].resolve()` / `.reject(reason)`), the
+ * strict timers, and a record of what it dispatched, rejected and showed as
+ * busy.
+ */
+function askerHarness(state) {
+  const box = { state };
+  const calls = [];
+  const dispatched = [];
+  const rejected = [];
+  const busyShown = [];
+  const timers = strictTimers();
+  const asker = previewAsker({
+    getState: () => box.state,
+    invoke: (command, args) =>
+      new Promise((resolve, reject) => {
+        calls.push({ command, args, resolve, reject });
+      }),
+    dispatch: (action) => {
+      dispatched.push(action);
+      box.state = reduce(box.state, action);
+    },
+    reject: (command, reason) => rejected.push([command, reason]),
+    showBusy: () => busyShown.push('run-busy'),
+    timers,
+  });
+  return { asker, box, busyShown, calls, dispatched, rejected, timers };
+}
+
+const quality = (text) => ({ type: 'set-quality-text', payload: text });
+const sentArgs = (calls) => calls.map((call) => call.args);
+const lossyArgs = (q) => ({ settings: { mode: 'lossy', quality: q } });
+const LOSSLESS_ARGS = { settings: { mode: 'lossless', quality: 75 } };
+
+/** Refuses call `index` with `reason` and lets the refusal be handled. */
+async function refuse(h, index, reason) {
+  h.calls[index].reject(reason);
+  await settle();
+}
+
+async function accept(h, index) {
+  h.calls[index].resolve(null);
+  await settle();
+}
+
+test('the_asker_retries_three_times_200_ms_apart', () => {
+  assert.equal(PREVIEW_BUSY_RETRIES, 3);
+  assert.equal(PREVIEW_RETRY_MS, 200);
 });
 
-test('askPreview_sends_nothing_without_preview_args', async () => {
-  const { calls, deps, log } = harness(initialState());
-  assert.equal(await askPreview(deps), false);
-  assert.deepEqual(calls, []);
-  assert.deepEqual(log, []);
+test('a_trigger_during_a_flight_is_sent_once_it_settles_with_the_last_settings', async () => {
+  const h = askerHarness(apply(initialState(), loaded('7'), lossy));
+  h.asker.ask();
+  for (const text of ['74', '73', '72']) {
+    h.box.state = reduce(h.box.state, quality(text));
+    h.asker.ask();
+  }
+  assert.deepEqual(sentArgs(h.calls), [lossyArgs(75)], 'nothing more while the first is in flight');
+  await accept(h, 0);
+  assert.deepEqual(sentArgs(h.calls), [lossyArgs(75), lossyArgs(72)]);
+  await accept(h, 1);
+  assert.equal(h.calls.length, 2);
+  assert.deepEqual(h.box.state.single.requested, { mode: 'lossy', quality: 72 });
+  assert.deepEqual(h.rejected, []);
 });
 
-test('a_refused_preview_records_nothing_and_reports_the_rejection', async () => {
-  const { box, deps, log } = harness(apply(initialState(), loaded('7')), { preview_image: { reject: 'busy' } });
-  assert.equal(await askPreview(deps), false);
-  assert.deepEqual(log, [
-    ['invoke', 'preview_image'],
-    ['reject', 'preview_image', 'busy'],
-  ]);
-  assert.equal(box.state.single.requested, null);
+test('a_trigger_with_no_flight_going_is_sent_at_once', async () => {
+  const h = askerHarness(apply(initialState(), loaded('7'), lossy));
+  h.asker.ask();
+  await accept(h, 0);
+  h.box.state = reduce(h.box.state, quality('60'));
+  h.asker.ask();
+  // Sent in the same turn, not after a wait.
+  assert.deepEqual(sentArgs(h.calls), [lossyArgs(75), lossyArgs(60)]);
+  assert.deepEqual(h.timers.set, []);
+});
+
+test('a_flight_that_settles_with_nothing_new_sends_nothing_more', async () => {
+  const h = askerHarness(apply(initialState(), loaded('7')));
+  h.asker.ask();
+  h.asker.ask();
+  await accept(h, 0);
+  assert.deepEqual(sentArgs(h.calls), [LOSSLESS_ARGS]);
+  // Nothing to ask at all: nothing sent.
+  const none = askerHarness(initialState());
+  none.asker.ask();
+  assert.deepEqual(none.calls, []);
+});
+
+test('a_refusal_with_no_change_meanwhile_does_not_resend', async () => {
+  const h = askerHarness(apply(initialState(), loaded('7')));
+  h.asker.ask();
+  h.asker.ask();
+  await refuse(h, 0, 'invalid-settings');
+  assert.equal(h.calls.length, 1);
+  assert.deepEqual(h.rejected, [['preview_image', 'invalid-settings']]);
+  assert.equal(h.box.state.single.requested, null);
+});
+
+test('a_refusal_with_a_changed_setting_meanwhile_sends_the_change', async () => {
+  const h = askerHarness(apply(initialState(), loaded('7'), lossy));
+  h.asker.ask();
+  h.box.state = reduce(h.box.state, quality('60'));
+  h.asker.ask();
+  await refuse(h, 0, 'invalid-settings');
+  assert.deepEqual(sentArgs(h.calls), [lossyArgs(75), lossyArgs(60)]);
+});
+
+test('a_busy_preview_is_retried_after_200_ms_and_then_recorded', async () => {
+  const h = askerHarness(apply(initialState(), loaded('7')));
+  h.asker.ask();
+  await refuse(h, 0, 'busy');
+  assert.deepEqual(h.rejected, [], 'a retried refusal is not reported');
+  assert.equal(h.timers.set.length, 1);
+  assert.equal(h.timers.set[0].delay, 200);
+  h.timers.advance(199);
+  assert.equal(h.calls.length, 1);
+  h.timers.advance(1);
+  assert.deepEqual(sentArgs(h.calls), [LOSSLESS_ARGS, LOSSLESS_ARGS]);
+  await accept(h, 1);
+  assert.deepEqual(h.box.state.single.requested, { mode: 'lossless', quality: 75 });
+  assert.deepEqual(h.rejected, []);
+});
+
+test('a_preview_that_stays_busy_gives_up_after_three_retries', async () => {
+  const h = askerHarness(apply(initialState(), loaded('7')));
+  h.asker.ask();
+  for (let index = 0; index < 4; index += 1) {
+    await refuse(h, index, 'busy');
+    h.timers.advance(200);
+  }
+  assert.equal(h.calls.length, 4, 'the first request and three retries');
+  assert.equal(h.timers.set.length, 3);
+  assert.deepEqual(h.rejected, [['preview_image', 'busy']]);
+  h.timers.advance(10000);
+  assert.equal(h.calls.length, 4);
+  assert.equal(h.box.state.single.requested, null);
+  // Given up, the next trigger starts afresh, with three retries of its own.
+  h.asker.ask();
+  await refuse(h, 4, 'busy');
+  assert.equal(h.timers.set.length, 4);
+});
+
+test('a_non_busy_refusal_is_not_retried', async () => {
+  for (const reason of ['invalid-settings', 'no-image', 'something-odd']) {
+    const h = askerHarness(apply(initialState(), loaded('7')));
+    h.asker.ask();
+    await refuse(h, 0, reason);
+    h.timers.advance(10000);
+    assert.equal(h.calls.length, 1, reason);
+    assert.deepEqual(h.timers.set, [], reason);
+    assert.deepEqual(h.rejected, [['preview_image', reason]], reason);
+  }
+});
+
+test('a_retry_asks_for_the_new_image_after_a_load', async () => {
+  const h = askerHarness(apply(initialState(), loaded('7')));
+  h.asker.ask();
+  await refuse(h, 0, 'busy');
+  // Image 8 loads while the retry waits; its own trigger adds nothing.
+  h.box.state = reduce(h.box.state, loaded('8'));
+  h.asker.ask();
+  assert.equal(h.calls.length, 1);
+  h.timers.advance(200);
+  assert.equal(h.calls.length, 2);
+  await accept(h, 1);
+  const recorded = h.dispatched.filter((action) => action.type === 'preview-requested');
+  assert.deepEqual(recorded.map((action) => action.payload.image), ['8']);
+  assert.deepEqual(h.box.state.single.requested, { mode: 'lossless', quality: 75 });
+  assert.equal(h.box.state.single.image.key, '8');
+});
+
+test('a_retry_after_a_switch_to_batch_sends_nothing', async () => {
+  const h = askerHarness(apply(initialState(), loaded('7')));
+  h.asker.ask();
+  await refuse(h, 0, 'busy');
+  h.box.state = reduce(h.box.state, { type: 'set-view', payload: 'batch' });
+  h.timers.advance(200);
+  assert.equal(h.calls.length, 1);
+  // Back in Single image the next trigger sends, with all three retries again.
+  h.box.state = reduce(h.box.state, { type: 'set-view', payload: 'single' });
+  h.asker.ask();
+  assert.equal(h.calls.length, 2);
+  await refuse(h, 1, 'busy');
+  assert.equal(h.timers.set.length, 2);
+  assert.deepEqual(h.rejected, []);
 });
 
 test('the_preview_requested_action_names_the_image_it_was_sent_for', async () => {
-  const { box, deps } = harness(apply(initialState(), loaded('7')));
-  const sent = askPreview(deps);
+  const h = askerHarness(apply(initialState(), loaded('7')));
+  h.asker.ask();
   // A new image arrives while the request is on its way.
-  box.state = reduce(box.state, loaded('8'));
-  await sent;
-  assert.equal(box.state.single.image.key, '8');
-  assert.equal(box.state.single.requested, null);
+  h.box.state = reduce(h.box.state, loaded('8'));
+  await accept(h, 0);
+  assert.equal(h.box.state.single.image.key, '8');
+  assert.equal(h.box.state.single.requested, null);
+  assert.deepEqual(
+    h.dispatched.map((action) => action.payload.image),
+    ['7'],
+  );
+});
+
+test('a_run_busy_with_no_preview_going_is_shown_at_once', () => {
+  const h = askerHarness(apply(initialState(), loaded('7')));
+  h.asker.runBusy();
+  assert.deepEqual(h.busyShown, ['run-busy']);
+});
+
+test('a_run_busy_during_an_accepted_flight_is_shown_when_it_settles', async () => {
+  const h = askerHarness(apply(initialState(), loaded('7')));
+  h.asker.ask();
+  // Another command was refused while the request is on its way.
+  h.asker.runBusy();
+  assert.deepEqual(h.busyShown, []);
+  await accept(h, 0);
+  assert.deepEqual(h.busyShown, ['run-busy']);
+  // A non-busy refusal releases it the same way.
+  const other = askerHarness(apply(initialState(), loaded('7')));
+  other.asker.ask();
+  other.asker.runBusy();
+  await refuse(other, 0, 'invalid-settings');
+  assert.deepEqual(other.busyShown, ['run-busy']);
+});
+
+test('the_run_busy_of_a_retried_refusal_is_not_shown_in_either_order', async () => {
+  const h = askerHarness(apply(initialState(), loaded('7')));
+  h.asker.ask();
+  // Its run-busy first, then the refusal.
+  h.asker.runBusy();
+  await refuse(h, 0, 'busy');
+  assert.deepEqual(h.busyShown, []);
+  // The refusal first, then its run-busy.
+  h.timers.advance(200);
+  await refuse(h, 1, 'busy');
+  h.asker.runBusy();
+  assert.deepEqual(h.busyShown, []);
+  // Another command's run-busy while the retry waits is shown.
+  h.asker.runBusy();
+  assert.deepEqual(h.busyShown, ['run-busy']);
+});
+
+test('the_last_refusals_run_busy_is_shown', async () => {
+  const h = askerHarness(apply(initialState(), loaded('7')));
+  h.asker.ask();
+  for (let index = 0; index < 4; index += 1) {
+    h.asker.runBusy();
+    await refuse(h, index, 'busy');
+    h.timers.advance(200);
+  }
+  assert.deepEqual(h.busyShown, ['run-busy']);
+  // Its run-busy arriving after the refusal: shown then.
+  const late = askerHarness(apply(initialState(), loaded('7')));
+  late.asker.ask();
+  for (let index = 0; index < 4; index += 1) {
+    await refuse(late, index, 'busy');
+    late.asker.runBusy();
+    late.timers.advance(200);
+  }
+  assert.deepEqual(late.busyShown, ['run-busy']);
 });
 
 test('switching_view_sends_set_view_then_dispatches_and_asks_for_a_preview_in_single', async () => {
@@ -1273,7 +1509,10 @@ test('syncModifier_sets_exactly_the_chosen_modifier', () => {
 // --- the decode failure in the status line --------------------------------------
 
 test('a_picture_failure_says_so_in_the_status_line', () => {
-  const state = reduce(initialState(), { type: 'picture-failed', payload: null });
+  const state = reduce(apply(initialState(), loaded('7')), {
+    type: 'picture-failed',
+    payload: { side: 'original', key: '7' },
+  });
   assert.equal(state.message, MESSAGES.pictureFailed);
   assert.equal(MESSAGES.pictureFailed, 'The picture could not be shown.');
   assert.equal(state.messageSeq, 1);
