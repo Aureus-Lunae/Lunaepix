@@ -46,6 +46,9 @@ Copied verbatim from the spec's Handoff, plus the standing process rules and the
   - Stale docs: "Widen the rule (Recommended)": the comment rule also covers docs of types, enum variants, guards, constants and INTERFACE sections whose use a change widens.
   - Window wiring: "A: test app.js itself (Recommended)": the wiring lives in `ui/window.js` (`startWindow`, taking the page, Tauri, timers, storage, ResizeObserver and a log); `ui/app.js` is only the entry that passes the real globals. Node tests drive every listener with strict fakes. This replaces "`app.js` only wires" below.
   - New text: "The picture could not be shown." (status line, a picture the webview cannot decode): "Keep it (Recommended)".
+  - Async window actions (after the final review): "A: rule + fix all (Recommended)": the window records which picture each side actually shows and Save requires it to equal the ready version; previews go one at a time, a change made during one is sent when it settles, and a busy answer is retried; every async window action states its in-flight and late-answer policy, with a test for each.
+  - Save text: "New text (Recommended)": a save with no folder chosen that fails with output-missing says "The original's folder cannot be written to. Choose a folder in Save to."; Batch and saves to a chosen folder keep today's text.
+  - Private folder left by a close during a load: "Note it (Recommended)": INTERFACE.md and the README say so; no code.
 
 Calls made while planning (not user decisions; flagged for the plan review):
 
