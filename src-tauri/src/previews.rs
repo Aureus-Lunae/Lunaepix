@@ -82,6 +82,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::events::Event;
     use crate::single::{LoadedImage, PreviewJob};
 
     fn one_pixel(_: &Path) -> ProbeAnswer {
@@ -143,11 +144,19 @@ mod tests {
         single.load(&path, one_pixel).unwrap();
     }
 
+    /// `job` settles with `result`: the one event it sent, if any.
+    fn settle(single: &Single, job: &PreviewJob, result: Option<FileResult>) -> Option<Event> {
+        let mut sent = Vec::new();
+        single.settle_preview(job, result, &mut |event| sent.push(event));
+        assert!(sent.len() <= 1, "{sent:?}");
+        sent.pop()
+    }
+
     /// A request whose worker wrote `bytes` and succeeded: its job.
     fn ready(single: &Single, bytes: &[u8]) -> PreviewJob {
-        let job = single.begin_preview(lossy()).unwrap();
+        let job = single.begin_preview(lossy(), &mut |_| {}).unwrap();
         fs::write(&job.dest, bytes).unwrap();
-        assert!(single.settle_preview(&job, success()).is_some());
+        assert!(settle(single, &job, success()).is_some());
         job
     }
 
@@ -306,7 +315,7 @@ mod tests {
     #[test]
     fn a_version_being_made_answers_404() {
         let (_dir, single, _) = png_with_version_1();
-        let making = single.begin_preview(lossy()).unwrap();
+        let making = single.begin_preview(lossy(), &mut |_| {}).unwrap();
         fs::write(&making.dest, b"half written").unwrap();
         assert_eq!(serve(&single, "/1-2", None), not_found());
         // The kept one still answers.
@@ -316,8 +325,8 @@ mod tests {
     #[test]
     fn a_failed_version_answers_404() {
         let (_dir, single, _) = png_with_version_1();
-        let failing = single.begin_preview(lossy()).unwrap();
-        assert!(single.settle_preview(&failing, crash()).is_some());
+        let failing = single.begin_preview(lossy(), &mut |_| {}).unwrap();
+        assert!(settle(&single, &failing, crash()).is_some());
         assert_eq!(serve(&single, "/1-2", None), not_found());
         assert_eq!(serve(&single, "/1-1", None), ok("image/png", b"version 1"));
     }
@@ -390,5 +399,64 @@ mod tests {
         let png = dir.path().join("original.png");
         fs::write(&png, b"GIF8").unwrap();
         assert_eq!(serve(&holding(png), "/1", None), ok("image/png", b"GIF8"));
+    }
+
+    // --- fix round 1 ------------------------------------------------------------
+
+    #[test]
+    fn a_leading_zero_image_key_serves_the_same_as_without() {
+        let (_dir, single, _job) = png_with_version_1();
+        assert_eq!(serve(&single, "/01", None), ok("image/png", b"original"));
+        assert_eq!(serve(&single, "/01", None), serve(&single, "/1", None));
+    }
+
+    #[test]
+    fn a_leading_zero_version_serves_the_same_as_without() {
+        let (_dir, single, _job) = png_with_version_1();
+        assert_eq!(serve(&single, "/1-01", None), ok("image/png", b"version 1"));
+        assert_eq!(serve(&single, "/1-01", None), serve(&single, "/1-1", None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_extension_has_no_content_type() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let name = Path::new(OsStr::from_bytes(b"original.p\xffng"));
+        assert_eq!(content_type_of(name), None);
+        assert_eq!(
+            content_type_of(Path::new("original.png")),
+            Some("image/png")
+        );
+    }
+
+    /// The headers every answer carries, with exactly these values.
+    fn has_policy_and_nosniff(response: &PreviewResponse) {
+        let http = response.clone().into_http();
+        assert_eq!(
+            http.headers()["content-security-policy"],
+            "default-src 'none'; style-src 'unsafe-inline'"
+        );
+        assert_eq!(http.headers()["x-content-type-options"], "nosniff");
+    }
+
+    #[test]
+    fn a_preview_200_carries_the_csp_and_nosniff() {
+        let (_dir, single, _job) = png_with_version_1();
+        for key in ["/1", "/1-1"] {
+            let answer = serve(&single, key, None);
+            assert_eq!(answer.status, 200);
+            has_policy_and_nosniff(&answer);
+        }
+    }
+
+    #[test]
+    fn a_preview_404_carries_the_csp_and_nosniff() {
+        let (_dir, single, _job) = png_with_version_1();
+        for (key, query) in [("/2", None), ("/1-2", None), ("/1", Some("x=1"))] {
+            let answer = serve(&single, key, query);
+            assert_eq!(answer.status, 404);
+            has_policy_and_nosniff(&answer);
+        }
     }
 }

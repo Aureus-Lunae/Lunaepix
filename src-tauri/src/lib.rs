@@ -296,8 +296,11 @@ fn choose_output_folder(app: AppHandle) -> Result<(), CommandError> {
     })
 }
 
-/// Back to writing next to the originals.
-#[tauri::command]
+/// Back to writing next to the originals. Not on the main thread (`async`):
+/// the name Save as starts with is found by listing the original's folder.
+/// (`choose_output_folder`'s answer already runs on the dialog plugin's
+/// own thread.)
+#[tauri::command(async)]
 fn clear_output_folder(app: AppHandle) -> Result<(), CommandError> {
     session(&app).clear_output_folder(&mut |event| emit(&app, event))
 }

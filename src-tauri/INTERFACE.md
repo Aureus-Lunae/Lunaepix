@@ -59,7 +59,10 @@ await invoke('preview_image', { settings: { mode: 'lossless', quality: 75 } });
 
 - `"busy"`: a run is active, a dialog for one is open, or an image is being
   loaded. A `run-busy` event goes out as well. Every command but
-  `open_output_folder` can be busy.
+  `open_output_folder` can be busy. Accepting a `preview_image` request
+  also holds the guard for a moment (through stopping the previous
+  request's worker and sending `preview-started`), so a command in that
+  moment answers `"busy"` too; a retry works.
 - `"invalid-view"`: the argument is not exactly `{ "view": "single" }` or
   `{ "view": "batch" }`: another spelling (`"Single"`), another type, `null`,
   a missing or an extra key is refused, and the view stays as it was.
@@ -83,13 +86,15 @@ await invoke('preview_image', { settings: { mode: 'lossless', quality: 75 } });
   system could not open the folder, for example because it was removed.
 
 `start_run` checks, in this order: busy, the settings, the output folder,
-then the list. `preview_image` checks, in this order: busy, the settings,
-then the image. The list is planned again at that moment, so a file deleted
+then the list. The list is planned again at that moment, so a file deleted
 since it was added runs as a skipped row ("Not a readable file") and the
 rest still runs. A row that is a folder by then (a dropped folder that
 could not be read, or a path that did not exist when it was added) stays
 one "Not a readable file" row: the run never looks inside it. To add its
 images, drop the folder again. Nothing runs when it rejects.
+
+`preview_image` checks, in this order: busy, the settings, then the image.
+Nothing starts when it rejects.
 
 A dialog closed without a choice changes nothing and sends `run-cancelled`.
 
@@ -160,10 +165,13 @@ would write that file (same mode, quality, notes and reasons). Each request
 gets a version number: `1` for the first of a launch, then one more for each
 request, whatever the image. Only the latest request counts: a new
 `preview_image` stops the worker of the one before, and the one before
-sends nothing more. Making a version is not busy: other commands and drops
-work meanwhile. These stop it, and its outcome is never sent: `set_view`
+sends nothing after the new `preview-started`. Making a version is not
+busy: other commands and drops work meanwhile. These stop it: `set_view`
 to Batch, `move_drop_to_batch`, `start_run`, a new image loaded, and the
-window closing. A load attempt that loads nothing does not stop it. The
+window closing. From that moment the request sends nothing. Its outcome
+may have gone out just before; it then arrives before the stopping call's
+own event (`image-changed`, `list-changed`, `run-started`), never after it.
+A load attempt that loads nothing does not stop it. The
 backend keeps one version per image: the last that succeeded. A failure
 keeps the version kept before; a new image forgets it.
 
@@ -304,16 +312,17 @@ lossless. `before` is the copy's size and `after` the version's, in bytes;
 `after` can be larger than `before` in lossless mode. `note` is Batch's note
 (the same sentences as `file-done`'s, for example "original kept: lossy was
 not smaller") or `null`; the key is always there. Only the latest request's
-outcome is sent, but one that was decided just as a newer request started
-can still arrive after that request's `preview-started`: show a
-`preview-ready` or `preview-failed` only when its `image` and `version`
-match the last `preview-started`.
+outcome is sent, and it never arrives after a newer request's
+`preview-started`: a `preview-ready` or `preview-failed` always belongs to
+the last `preview-started` before it.
 
 ```json
 { "image": "7", "version": 4, "key": "7-4", "mode": "lossy", "quality": 75,
   "before": 2400000, "after": 610000, "note": null }
-{ "image": "7", "version": 5, "key": "7-5", "mode": "lossless", "quality": null,
+{ "image": "7", "version": 5, "key": "7-5", "mode": "lossy", "quality": 60,
   "before": 512000, "after": 498000, "note": "kept lossless: animated PNG" }
+{ "image": "7", "version": 6, "key": "7-6", "mode": "lossless", "quality": null,
+  "before": 512000, "after": 498000, "note": null }
 ```
 
 ### `preview-failed`
@@ -441,7 +450,9 @@ anything else as `null`, so no other text reaches an image address.
   `200` with `Content-Type: image/svg+xml` and the file's own bytes. Anything
   else, and a thumbnail that cannot be made (not an image, damaged, too
   large, the worker failed or timed out), is `404` with an empty body. Show
-  an empty square then; nothing goes to the status line.
+  an empty square then; nothing goes to the status line. Every answer,
+  `200` or `404`, also carries `Content-Security-Policy: default-src
+  'none'; style-src 'unsafe-inline'` and `X-Content-Type-Options: nosniff`.
 - **How:** a worker process makes each thumbnail (the window process never
   opens the file), at most two at a time; other requests wait their turn.
   Thumbnails and "cannot be shown" are kept for the current list and dropped
@@ -481,7 +492,11 @@ anything else as `null`, so no other text reaches an image address.
   its format: `image/png`, `image/jpeg`, `image/webp` or `image/svg+xml`.
   Anything else (another image, an older or a newer version, a version that
   failed or was stopped, a file that can no longer be read) is `404` with
-  an empty body.
+  an empty body. Leading zeros are accepted: `/07-04` is `/7-4`. Every
+  answer carries the same two headers as the `thumb` scheme's
+  (`Content-Security-Policy: default-src 'none'; style-src
+  'unsafe-inline'`, `X-Content-Type-Options: nosniff`), so an SVG opened by
+  itself runs no script.
 - **How:** the window process reads the file and never decodes it; the
   webview does. The file is read on a thread of its own.
 

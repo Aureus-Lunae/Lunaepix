@@ -22,8 +22,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::events::{
-    Event, FileStarted, ListChanged, ListRow, OVER_LIMIT_NAME, PreviewStarted, RunFinished,
-    RunStarted, file_done, file_name_of, output_changed, over_limit_reason, over_limit_row,
+    Event, FileStarted, ListChanged, ListRow, OVER_LIMIT_NAME, RunFinished, RunStarted, file_done,
+    file_name_of, output_changed, over_limit_reason, over_limit_row,
 };
 use crate::single::{
     FOLDERS_GO_IN_BATCH_NOTICE, NOT_AN_IMAGE_NOTICE, PreviewJob, Single, View, left_out_notice,
@@ -439,19 +439,19 @@ impl Session {
     }
 
     /// A drop on the window: nothing for no paths; `run-busy` while busy;
-    /// otherwise `add_later` gets the ticket and the paths, to call
+    /// otherwise `receive_later` gets the ticket and the paths, to call
     /// [`Session::receive_drop`] off the main thread.
     pub fn drop_paths(
         &self,
         paths: Vec<PathBuf>,
         emit: &mut impl FnMut(Event),
-        add_later: impl FnOnce(RunTicket, Vec<PathBuf>),
+        receive_later: impl FnOnce(RunTicket, Vec<PathBuf>),
     ) {
         if paths.is_empty() {
             return;
         }
         if let Ok(ticket) = claim_run(&self.guard, emit) {
-            add_later(ticket, paths);
+            receive_later(ticket, paths);
         }
     }
 
@@ -766,13 +766,14 @@ impl Session {
 
     /// `preview_image`: busy check, `settings` (as `start_run` checks them,
     /// [`parse_settings`]), then an image ([`CommandError::NoImage`]), in
-    /// that order. Then the previous request's worker is stopped, the new
-    /// version is the latest request ([`Single::begin_preview`]),
-    /// `preview-started` goes out, and `start` gets the job, to hand to
-    /// [`Session::run_preview`] on a thread of its own. Making a version is
-    /// not busy: the guard is held through the checks and the new version
-    /// only (so a run cannot start in between and miss the new worker), and
-    /// is given back before `start`.
+    /// that order. Then the new version is the latest request and
+    /// `preview-started` goes out, in one lock section
+    /// ([`Single::begin_preview`]), the previous request's worker is
+    /// stopped, and `start` gets the job, to hand to [`Session::run_preview`]
+    /// on a thread of its own. Making a version is not busy: the guard is
+    /// held through the checks and the new version only (so a run cannot
+    /// start in between and miss the new worker), and is given back before
+    /// `start`.
     pub fn preview_image(
         &self,
         settings: Option<&Value>,
@@ -784,11 +785,7 @@ impl Session {
         // A call without settings is refused like any badly shaped one.
         let settings = settings.ok_or(CommandError::InvalidSettings)?;
         let compression = parse_settings(settings)?;
-        let job = self.single.begin_preview(compression)?;
-        emit(Event::PreviewStarted(PreviewStarted {
-            image: job.key.to_string(),
-            version: job.version,
-        }));
+        let job = self.single.begin_preview(compression, emit)?;
         drop(ticket);
         start(job);
         Ok(())
@@ -798,13 +795,16 @@ impl Session {
     /// request's compression, never replacing) until the job is stopped,
     /// and send what [`Single::settle_preview`] makes of the result: for
     /// the latest request `preview-ready` or `preview-failed`, otherwise
-    /// nothing.
+    /// nothing. The worker runs while this holds the worker gate
+    /// ([`Single::worker_gate`]), so it never starts while a version folder
+    /// is being cleaned up.
     pub fn run_preview(&self, job: PreviewJob, worker: &Worker, emit: &mut impl FnMut(Event)) {
         let worker = worker.with_options(&job.options());
-        let result = run_until_stopped(&[job.job()], &worker, &job.stop, |_, _, _| {}).pop();
-        if let Some(event) = self.single.settle_preview(&job, result) {
-            emit(event);
-        }
+        let result = {
+            let _gate = self.single.worker_gate();
+            run_until_stopped(&[job.job()], &worker, &job.stop, |_, _, _| {}).pop()
+        };
+        self.single.settle_preview(&job, result, emit);
     }
 
     /// The window closes: stop the preview and remove Single image mode's
@@ -5272,5 +5272,247 @@ mod tests {
             copy.with_file_name("v1.png").display()
         );
         assert_eq!(fs::read_to_string(&log).unwrap(), expected);
+    }
+
+    /// Fix round 1: a call that competes with a preview's outcome, the
+    /// offer after a failed attempt, the suggested name on clearing the
+    /// output folder.
+    mod fix1 {
+        use std::cell::Cell;
+
+        use lunaepix_core::{Crash, Outcome, RunError};
+
+        use super::*;
+        use crate::single::SettleSeam;
+
+        /// A call that can land while a preview's outcome is settled.
+        #[derive(Debug, Clone, Copy)]
+        enum Call {
+            Choice,
+            Drop,
+            BatchView,
+            MoveDrop,
+            StartRun,
+            Shutdown,
+            NewerRequest,
+        }
+
+        fn ready() -> FileResult {
+            FileResult::Optimized(Outcome {
+                before: 3,
+                after: 2,
+                millis: 5,
+                note: None,
+            })
+        }
+
+        fn failure() -> FileResult {
+            FileResult::Failed(RunError::Crashed {
+                path: PathBuf::new(),
+                cause: Crash::NoValidResult,
+                stderr: String::new(),
+            })
+        }
+
+        fn is_outcome(event: &Event) -> bool {
+            matches!(event, Event::PreviewReady(_) | Event::PreviewFailed(_))
+        }
+
+        /// The event the call itself sends, if it sends one.
+        fn own_event(call: Call) -> Option<&'static str> {
+            match call {
+                Call::Choice | Call::Drop => Some("image-changed"),
+                Call::MoveDrop => Some("list-changed"),
+                Call::StartRun => Some("run-started"),
+                Call::NewerRequest => Some("preview-started"),
+                Call::BatchView | Call::Shutdown => None,
+            }
+        }
+
+        fn compete(session: &Session, window: &Window, paths: &[PathBuf], call: Call) {
+            match call {
+                Call::Choice => choose_image(session, window, Some(&paths[1]), &Prober::sized()),
+                Call::Drop => drop_routed(session, window, &paths[1..2], &Prober::sized()),
+                Call::BatchView => set_view(session, window, "batch"),
+                Call::MoveDrop => session.move_drop_to_batch(&mut window.emit()).unwrap(),
+                Call::StartRun => {
+                    let prepared = started(session, window, &lossy(40));
+                    run_fake(session, window, prepared);
+                }
+                Call::Shutdown => session.shutdown(),
+                Call::NewerRequest => {
+                    let (answer, _newer) = preview(session, window, Some(&lossy(60)));
+                    answer.unwrap();
+                }
+            }
+        }
+
+        /// `a.png` loaded by a drop that left `b.png` out, `c.png` in the
+        /// list, and version 1 asked for; it settles with `result` while
+        /// `call` lands at `at`. The outcome never follows the call's own
+        /// events: before the decision it is not sent at all, right after
+        /// the send it came first, once.
+        fn race(call: Call, at: SettleSeam, result: FileResult) {
+            let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png"), ("c.png", b"png")]);
+            let session = Session::new();
+            let window = Window::default();
+            drop_routed(&session, &window, &paths[..2], &Prober::sized());
+            pick(&session, &window, &paths[2..]);
+            let (answer, job) = preview(&session, &window, Some(&lossy(40)));
+            answer.unwrap();
+            let job = job.unwrap();
+            fs::write(&job.dest, b"v").unwrap();
+            window.take();
+
+            let from = Cell::new(None);
+            session.single().settle_preview_with(
+                &job,
+                Some(result),
+                &mut window.emit(),
+                &mut |seam| {
+                    if seam == at {
+                        from.set(Some(window.0.borrow().len()));
+                        compete(&session, &window, &paths, call);
+                    }
+                },
+            );
+            let from = from.get().expect("the seam was reached");
+            let events = window.take();
+            let names: Vec<&str> = events.iter().map(Event::name).collect();
+            if let Some(own) = own_event(call) {
+                assert!(names[from..].contains(&own), "{names:?}");
+            }
+            assert!(!events[from..].iter().any(is_outcome), "{names:?}");
+            let sent = events[..from]
+                .iter()
+                .filter(|event| is_outcome(event))
+                .count();
+            let expected = match at {
+                SettleSeam::BeforeDecision => 0,
+                SettleSeam::AfterSend => 1,
+            };
+            assert_eq!(sent, expected, "{names:?}");
+        }
+
+        macro_rules! races {
+            ($($name:ident: $call:ident, $seam:ident, $result:ident;)*) => {
+                $(
+                    #[test]
+                    fn $name() {
+                        race(Call::$call, SettleSeam::$seam, $result());
+                    }
+                )*
+            };
+        }
+
+        races! {
+            race_choice_before_ready: Choice, BeforeDecision, ready;
+            race_choice_before_failed: Choice, BeforeDecision, failure;
+            race_choice_after_ready: Choice, AfterSend, ready;
+            race_choice_after_failed: Choice, AfterSend, failure;
+            race_drop_before_ready: Drop, BeforeDecision, ready;
+            race_drop_before_failed: Drop, BeforeDecision, failure;
+            race_drop_after_ready: Drop, AfterSend, ready;
+            race_drop_after_failed: Drop, AfterSend, failure;
+            race_batch_view_before_ready: BatchView, BeforeDecision, ready;
+            race_batch_view_before_failed: BatchView, BeforeDecision, failure;
+            race_batch_view_after_ready: BatchView, AfterSend, ready;
+            race_batch_view_after_failed: BatchView, AfterSend, failure;
+            race_move_drop_before_ready: MoveDrop, BeforeDecision, ready;
+            race_move_drop_before_failed: MoveDrop, BeforeDecision, failure;
+            race_move_drop_after_ready: MoveDrop, AfterSend, ready;
+            race_move_drop_after_failed: MoveDrop, AfterSend, failure;
+            race_start_run_before_ready: StartRun, BeforeDecision, ready;
+            race_start_run_before_failed: StartRun, BeforeDecision, failure;
+            race_start_run_after_ready: StartRun, AfterSend, ready;
+            race_start_run_after_failed: StartRun, AfterSend, failure;
+            race_shutdown_before_ready: Shutdown, BeforeDecision, ready;
+            race_shutdown_before_failed: Shutdown, BeforeDecision, failure;
+            race_shutdown_after_ready: Shutdown, AfterSend, ready;
+            race_shutdown_after_failed: Shutdown, AfterSend, failure;
+            race_newer_request_before_ready: NewerRequest, BeforeDecision, ready;
+            race_newer_request_before_failed: NewerRequest, BeforeDecision, failure;
+            race_newer_request_after_ready: NewerRequest, AfterSend, ready;
+            race_newer_request_after_failed: NewerRequest, AfterSend, failure;
+        }
+
+        // Every load attempt ends the offer, also one that fails.
+
+        fn nothing_to_move(session: &Session, window: &Window) {
+            window.take();
+            assert_eq!(
+                session.move_drop_to_batch(&mut window.emit()),
+                Err(CommandError::NothingToMove)
+            );
+            assert!(lock(&session.list).rows(None).is_empty());
+        }
+
+        #[test]
+        fn the_offer_is_gone_after_a_refused_choice() {
+            let (_dir, paths, session, window) = with_an_offer();
+            let refusing = Prober::new(ProbeAnswer::Refused("damaged".to_owned()));
+            choose_image(&session, &window, Some(&paths[2]), &refusing);
+            assert_eq!(refusing.asked().len(), 1, "the probe refused it");
+            nothing_to_move(&session, &window);
+        }
+
+        #[test]
+        fn the_offer_is_gone_after_a_non_image_choice() {
+            let (dir, _paths, session, window) = with_an_offer();
+            let text = dir.path().join("notes.txt");
+            fs::write(&text, b"text").unwrap();
+            choose_image(&session, &window, Some(&text), &Prober::sized());
+            nothing_to_move(&session, &window);
+        }
+
+        #[test]
+        fn the_offer_is_gone_after_a_text_only_drop() {
+            let (dir, _paths, session, window) = with_an_offer();
+            let text = dir.path().join("notes.txt");
+            fs::write(&text, b"text").unwrap();
+            drop_routed(&session, &window, &[text], &Prober::sized());
+            nothing_to_move(&session, &window);
+        }
+
+        #[test]
+        fn the_offer_is_gone_after_a_folder_only_drop() {
+            let (dir, _paths, session, window) = with_an_offer();
+            let folder = dir.path().join("more");
+            fs::create_dir(&folder).unwrap();
+            fs::write(folder.join("d.png"), b"png").unwrap();
+            drop_routed(
+                &session,
+                &window,
+                std::slice::from_ref(&folder),
+                &Prober::sized(),
+            );
+            window.take();
+            // A folder-only drop leaves its folder out, so it is the offer
+            // now (INTERFACE.md: a drop with `left_out` above 0 is kept); the
+            // earlier drop's images are not.
+            assert_eq!(session.move_drop_to_batch(&mut window.emit()), Ok(()));
+            let rows = lock(&session.list).rows(None);
+            assert_eq!(sources(&rows), [folder.join("d.png")]);
+        }
+
+        // Clearing the output folder lists the original's folder.
+
+        #[test]
+        fn clear_output_folder_suggests_the_first_free_name_next_to_the_original() {
+            let (dir, paths) = files(&[("holiday.jpg", b"jpg"), ("optimized-holiday.jpg", b"jpg")]);
+            let session = Session::new();
+            let window = Window::default();
+            choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+            choose_output(&session, &window, &dir.path().join("exports"));
+            window.take();
+            session.clear_output_folder(&mut window.emit()).unwrap();
+            let events = window.take();
+            let names: Vec<&str> = events.iter().map(Event::name).collect();
+            assert_eq!(names, ["output-changed", "name-suggested"]);
+            assert_eq!(
+                value(&events[1]),
+                json!({ "image": "1", "suggested": "optimized-holiday-1" })
+            );
+        }
     }
 }

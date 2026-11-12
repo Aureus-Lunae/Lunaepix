@@ -30,6 +30,12 @@ serde_json = "1.0.154"
 # removing a temporary file in it. Already shipped (lunaepix-core uses it).
 tempfile = "3.27.0"
 
+[target.'cfg(unix)'.dependencies]
+# Single image mode opens the image to load with O_NONBLOCK, so a FIFO put
+# in its place after the check cannot block the load. Already shipped
+# (lunaepix-core and tauri use it), so no new package.
+libc = "0.2.191"
+
 [dev-dependencies]
 # Test fixtures for the worker-mode smoke test, as in the CLI's tests.
 png = "0.17.16"
