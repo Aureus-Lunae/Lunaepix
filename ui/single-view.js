@@ -14,9 +14,8 @@
 // window.js looks up the elements and hands events to these functions; its
 // own wiring is tested through its start function (tests/ui/window.test.js).
 // Every choice about what is sent or shown is made here, in window.js or in
-// the pure modules (state.js, single.js, zoom.js, prefs.js).
+// the pure modules (state.js, single.js, zoom.js).
 
-import { writeLayout } from './prefs.js';
 import {
   canSwitchView,
   imageAlt,
@@ -46,6 +45,8 @@ export const QUALITY_SETTLE_MS = 400;
 
 export const LOADING_TEXT = 'Loading picture…';
 export const COMPRESSING_TEXT = 'Compressing…';
+const HIDE_SETTINGS_TEXT = 'Hide settings';
+const SHOW_SETTINGS_TEXT = 'Show settings';
 
 // --- addresses and what shows ---------------------------------------------------
 
@@ -83,8 +84,13 @@ export function pictureView(state, src) {
  *   Batch's drop area and panel only in
  *   Batch, and Batch's summary in place of the settings only in Batch (in
  *   Single image the one settings block is in Single image's slot);
- * - in Single image, the drop area until an image is loaded, then the file
- *   row, the tools, the picture, Save as, the size box and Save;
+ * - where the one settings block and the one status line go: Single image's
+ *   column or Batch's places (`settingsSlot`, `statusSlot`);
+ * - in Single image, the drop area until an image is loaded, then the
+ *   picture with its zoom controls, and in the column the file, Save as, the
+ *   size box and Save (the settings and the status line show in both);
+ * - whether the column is folded, and the text of its button ("Hide
+ *   settings" while it shows, "Show settings" while folded);
  * - which drop target files dragged over the window light up: Batch's drop
  *   area, Single image's, or the picture once an image is loaded;
  * - the Switch to Batch offer (shown while it lasts, usable while the switch is).
@@ -93,6 +99,7 @@ export function screenView(state) {
   const single = state.view === 'single';
   const image = state.single.image;
   const panel = panelView(state);
+  const columnHidden = state.single.columnHidden;
   return {
     view: state.view,
     single,
@@ -102,7 +109,9 @@ export function screenView(state) {
     showSingleDrop: image === null,
     showLoaded: image !== null,
     settingsSlot: single ? 'single' : 'batch',
-    layout: state.single.layout,
+    statusSlot: single ? 'single' : 'batch',
+    columnHidden,
+    columnToggleText: columnHidden ? SHOW_SETTINGS_TEXT : HIDE_SETTINGS_TEXT,
     fileName: image === null ? '' : image.name,
     pixelSize: pixelSizeText(image),
     extension: image === null ? '' : image.extension,
@@ -219,22 +228,57 @@ export function syncPicture(doc, slot, url, alt, onDone, onFail) {
 }
 
 /**
- * Puts the one settings block first in `slot` (before Save as in Single
- * image's slot). A block already there is not moved. Focus inside the block
- * stays on the same control: a browser drops the focus of an element that
- * moves, so it is given back.
+ * Puts a block the two modes share (the one settings block, the one status
+ * line) first in `slot`: for the settings that is before Save as in Single
+ * image's slot. A block already there is not moved. Focus inside the block
+ * stays on the same control (a radio, Switch to Batch): a browser drops the
+ * focus of an element that moves, so it is given back.
  */
-export function moveSettings(doc, settings, slot) {
-  if (slot.contains(settings)) {
+export function moveBlock(doc, block, slot) {
+  if (slot.contains(block)) {
     return false;
   }
   const active = doc.activeElement;
-  const inside = active !== null && active !== undefined && settings.contains(active);
-  slot.prepend(settings);
+  const inside = active !== null && active !== undefined && block.contains(active);
+  slot.prepend(block);
   if (inside) {
     active.focus();
   }
   return true;
+}
+
+/**
+ * Writes the header's measured `height` as `--headerHeight` (in px) on the
+ * page's root element, where the CSS reads it (the work area's height, the
+ * narrow picture's maximum height, `scroll-padding-top`). Only a positive,
+ * finite number that differs from the value written before is written; true
+ * when it wrote.
+ */
+export function syncHeaderHeight(root, height) {
+  if (!isPositive(height)) {
+    return false;
+  }
+  const value = `${height}px`;
+  if (root.style.getPropertyValue('--headerHeight') === value) {
+    return false;
+  }
+  root.style.setProperty('--headerHeight', value);
+  return true;
+}
+
+/**
+ * Observes `element` with `Observer` (the ResizeObserver class) and calls
+ * `onResize` on each of its resizes. Without a usable class it observes
+ * nothing and returns null, so the window still starts; it returns the
+ * observer otherwise.
+ */
+export function observeSize(Observer, element, onResize) {
+  if (typeof Observer !== 'function') {
+    return null;
+  }
+  const observer = new Observer(() => onResize());
+  observer.observe(element);
+  return observer;
 }
 
 /**
@@ -456,15 +500,25 @@ export function dividerFromPointer(clientX, rect) {
 }
 
 /**
- * A pointer drag starting at (x, y) on `target` with `button`: on the handle
- * it moves the divider, anywhere else it pans. Only the primary button (0)
- * drags; any other button gives null (no drag).
+ * Whether `target` is the zoom controls (`controls`, the group floating over
+ * the picture) or something inside them. A press or a wheel turn there is
+ * meant for a button, not for the picture. False without a target.
  */
-export function dragStart(handle, target, x, y, button) {
-  if (button !== 0) {
+export function isOnControls(controls, target) {
+  return target !== null && target !== undefined && controls.contains(target);
+}
+
+/**
+ * A pointer drag starting at (x, y) on `target` with `button`: on the handle
+ * it moves the divider, on the zoom controls nothing drags (the press is a
+ * button's), anywhere else it pans. `parts`: `handle`, `controls`. Only the
+ * primary button (0) drags; any other button gives null (no drag).
+ */
+export function dragStart(parts, target, x, y, button) {
+  if (button !== 0 || isOnControls(parts.controls, target)) {
     return null;
   }
-  return { mode: handle.contains(target) ? 'divider' : 'pan', x, y };
+  return { mode: parts.handle.contains(target) ? 'divider' : 'pan', x, y };
 }
 
 /**
@@ -831,10 +885,4 @@ export function bindPreviewTriggers(parts, handlers) {
     handlers.dispatch({ type: 'set-quality-text', payload: parts.number.value });
     handlers.later();
   });
-}
-
-/** The layout switch: stores the choice (a storage that fails is ignored) and shows it. */
-export function chooseLayout(deps, layout) {
-  writeLayout(deps.storage, layout);
-  deps.dispatch({ type: 'layout-changed', payload: layout });
 }

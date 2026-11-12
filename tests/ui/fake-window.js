@@ -1,5 +1,6 @@
 // Stand-ins for what the window's start function (ui/window.js) is given:
-// the page, the Tauri API, the timers, the storage and ResizeObserver. They
+// the page, the Tauri API, the timers and ResizeObserver (and a storage the
+// window must leave alone). They
 // record what the window does with them, and are as strict as the real ones
 // where a mistake would only show in the app: a timer called with the wrong
 // `this` throws, as setTimeout does in a webview; asking the page for an id it
@@ -8,34 +9,24 @@
 import { fakeDocument } from './fake-document.js';
 
 // Every element of ui/index.html that has an id, in its nesting, plus the
-// compressed layer (no id in the page, so `_layer`, which `getElementById`
-// refuses): [id, tag, parent id or null, fields to set]. Inputs carry their
-// type and value, so `valueAsNumber` and the radios read as in the page.
+// elements without one that a test needs (the compressed layer, the column
+// and its top; their names start with `_`, which `getElementById` refuses):
+// [id, tag, parent id or null, fields to set]. Inputs carry their type and
+// value, so `valueAsNumber` and the radios read as in the page.
 const PAGE = [
-  ['viewSingle', 'input', null, { type: 'radio', value: 'single', checked: true }],
-  ['viewBatch', 'input', null, { type: 'radio', value: 'batch' }],
-  ['drop', 'section', null, { hidden: true }],
+  ['header', 'header', null],
+  ['viewSingle', 'input', 'header', { type: 'radio', value: 'single', checked: true }],
+  ['viewBatch', 'input', 'header', { type: 'radio', value: 'batch' }],
+  ['main', 'main', null, { classes: ['lunaepixMain', '-single'] }],
+  ['drop', 'section', 'main', { hidden: true }],
   ['dropTitle', 'h2', 'drop'],
   ['chooseFiles', 'button', 'drop'],
-  ['status', 'p', null],
-  ['switchToBatch', 'button', null, { hidden: true }],
-  ['single', 'section', null],
-  ['singleFile', 'div', 'single'],
-  ['singleFileName', 'h2', 'singleFile'],
-  ['singleFileSize', 'span', 'singleFile'],
-  ['chooseOther', 'button', 'singleFile'],
-  ['singleTools', 'div', 'single'],
-  ['layoutUnder', 'input', 'singleTools', { type: 'radio', value: 'under', checked: true }],
-  ['layoutBeside', 'input', 'singleTools', { type: 'radio', value: 'beside' }],
-  ['zoomOut', 'button', 'singleTools'],
-  ['zoomIn', 'button', 'singleTools'],
-  ['zoomActual', 'button', 'singleTools'],
-  ['zoomFit', 'button', 'singleTools'],
-  ['singleBody', 'div', 'single', { classes: ['lunaepixSingle__body', '-under'] }],
-  ['singleDrop', 'section', 'singleBody'],
+  ['batchStatusSlot', 'div', 'main'],
+  ['single', 'section', 'main', { classes: ['lunaepixSingle'] }],
+  ['singleDrop', 'section', 'single'],
   ['singleDropHeading', 'h2', 'singleDrop'],
   ['chooseImage', 'button', 'singleDrop'],
-  ['picture', 'div', 'singleBody', { hidden: true }],
+  ['picture', 'div', 'single', { hidden: true }],
   ['stageOriginal', 'div', 'picture'],
   ['imageOriginal', 'img', 'stageOriginal', { alt: 'Original', hidden: true, classes: ['lunaepixSingle__image'] }],
   ['_layer', 'div', 'picture', { classes: ['lunaepixSingle__layer', '-compressed'] }],
@@ -49,7 +40,21 @@ const PAGE = [
   ['divider', 'input', 'picture', { type: 'range', value: '50' }],
   ['handle', 'div', 'picture'],
   ['pictureBusy', 'p', 'picture'],
-  ['singleSettingsSlot', 'div', 'singleBody'],
+  ['zoomControls', 'div', 'picture'],
+  ['zoomOut', 'button', 'zoomControls'],
+  ['zoomValue', 'span', 'zoomControls'],
+  ['zoomIn', 'button', 'zoomControls'],
+  ['zoomActual', 'button', 'zoomControls'],
+  ['zoomFit', 'button', 'zoomControls'],
+  ['_column', 'aside', 'single'],
+  ['_columnTop', 'div', '_column'],
+  ['columnToggle', 'button', '_columnTop', { text: 'Hide settings' }],
+  ['columnBody', 'div', '_column'],
+  ['singleFile', 'div', 'columnBody'],
+  ['singleFileName', 'h2', 'singleFile'],
+  ['singleFileSize', 'span', 'singleFile'],
+  ['chooseOther', 'button', 'singleFile'],
+  ['singleSettingsSlot', 'div', 'columnBody'],
   ['settings', 'div', 'singleSettingsSlot'],
   ['modeLossless', 'input', 'settings', { type: 'radio', value: 'lossless', checked: true }],
   ['modeLossy', 'input', 'settings', { type: 'radio', value: 'lossy' }],
@@ -65,15 +70,20 @@ const PAGE = [
   ['saveName', 'input', 'saveAs', { type: 'text' }],
   ['saveExtension', 'span', 'saveAs'],
   ['nameError', 'p', 'saveAs'],
-  ['sizes', 'div', 'singleBody'],
+  ['columnFoot', 'div', '_column'],
+  ['sizes', 'div', 'columnFoot'],
   ['sizeOriginal', 'dd', 'sizes'],
   ['sizeCompressed', 'dd', 'sizes'],
   ['sizeSaves', 'dd', 'sizes'],
   ['sizeNote', 'p', 'sizes'],
-  ['singleFoot', 'div', 'singleBody'],
+  ['singleStatusSlot', 'div', 'columnFoot'],
+  ['statusLine', 'div', 'singleStatusSlot'],
+  ['status', 'p', 'statusLine'],
+  ['switchToBatch', 'button', 'statusLine', { hidden: true }],
+  ['singleFoot', 'div', 'columnFoot'],
   ['singleOpenFolder', 'button', 'singleFoot'],
   ['save', 'button', 'singleFoot'],
-  ['panel', 'section', null, { hidden: true }],
+  ['panel', 'section', 'main', { hidden: true }],
   ['panelHeading', 'h2', 'panel'],
   ['clearList', 'button', 'panel'],
   ['results', 'table', 'panel'],
@@ -93,14 +103,19 @@ const PAGE = [
 ];
 
 /**
- * The page: the shared fake document with every element above, in its place.
- * `byId(id)` gives an element to the test; `getElementById` is what the
- * window calls, and it throws for an id the page does not have.
+ * The page: the shared fake document with every element above, in its place,
+ * under `body` and the root element (`documentElement`, where the window
+ * writes the header's height). `byId(id)` gives an element to the test;
+ * `getElementById` is what the window calls, and it throws for an id the
+ * page does not have.
  */
 export function fakePage() {
   const doc = fakeDocument();
   const elements = new Map();
+  const root = doc.createElement('html');
   const body = doc.createElement('body');
+  root.append(body);
+  doc.documentElement = root;
   for (const [id, tag, parentId, fields = {}] of PAGE) {
     const element = doc.createElement(tag);
     // A name starting with `_` is for the test only: that element has no id in the page.
@@ -220,9 +235,15 @@ export function strictTimers() {
   return { set, cleared, setTimer, clearTimer, advance };
 }
 
-/** A storage holding `stored` (key → text); `throws` makes every access throw, as a blocked storage does. */
+/**
+ * A storage holding `stored` (key → text) that records every read (`reads`)
+ * and write (`writes`); `throws` makes every access throw, as a blocked
+ * storage does. The window no longer takes one: the tests hand it in all the
+ * same, to show that nothing reads or writes it.
+ */
 export function fakeStorage(stored = {}, throws = false) {
   const items = new Map(Object.entries(stored));
+  const reads = [];
   const writes = [];
   const guard = () => {
     if (throws) {
@@ -230,8 +251,10 @@ export function fakeStorage(stored = {}, throws = false) {
     }
   };
   return {
+    reads,
     writes,
     getItem(key) {
+      reads.push(key);
       guard();
       return items.has(key) ? items.get(key) : null;
     },

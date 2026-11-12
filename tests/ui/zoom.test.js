@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { divider, isUsableSize, pan, step, toActual, toFit, zoomAt, zoomLimits } from '../../ui/zoom.js';
+import { divider, isUsableSize, pan, step, toActual, toFit, zoomAt, zoomLimits, zoomText } from '../../ui/zoom.js';
 
 // Positions are computed with floating point; they are compared within this.
 const EPSILON = 1e-9;
@@ -334,4 +334,31 @@ test('divider gives the middle for a value that is not a number', () => {
     assert.equal(divider(junk), 50, String(junk));
   }
   assert.equal(divider(30), 30);
+});
+
+test('zoomText_gives_the_scale_as_a_whole_percentage', () => {
+  assert.equal(zoomText({ scale: 0.276, x: 0, y: 0 }), '28%');
+  assert.equal(zoomText({ scale: 1, x: 10, y: -4 }), '100%');
+  assert.equal(zoomText({ scale: 8, x: 0, y: 0 }), '800%');
+  assert.equal(zoomText({ scale: 0.125, x: 0, y: 0 }), '13%');
+  assert.equal(zoomText({ scale: 0.001, x: 0, y: 0 }), '0%');
+  // Fit of a big picture in a small area.
+  assert.equal(zoomText(toFit(BIG_LIMITS)), '20%');
+});
+
+test('zoomText_gives_nothing_for_a_view_without_a_usable_scale', () => {
+  for (const view of [
+    null,
+    undefined,
+    {},
+    { scale: NaN },
+    { scale: 0 },
+    { scale: -1 },
+    { scale: Infinity },
+    { scale: '1' },
+  ]) {
+    assert.equal(zoomText(view), '', JSON.stringify(view) ?? String(view));
+  }
+  // Control: a usable scale gives a text.
+  assert.equal(zoomText({ scale: 0.5 }), '50%');
 });

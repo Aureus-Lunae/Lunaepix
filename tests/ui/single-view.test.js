@@ -11,15 +11,16 @@ import {
   bindPreviewTriggers,
   bindRadios,
   busyText,
-  chooseLayout,
   debounce,
   dividerFromPointer,
   dragMove,
   dragStart,
   initialZoom,
+  isOnControls,
   makeDispatch,
-  moveSettings,
+  moveBlock,
   moveToBatch,
+  observeSize,
   onRegionKey,
   pictureSize,
   pictureSlot,
@@ -34,6 +35,7 @@ import {
   showText,
   swapPicture,
   switchView,
+  syncHeaderHeight,
   syncModifier,
   syncName,
   syncPicture,
@@ -46,7 +48,6 @@ import {
 } from '../../ui/single-view.js';
 import { MESSAGES, initialState, reduce } from '../../ui/state.js';
 import { sizeView } from '../../ui/single.js';
-import { LAYOUT_KEY } from '../../ui/prefs.js';
 import { step, toActual, toFit, zoomAt, zoomLimits } from '../../ui/zoom.js';
 import { fakeDocument } from './fake-document.js';
 import { strictTimers } from './fake-window.js';
@@ -330,7 +331,7 @@ test('syncPicture_with_no_url_hides_the_image_and_cancels_a_pending_swap', async
   assert.deepEqual(stage.children, [shown]);
 });
 
-// --- moveSettings -----------------------------------------------------------
+// --- moveBlock (the settings and the status line) ------------------------------
 
 function settingsLayout(doc) {
   const single = doc.createElement('div');
@@ -344,7 +345,7 @@ function settingsLayout(doc) {
   return { single, batch, settings, radio, saveAs };
 }
 
-test('moveSettings_moves_the_one_block_and_keeps_focus_inside_it', () => {
+test('moveBlock_moves_the_one_block_and_keeps_focus_inside_it', () => {
   const doc = fakeDocument();
   const { single, batch, settings, radio, saveAs } = settingsLayout(doc);
   radio.focus();
@@ -355,7 +356,7 @@ test('moveSettings_moves_the_one_block_and_keeps_focus_inside_it', () => {
     focusCalls.push('radio');
     realFocus();
   };
-  assert.equal(moveSettings(doc, settings, single), true);
+  assert.equal(moveBlock(doc, settings, single), true);
   // The one block, first in the slot (before Save as), gone from Batch's slot.
   assert.deepEqual(single.children, [settings, saveAs]);
   assert.deepEqual(batch.children, []);
@@ -364,18 +365,43 @@ test('moveSettings_moves_the_one_block_and_keeps_focus_inside_it', () => {
   assert.equal(doc.activeElement, radio);
 });
 
-test('moveSettings_leaves_focus_outside_alone_and_does_not_move_a_block_already_in_its_slot', () => {
+test('moveBlock_leaves_focus_outside_alone_and_does_not_move_a_block_already_in_its_slot', () => {
   const doc = fakeDocument();
   const { single, batch, settings } = settingsLayout(doc);
   const outside = doc.createElement('button');
   outside.focus();
-  assert.equal(moveSettings(doc, settings, single), true);
+  assert.equal(moveBlock(doc, settings, single), true);
   assert.equal(doc.activeElement, outside);
   // Already there: nothing moves.
   const before = single.children.slice();
-  assert.equal(moveSettings(doc, settings, single), false);
+  assert.equal(moveBlock(doc, settings, single), false);
   assert.deepEqual(single.children, before);
   assert.deepEqual(batch.children, []);
+});
+
+test('moving_the_status_line_keeps_focus_on_switch_to_batch', () => {
+  const doc = fakeDocument();
+  const singleSlot = doc.createElement('div');
+  const batchSlot = doc.createElement('div');
+  const statusLine = doc.createElement('div');
+  const status = doc.createElement('p');
+  const switchToBatch = doc.createElement('button');
+  statusLine.append(status, switchToBatch);
+  singleSlot.append(statusLine);
+  switchToBatch.focus();
+  // A browser blurs a focused element that moves; it must be focused again.
+  const focusCalls = [];
+  const realFocus = switchToBatch.focus.bind(switchToBatch);
+  switchToBatch.focus = () => {
+    focusCalls.push('switchToBatch');
+    realFocus();
+  };
+  assert.equal(moveBlock(doc, statusLine, batchSlot), true);
+  assert.deepEqual(batchSlot.children, [statusLine]);
+  assert.deepEqual(singleSlot.children, []);
+  assert.deepEqual(statusLine.children, [status, switchToBatch]);
+  assert.deepEqual(focusCalls, ['switchToBatch']);
+  assert.equal(doc.activeElement, switchToBatch);
 });
 
 // --- syncSizes / syncName / showText ------------------------------------------
@@ -542,7 +568,7 @@ test('screenView_in_single_with_an_image_shows_the_loaded_blocks', () => {
   assert.equal(view.showBatchDrop, false);
   assert.equal(view.showBatchPanel, false);
   assert.equal(view.settingsSlot, 'single');
-  assert.equal(view.layout, 'under');
+  assert.equal(view.statusSlot, 'single');
   assert.equal(view.fileName, 'holiday.jpg');
   assert.equal(view.pixelSize, '4032 × 3024');
   assert.equal(view.extension, '.jpg');
@@ -573,10 +599,25 @@ test('screenView_in_batch_shows_batch_and_puts_the_settings_in_batchs_slot', () 
   assert.equal(view.showBatchDrop, true);
   assert.equal(view.showBatchPanel, false);
   assert.equal(view.settingsSlot, 'batch');
+  assert.equal(view.statusSlot, 'batch');
   assert.equal(screenView(apply(batch, listed)).showBatchPanel, true);
   const finished = apply(batch, listed, runStarted, runFinished);
   assert.equal(screenView(finished).showSummary, true);
   assert.equal(screenView(apply(batch, listed)).showSummary, false);
+});
+
+test('screenView_says_hide_settings_while_the_column_shows_and_show_settings_while_folded', () => {
+  const shown = screenView(apply(initialState(), loaded('7')));
+  assert.equal(shown.columnHidden, false);
+  assert.equal(shown.columnToggleText, 'Hide settings');
+  const folded = screenView(apply(initialState(), loaded('7'), { type: 'set-column-hidden', payload: true }));
+  assert.equal(folded.columnHidden, true);
+  assert.equal(folded.columnToggleText, 'Show settings');
+  // A new image keeps the column folded.
+  const next = screenView(
+    apply(initialState(), loaded('7'), { type: 'set-column-hidden', payload: true }, loaded('8')),
+  );
+  assert.equal(next.columnHidden, true);
 });
 
 test('the_drag_highlight_goes_to_the_drop_area_that_shows_or_the_picture', () => {
@@ -794,15 +835,16 @@ test('a_drag_that_starts_on_the_handle_moves_the_divider_and_elsewhere_pans', ()
   const picture = doc.createElement('div');
   const handle = doc.createElement('div');
   const knob = doc.createElement('span');
+  const controls = doc.createElement('div');
   handle.append(knob);
-  picture.append(handle);
+  picture.append(handle, controls);
   const rect = { left: 0, width: 200 };
 
-  const onHandle = dragStart(handle, knob, 50, 10, 0);
+  const onHandle = dragStart({ handle, controls }, knob, 50, 10, 0);
   assert.equal(onHandle.mode, 'divider');
   assert.deepEqual(dragMove(onHandle, 150, 20, rect).result, { divider: 75 });
 
-  const elsewhere = dragStart(handle, picture, 50, 10, 0);
+  const elsewhere = dragStart({ handle, controls }, picture, 50, 10, 0);
   assert.equal(elsewhere.mode, 'pan');
   const moved = dragMove(elsewhere, 60, 4, rect);
   assert.deepEqual(moved.result, { dx: 10, dy: -6 });
@@ -816,18 +858,57 @@ test('a_middle_or_right_button_starts_no_drag', () => {
   const doc = fakeDocument();
   const picture = doc.createElement('div');
   const handle = doc.createElement('div');
-  picture.append(handle);
+  const controls = doc.createElement('div');
+  picture.append(handle, controls);
   // 1 is the middle button, 2 the right one: on the handle or elsewhere, no drag.
   for (const button of [1, 2, undefined, '0']) {
-    assert.equal(dragStart(handle, handle, 50, 10, button), null, String(button));
-    assert.equal(dragStart(handle, picture, 50, 10, button), null, String(button));
+    assert.equal(dragStart({ handle, controls }, handle, 50, 10, button), null, String(button));
+    assert.equal(dragStart({ handle, controls }, picture, 50, 10, button), null, String(button));
+  }
+});
+
+test('dragStart_on_the_zoom_controls_gives_no_drag', () => {
+  const doc = fakeDocument();
+  const picture = doc.createElement('div');
+  const handle = doc.createElement('div');
+  const controls = doc.createElement('div');
+  const zoomIn = doc.createElement('button');
+  controls.append(zoomIn);
+  picture.append(handle, controls);
+  assert.equal(dragStart({ handle, controls }, controls, 50, 10, 0), null);
+  assert.equal(dragStart({ handle, controls }, zoomIn, 50, 10, 0), null);
+  // Control: the handle and the picture still start a drag.
+  assert.equal(dragStart({ handle, controls }, handle, 50, 10, 0).mode, 'divider');
+  assert.equal(dragStart({ handle, controls }, picture, 50, 10, 0).mode, 'pan');
+});
+
+test('isOnControls_is_true_for_the_group_and_anything_inside', () => {
+  const doc = fakeDocument();
+  const controls = doc.createElement('div');
+  const button = doc.createElement('button');
+  const value = doc.createElement('span');
+  controls.append(button, value);
+  for (const target of [controls, button, value]) {
+    assert.equal(isOnControls(controls, target), true);
+  }
+});
+
+test('isOnControls_is_false_for_the_picture_the_handle_and_no_target', () => {
+  const doc = fakeDocument();
+  const picture = doc.createElement('div');
+  const handle = doc.createElement('div');
+  const controls = doc.createElement('div');
+  picture.append(handle, controls);
+  for (const target of [picture, handle, null, undefined]) {
+    assert.equal(isOnControls(controls, target), false, String(target));
   }
 });
 
 test('a_divider_drag_over_an_area_without_width_moves_nothing', () => {
   const doc = fakeDocument();
   const handle = doc.createElement('div');
-  const drag = dragStart(handle, handle, 50, 10, 0);
+  const controls = doc.createElement('div');
+  const drag = dragStart({ handle, controls }, handle, 50, 10, 0);
   for (const rect of [
     { left: 0, width: 0 },
     { left: 0, width: Number.NaN },
@@ -1443,7 +1524,7 @@ test('dragging_the_slider_and_typing_in_the_number_field_do_not_ask_at_once', ()
   assert.equal(log.some(([kind]) => kind === 'ask'), false);
 });
 
-// --- radios, layout, modifiers --------------------------------------------------
+// --- radios, modifiers ----------------------------------------------------------
 
 test('syncRadios_checks_the_radio_with_the_value_and_sets_aria_disabled', () => {
   const doc = fakeDocument();
@@ -1476,34 +1557,83 @@ test('bindRadios_calls_back_only_for_the_radio_that_became_checked', () => {
   assert.deepEqual(picked, ['beside']);
 });
 
-test('chooseLayout_stores_and_dispatches_the_layout', () => {
-  const stored = [];
-  const dispatched = [];
-  const storage = { setItem: (key, value) => stored.push([key, value]) };
-  chooseLayout({ storage, dispatch: (action) => dispatched.push(action) }, 'beside');
-  assert.deepEqual(stored, [[LAYOUT_KEY, 'beside']]);
-  assert.deepEqual(dispatched, [{ type: 'layout-changed', payload: 'beside' }]);
-});
-
-test('chooseLayout_with_a_storage_that_throws_still_dispatches', () => {
-  const dispatched = [];
-  const storage = {
-    setItem: () => {
-      throw new Error('QuotaExceededError');
-    },
-  };
-  chooseLayout({ storage, dispatch: (action) => dispatched.push(action) }, 'under');
-  assert.deepEqual(dispatched, [{ type: 'layout-changed', payload: 'under' }]);
-});
-
 test('syncModifier_sets_exactly_the_chosen_modifier', () => {
   const doc = fakeDocument();
-  const body = doc.createElement('div');
-  body.classList.add('lunaepixSingle__body', '-under');
-  syncModifier(body, ['under', 'beside'], 'beside');
-  assert.deepEqual([...body.classList], ['lunaepixSingle__body', '-beside']);
-  syncModifier(body, ['under', 'beside'], 'under');
-  assert.deepEqual([...body.classList], ['lunaepixSingle__body', '-under']);
+  const main = doc.createElement('main');
+  main.classList.add('lunaepixMain', '-single');
+  syncModifier(main, ['single', 'batch'], 'batch');
+  assert.deepEqual([...main.classList], ['lunaepixMain', '-batch']);
+  syncModifier(main, ['single', 'batch'], 'single');
+  assert.deepEqual([...main.classList], ['lunaepixMain', '-single']);
+});
+
+// --- the header's height and the size observer ------------------------------------
+
+test('syncHeaderHeight_writes_a_measured_height', () => {
+  const doc = fakeDocument();
+  const root = doc.createElement('html');
+  assert.equal(syncHeaderHeight(root, 64), true);
+  assert.equal(root.style.getPropertyValue('--headerHeight'), '64px');
+  assert.equal(syncHeaderHeight(root, 96), true);
+  assert.equal(syncHeaderHeight(root, 60.5), true);
+  assert.deepEqual(root.style.writes, [
+    ['--headerHeight', '64px'],
+    ['--headerHeight', '96px'],
+    ['--headerHeight', '60.5px'],
+  ]);
+});
+
+test('syncHeaderHeight_ignores_an_unusable_or_unchanged_height', () => {
+  const doc = fakeDocument();
+  const root = doc.createElement('html');
+  for (const height of [0, -5, Number.NaN, Number.POSITIVE_INFINITY, '64', null, undefined]) {
+    assert.equal(syncHeaderHeight(root, height), false, String(height));
+  }
+  assert.deepEqual(root.style.writes, []);
+  // The same height again writes nothing more.
+  syncHeaderHeight(root, 64);
+  assert.equal(syncHeaderHeight(root, 64), false);
+  assert.deepEqual(root.style.writes, [['--headerHeight', '64px']]);
+});
+
+test('observeSize_observes_the_element_and_calls_back_on_a_resize', () => {
+  const doc = fakeDocument();
+  const element = doc.createElement('header');
+  const made = [];
+  class Observer {
+    constructor(callback) {
+      this.callback = callback;
+      this.targets = [];
+      made.push(this);
+    }
+
+    observe(target) {
+      this.targets.push(target);
+    }
+  }
+  let calls = 0;
+  const observer = observeSize(Observer, element, () => {
+    calls += 1;
+  });
+  assert.equal(made.length, 1);
+  assert.equal(observer, made[0]);
+  assert.deepEqual(observer.targets, [element]);
+  observer.callback([{ target: element }]);
+  assert.equal(calls, 1);
+});
+
+test('observeSize_without_a_ResizeObserver_observes_nothing', () => {
+  const doc = fakeDocument();
+  const element = doc.createElement('header');
+  for (const missing of [undefined, null, {}, 'ResizeObserver']) {
+    assert.equal(
+      observeSize(missing, element, () => {
+        throw new Error('called');
+      }),
+      null,
+      String(missing),
+    );
+  }
 });
 
 // --- the decode failure in the status line --------------------------------------

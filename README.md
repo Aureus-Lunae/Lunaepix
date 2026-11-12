@@ -90,17 +90,19 @@ under a name you choose.
    split by a divider: the original on the left, the compressed one on the
    right. Drag the handle, or tab to it and use the arrow keys. A new picture
    starts shrunk to fit the window ("Fit"); a small picture is not enlarged
-   to fill it. "Zoom in" and "Zoom out", the mouse wheel and "100%" zoom up
-   to 800% (an SVG up to eight times its fitted size); "Fit" goes back. Drag
-   the picture to move it, or tab to it and use the arrow keys. Both sides
-   always show the same spot at the same zoom.
+   to fill it. The zoom controls float at the bottom of the picture: "−" and
+   "+", the zoom as a percentage, "100%" and "Fit". "−", "+", the mouse wheel
+   and "100%" zoom up to 800% (an SVG up to eight times its fitted size);
+   "Fit" goes back. Drag the picture to move it, or tab to it and use the
+   arrow keys; a press or the wheel on the zoom controls leaves the picture
+   alone. Both sides always show the same spot at the same zoom.
 3. Choose **Lossless** or **Lossy**, and the quality, as in Batch; "Save to"
    works the same way too. The compressed side updates a moment after you let
    go of the slider (about 0.4 seconds after the last key when you type a
    number), not while you drag. "Compressing…" shows meanwhile, then
    "Loading picture…" while the window draws it, and the old picture stays
    until the new one shows; Save waits for it, so it always saves the version
-   you see. A box next to the picture shows the original size, the compressed
+   you see. A box above Save shows the original size, the compressed
    size and how much it saves for the version that shows, with a note
    when the file was handled differently from the setting (for example
    "original kept: lossy was not smaller").
@@ -122,12 +124,18 @@ under a name you choose.
    and offers the same button. The offer ends at the next picture you load
    and when you change mode by hand.
 
-Two layouts are available: **Settings under** the picture (the default) and
-**Settings beside** it. In a window narrower than about 640 pixels (at the
-normal text size) "beside" looks like "under"; the choice is kept. The choice
-is the one thing the app remembers between launches. Changing mode and coming
-back leaves the picture, the settings and the preview as they were. The switch
-cannot be used while a Batch run or a save is going.
+The picture fills the window under the header, and the settings sit in a
+column on its right: the file's name and size with "Choose other", the
+settings and "Save as" (this part scrolls when it does not fit), and at the
+bottom the sizes, the status line, "Open folder" and **Save**. Before a
+picture is loaded the column shows only the settings. **Hide settings** at
+the top of the column folds it to a narrow strip, so the picture gets the
+whole width; **Show settings** brings it back. The column starts shown at
+every launch. In a window narrower than about 640 pixels (at the normal text
+size) the picture comes first and the column sits under it, and the page
+scrolls. Changing mode and coming back leaves the picture, the settings and
+the preview as they were. The switch cannot be used while a Batch run or a
+save is going.
 
 ### Batch mode
 
@@ -155,10 +163,8 @@ cannot be used while a Batch run or a save is going.
    - Without Re-add, the next drop or pick starts a new list.
    - "Clear" empties the list, before or after a run.
 
-Nothing is remembered between launches except one choice: where Single image
-mode shows the settings (under the picture or beside it), kept in the
-window's own storage. Every start is in Single image mode, Lossless, quality
-75, next to the originals.
+Nothing is remembered between launches. Every start is in Single image mode,
+Lossless, quality 75, next to the originals, with the settings column shown.
 
 ### Thumbnails
 

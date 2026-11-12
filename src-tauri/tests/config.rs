@@ -1814,33 +1814,20 @@ fn label_texts(html: &str) -> Vec<(String, String)> {
 }
 
 /// What the Single image screen needs for the accessibility rules, read as
-/// tokens: the Single image / Batch switch and the layout switch are each a
-/// `<fieldset>` with its legend ("Work on", "Settings") and exactly its two
-/// radios; the picture area is `role="region"` with `aria-label="Picture"`
-/// and `tabindex="0"`; and the compare divider is a range input (id
-/// `divider`, 0 to 100, step 1) named by a `<label for>` and sitting inside
-/// that region.
+/// tokens: the Single image / Batch switch is a `<fieldset>` with its legend
+/// ("Work on") and exactly its two radios; the picture area is
+/// `role="region"` with `aria-label="Picture"` and `tabindex="0"`; and the
+/// compare divider is a range input (id `divider`, 0 to 100, step 1) named by
+/// a `<label for>` and sitting inside that region. (Task 11 removed the
+/// layout switch; [`column_problems`] checks that it stays gone.)
 fn single_screen_problems(html: &str) -> Vec<String> {
     let mut problems = Vec::new();
-    let fieldsets = fieldsets_with_radios(html);
-    for (legend, radios, what) in [
-        (
-            "Work on",
-            ["single", "batch"],
-            "a fieldset with the legend \"Work on\" and the radios single, batch",
-        ),
-        (
-            "Settings",
-            ["under", "beside"],
-            "a fieldset with the legend \"Settings\" and the radios under, beside",
-        ),
-    ] {
-        let found = fieldsets
-            .iter()
-            .any(|(text, values)| text == legend && values.as_slice() == radios);
-        if !found {
-            problems.push(what.to_owned());
-        }
+    let found = fieldsets_with_radios(html)
+        .iter()
+        .any(|(text, values)| text == "Work on" && values.as_slice() == ["single", "batch"]);
+    if !found {
+        problems
+            .push("a fieldset with the legend \"Work on\" and the radios single, batch".to_owned());
     }
 
     // The region, and whether the divider is inside it.
@@ -1906,16 +1893,14 @@ fn single_screen_problems(html: &str) -> Vec<String> {
 const SINGLE_FIXTURE: &str = "<header><fieldset><legend>Work on</legend>\
      <label><input type=\"radio\" name=\"view\" value=\"single\" checked> Single image</label>\
      <label><input type=\"radio\" name=\"view\" value=\"batch\"> Batch</label></fieldset></header>\
-     <fieldset><legend>Settings</legend>\
-     <label><input type=\"radio\" name=\"layout\" value=\"under\" checked> Settings under</label>\
-     <label><input type=\"radio\" name=\"layout\" value=\"beside\"> Settings beside</label></fieldset>\
      <div id=\"picture\" role=\"region\" aria-label=\"Picture\" tabindex=\"0\">\
      <div><img alt=\"Original\"></div>\
      <label for=\"divider\">Compare original and compressed</label>\
      <input id=\"divider\" type=\"range\" min=\"0\" max=\"100\" step=\"1\" value=\"50\"></div>";
 
 #[test]
-fn index_html_has_both_switches_as_fieldsets_with_legends_the_region_and_the_labelled_divider() {
+fn index_html_has_the_view_switch_as_a_fieldset_with_a_legend_the_region_and_the_labelled_divider()
+{
     assert_eq!(single_screen_problems(&index_html()), Vec::<String>::new());
 }
 
@@ -1939,7 +1924,6 @@ fn a_single_screen_fixture_with_everything_passes_in_any_spelling() {
 #[test]
 fn a_single_screen_fixture_without_a_divider_label_a_legend_or_the_region_is_flagged() {
     const VIEWS: &str = "a fieldset with the legend \"Work on\" and the radios single, batch";
-    const LAYOUTS: &str = "a fieldset with the legend \"Settings\" and the radios under, beside";
     const REGION: &str = "an element with role=\"region\" and aria-label=\"Picture\"";
     const TABINDEX: &str = "tabindex=\"0\" on the Picture region";
     const LABEL: &str = "a <label for=\"divider\"> saying \"Compare original and compressed\"";
@@ -1978,10 +1962,6 @@ fn a_single_screen_fixture_without_a_divider_label_a_legend_or_the_region_is_fla
             vec![VIEWS],
         ),
         (
-            SINGLE_FIXTURE.replace("<legend>Settings</legend>", "<legend>Layout</legend>"),
-            vec![LAYOUTS],
-        ),
-        (
             SINGLE_FIXTURE.replace(" tabindex=\"0\"", ""),
             vec![TABINDEX],
         ),
@@ -2006,6 +1986,348 @@ fn a_single_screen_fixture_without_a_divider_label_a_legend_or_the_region_is_fla
     for (html, problems) in cases {
         let expected: Vec<String> = problems.into_iter().map(str::to_owned).collect();
         assert_eq!(single_screen_problems(&html), expected, "{html}");
+    }
+}
+
+// --- the docked column and the floating zoom controls (Task 11) --------------
+
+/// One element of a page read as tokens: its start tag, the element it sits
+/// in, and its text (its own and that of everything inside it).
+struct Element {
+    tag: StartTag,
+    parent: Option<usize>,
+    text: String,
+}
+
+/// The elements of `html` in document order, each with the element it sits
+/// in. An end tag closes the nearest open element of its name (and whatever
+/// was left open inside it); a void element never stays open. Comments are
+/// neither elements nor text.
+fn elements(html: &str) -> Vec<Element> {
+    let mut all: Vec<Element> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    for piece in pieces(html) {
+        match piece {
+            Piece::Start(tag) => {
+                let void = VOID_ELEMENTS.contains(&tag.name.as_str());
+                all.push(Element {
+                    tag,
+                    parent: open.last().copied(),
+                    text: String::new(),
+                });
+                if !void {
+                    open.push(all.len() - 1);
+                }
+            }
+            Piece::End(name) => {
+                if let Some(at) = open.iter().rposition(|&index| all[index].tag.name == name) {
+                    open.truncate(at);
+                }
+            }
+            Piece::Text(text) => {
+                for &index in &open {
+                    all[index].text.push_str(&text);
+                }
+            }
+            Piece::Comment(_) => {}
+        }
+    }
+    all
+}
+
+/// Whether element `index` sits (at any depth) inside element `outer`.
+fn is_inside(all: &[Element], index: usize, outer: usize) -> bool {
+    let mut current = all[index].parent;
+    while let Some(at) = current {
+        if at == outer {
+            return true;
+        }
+        current = all[at].parent;
+    }
+    false
+}
+
+const COLUMN_ASIDE: &str = "an <aside> with aria-label=\"Settings\"";
+const COLUMN_SCROLL: &str =
+    "a part of the Settings aside with role=\"region\", an aria-label and tabindex=\"0\"";
+const COLUMN_TOGGLE: &str = "a \"Hide settings\" button in the Settings aside with \
+     aria-expanded=\"true\" and aria-controls naming elements of the page";
+const ZOOM_GROUP: &str = "a role=\"group\" with aria-label=\"Zoom\" inside the Picture region";
+const ZOOM_OUT: &str = "a button with aria-label=\"Zoom out\" in the zoom group";
+const ZOOM_IN: &str = "a button with aria-label=\"Zoom in\" in the zoom group";
+const NO_LAYOUT: &str = "no input with name=\"layout\" (the layout switch is gone)";
+
+/// What Task 11's layout needs in the page, read as tokens: the column is an
+/// `<aside aria-label="Settings">`; inside it a part that scrolls on its own
+/// (`role="region"`, a non-empty `aria-label`, `tabindex="0"`) and the "Hide
+/// settings" button, which starts expanded and controls elements that exist;
+/// inside the Picture region a `role="group"` named "Zoom" with the buttons
+/// named "Zoom out" and "Zoom in"; and no input named `layout` anywhere.
+fn column_problems(html: &str) -> Vec<String> {
+    let all = elements(html);
+    let ids: HashSet<&str> = all
+        .iter()
+        .filter_map(|element| element.tag.attr("id"))
+        .collect();
+    let find = |predicate: &dyn Fn(usize, &Element) -> bool| {
+        all.iter()
+            .enumerate()
+            .find(|(index, element)| predicate(*index, element))
+            .map(|(index, _)| index)
+    };
+    let inside =
+        |index: usize, outer: Option<usize>| outer.is_some_and(|at| is_inside(&all, index, at));
+    let mut problems = Vec::new();
+
+    let aside = find(&|_, element| {
+        element.tag.name == "aside" && element.tag.attr("aria-label") == Some("Settings")
+    });
+    if aside.is_none() {
+        problems.push(COLUMN_ASIDE.to_owned());
+    }
+    let scroll = find(&|index, element| {
+        inside(index, aside)
+            && element.tag.attr("role") == Some("region")
+            && element
+                .tag
+                .attr("aria-label")
+                .is_some_and(|label| !label.trim().is_empty())
+            && element.tag.attr("tabindex") == Some("0")
+    });
+    if scroll.is_none() {
+        problems.push(COLUMN_SCROLL.to_owned());
+    }
+    let toggle = find(&|index, element| {
+        let controls = element.tag.attr("aria-controls").unwrap_or_default();
+        inside(index, aside)
+            && element.tag.name == "button"
+            && one_line(&element.text) == "Hide settings"
+            && element.tag.attr("aria-expanded") == Some("true")
+            && controls.split_ascii_whitespace().next().is_some()
+            && controls.split_ascii_whitespace().all(|id| ids.contains(id))
+    });
+    if toggle.is_none() {
+        problems.push(COLUMN_TOGGLE.to_owned());
+    }
+
+    let picture = find(&|_, element| {
+        element.tag.attr("role") == Some("region")
+            && element.tag.attr("aria-label") == Some("Picture")
+    });
+    let group = find(&|index, element| {
+        inside(index, picture)
+            && element.tag.attr("role") == Some("group")
+            && element.tag.attr("aria-label") == Some("Zoom")
+    });
+    if group.is_none() {
+        problems.push(ZOOM_GROUP.to_owned());
+    }
+    for (name, what) in [("Zoom out", ZOOM_OUT), ("Zoom in", ZOOM_IN)] {
+        let named = find(&|index, element| {
+            inside(index, group)
+                && element.tag.name == "button"
+                && element.tag.attr("aria-label") == Some(name)
+        });
+        if named.is_none() {
+            problems.push(what.to_owned());
+        }
+    }
+
+    if find(&|_, element| element.tag.name == "input" && element.tag.attr("name") == Some("layout"))
+        .is_some()
+    {
+        problems.push(NO_LAYOUT.to_owned());
+    }
+    problems
+}
+
+const COLUMN_PICTURE: &str = "<div id=\"picture\" role=\"region\" aria-label=\"Picture\" tabindex=\"0\">\
+     <div role=\"group\" aria-label=\"Zoom\">\
+     <button type=\"button\" aria-label=\"Zoom out\">\u{2212}</button><span>28%</span>\
+     <button type=\"button\" aria-label=\"Zoom in\">+</button>\
+     <button type=\"button\">100%</button><button type=\"button\">Fit</button></div></div>";
+const COLUMN_TOP: &str = "<div><button type=\"button\" aria-expanded=\"true\" \
+     aria-controls=\"columnBody columnFoot\">Hide settings</button></div>";
+const COLUMN_BODY: &str = "<div id=\"columnBody\" role=\"region\" aria-label=\"Image settings\" \
+     tabindex=\"0\"><h2>holiday.jpg</h2><input type=\"text\" id=\"saveName\"></div>";
+const COLUMN_FOOT: &str = "<div id=\"columnFoot\"><button type=\"button\">Save</button></div>";
+
+/// Markup with everything [`column_problems`] asks for, from its parts.
+fn column_fixture(picture: &str, top: &str, body: &str, foot: &str) -> String {
+    format!("{picture}<aside aria-label=\"Settings\">{top}{body}{foot}</aside>")
+}
+
+fn full_column_fixture() -> String {
+    column_fixture(COLUMN_PICTURE, COLUMN_TOP, COLUMN_BODY, COLUMN_FOOT)
+}
+
+#[test]
+fn index_html_has_the_column_the_zoom_controls_and_no_layout_switch() {
+    assert_eq!(column_problems(&index_html()), Vec::<String>::new());
+}
+
+#[test]
+fn a_column_fixture_with_everything_passes_in_any_spelling() {
+    assert_eq!(
+        column_problems(&full_column_fixture()),
+        Vec::<String>::new()
+    );
+    let spelled = full_column_fixture()
+        .replace("<aside aria-label", "<ASIDE ARIA-LABEL")
+        .replace("</aside>", "</ASIDE>")
+        .replace(">Hide settings<", ">\n  Hide\n  settings\n<")
+        .replace(
+            "aria-controls=\"columnBody columnFoot\"",
+            "ARIA-CONTROLS='  columnBody\n columnFoot '",
+        )
+        .replace("role=\"group\"", "ROLE='group'")
+        .replace(
+            "<button type=\"button\" aria-label=\"Zoom in\"",
+            "<BUTTON aria-label='Zoom in'",
+        );
+    assert_eq!(column_problems(&spelled), Vec::<String>::new());
+    // A layout radio only in a comment is not an input.
+    let commented = format!(
+        "{}<!-- <input type=\"radio\" name=\"layout\" value=\"under\"> -->",
+        full_column_fixture()
+    );
+    assert_eq!(column_problems(&commented), Vec::<String>::new());
+}
+
+#[test]
+fn a_column_fixture_with_each_part_missing_or_misplaced_is_flagged() {
+    let full = full_column_fixture();
+    let layout = "<fieldset><legend>Settings</legend>\
+         <label><input type=\"radio\" name=\"layout\" value=\"under\" checked> Settings under</label>\
+         <label><input type=\"radio\" name=\"layout\" value=\"beside\"> Settings beside</label></fieldset>";
+    let cases: Vec<(String, Vec<&str>)> = vec![
+        // The aside: missing, misnamed, another element.
+        (
+            full.replace("aria-label=\"Settings\"", "aria-label=\"Options\""),
+            vec![COLUMN_ASIDE, COLUMN_SCROLL, COLUMN_TOGGLE],
+        ),
+        (
+            full.replace("<aside ", "<div ")
+                .replace("</aside>", "</div>"),
+            vec![COLUMN_ASIDE, COLUMN_SCROLL, COLUMN_TOGGLE],
+        ),
+        // The scrolling part: each attribute missing, an empty name, outside the aside.
+        (
+            full.replace(
+                " role=\"region\" aria-label=\"Image settings\"",
+                " aria-label=\"Image settings\"",
+            ),
+            vec![COLUMN_SCROLL],
+        ),
+        (
+            full.replace(" aria-label=\"Image settings\"", ""),
+            vec![COLUMN_SCROLL],
+        ),
+        (
+            full.replace("aria-label=\"Image settings\"", "aria-label=\" \""),
+            vec![COLUMN_SCROLL],
+        ),
+        (
+            full.replace(
+                "aria-label=\"Image settings\" tabindex=\"0\"",
+                "aria-label=\"Image settings\"",
+            ),
+            vec![COLUMN_SCROLL],
+        ),
+        (
+            full.replace(
+                "aria-label=\"Image settings\" tabindex=\"0\"",
+                "aria-label=\"Image settings\" tabindex=\"-1\"",
+            ),
+            vec![COLUMN_SCROLL],
+        ),
+        (
+            column_fixture(COLUMN_PICTURE, COLUMN_TOP, "", COLUMN_FOOT) + COLUMN_BODY,
+            vec![COLUMN_SCROLL],
+        ),
+        // The toggle: its attributes, its text, a control that is not in the page, in a comment, outside.
+        (
+            full.replace(" aria-expanded=\"true\"", ""),
+            vec![COLUMN_TOGGLE],
+        ),
+        (
+            full.replace("aria-expanded=\"true\"", "aria-expanded=\"false\""),
+            vec![COLUMN_TOGGLE],
+        ),
+        (
+            full.replace(" aria-controls=\"columnBody columnFoot\"", ""),
+            vec![COLUMN_TOGGLE],
+        ),
+        (
+            full.replace(
+                "aria-controls=\"columnBody columnFoot\"",
+                "aria-controls=\"\"",
+            ),
+            vec![COLUMN_TOGGLE],
+        ),
+        (
+            full.replace(
+                "aria-controls=\"columnBody columnFoot\"",
+                "aria-controls=\"columnBody columnGone\"",
+            ),
+            vec![COLUMN_TOGGLE],
+        ),
+        (
+            full.replace(">Hide settings<", ">Hide<"),
+            vec![COLUMN_TOGGLE],
+        ),
+        (
+            column_fixture(
+                COLUMN_PICTURE,
+                &format!("<!-- {COLUMN_TOP} -->"),
+                COLUMN_BODY,
+                COLUMN_FOOT,
+            ),
+            vec![COLUMN_TOGGLE],
+        ),
+        (
+            column_fixture(COLUMN_PICTURE, "", COLUMN_BODY, COLUMN_FOOT) + COLUMN_TOP,
+            vec![COLUMN_TOGGLE],
+        ),
+        // The zoom group: outside the Picture region, unnamed, no group; each button's name.
+        (
+            full.replace(
+                "tabindex=\"0\"><div role=\"group\"",
+                "tabindex=\"0\"></div><div role=\"group\"",
+            )
+            .replace("Fit</button></div></div>", "Fit</button></div>"),
+            vec![ZOOM_GROUP, ZOOM_OUT, ZOOM_IN],
+        ),
+        (
+            full.replace("role=\"group\" aria-label=\"Zoom\"", "role=\"group\""),
+            vec![ZOOM_GROUP, ZOOM_OUT, ZOOM_IN],
+        ),
+        (
+            full.replace("role=\"group\" ", ""),
+            vec![ZOOM_GROUP, ZOOM_OUT, ZOOM_IN],
+        ),
+        (full.replace(" aria-label=\"Zoom out\"", ""), vec![ZOOM_OUT]),
+        (
+            full.replace("aria-label=\"Zoom in\"", "aria-label=\"Zoom\""),
+            vec![ZOOM_IN],
+        ),
+        (
+            full.replace(
+                "<button type=\"button\" aria-label=\"Zoom in\">+</button>",
+                "",
+            ),
+            vec![ZOOM_IN],
+        ),
+        // The layout switch still there, inside or outside the column.
+        (format!("{layout}{full}"), vec![NO_LAYOUT]),
+        (
+            full.replace(COLUMN_FOOT, &format!("{COLUMN_FOOT}{layout}")),
+            vec![NO_LAYOUT],
+        ),
+    ];
+    for (html, problems) in cases {
+        let expected: Vec<String> = problems.into_iter().map(str::to_owned).collect();
+        assert_eq!(column_problems(&html), expected, "{html}");
     }
 }
 

@@ -1,16 +1,16 @@
 // The window itself: ui/window.js's start function, driven through the fake
-// page, a fake Tauri, strict timers, a storage and a ResizeObserver
-// (fake-window.js). Each test fires the events a person or the backend would
-// and asserts what the window sends and what the page shows.
+// page, a fake Tauri, strict timers and a ResizeObserver (fake-window.js).
+// Each test fires the events a person or the backend would and asserts what
+// the window sends and what the page shows. A storage is handed in too, so
+// the tests can show the window never touches it.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 import { startWindow } from '../../ui/window.js';
-import { LAYOUT_KEY } from '../../ui/prefs.js';
 import { MESSAGES, initialState, reduce } from '../../ui/state.js';
-import { pan, step, toActual, toFit, zoomAt, zoomLimits } from '../../ui/zoom.js';
+import { pan, step, toActual, toFit, zoomAt, zoomLimits, zoomText } from '../../ui/zoom.js';
 import { fakePage, fakeResizeObservers, fakeStorage, fakeTauri, settle, strictTimers } from './fake-window.js';
 
 /**
@@ -64,8 +64,14 @@ const BIG = { width: 4000, height: 3000 };
 const LIMITS = zoomLimits(BIG, AREA);
 const FIT = toFit(LIMITS);
 
-/** Starts the window on a fresh fake page; every fake is returned for the test. */
-function start({ stored = {}, storageThrows = false, refuse = {}, refuseListen = [], hold = [] } = {}) {
+/** The key Task 9's layout switch stored its choice under; a launch may still find it. */
+const OLD_LAYOUT_KEY = 'lunaepix.layout';
+
+/**
+ * Starts the window on a fresh fake page; every fake is returned for the
+ * test. `resizeObserver: false` starts it without the ResizeObserver class.
+ */
+function start({ stored = {}, refuse = {}, refuseListen = [], hold = [], resizeObserver = true } = {}) {
   const doc = fakePage();
   const picture = doc.byId('picture');
   picture.clientWidth = AREA.width;
@@ -73,7 +79,7 @@ function start({ stored = {}, storageThrows = false, refuse = {}, refuseListen =
   picture.rect = { ...RECT };
   const tauri = fakeTauri({ refuse, refuseListen, hold });
   const timers = strictTimers();
-  const storage = fakeStorage(stored, storageThrows);
+  const storage = fakeStorage(stored);
   const observers = fakeResizeObservers();
   const logged = [];
   const { listening } = startWindow({
@@ -81,7 +87,7 @@ function start({ stored = {}, storageThrows = false, refuse = {}, refuseListen =
     tauri,
     timers,
     storage,
-    ResizeObserver: observers.ResizeObserver,
+    ResizeObserver: resizeObserver ? observers.ResizeObserver : undefined,
     log: (...args) => logged.push(args),
   });
   return { doc, el: doc.byId, tauri, timers, storage, observers, logged, listening };
@@ -156,19 +162,38 @@ const sent = (w, command) => w.tauri.calls.filter(([name]) => name === command);
 
 // --- start ----------------------------------------------------------------------
 
-test('start_shows_the_stored_layout', () => {
-  const w = start({ stored: { [LAYOUT_KEY]: 'beside' } });
-  assert.equal(w.el('singleBody').classList.contains('-beside'), true);
-  assert.equal(w.el('singleBody').classList.contains('-under'), false);
-  assert.equal(w.el('layoutBeside').checked, true);
-  assert.equal(w.el('layoutUnder').checked, false);
+/** Whether the column is shown, as every part of the page says it: the modifier, the toggle, the parts. */
+function columnShown(w) {
+  const folded = w.el('single').classList.contains('-folded');
+  const expanded = w.el('columnToggle').getAttribute('aria-expanded');
+  const text = w.el('columnToggle').textContent;
+  const partsHidden = [w.el('columnBody').hidden, w.el('columnFoot').hidden];
+  if (!folded && expanded === 'true' && text === 'Hide settings' && partsHidden.every((hidden) => !hidden)) {
+    return true;
+  }
+  if (folded && expanded === 'false' && text === 'Show settings' && partsHidden.every((hidden) => hidden)) {
+    return false;
+  }
+  throw new Error(`the column is half folded: ${JSON.stringify({ folded, expanded, text, partsHidden })}`);
+}
+
+test('a_new_launch_starts_with_the_column_shown', async () => {
+  const first = start();
+  first.el('columnToggle').click();
+  assert.equal(columnShown(first), false);
+  // A new launch: nothing of the folded column is carried over.
+  const w = start({ stored: { [OLD_LAYOUT_KEY]: 'beside' } });
+  assert.equal(columnShown(w), true);
 });
 
-test('start_with_a_storage_that_throws_shows_under', () => {
-  const w = start({ storageThrows: true });
-  assert.equal(w.el('singleBody').classList.contains('-under'), true);
-  assert.equal(w.el('singleBody').classList.contains('-beside'), false);
-  assert.equal(w.el('layoutUnder').checked, true);
+test('the_stored_layout_value_is_not_read', async () => {
+  const w = start({ stored: { [OLD_LAYOUT_KEY]: 'beside' } });
+  await load(w);
+  w.el('columnToggle').click();
+  w.el('columnToggle').click();
+  await settle();
+  assert.deepEqual(w.storage.reads, []);
+  assert.deepEqual(w.storage.writes, []);
 });
 
 test('start_listens_to_every_backend_event', async () => {
@@ -205,7 +230,7 @@ test('start_shows_single_image_empty', () => {
 
 test('start_does_not_show_batch_or_the_picture', () => {
   const w = start();
-  for (const id of ['drop', 'panel', 'picture', 'singleFile', 'singleTools', 'saveAs', 'sizes', 'singleFoot']) {
+  for (const id of ['drop', 'panel', 'picture', 'singleFile', 'saveAs', 'sizes', 'singleFoot']) {
     assert.equal(w.el(id).hidden, true, id);
   }
   assert.equal(w.el('switchToBatch').hidden, true);
@@ -440,20 +465,202 @@ test('an_unchecked_radio_or_a_locked_switch_sends_nothing', async () => {
   assert.equal(w.el('single').hidden, false);
 });
 
-test('picking_beside_stores_it_and_moves_the_settings_beside', async () => {
+// --- the column: Hide settings, Show settings, what sits where ------------------------
+
+test('hide_settings_folds_the_column_and_show_settings_brings_it_back', async () => {
   const w = start();
-  await pick(w.el('layoutBeside'));
-  assert.deepEqual(w.storage.writes, [[LAYOUT_KEY, 'beside']]);
-  assert.equal(w.el('singleBody').classList.contains('-beside'), true);
-  assert.equal(w.el('singleBody').classList.contains('-under'), false);
+  await load(w);
+  assert.equal(columnShown(w), true);
+  w.el('columnToggle').click();
+  assert.equal(columnShown(w), false);
+  w.el('columnToggle').click();
+  assert.equal(columnShown(w), true);
 });
 
-test('an_unchecked_layout_radio_changes_nothing', () => {
+test('other_clicks_leave_the_column_as_it_is', async () => {
   const w = start();
-  w.el('layoutUnder').checked = false;
-  w.el('layoutUnder').fire('change');
-  assert.deepEqual(w.storage.writes, []);
-  assert.equal(w.el('singleBody').classList.contains('-under'), true);
+  await loadShown(w);
+  for (const id of ['zoomIn', 'zoomOut', 'zoomActual', 'zoomFit', 'chooseOther', 'save', 'singleOpenFolder']) {
+    w.el(id).click();
+    await settle();
+    assert.equal(columnShown(w), true, id);
+  }
+  // Folded, the same clicks leave it folded.
+  w.el('columnToggle').click();
+  for (const id of ['zoomIn', 'zoomFit', 'chooseOther']) {
+    w.el(id).click();
+    await settle();
+    assert.equal(columnShown(w), false, id);
+  }
+});
+
+test('hiding_the_column_hides_its_contents_but_not_show_settings', async () => {
+  const w = start();
+  await load(w);
+  w.el('columnToggle').click();
+  assert.equal(w.el('columnBody').hidden, true);
+  assert.equal(w.el('columnFoot').hidden, true);
+  // Show settings itself stays, and nothing above it is hidden.
+  for (let element = w.el('columnToggle'); element; element = element.parent) {
+    assert.equal(element.hidden, false, element.id || element.tagName);
+  }
+});
+
+test('showing_it_again_removes_hidden_from_every_part', async () => {
+  const w = start();
+  await load(w);
+  w.el('columnToggle').click();
+  w.el('columnToggle').click();
+  assert.equal(w.el('columnBody').hidden, false);
+  assert.equal(w.el('columnFoot').hidden, false);
+  // The parts inside show as they did before folding.
+  for (const id of ['singleFile', 'settings', 'saveAs', 'sizes', 'statusLine', 'singleFoot']) {
+    assert.equal(w.el(id).hidden, false, id);
+  }
+});
+
+test('hiding_the_column_while_focus_is_inside_moves_focus_to_show_settings', async () => {
+  for (const id of ['saveName', 'save']) {
+    const w = start();
+    await loadShown(w);
+    w.doc.strictFocus = true;
+    w.el(id).focus();
+    assert.equal(w.doc.activeElement, w.el(id), id);
+    w.el('columnToggle').click();
+    assert.equal(w.doc.activeElement, w.el('columnToggle'), id);
+  }
+});
+
+test('hiding_it_with_focus_elsewhere_leaves_focus_alone', async () => {
+  const w = start();
+  await loadShown(w);
+  w.doc.strictFocus = true;
+  w.el('zoomIn').focus();
+  w.el('columnToggle').click();
+  assert.equal(columnShown(w), false);
+  assert.equal(w.doc.activeElement, w.el('zoomIn'));
+});
+
+test('a_load_with_focus_on_choose_image_moves_focus_to_choose_other', async () => {
+  const w = start();
+  w.doc.strictFocus = true;
+  w.el('chooseImage').focus();
+  await load(w);
+  assert.equal(w.el('singleDrop').hidden, true);
+  assert.equal(w.doc.activeElement, w.el('chooseOther'));
+});
+
+test('a_load_with_the_column_folded_moves_focus_from_choose_image_to_the_picture', async () => {
+  const w = start();
+  w.el('columnToggle').click();
+  w.doc.strictFocus = true;
+  w.el('chooseImage').focus();
+  await load(w);
+  // Choose other is folded away with the column; the picture took the drop area's place.
+  assert.deepEqual(w.doc.refusedFocus, []);
+  assert.equal(w.doc.activeElement, w.el('picture'));
+});
+
+test('with_an_image_the_settings_status_and_save_sit_in_the_column', async () => {
+  const w = start();
+  await load(w);
+  assert.equal(w.el('settings').parent, w.el('singleSettingsSlot'));
+  assert.equal(w.el('statusLine').parent, w.el('singleStatusSlot'));
+  for (const id of ['singleFile', 'settings', 'saveAs']) {
+    assert.ok(w.el('columnBody').contains(w.el(id)), id);
+  }
+  for (const id of ['sizes', 'status', 'switchToBatch', 'save', 'singleOpenFolder']) {
+    assert.ok(w.el('columnFoot').contains(w.el(id)), id);
+  }
+  // The size box, then the status line, then Open folder and Save.
+  assert.deepEqual(w.el('columnFoot').children, [w.el('sizes'), w.el('singleStatusSlot'), w.el('singleFoot')]);
+});
+
+test('in_batch_the_settings_and_the_status_line_are_back_in_batchs_places', async () => {
+  const w = start();
+  await load(w);
+  await pick(w.el('viewBatch'));
+  assert.equal(w.el('settings').parent, w.el('batchSettingsSlot'));
+  assert.equal(w.el('statusLine').parent, w.el('batchStatusSlot'));
+  assert.equal(w.el('columnFoot').contains(w.el('status')), false);
+  // One of each: the column holds no copy.
+  assert.equal(w.doc.created.filter((element) => element.id === 'status').length, 1);
+  // And back again.
+  await pick(w.el('viewSingle'));
+  assert.equal(w.el('statusLine').parent, w.el('singleStatusSlot'));
+  assert.equal(w.el('settings').parent, w.el('singleSettingsSlot'));
+});
+
+test('in_the_empty_state_the_column_shows_only_the_settings', () => {
+  const w = start();
+  assert.equal(w.el('settings').hidden, false);
+  assert.ok(w.el('columnBody').contains(w.el('settings')));
+  for (const id of ['singleFile', 'saveAs', 'sizes', 'singleFoot']) {
+    assert.equal(w.el(id).hidden, true, id);
+  }
+  // The drop area takes the picture's place.
+  assert.equal(w.el('singleDrop').hidden, false);
+  assert.equal(w.el('picture').hidden, true);
+});
+
+test('with_an_image_loaded_the_column_shows_the_file_save_as_sizes_and_save', async () => {
+  const w = start();
+  await load(w);
+  for (const id of ['singleFile', 'settings', 'saveAs', 'sizes', 'singleFoot']) {
+    assert.equal(w.el(id).hidden, false, id);
+  }
+  assert.equal(w.el('singleDrop').hidden, true);
+  assert.equal(w.el('picture').hidden, false);
+});
+
+test('single_image_marks_the_main_area_single', () => {
+  const w = start();
+  assert.equal(w.el('main').classList.contains('-single'), true);
+  assert.equal(w.el('main').classList.contains('-batch'), false);
+});
+
+test('batch_marks_the_main_area_batch', async () => {
+  const w = start();
+  await pick(w.el('viewBatch'));
+  assert.equal(w.el('main').classList.contains('-batch'), true);
+  assert.equal(w.el('main').classList.contains('-single'), false);
+});
+
+// --- the header's height ----------------------------------------------------------
+
+const headerHeight = (w) => w.doc.documentElement.style.getPropertyValue('--headerHeight');
+
+test('start_observes_the_header_and_writes_its_height', () => {
+  const w = start();
+  const header = w.el('header');
+  header.rect = { left: 0, top: 0, width: 760, height: 64 };
+  w.observers.resize(header);
+  assert.equal(headerHeight(w), '64px');
+  // The header wraps on a narrow window: taller.
+  header.rect = { left: 0, top: 0, width: 360, height: 96 };
+  w.observers.resize(header);
+  assert.equal(headerHeight(w), '96px');
+  assert.deepEqual(w.doc.documentElement.style.writes, [
+    ['--headerHeight', '64px'],
+    ['--headerHeight', '96px'],
+  ]);
+});
+
+test('a_header_resize_to_zero_writes_nothing', () => {
+  const w = start();
+  const header = w.el('header');
+  header.rect = { left: 0, top: 0, width: 0, height: 0 };
+  w.observers.resize(header);
+  assert.deepEqual(w.doc.documentElement.style.writes, []);
+});
+
+test('start_without_a_ResizeObserver_writes_no_height_and_does_not_throw', async () => {
+  const w = start({ resizeObserver: false });
+  assert.deepEqual(w.observers.observers, []);
+  assert.deepEqual(w.doc.documentElement.style.writes, []);
+  // The window still works.
+  await load(w);
+  assert.equal(shown(w), transformOf(FIT));
 });
 
 // --- the settings and the preview triggers -------------------------------------------
@@ -591,6 +798,78 @@ test('the_wheel_zooms_about_the_pointer_and_keeps_the_page_still', async () => {
   const expected = zoomAt(FIT, 1.25, { x: 200, y: 150 }, LIMITS, BIG, AREA);
   assert.notEqual(transformOf(expected), transformOf(FIT));
   assert.equal(shown(w), transformOf(expected));
+});
+
+test('the_zoom_percentage_follows_the_buttons_and_the_wheel', async () => {
+  const w = start();
+  await load(w);
+  const value = () => w.el('zoomValue').textContent;
+  // Fit for 4000 × 3000 in 800 × 600 is 20%.
+  assert.equal(value(), '20%');
+  assert.equal(value(), zoomText(FIT));
+  const in1 = step(FIT, 1, LIMITS, BIG, AREA);
+  w.el('zoomIn').click();
+  assert.equal(value(), zoomText(in1));
+  assert.equal(value(), '25%');
+  w.el('zoomOut').click();
+  assert.equal(value(), '20%');
+  w.el('zoomActual').click();
+  assert.equal(value(), '100%');
+  w.el('zoomFit').click();
+  assert.equal(value(), '20%');
+  w.el('picture').fire('wheel', { deltaY: -100, clientX: RECT.left + 200, clientY: RECT.top + 150 });
+  assert.equal(value(), zoomText(zoomAt(FIT, 1.25, { x: 200, y: 150 }, LIMITS, BIG, AREA)));
+  assert.notEqual(value(), '20%');
+  assert.equal(w.el('zoomValue').hidden, false);
+});
+
+test('a_zoom_that_does_not_change_the_view_keeps_the_text', async () => {
+  const w = start();
+  await load(w);
+  const writes = w.el('zoomValue').textWrites;
+  assert.equal(w.el('zoomValue').textContent, '20%');
+  // At Fit: Zoom out and Fit change nothing, and nothing is written again.
+  w.el('zoomOut').click();
+  w.el('zoomFit').click();
+  w.el('picture').fire('wheel', { deltaY: 0, clientX: 200, clientY: 150 });
+  assert.equal(w.el('zoomValue').textContent, '20%');
+  assert.equal(w.el('zoomValue').textWrites, writes);
+});
+
+test('a_press_on_the_zoom_controls_starts_no_drag', async () => {
+  const w = start();
+  const view = await zoomedIn(w);
+  const picture = w.el('picture');
+  for (const target of [w.el('zoomIn'), w.el('zoomValue'), w.el('zoomControls')]) {
+    picture.fire('pointerdown', pointer({ target }));
+    picture.fire('pointermove', pointer({ clientX: 250 }));
+    picture.fire('pointerup', pointer({ clientX: 250 }));
+  }
+  assert.deepEqual(picture.captured, []);
+  assert.equal(shown(w), transformOf(view));
+  // Control: a press on the picture still drags, and one on the handle moves the divider.
+  picture.fire('pointerdown', pointer({ target: w.el('stageOriginal').children[0] }));
+  picture.fire('pointermove', pointer({ clientX: 290 }));
+  assert.deepEqual(picture.captured, [5]);
+  assert.equal(shown(w), transformOf(pan(view, -10, 0, BIG, AREA)));
+  picture.fire('pointerup', pointer({}));
+  picture.fire('pointerdown', pointer({ target: w.el('handle') }));
+  picture.fire('pointermove', pointer({ clientX: RECT.left + 200 }));
+  assert.equal(w.el('divider').value, '25');
+});
+
+test('the_wheel_over_the_zoom_controls_does_not_zoom', async () => {
+  const w = start();
+  await load(w);
+  for (const target of [w.el('zoomFit'), w.el('zoomControls')]) {
+    const event = w.el('picture').fire('wheel', { deltaY: -100, clientX: 400, clientY: 580, target });
+    assert.equal(event.defaultPrevented, false);
+  }
+  assert.equal(shown(w), transformOf(FIT));
+  // Control: the wheel on the picture zooms.
+  const onPicture = w.el('picture').fire('wheel', { deltaY: -100, clientX: 400, clientY: 300 });
+  assert.equal(onPicture.defaultPrevented, true);
+  assert.notEqual(shown(w), transformOf(FIT));
 });
 
 test('a_wheel_turn_without_a_vertical_delta_keeps_the_view', async () => {
