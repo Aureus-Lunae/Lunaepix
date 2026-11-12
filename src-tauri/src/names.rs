@@ -96,7 +96,7 @@ fn is_reserved(name: &str) -> bool {
 
 #[cfg(test)]
 #[path = "../tests/common/save_names.rs"]
-mod save_names;
+pub(crate) mod save_names;
 
 #[cfg(test)]
 mod tests {

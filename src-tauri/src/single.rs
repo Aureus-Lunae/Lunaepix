@@ -13,9 +13,10 @@
 //! made. Keys and version numbers start at 1 and only go up during a launch.
 //!
 //! Every decision about shared state is acted on in the lock section that
-//! makes it: a preview's outcome is sent there, `preview-started` too, and a
-//! load stores its image only if the window is still open. Slow work (a
-//! worker run, a file copy, a delete, a folder listing) happens outside the
+//! makes it: a preview's outcome is sent there, `preview-started` too, a
+//! load stores its image only if the window is still open, and a save takes
+//! the image and its kept version's path together. Slow work (a worker run,
+//! a file copy or read, a delete, a folder listing) happens outside the
 //! lock. Preview workers and the clean-up of a version folder also take the
 //! worker gate, so the clean-up never removes a running worker's staging
 //! file.
@@ -155,13 +156,65 @@ fn suggested_name_with(
     free: impl FnOnce(&Path, &OsStr) -> Option<OsString>,
 ) -> String {
     let folder = out.unwrap_or_else(|| original.parent().unwrap_or(Path::new("")));
-    let name = batch_output_name(original, out.is_some());
-    let chosen = free(folder, &name).unwrap_or(name);
+    free_stem(folder, &batch_output_name(original, out.is_some()), free)
+}
+
+/// The name for the Save as box, without the extension: the first free name
+/// for the file name `name` in `folder` as `free` finds it
+/// ([`first_free_name`] outside the tests), or `name` itself when none is
+/// free. Only the last extension goes (`beach.v2.jpg` gives `beach.v2`). A
+/// name that is not valid UTF-8 is decoded lossily.
+pub(crate) fn free_stem(
+    folder: &Path,
+    name: &OsStr,
+    free: impl FnOnce(&Path, &OsStr) -> Option<OsString>,
+) -> String {
+    let chosen = free(folder, name).unwrap_or_else(|| name.to_owned());
     Path::new(&chosen)
         .file_stem()
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned()
+}
+
+/// `save_image`'s argument: the name typed in Save as (without the
+/// extension) and the key of the version the window shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveArgs {
+    pub name: String,
+    pub preview: String,
+}
+
+/// `save_image`'s whole argument object: exactly
+/// `{ "name": <string>, "preview": <string> }`. Anything else (no JSON, not
+/// an object, a missing or an extra key, a key of another type, `null`) is
+/// [`CommandError::InvalidName`]. The strings themselves are checked later.
+pub fn parse_save_args(args: Option<&Value>) -> Result<SaveArgs, CommandError> {
+    let args = args
+        .and_then(Value::as_object)
+        .filter(|args| args.len() == 2)
+        .ok_or(CommandError::InvalidName)?;
+    let text = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or(CommandError::InvalidName)
+    };
+    Ok(SaveArgs {
+        name: text("name")?,
+        preview: text("preview")?,
+    })
+}
+
+/// What a save writes, as [`Single::save_source`] found it in one lock
+/// section: the current image (its folder, extension and permissions) and
+/// the path of the version the window named.
+#[derive(Debug, Clone)]
+pub(crate) struct SaveSource {
+    pub image: LoadedImage,
+    /// `image-<key>/v<n><.ext>`: written once by its own worker, never
+    /// again, so it holds version `n`'s bytes for as long as it exists.
+    pub version: PathBuf,
 }
 
 /// What a drop in Single image mode does with its items.
@@ -596,6 +649,30 @@ impl Single {
             .ready
             .as_ref()
             .map(|ready| (ready.key, ready.version))
+    }
+
+    /// What a save of the version `preview` writes, decided in one lock
+    /// section: [`CommandError::NoImage`] without an image,
+    /// [`CommandError::NotReady`] unless `preview` is exactly
+    /// `"<key>-<n>"` of the kept version (not an older or a running one, no
+    /// other spelling); otherwise the image and that version's path, taken
+    /// together. The file is read after the lock is let go: a newer ready
+    /// version or the window closing may delete it by then, but never
+    /// change it (see [`SaveSource::version`]).
+    pub(crate) fn save_source(&self, preview: &str) -> Result<SaveSource, CommandError> {
+        let state = lock(&self.state);
+        let image = state.image.as_ref().ok_or(CommandError::NoImage)?;
+        let ready = state
+            .ready
+            .as_ref()
+            .filter(|ready| {
+                ready.key == image.key && format!("{}-{}", ready.key, ready.version) == preview
+            })
+            .ok_or(CommandError::NotReady)?;
+        Ok(SaveSource {
+            image: image.clone(),
+            version: ready.path.clone(),
+        })
     }
 
     /// The file the `preview` scheme serves: for `version` `None` the copy
@@ -1052,6 +1129,29 @@ mod tests {
             Some(OsString::from("optimized-holiday-7.jpg"))
         });
         assert_eq!(found, "optimized-holiday-7");
+    }
+
+    #[test]
+    fn free_stem_falls_back_to_the_name_when_no_number_is_free() {
+        let asked = Cell::new(false);
+        let stem = free_stem(
+            Path::new("/srv/out"),
+            OsStr::new("beach.v2.jpg"),
+            |folder, name| {
+                assert_eq!(folder, Path::new("/srv/out"));
+                assert_eq!(name, OsStr::new("beach.v2.jpg"));
+                asked.set(true);
+                None
+            },
+        );
+        assert!(asked.get());
+        // The stem: not empty, without the extension, the dot inside kept.
+        assert_eq!(stem, "beach.v2");
+        // When a free name is found, its stem.
+        let found = free_stem(Path::new("/srv/out"), OsStr::new("beach.jpg"), |_, _| {
+            Some(OsString::from("beach-3.jpg"))
+        });
+        assert_eq!(found, "beach-3");
     }
 
     // --- loading ------------------------------------------------------------------

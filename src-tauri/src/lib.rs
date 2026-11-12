@@ -76,7 +76,7 @@ fn session(app: &AppHandle) -> &Session {
 /// Start `job` on a thread of its own, so that reading folders and running
 /// files never block the main thread. Used through
 /// [`session::on_own_thread_or_here`], which does the work on the calling
-/// thread when this fails, so a run or a drop is never lost.
+/// thread when this fails, so a run, a drop or a preview job is never lost.
 fn spawn_work_thread(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("lunaepix-run".to_owned())
@@ -167,7 +167,8 @@ fn one_path(picked: Option<FilePath>) -> Option<PathBuf> {
 }
 
 /// What the window closing does: stop the run, then stop the preview and
-/// remove Single image mode's private folder.
+/// remove Single image mode's private folder. It waits for neither the run
+/// nor a save (see [`Session::save_image`]).
 fn close_down(stop: &StopHandle, session: &Session) {
     stop.stop();
     session.shutdown();
@@ -276,6 +277,18 @@ fn preview_image(app: AppHandle, settings: Option<serde_json::Value>) -> Result<
     })
 }
 
+/// Save the compressed version the window shows under the name typed in
+/// Save as, never replacing a file. Takes the whole argument object,
+/// `{ "name": "beach", "preview": "7-3" }`, so an extra key is refused too
+/// (see [`Session::save_image`]). Resolves once the file is written and
+/// `image-saved` has gone out. Not on the main thread (`async`): it reads
+/// and writes files, and its `image-saved` goes through the one event
+/// queue behind the preview's events.
+#[tauri::command(async)]
+fn save_image(app: AppHandle, request: tauri::ipc::Request<'_>) -> Result<(), CommandError> {
+    session(&app).save_image(json_body(request.body()), &mut |event| emit(&app, event))
+}
+
 /// Switch to Batch and add every item of the last Single image drop that
 /// left items out. Not on the main thread (`async`): adding reads folders.
 #[tauri::command(async)]
@@ -351,7 +364,8 @@ fn start_run(app: AppHandle, settings: Option<serde_json::Value>) -> Result<(), 
     )
 }
 
-/// Open the output folder of the last completed run in the file manager.
+/// Open the folder of the last save, or the output folder of the last
+/// completed run, whichever came last, in the file manager.
 /// Runs on the main thread: it sends no event.
 #[tauri::command]
 fn open_output_folder(app: AppHandle) -> Result<(), CommandError> {
@@ -487,12 +501,11 @@ pub fn run() -> ExitCode {
         .manage(state)
         .register_asynchronous_uri_scheme_protocol("thumb", thumb_protocol)
         .register_asynchronous_uri_scheme_protocol("preview", preview_protocol)
-        // `save_image` is declared in `build.rs` and granted already; its
-        // handler comes with the save.
         .invoke_handler(tauri::generate_handler![
             set_view,
             choose_image,
             preview_image,
+            save_image,
             move_drop_to_batch,
             choose_files,
             clear_list,

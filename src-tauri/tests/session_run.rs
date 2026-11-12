@@ -559,6 +559,29 @@ fn a_later_ready_preview_replaces_the_kept_version() {
     assert!(!image_folder(&session).join("v1.png").exists());
 }
 
+// Saving the shown version.
+
+#[test]
+fn save_writes_exactly_the_served_versions_bytes_through_the_real_worker() {
+    let (dir, session, _) = loaded("a.png", &gradient_png());
+    let ready = only_ready(&preview_with(&session, &lossy(40), &worker()));
+    let shown = served(&session, &format!("/{}", ready.key));
+    assert_eq!(shown.status, 200);
+    let heard = Heard::default();
+    session
+        .save_image(
+            Some(&json!({ "name": "beach", "preview": ready.key })),
+            &mut heard.emit(),
+        )
+        .unwrap();
+    let saved = fs::read(dir.path().join("beach.png")).unwrap();
+    assert_eq!(saved, shown.body);
+    assert_eq!(saved.len() as u64, ready.after);
+    // The version, not the original.
+    assert_ne!(saved, gradient_png());
+    assert_eq!(names(&heard.take()), ["image-saved"]);
+}
+
 // Failures.
 
 /// A gradient PNG previewed by `worker`, which fails: the `preview-failed`.
