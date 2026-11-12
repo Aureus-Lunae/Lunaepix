@@ -9,6 +9,7 @@
 //! keys, never paths.
 
 pub mod events;
+pub mod names;
 pub mod session;
 pub mod thumbs;
 
