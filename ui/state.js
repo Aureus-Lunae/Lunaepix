@@ -11,9 +11,16 @@
 // never overlap (see src-tauri/INTERFACE.md).
 //
 // The phases: 'empty' (no list, no panel), 'ready' (a list, the settings and
-// Run), 'running' and 'finished' (the run's rows, the summary).
+// Run), 'running' and 'finished' (the run's rows, the summary). They are
+// Batch's. `view` says which mode shows; Single image mode's part of the
+// state is `single`, and its actions and events are handled in single.js.
+//
+// This module and single.js import each other's functions. Neither uses the
+// other's bindings while it loads, only inside functions, so either can be
+// loaded first.
 
 import { fileCount, formatPercent, formatSize, formatSummary, formatTime, formatTotal } from './format.js';
+import { initialSingle, nameRejectionText, reduceSingle } from './single.js';
 
 /** Messages for the live region. A rejection the page does not know gets `unknown`. */
 export const MESSAGES = Object.freeze({
@@ -25,9 +32,15 @@ export const MESSAGES = Object.freeze({
   emptyList: 'No file in the list can be optimised.',
   outputMissing:
     'The output folder is gone or cannot be written to. Choose it again, or save next to the originals.',
+  noImage: 'Load an image first.',
+  notReady: 'The compressed version is not ready yet.',
+  nothingToMove: 'There is nothing to move to Batch any more.',
+  saveFailed: 'The file could not be saved.',
   unknown: 'Something went wrong.',
 });
 
+// `output-missing` is also save_image's (the output folder, or with none the
+// original's own folder); it keeps the same text.
 const REJECTIONS = Object.freeze({
   busy: MESSAGES.busy,
   'no-output': MESSAGES.noOutput,
@@ -35,11 +48,20 @@ const REJECTIONS = Object.freeze({
   'invalid-settings': MESSAGES.invalidSettings,
   'empty-list': MESSAGES.emptyList,
   'output-missing': MESSAGES.outputMissing,
+  'no-image': MESSAGES.noImage,
+  'not-ready': MESSAGES.notReady,
+  'nothing-to-move': MESSAGES.nothingToMove,
+  'save-failed': MESSAGES.saveFailed,
 });
 
-const MODES = Object.freeze(['lossless', 'lossy']);
+// save_image's rejections whose text depends on the name that was sent: they
+// are known, and `reduceSingle` writes their message. (`invalid-view` is in
+// neither list: the window never sends another view, so it is logged.)
+const NAME_REJECTIONS = Object.freeze(['invalid-name', 'name-taken']);
+
+export const MODES = Object.freeze(['lossless', 'lossy']);
 const START_QUALITY = 75;
-const NO_REASON = 'No reason was given';
+export const NO_REASON = 'No reason was given';
 const NO_NAME = '(no name)';
 const NEXT_TO_ORIGINALS = 'Next to the originals';
 const NOT_FINISHED = 'The run ended before this file was done';
@@ -61,16 +83,21 @@ export function initialState() {
     // The settings of the run, as `run-started` named them.
     run: null,
     summary: null,
+    // Whether Open folder has a folder to open: set by the last completed
+    // run's `has_output`, and by a save (`image-saved`).
     hasOutput: false,
     dragOver: false,
     // The live region text. `messageSeq` changes with every message, so the
     // same text twice is still announced twice.
     message: '',
     messageSeq: 0,
+    // The mode that shows: 'single' at every launch, or 'batch'.
+    view: 'single',
+    single: initialSingle(),
   };
 }
 
-function isObject(value) {
+export function isObject(value) {
   return typeof value === 'object' && value !== null;
 }
 
@@ -78,12 +105,17 @@ function count(value) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
-function sizeOrNull(value) {
+export function sizeOrNull(value) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
-function sentenceOrNull(value) {
+export function sentenceOrNull(value) {
   return typeof value === 'string' && value !== '' ? value : null;
+}
+
+/** A quality as the backend sends it: a whole number 0–100, or null. */
+export function qualityOrNull(value) {
+  return Number.isInteger(value) && value >= 0 && value <= 100 ? value : null;
 }
 
 /** The quality a text stands for: a whole number 0–100 in plain digits, or null. */
@@ -95,7 +127,7 @@ function parseQuality(text) {
   return quality <= 100 ? quality : null;
 }
 
-function withMessage(state, message) {
+export function withMessage(state, message) {
   return { ...state, message, messageSeq: state.messageSeq + 1 };
 }
 
@@ -142,10 +174,7 @@ function runFrom(payload) {
   if (!MODES.includes(payload.mode)) {
     return null;
   }
-  const quality =
-    payload.mode === 'lossy' && Number.isInteger(payload.quality) && payload.quality >= 0 && payload.quality <= 100
-      ? payload.quality
-      : null;
+  const quality = payload.mode === 'lossy' ? qualityOrNull(payload.quality) : null;
   return { mode: payload.mode, quality };
 }
 
@@ -343,7 +372,25 @@ export function reduce(state, action) {
     case 'run-busy':
       return withMessage(state, MESSAGES.busy);
 
+    // Single image mode's actions and events (see single.js).
+    case 'set-view':
+    case 'set-name-text':
+    case 'preview-requested':
+    case 'layout-changed':
+    case 'save-started':
+    case 'save-ended':
+    case 'image-changed':
+    case 'name-suggested':
+    case 'preview-started':
+    case 'preview-ready':
+    case 'preview-failed':
+    case 'image-saved':
+      return reduceSingle(state, action);
+
     case 'command-rejected':
+      if (NAME_REJECTIONS.includes(payload)) {
+        return reduceSingle(state, action);
+      }
       return withMessage(
         state,
         typeof payload === 'string' && Object.hasOwn(REJECTIONS, payload)
@@ -371,8 +418,17 @@ export function canChoose(state) {
   return state.phase !== 'running';
 }
 
+/** Open folder: after a run that wrote something, or after a save; not while a run is going. */
 export function canOpenFolder(state) {
   return state.phase !== 'running' && state.hasOutput === true;
+}
+
+/**
+ * The Single image / Batch switch (and Switch to Batch): locked while a run
+ * or a save is going, free again after. A locked switch does nothing.
+ */
+export function canSwitchView(state) {
+  return state.phase !== 'running' && state.single.saving === null;
 }
 
 /** Run needs a list with a row that will be compressed, and valid settings. */
@@ -383,11 +439,16 @@ export function canRun(state) {
 }
 
 /**
- * The `settings` argument of `start_run`: the mode and the quality as a whole
- * number (also for a lossless run, where the backend ignores it), or null
- * while the number field holds anything but a whole number 0–100.
+ * The `settings` argument of `start_run` and `preview_image`: the mode and the
+ * quality as a whole number. Lossless sends the last valid quality, which the
+ * backend needs as a whole number 0–100 and then ignores, so the hidden
+ * number field never blocks it. Lossy sends the number field's quality, or
+ * gives null while the field holds anything but a whole number 0–100.
  */
 export function runSettings(state) {
+  if (state.mode === 'lossless') {
+    return { mode: 'lossless', quality: state.quality };
+  }
   const quality = parseQuality(state.qualityText);
   return quality === null ? null : { mode: state.mode, quality };
 }
@@ -441,12 +502,17 @@ export function panelView(state) {
 /**
  * What the page does after a command was rejected: the action to dispatch
  * (none for "busy", which the backend's `run-busy` event already announces),
- * and whether to log the reason to the console (only one it does not know).
+ * and whether to log the reason to the console: one it does not know, and,
+ * when `state` is given, a name rejection the window cannot explain (an
+ * `invalid-name` for a stem the window accepts, or either name rejection
+ * with no image), which gets the generic message. Pass the state of the
+ * moment the rejection arrived, before `save-ended`.
  */
-export function afterRejection(reason) {
+export function afterRejection(reason, state) {
   const kind = classifyRejection(reason);
+  const unexplained = state !== undefined && NAME_REJECTIONS.includes(reason) && nameRejectionText(state, reason) === null;
   return {
-    log: kind === 'unknown',
+    log: kind === 'unknown' || unexplained,
     action: kind === 'busy' ? null : { type: 'command-rejected', payload: reason },
   };
 }
@@ -461,7 +527,8 @@ export function classifyRejection(reason) {
   if (reason === 'busy') {
     return 'busy';
   }
-  return typeof reason === 'string' && Object.hasOwn(REJECTIONS, reason) ? 'known' : 'unknown';
+  const known = typeof reason === 'string' && (Object.hasOwn(REJECTIONS, reason) || NAME_REJECTIONS.includes(reason));
+  return known ? 'known' : 'unknown';
 }
 
 /** Whether the last run planned no file at all, so there is nothing to total. */
