@@ -2,10 +2,9 @@
 //! the output setting, the busy guard, the run itself with its events, the
 //! output folder a run or a save leaves behind, and Single image mode's
 //! view, loading, drops and save (its state in `single`). No Tauri here: the
-//! side effects (the
-//! window's events, the dialogs, the run thread, the system opener, the
-//! runner, the probe) come in as closures, so all of it is tested without a
-//! window, failures included.
+//! side effects (the window's events, the dialogs, the run thread, the
+//! system opener, the runner, the probe, the save's writer) come in as
+//! closures, so all of it is tested without a window, failures included.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -43,9 +42,14 @@ use crate::thumbs::Thumbs;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CommandError {
-    /// A run (or a dialog for one) is already active.
+    /// The guard ([`RunGuard`]) is held: a run, a dialog (for files, a
+    /// folder or an image), a load of a chosen or dropped image, or a save
+    /// is active, or another command is in its short checked section (a
+    /// preview request, a list or output change).
     Busy,
-    /// No completed run has written output yet.
+    /// `open_output_folder` has no folder: nothing was saved and no
+    /// completed run wrote output yet, or the last completed run (after any
+    /// save) wrote nothing. A save sets the folder as a run does.
     NoOutput,
     /// The system could not open the folder (for example, it was removed).
     OpenFailed,
@@ -54,7 +58,9 @@ pub enum CommandError {
     InvalidSettings,
     /// No file in the list can be compressed.
     EmptyList,
-    /// The chosen output folder is gone or cannot be written to.
+    /// The chosen output folder is gone or cannot be written to. For a save
+    /// with no chosen folder it is the original's own folder; for a save it
+    /// is also a folder that went away just before the write.
     OutputMissing,
     /// `set_view` was given anything but `{ "view": "single" }` or
     /// `{ "view": "batch" }`.
@@ -66,7 +72,9 @@ pub enum CommandError {
     NothingToMove,
     /// `save_image` named a version that is not the kept version of the
     /// current image: none is ready yet, the last attempt failed, a newer
-    /// one has replaced it, or the key is another image's.
+    /// one has replaced it, or the key is another image's. Also when a newer
+    /// version or the window closing removed the named version's file
+    /// before the save read it (after the read the save goes on).
     NotReady,
     /// `save_image` was given a name the rules refuse
     /// ([`crate::names::check_save_name`]), or an argument that is not
@@ -107,11 +115,15 @@ fn read_version(path: &Path) -> Result<Vec<u8>, CommandError> {
     })
 }
 
-/// What a failed save write means for the window: a taken name is
-/// [`CommandError::NameTaken`], anything else [`CommandError::SaveFailed`].
+/// What a failed save write ([`save_new`]) means for the window: a taken
+/// name is [`CommandError::NameTaken`]; a folder that is gone (`save_new`
+/// creates none: `NotFound`), also one removed after [`can_write_in`]
+/// passed, is [`CommandError::OutputMissing`]; anything else is
+/// [`CommandError::SaveFailed`].
 fn save_error(error: &io::Error) -> CommandError {
     match error.kind() {
         io::ErrorKind::AlreadyExists => CommandError::NameTaken,
+        io::ErrorKind::NotFound => CommandError::OutputMissing,
         _ => CommandError::SaveFailed,
     }
 }
@@ -347,9 +359,9 @@ fn can_write_in(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Run `work(value)` on a thread that `spawn` starts. If no thread can be
-/// started, run it on this thread instead, so that `value` (a run, or a
-/// drop with its ticket) is never lost and the window never waits for
-/// events that cannot come.
+/// started, run it on this thread instead, so that `value` (a run, a drop
+/// with its ticket, or a preview job) is never lost and the window never
+/// waits for events that cannot come.
 pub fn on_own_thread_or_here<T: Send + 'static>(
     value: T,
     work: impl FnOnce(T) + Clone + Send + 'static,
@@ -879,10 +891,19 @@ impl Session {
     /// [`CommandError::OutputMissing`]). Then the version's bytes go to
     /// `<folder>/<name><ext>` with the original's permissions through
     /// [`save_new`]: a taken name (a file or a folder) is
-    /// [`CommandError::NameTaken`], any other failure
+    /// [`CommandError::NameTaken`], a folder gone by then
+    /// [`CommandError::OutputMissing`], any other failure
     /// [`CommandError::SaveFailed`]; nothing is written then. On success
     /// the folder becomes the one `open_output_folder` opens, and
     /// `image-saved` goes out, both before the guard is given back.
+    ///
+    /// Closing the window does not wait for a save: [`Session::shutdown`]
+    /// neither stops nor waits for it, so a save that has read its bytes
+    /// completes while the process runs on. If the process exits during the
+    /// write, the file may be missing and `save_new`'s hidden staging file
+    /// (`.tmp` and six characters) may be left in the target folder. Waiting
+    /// at close is not done: the close handler runs on the main thread,
+    /// and the guard it would wait for may be held by an open dialog.
     pub fn save_image(
         &self,
         args: Option<&Value>,
@@ -930,7 +951,9 @@ impl Session {
     }
 
     /// The window closes: stop the preview and remove Single image mode's
-    /// private folder ([`Single::shutdown`]).
+    /// private folder ([`Single::shutdown`]). A save that has not read its
+    /// version yet then answers [`CommandError::NotReady`]; one that has goes
+    /// on, and nothing here waits for it (see [`Session::save_image`]).
     pub fn shutdown(&self) {
         self.single.shutdown();
     }
@@ -946,13 +969,18 @@ impl Session {
     }
 }
 
-/// Allows one run at a time. A run holds a [`RunTicket`] from the moment it
-/// is asked for (before a dialog opens) until it is over.
+/// Allows one guarded action at a time (the busy guard). A run holds a
+/// [`RunTicket`] from the moment it is asked for (before a dialog opens)
+/// until it is over; so do a load of a chosen or dropped image (from the
+/// dialog or the drop until `image-changed` has gone out), a save (until
+/// `image-saved` has gone out) and a dialog for files or a folder. Every
+/// other command except `open_output_folder` holds one through its own
+/// checks and changes, a preview request only until its job is registered.
 #[derive(Debug, Clone, Default)]
 pub struct RunGuard(Arc<AtomicBool>);
 
-/// Proof that the holder may run. Dropping it frees the guard, also when the
-/// run panics.
+/// Proof that the holder may act (run, load, save, change the list or the
+/// output). Dropping it frees the guard, also when the holder panics.
 #[derive(Debug)]
 pub struct RunTicket(Arc<AtomicBool>);
 
@@ -976,8 +1004,9 @@ impl Drop for RunTicket {
     }
 }
 
-/// A ticket for a new run; or, while a run is active, `run-busy` to the
-/// window and [`CommandError::Busy`] to the caller.
+/// A ticket for the caller (a run, a dialog, a load, a save or another
+/// command); or, while another ticket is alive, `run-busy` to the window and
+/// [`CommandError::Busy`] to the caller.
 pub fn claim_run(
     guard: &RunGuard,
     emit: &mut impl FnMut(Event),
@@ -995,9 +1024,10 @@ pub fn worker_prober(worker: &Worker) -> impl Fn(&Path) -> ProbeAnswer + '_ {
 }
 
 /// Open the folder in `last_output` (the last save's, or the last completed
-/// run's output folder) with `open` (the system file manager). [`CommandError::NoOutput`] without calling `open` if there
-/// is none; [`CommandError::OpenFailed`] if `open` fails. The lock is not
-/// held while `open` runs.
+/// run's output folder) with `open` (the system file manager).
+/// [`CommandError::NoOutput`] without calling `open` if there is none;
+/// [`CommandError::OpenFailed`] if `open` fails. The lock is not held while
+/// `open` runs.
 pub fn open_last_output<E>(
     last_output: &Mutex<Option<PathBuf>>,
     open: impl FnOnce(&Path) -> Result<(), E>,
@@ -6319,8 +6349,15 @@ mod tests {
 
         // Failures.
 
+        /// The writer here fails without touching the disk, so this test
+        /// claims only the answer and that nothing is sent or stored. That
+        /// `save_new` removes its staging file on a failure is core's
+        /// `save_new_leaves_no_temporary_file_after_a_refusal` and
+        /// `save_new_returns_a_rename_error_that_is_not_a_taken_name_and_leaves_no_temp_file`;
+        /// the real staging case is
+        /// `a_folder_made_read_only_before_the_write_is_save_failed_and_leaves_no_file`.
         #[test]
-        fn a_failing_write_is_save_failed_and_leaves_no_file() {
+        fn a_failing_write_is_save_failed_and_sends_nothing() {
             let s = ready_image("holiday.jpg");
             let before = snapshot(s.dir.path());
             let answer = s.session.save_image_with(
@@ -6357,14 +6394,14 @@ mod tests {
         }
 
         #[test]
-        fn a_folder_removed_before_the_write_is_save_failed() {
+        fn a_folder_removed_before_the_write_is_output_missing() {
             let (s, out) = ready_with_exports();
             let answer = save_with(&s, "holiday", &mut |seam| {
                 if seam == SaveSeam::BeforeWrite {
                     fs::remove_dir(&out).unwrap();
                 }
             });
-            assert_eq!(answer, Err(CommandError::SaveFailed));
+            assert_eq!(answer, Err(CommandError::OutputMissing));
             assert!(!out.exists(), "the folder is not made again");
             assert!(s.window.take().is_empty());
             assert_eq!(last_output(&s.session), None);
@@ -6407,6 +6444,37 @@ mod tests {
             refused_save(&s, Some(&args("beach", &s.key)), CommandError::Busy);
             drop(open);
             assert_eq!(save(&s, "beach"), Ok(()));
+        }
+
+        #[test]
+        fn a_save_while_an_image_is_loading_is_busy() {
+            let s = ready_image("holiday.jpg");
+            let other = s.dir.path().join("other.jpg");
+            fs::write(&other, ORIGINAL).unwrap();
+            let loading = Window::default();
+            let asked = Cell::new(false);
+            s.session
+                .choose_image(&mut loading.emit(), |ticket| {
+                    s.session.load_image(
+                        ticket,
+                        Some(other.clone()),
+                        |_| {
+                            // The probe runs while the load holds the guard.
+                            asked.set(true);
+                            refused_save(&s, Some(&args("beach", &s.key)), CommandError::Busy);
+                            ProbeAnswer::Size(Probe {
+                                width: Some(1),
+                                height: Some(1),
+                            })
+                        },
+                        &mut loading.emit(),
+                    );
+                })
+                .unwrap();
+            assert!(asked.get(), "the probe ran");
+            // Once the load is over the guard is free: the new image has no
+            // ready version yet, so the save is refused for that, not busy.
+            refused_save(&s, Some(&args("beach", &s.key)), CommandError::NotReady);
         }
 
         // The ticket is held for the whole save.
@@ -6567,8 +6635,13 @@ mod tests {
             assert!(s.window.take().is_empty());
         }
 
+        /// `Session::shutdown` (what the window closing calls) neither waits
+        /// for nor stops a save that has read its bytes: while the process
+        /// runs on, the write completes. This does not cover the process
+        /// exiting during the write; then the file may be missing and a
+        /// staging file may be left in the folder (see `save_image`).
         #[test]
-        fn race_shutdown_before_write_still_saves_the_named_version() {
+        fn race_session_shutdown_before_write_does_not_stop_the_write() {
             let s = ready_image("holiday.jpg");
             let private = loaded(&s.session).copy.parent().unwrap().to_path_buf();
             let answer = save_with(&s, "beach", &mut |seam| {
@@ -6578,6 +6651,23 @@ mod tests {
             });
             assert!(!private.exists(), "shutdown removed the private folder");
             assert_eq!(answer, Ok(()));
+            assert_eq!(fs::read(s.dir.path().join("beach.jpg")).unwrap(), VERSION);
+        }
+
+        #[test]
+        fn image_saved_names_a_chosen_folder_without_a_name_by_an_empty_string() {
+            // A folder path ending in `..` has no file name, as a drive root
+            // such as `D:\` has none; it is still a writable folder.
+            let s = ready_image("holiday.jpg");
+            let exports = s.dir.path().join("exports");
+            fs::create_dir(&exports).unwrap();
+            choose_output(&s.session, &s.window, &exports.join(".."));
+            s.window.take();
+            assert_eq!(save(&s, "beach"), Ok(()));
+            assert_eq!(
+                only_saved(&s.window),
+                json!({ "name": "beach.jpg", "folder": "", "suggested": "beach-1" })
+            );
             assert_eq!(fs::read(s.dir.path().join("beach.jpg")).unwrap(), VERSION);
         }
 

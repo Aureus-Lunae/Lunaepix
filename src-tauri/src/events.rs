@@ -282,7 +282,8 @@ pub enum Event {
     FileStarted(FileStarted),
     FileDone(FileDone),
     RunFinished(RunFinished),
-    /// A drop or a command was refused because a run, or a dialog, is active.
+    /// A drop or a command was refused because the busy guard is held (a run,
+    /// a dialog, a load, a save, or another command's short checked section).
     RunBusy,
     /// A file or folder dialog was closed without a choice.
     RunCancelled,

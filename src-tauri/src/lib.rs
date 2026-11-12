@@ -76,7 +76,7 @@ fn session(app: &AppHandle) -> &Session {
 /// Start `job` on a thread of its own, so that reading folders and running
 /// files never block the main thread. Used through
 /// [`session::on_own_thread_or_here`], which does the work on the calling
-/// thread when this fails, so a run or a drop is never lost.
+/// thread when this fails, so a run, a drop or a preview job is never lost.
 fn spawn_work_thread(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("lunaepix-run".to_owned())
@@ -167,7 +167,8 @@ fn one_path(picked: Option<FilePath>) -> Option<PathBuf> {
 }
 
 /// What the window closing does: stop the run, then stop the preview and
-/// remove Single image mode's private folder.
+/// remove Single image mode's private folder. It waits for neither the run
+/// nor a save (see [`Session::save_image`]).
 fn close_down(stop: &StopHandle, session: &Session) {
     stop.stop();
     session.shutdown();

@@ -74,9 +74,11 @@ await invoke('save_image', { name: 'optimized-holiday', preview: '7-3' });
   kept for the current image: none is ready yet, the last attempt failed
   and none was ready before, a newer version has become ready, or the key
   is another image's. It is compared as text with the `key` of the last
-  `preview-ready` (so `"07-3"` is refused). Also when a newer version
-  became ready, or the window closed, while the save was reading the
-  version. Nothing is written.
+  `preview-ready` (so `"07-3"` is refused). Also when, after that check
+  but before the save read the version, a newer version became ready or
+  the window closed (either removes the version's file). Once the save has
+  read the version, neither stops it: the save goes on and succeeds.
+  Nothing is written when it answers `"not-ready"`.
 - `"invalid-name"`: `save_image`'s `name` breaks a name rule (see
   [Single image mode](#single-image-mode)), or the argument is not exactly
   an object with the two string keys `name` and `preview` (a missing or an
@@ -86,8 +88,7 @@ await invoke('save_image', { name: 'optimized-holiday', preview: '7-3' });
   included). Nothing is written, nothing is replaced, and the name is not
   numbered: choose another.
 - `"save-failed"`: the file could not be written for another reason (a
-  full disk, a folder that refused the write, a folder removed at that
-  very moment). Nothing is written.
+  full disk, a folder that refused the write). Nothing is written.
 - `"nothing-to-move"`: there is no drop to move: the last Single image drop
   left nothing out, or its offer has ended.
 - `"invalid-settings"`: `settings` is missing or `null`, or is not exactly
@@ -99,8 +100,9 @@ await invoke('save_image', { name: 'optimized-holiday', preview: '7-3' });
   ignored there.
 - `"output-missing"`: the chosen output folder is gone, is no longer a
   folder, or cannot be written to; for `save_image` with no chosen folder,
-  the same for the original's own folder. `start_run` and `save_image` do
-  not create it again.
+  the same for the original's own folder. For `save_image` it is also a
+  folder removed after its check but before the write. `start_run` and
+  `save_image` do not create it again.
   A folder deleted once the run has started is created again by the next
   file written into it.
 - `"empty-list"`: no file in the list can be compressed (the list is
@@ -123,8 +125,8 @@ Nothing starts when it rejects.
 `save_image` checks, in this order: busy, the argument's shape
 (`"invalid-name"`), the image, `preview` (`"not-ready"`), the name rules
 (`"invalid-name"`), then the folder (`"output-missing"`); the write itself
-can then give `"name-taken"` or `"save-failed"`. Nothing is written when it
-rejects.
+can then give `"name-taken"`, `"output-missing"` (the folder went away
+since its check) or `"save-failed"`. Nothing is written when it rejects.
 
 A dialog closed without a choice changes nothing and sends `run-cancelled`.
 
@@ -225,7 +227,10 @@ bytes (UTF-8) with the extension. The name is written exactly as typed
 until `image-saved` has gone out, so no other command, drop or run starts
 meanwhile; a version still being made goes on and may become ready. After a
 save, `open_output_folder` opens the folder written to, until a later save
-or completed run.
+or completed run. Closing the window does not wait for a save: a save that
+has read its version finishes while the app is still running, but if the
+app exits during the write the file may be missing, and a hidden staging
+file (`.tmp` and six characters) may be left in the target folder.
 
 ## Events
 
@@ -478,8 +483,10 @@ is true exactly when `open_output_folder` has a folder.
 
 ### `run-busy`
 
-A command or a drop was refused because a run, or a dialog for one, is
-active. Payload `null`.
+A command or a drop was refused because the backend is busy: a run is
+active, a dialog is open, an image is being loaded or saved, or another
+command is in its short checked moment (see `"busy"` under
+[Commands](#commands)). Payload `null`.
 
 ### `run-cancelled`
 
