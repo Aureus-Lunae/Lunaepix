@@ -14,12 +14,17 @@
 //   with 'batch' once `move_drop_to_batch` resolved. A "busy" answer
 //   dispatches nothing, so the view stays.
 // - `set-name-text` (a string): the Save as box was typed in.
-// - `preview-requested` (the `{ settings }` that `previewArgs` gave):
-//   dispatched once `preview_image` resolved, i.e. the backend accepted it.
-//   A refused request records nothing, so the next trigger asks again.
+// - `preview-requested` ({ image, settings }): build it with
+//   `previewRequestedAction` when `preview_image` is sent, and dispatch it
+//   once `preview_image` resolved, i.e. the backend accepted it. A refused
+//   request records nothing, so the next trigger asks again; one for an
+//   image that is no longer the current one records nothing either.
 // - `layout-changed` ('under' or 'beside').
 // - `save-started` (the `saveArgs` sent) and `save-ended` (whatever the
-//   answer): a save is going between the two.
+//   answer): a save is going between the two. When `save_image` rejects,
+//   dispatch the rejection (and call `afterRejection` with the state) BEFORE
+//   `save-ended`: the name rejections name the stem recorded by
+//   `save-started`, and without it they fall back to the box's text.
 //
 // The guard on preview outcomes (INTERFACE.md, "Rules for the window"): a
 // `preview-ready` or `preview-failed` counts only when its `image` is the
@@ -142,16 +147,16 @@ function isLatest(single, payload) {
 }
 
 /**
- * Whether the version shown was made with the settings last asked for. The
- * quality of a lossless version is null and does not count.
+ * Whether the version shown was made with `settings`: the same mode, and for
+ * lossy the same quality (a lossless version's quality is null and does not
+ * count). False when either is missing.
  */
-function shownMatchesRequest(single) {
-  const { ready, requested } = single;
+function shownMatches(ready, settings) {
   return (
     ready !== null &&
-    requested !== null &&
-    ready.mode === requested.mode &&
-    (ready.mode === 'lossless' || ready.quality === requested.quality)
+    settings !== null &&
+    ready.mode === settings.mode &&
+    (ready.mode === 'lossless' || ready.quality === settings.quality)
   );
 }
 
@@ -183,22 +188,39 @@ function imageChanged(state, payload) {
   return notice === null ? next : withMessage(next, notice);
 }
 
+/** The stem a name rejection is about: the one sent with the save going, else the box's text. */
+function rejectedStem(single) {
+  return single.saving === null ? single.nameText : single.saving.name;
+}
+
 /**
- * The message of `invalid-name` and `name-taken`, for the stem that was sent
- * (the box's text when no save is recorded). `name-taken` is also tied to the
- * box until its text changes.
+ * The text of `invalid-name` or `name-taken` for the stem that was sent, or
+ * null when the window cannot explain it: no image is loaded, or
+ * `invalid-name` came for a stem the window's name rules accept. The window
+ * shows the generic message then, and `afterRejection` logs it.
  */
-function nameRejected(state, reason) {
+export function nameRejectionText(state, reason) {
   const single = state.single;
   if (single.image === null) {
+    return null;
+  }
+  const stem = rejectedStem(single);
+  if (reason === 'name-taken') {
+    return `A file named ${stem}${single.image.extension} already exists there. Choose another name.`;
+  }
+  return nameProblem(stem, single.image.extension);
+}
+
+/** A name rejection: its message; `name-taken` is also tied to the box until its text changes. */
+function nameRejected(state, reason) {
+  const text = nameRejectionText(state, reason);
+  if (text === null) {
     return withMessage(state, MESSAGES.unknown);
   }
-  const stem = single.saving === null ? single.nameText : single.saving.name;
   if (reason === 'name-taken') {
-    const text = `A file named ${stem}${single.image.extension} already exists there. Choose another name.`;
-    return withMessage(withSingle(state, { refused: { name: stem, text } }), text);
+    return withMessage(withSingle(state, { refused: { name: rejectedStem(state.single), text } }), text);
   }
-  return withMessage(state, nameProblem(stem, single.image.extension) ?? MESSAGES.unknown);
+  return withMessage(state, text);
 }
 
 export function reduceSingle(state, action) {
@@ -216,7 +238,7 @@ export function reduceSingle(state, action) {
         // so a request whose version is not the one shown is asked again on
         // return to Single image.
         changes.compressing = false;
-        if (!shownMatchesRequest(single)) {
+        if (!shownMatches(single.ready, single.requested)) {
           changes.requested = null;
         }
       }
@@ -227,8 +249,11 @@ export function reduceSingle(state, action) {
       return typeof payload === 'string' ? withSingle(state, { nameText: payload, nameTyped: true }) : state;
 
     case 'preview-requested': {
+      // Only for the image it was sent for, if that is still the current one:
+      // a late answer for an image replaced since must not count for the new one.
       const settings = isObject(payload) ? settingsFrom(payload.settings) : null;
-      return single.image === null || settings === null ? state : withSingle(state, { requested: settings });
+      const current = single.image !== null && isObject(payload) && payload.image === single.image.key;
+      return current && settings !== null ? withSingle(state, { requested: settings }) : state;
     }
 
     case 'layout-changed':
@@ -310,8 +335,9 @@ export function reduceSingle(state, action) {
 
 /**
  * The `preview_image` argument when there is something new to make: an image
- * shows in Single image, the quality text is valid, and the settings differ
- * from the last request the backend accepted for this image. Otherwise null.
+ * shows in Single image, the settings are valid (`runSettings`: Lossless
+ * always, Lossy with a valid quality text), and they differ from the last
+ * request the backend accepted for this image. Otherwise null.
  */
 export function previewArgs(state) {
   const { image, requested } = state.single;
@@ -327,15 +353,30 @@ export function previewArgs(state) {
 }
 
 /**
- * Save needs a version shown and none being made, no failed last attempt, no
- * save going, and a name that passes the name rules. A name refused as taken
- * may be tried again (the file may have gone since).
+ * The `preview-requested` action to dispatch once `preview_image` with `args`
+ * resolved: built when the request is sent, so it names the image it was sent
+ * for. Null when `args` is null or no image is loaded.
+ */
+export function previewRequestedAction(state, args) {
+  const image = state.single.image;
+  if (args === null || image === null) {
+    return null;
+  }
+  return { type: 'preview-requested', payload: { image: image.key, settings: args.settings } };
+}
+
+/**
+ * Save needs a version shown that was made with the settings shown now (the
+ * mode, and for lossy the quality; so not between a settings change and its
+ * version), none being made, no failed last attempt, no save going, and a
+ * name that passes the name rules. A name refused as taken may be tried
+ * again (the file may have gone since).
  */
 export function canSave(state) {
   const { image, ready, compressing, failed, saving, nameText: text } = state.single;
   return (
     image !== null &&
-    ready !== null &&
+    shownMatches(ready, runSettings(state)) &&
     !compressing &&
     failed === null &&
     saving === null &&
@@ -356,16 +397,19 @@ function savesText(before, after) {
 /**
  * The size box: the sizes as Batch formats them ('' where there is none), the
  * saving as a percentage and bytes (negative for a file that grew), the note
- * (the failure's reason, else the version's note, else null) and whether a
- * version is being made. While one is, the previous numbers stay.
+ * and whether a version is being made. While one is, the previous numbers
+ * stay. The note is the last attempt's failure reason, except while a new
+ * version is being made ("Compressing…" wins); otherwise the shown version's
+ * note, or null.
  */
 export function sizeView(state) {
   const { image, ready, failed, compressing } = state.single;
+  const versionNote = ready === null ? null : ready.note;
   return {
     original: image === null || image.size === null ? '' : formatSize(image.size),
     compressed: ready === null ? '' : formatSize(ready.after),
     saves: ready === null ? '' : savesText(ready.before, ready.after),
-    note: failed ?? (ready === null ? null : ready.note),
+    note: failed !== null && !compressing ? failed : versionNote,
     busy: compressing,
   };
 }

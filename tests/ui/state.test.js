@@ -792,6 +792,20 @@ test('switching_to_lossless_puts_back_the_last_valid_quality', () => {
   assert.equal(canRun(state), true);
 });
 
+test('run_in_lossless_is_not_blocked_by_an_invalid_hidden_quality_text', () => {
+  // Not reachable through `reduce` (set-mode puts back the last valid
+  // quality), so the state is built: the hidden text must never block
+  // Lossless, which sends the last valid quality.
+  const lossless = { ...apply(initialState(), threeFiles(), setMode('lossy'), setQuality('60'), setMode('lossless')), qualityText: 'abc' };
+  assert.deepEqual(runSettings(lossless), { mode: 'lossless', quality: 60 });
+  assert.equal(canRun(lossless), true);
+  assert.deepEqual(startRunArgs(lossless), { settings: { mode: 'lossless', quality: 60 } });
+  // The same text in Lossy blocks Run.
+  const lossy = { ...lossless, mode: 'lossy' };
+  assert.equal(runSettings(lossy), null);
+  assert.equal(canRun(lossy), false);
+});
+
 test('switching_to_lossless_keeps_a_valid_quality_text_as_typed', () => {
   const state = apply(initialState(), threeFiles(), setMode('lossy'), setQuality('075'), setMode('lossless'));
   assert.equal(state.qualityText, '075');

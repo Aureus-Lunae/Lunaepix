@@ -20,7 +20,7 @@
 // loaded first.
 
 import { fileCount, formatPercent, formatSize, formatSummary, formatTime, formatTotal } from './format.js';
-import { initialSingle, reduceSingle } from './single.js';
+import { initialSingle, nameRejectionText, reduceSingle } from './single.js';
 
 /** Messages for the live region. A rejection the page does not know gets `unknown`. */
 export const MESSAGES = Object.freeze({
@@ -439,11 +439,16 @@ export function canRun(state) {
 }
 
 /**
- * The `settings` argument of `start_run`: the mode and the quality as a whole
- * number (also for a lossless run, where the backend ignores it), or null
- * while the number field holds anything but a whole number 0–100.
+ * The `settings` argument of `start_run` and `preview_image`: the mode and the
+ * quality as a whole number. Lossless sends the last valid quality, which the
+ * backend needs as a whole number 0–100 and then ignores, so the hidden
+ * number field never blocks it. Lossy sends the number field's quality, or
+ * gives null while the field holds anything but a whole number 0–100.
  */
 export function runSettings(state) {
+  if (state.mode === 'lossless') {
+    return { mode: 'lossless', quality: state.quality };
+  }
   const quality = parseQuality(state.qualityText);
   return quality === null ? null : { mode: state.mode, quality };
 }
@@ -497,12 +502,17 @@ export function panelView(state) {
 /**
  * What the page does after a command was rejected: the action to dispatch
  * (none for "busy", which the backend's `run-busy` event already announces),
- * and whether to log the reason to the console (only one it does not know).
+ * and whether to log the reason to the console: one it does not know, and,
+ * when `state` is given, a name rejection the window cannot explain (an
+ * `invalid-name` for a stem the window accepts, or either name rejection
+ * with no image), which gets the generic message. Pass the state of the
+ * moment the rejection arrived, before `save-ended`.
  */
-export function afterRejection(reason) {
+export function afterRejection(reason, state) {
   const kind = classifyRejection(reason);
+  const unexplained = state !== undefined && NAME_REJECTIONS.includes(reason) && nameRejectionText(state, reason) === null;
   return {
-    log: kind === 'unknown',
+    log: kind === 'unknown' || unexplained,
     action: kind === 'busy' ? null : { type: 'command-rejected', payload: reason },
   };
 }

@@ -13,6 +13,7 @@ import {
   offerView,
   pixelSizeText,
   previewArgs,
+  previewRequestedAction,
   reduceSingle,
   saveArgs,
   sizeView,
@@ -52,9 +53,9 @@ const setView = (view) => ({ type: 'set-view', payload: view });
 const setMode = (mode) => ({ type: 'set-mode', payload: mode });
 const setQuality = (text) => ({ type: 'set-quality-text', payload: text });
 const typed = (text) => ({ type: 'set-name-text', payload: text });
-const requested = (mode = 'lossless', quality = 75) => ({
+const requested = (mode = 'lossless', quality = 75, image = '7') => ({
   type: 'preview-requested',
-  payload: { settings: { mode, quality } },
+  payload: { image, settings: { mode, quality } },
 });
 const started = (image, version) => ({ type: 'preview-started', payload: { image, version } });
 const ready = (image, version, overrides = {}) => ({
@@ -93,7 +94,7 @@ function withVersion(key = '7') {
     initialState(),
     setMode('lossy'),
     loaded(key),
-    requested('lossy', 75),
+    requested('lossy', 75, key),
     started(key, 1),
     ready(key, 1),
   );
@@ -354,7 +355,7 @@ test('the_offer_cannot_be_used_while_a_save_is_going', () => {
     initialState(),
     setMode('lossy'),
     imageChanged(holiday('8'), 1, notice),
-    requested('lossy', 75),
+    requested('lossy', 75, '8'),
     started('8', 1),
     ready('8', 1),
   );
@@ -730,7 +731,7 @@ test('sizes_are_formatted_as_batch_does', () => {
   const small = apply(
     initialState(),
     imageChanged(logo('9')),
-    requested(),
+    requested('lossless', 75, '9'),
     started('9', 1),
     ready('9', 1, { mode: 'lossless', quality: null, before: 4100, after: 3000 }),
   );
@@ -940,4 +941,151 @@ test('reduce_never_changes_the_state_it_was_given_for_the_single_actions', () =>
     assert.notEqual(next, state, action.type);
     assert.deepEqual(state, copy, action.type);
   }
+});
+
+// fix round 1
+
+test('lossless_with_an_invalid_hidden_quality_text_still_asks_for_a_version', () => {
+  // Through the reducer, picking Lossless puts back the last valid quality,
+  // so the hidden text is valid again:
+  const viaReducer = apply(initialState(), loaded('7'), setMode('lossy'), setQuality('60'), setQuality('abc'), setMode('lossless'));
+  assert.deepEqual(previewArgs(viaReducer), { settings: { mode: 'lossless', quality: 60 } });
+  // Even a hidden text that is not valid does not block Lossless: the
+  // backend needs a whole number 0–100 there and ignores it, and the last
+  // valid quality is sent.
+  const lossless = { ...apply(initialState(), loaded('7'), setMode('lossy'), setQuality('60'), setMode('lossless')), qualityText: 'abc' };
+  assert.deepEqual(previewArgs(lossless), { settings: { mode: 'lossless', quality: 60 } });
+});
+
+test('lossy_with_an_invalid_quality_text_asks_for_nothing', () => {
+  const lossy = apply(initialState(), loaded('7'), setMode('lossy'), setQuality('60'), setQuality('abc'));
+  assert.equal(previewArgs(lossy), null);
+  assert.equal(previewArgs({ ...lossy, qualityText: '' }), null);
+});
+
+test('save_is_refused_after_a_mode_change_until_the_matching_version_is_ready', () => {
+  const lossy = withVersion('7');
+  assert.equal(canSave(lossy), true);
+  // Lossless picked: the version shown is still lossy, and nothing has started yet.
+  const changed = reduce(lossy, setMode('lossless'));
+  assert.equal(canSave(changed), false);
+  assert.equal(saveArgs(changed), null);
+  const asked = apply(changed, requested('lossless', 75), started('7', 2));
+  assert.equal(canSave(asked), false);
+  const done = reduce(asked, ready('7', 2, { mode: 'lossless', quality: null }));
+  assert.equal(canSave(done), true);
+  assert.deepEqual(saveArgs(done), { name: 'optimized-holiday', preview: '7-2' });
+});
+
+test('save_is_refused_after_a_quality_change_until_the_matching_version_is_ready', () => {
+  const changed = reduce(withVersion('7'), setQuality('60'));
+  assert.equal(canSave(changed), false);
+  assert.equal(saveArgs(changed), null);
+  const done = apply(changed, requested('lossy', 60), started('7', 2), ready('7', 2, { quality: 60 }));
+  assert.equal(canSave(done), true);
+  // A lossless version matches whatever quality the hidden field holds.
+  const lossless = apply(
+    initialState(),
+    loaded('7'),
+    requested('lossless', 75),
+    started('7', 1),
+    ready('7', 1, { mode: 'lossless', quality: null }),
+  );
+  assert.equal(canSave(lossless), true);
+});
+
+test('save_is_refused_while_the_quality_text_is_invalid', () => {
+  const typing = reduce(withVersion('7'), setQuality('6x'));
+  assert.equal(canSave(typing), false);
+  // Back to the value the version was made with: allowed again.
+  assert.equal(canSave(reduce(typing, setQuality('75'))), true);
+});
+
+test('a_preview_requested_for_another_image_records_nothing', () => {
+  // preview_image for image 7 resolves late, after image 8 has loaded.
+  const late = apply(initialState(), loaded('7'), loaded('8'), requested('lossless', 75, '7'));
+  assert.equal(late.single.requested, null);
+  assert.deepEqual(previewArgs(late), { settings: { mode: 'lossless', quality: 75 } });
+  const noKey = reduce(reduce(initialState(), loaded('8')), {
+    type: 'preview-requested',
+    payload: { settings: { mode: 'lossless', quality: 75 } },
+  });
+  assert.equal(noKey.single.requested, null);
+  // Control: the current image's acceptance is recorded.
+  const current = apply(initialState(), loaded('7'), loaded('8'), requested('lossless', 75, '8'));
+  assert.deepEqual(current.single.requested, { mode: 'lossless', quality: 75 });
+  assert.equal(previewArgs(current), null);
+});
+
+test('preview_requested_action_carries_the_image_key_from_when_it_was_sent', () => {
+  const state = reduce(initialState(), loaded('7'));
+  const args = previewArgs(state);
+  assert.deepEqual(previewRequestedAction(state, args), {
+    type: 'preview-requested',
+    payload: { image: '7', settings: { mode: 'lossless', quality: 75 } },
+  });
+  // Built before the send, it stays image 7's even after image 8 loads.
+  const action = previewRequestedAction(state, args);
+  const after = apply(state, loaded('8'), action);
+  assert.equal(after.single.requested, null);
+  // Nothing to send, or no image: no action.
+  assert.equal(previewRequestedAction(state, null), null);
+  assert.equal(previewRequestedAction(initialState(), { settings: { mode: 'lossless', quality: 75 } }), null);
+});
+
+test('an_invalid_name_the_window_accepts_is_logged', () => {
+  const accepted = withVersion('7');
+  assert.equal(afterRejection('invalid-name', accepted).log, true);
+  // With no image, neither name rejection has a text of its own: logged too.
+  assert.equal(afterRejection('invalid-name', initialState()).log, true);
+  assert.equal(afterRejection('name-taken', initialState()).log, true);
+  // While a save is going, the stem that was sent decides.
+  const sentBad = reduce(withVersion('7'), saveStarted('a:b', '7-1'));
+  assert.equal(afterRejection('invalid-name', sentBad).log, false);
+});
+
+test('a_name_rejection_the_window_explains_is_not_logged', () => {
+  assert.equal(afterRejection('invalid-name', reduce(withVersion('7'), typed('CON'))).log, false);
+  assert.equal(afterRejection('name-taken', withVersion('7')).log, false);
+  // The box's own problem does not explain a refusal of a stem that had none.
+  const sentGood = reduce(reduce(withVersion('7'), typed('a:b')), saveStarted('fine', '7-1'));
+  assert.equal(afterRejection('invalid-name', sentGood).log, true);
+  // Without the state it is classified by the string alone, as before.
+  assert.equal(afterRejection('invalid-name').log, false);
+  // With the state, other rejections are still classified by the string.
+  assert.equal(afterRejection('not-ready', initialState()).log, false);
+  assert.equal(afterRejection('whatever', initialState()).log, true);
+});
+
+test('compressing_hides_a_previous_failure_note', () => {
+  const failed = apply(withVersion('7'), setQuality('60'), requested('lossy', 60), started('7', 2), failedPreview('7', 2));
+  assert.equal(sizeView(failed).note, 'the optimiser crashed on this file (it gave no valid result)');
+  const again = apply(failed, setQuality('50'), requested('lossy', 50), started('7', 3));
+  const sizes = sizeView(again);
+  assert.equal(sizes.busy, true);
+  assert.equal(sizes.note, null);
+  // The version shown keeps its own note while the new one is made.
+  const noted = apply(
+    initialState(),
+    loaded('7'),
+    requested('lossless', 75),
+    started('7', 1),
+    ready('7', 1, { mode: 'lossless', quality: null, note: 'kept lossless: animated PNG' }),
+    setMode('lossy'),
+    requested('lossy', 75),
+    started('7', 2),
+    failedPreview('7', 2),
+    setQuality('50'),
+    requested('lossy', 50),
+    started('7', 3),
+  );
+  assert.equal(sizeView(noted).note, 'kept lossless: animated PNG');
+});
+
+test('a_failure_after_compressing_shows_its_note', () => {
+  const busy = apply(withVersion('7'), setQuality('60'), requested('lossy', 60), started('7', 2));
+  assert.equal(sizeView(busy).note, null);
+  const failed = reduce(busy, failedPreview('7', 2));
+  assert.equal(sizeView(failed).busy, false);
+  assert.equal(sizeView(failed).note, 'the optimiser crashed on this file (it gave no valid result)');
 });
