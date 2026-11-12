@@ -13,7 +13,7 @@
 #![allow(dead_code)]
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -31,9 +31,17 @@ pub struct SaveNames {
 /// Reads and expands the fixture. Panics with the reason when the file is
 /// missing or malformed: a test that cannot read its fixture must fail.
 pub fn load() -> SaveNames {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/save-names.json");
-    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    parse(&raw()).unwrap_or_else(|e| panic!("{}: {e}", path().display()))
+}
+
+/// Where the fixture is.
+pub fn path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/save-names.json")
+}
+
+/// The fixture file as it is, for a test of how it is written.
+pub fn raw() -> String {
+    fs::read_to_string(path()).unwrap_or_else(|e| panic!("{}: {e}", path().display()))
 }
 
 /// [`load`] on the text of a fixture.
@@ -68,9 +76,11 @@ pub fn parse(text: &str) -> Result<SaveNames, String> {
 const MAX_TIMES: u64 = 10_000;
 
 /// One name of the fixture: a string as it is, or a rule
-/// `{"repeat": text, "times": n, "then": text}` (`then` optional) for the
-/// text `n` times (at most [`MAX_TIMES`]) and then `then`. Anything else is
-/// an error.
+/// `{"before": text, "repeat": text, "times": n, "then": text}` (`before` and
+/// `then` optional) for `before`, then the text `n` times (at most
+/// [`MAX_TIMES`]), then `then`. `n` is a whole number written without a
+/// decimal point or exponent (`2`, not `2.0`): the window's loader refuses the
+/// other spellings, so this one does too. Anything else is an error.
 pub fn expand(entry: &Value) -> Result<String, String> {
     if let Some(text) = entry.as_str() {
         return Ok(text.to_owned());
@@ -80,7 +90,7 @@ pub fn expand(entry: &Value) -> Result<String, String> {
         .ok_or_else(|| format!("not a string or a rule: {entry}"))?;
     if let Some(key) = rule
         .keys()
-        .find(|key| !["repeat", "times", "then"].contains(&key.as_str()))
+        .find(|key| !["before", "repeat", "times", "then"].contains(&key.as_str()))
     {
         return Err(format!("unknown key {key:?} in {entry}"));
     }
@@ -95,11 +105,13 @@ pub fn expand(entry: &Value) -> Result<String, String> {
         .ok_or_else(|| {
             format!("\"times\" is not a whole number from 0 to {MAX_TIMES} in {entry}")
         })?;
-    let then = match rule.get("then") {
-        None => "",
-        Some(then) => then
+    let optional_text = |key: &str| match rule.get(key) {
+        None => Ok(""),
+        Some(text) => text
             .as_str()
-            .ok_or_else(|| format!("\"then\" is not a string in {entry}"))?,
+            .ok_or_else(|| format!("\"{key}\" is not a string in {entry}")),
     };
-    Ok(format!("{}{then}", repeat.repeat(times as usize)))
+    let before = optional_text("before")?;
+    let then = optional_text("then")?;
+    Ok(format!("{before}{}{then}", repeat.repeat(times as usize)))
 }

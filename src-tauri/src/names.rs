@@ -25,8 +25,8 @@ pub enum NameProblem {
     /// The name ends in a space or a dot, which Windows drops.
     TrailingSpaceOrDot,
     /// A device name Windows does not allow as a file name: `con`, `prn`,
-    /// `aux`, `nul`, `com1` to `com9`, `lpt1` to `lpt9`, with or without an
-    /// extension, in any case.
+    /// `aux`, `nul`, `com1` to `com9` and `com¹ ² ³`, `lpt1` to `lpt9` and
+    /// `lpt¹ ² ³`, with or without an extension, in any case.
     Reserved,
     /// More than [`MAX_NAME_CHARS`] characters or [`MAX_NAME_BYTES`] bytes.
     TooLong,
@@ -74,15 +74,22 @@ fn is_forbidden(c: char) -> bool {
 }
 
 /// Whether the part of `name` before its first dot is a device name, in any
-/// case (`Con.txt` and `nul.tar` are, `console` and `com10` are not).
+/// case (`Con.txt` and `nul.tar` are, `console` and `com10` are not). Windows
+/// also reserves `com` and `lpt` followed by the superscript digits ¹ ² ³
+/// (U+00B9, U+00B2, U+00B3), so `COM¹` is refused, and `com⁴` is not.
 fn is_reserved(name: &str) -> bool {
     let lower = name.to_lowercase();
     let head = lower.split('.').next().unwrap_or_default();
     match head {
         "con" | "prn" | "aux" | "nul" => true,
         _ => ["com", "lpt"].iter().any(|device| {
-            head.strip_prefix(device)
-                .is_some_and(|n| matches!(n.as_bytes(), [b'1'..=b'9']))
+            head.strip_prefix(device).is_some_and(|number| {
+                let mut chars = number.chars();
+                matches!(
+                    (chars.next(), chars.next()),
+                    (Some('1'..='9' | '\u{B9}' | '\u{B2}' | '\u{B3}'), None)
+                )
+            })
         }),
     }
 }
@@ -216,6 +223,7 @@ mod tests {
             json!({ "repeat": "a", "times": 10_001 }),
             json!({ "repeat": 7, "times": 2 }),
             json!({ "repeat": "a", "times": 2, "then": 1 }),
+            json!({ "repeat": "a", "times": 2, "before": 1 }),
             json!({ "repeat": "a", "times": 2, "extra": "x" }),
             json!(42),
             json!(["a"]),
@@ -223,6 +231,69 @@ mod tests {
         ] {
             assert!(expand(&bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_rule_may_start_with_a_before_text() {
+        assert_eq!(
+            expand(&json!({ "before": "con.", "repeat": "x", "times": 2, "then": "!" })).unwrap(),
+            "con.xx!"
+        );
+    }
+
+    /// The `times` of a rule written as JSON text, so that how it is written
+    /// (`2`, `2.0`) reaches the loader as it would from the file.
+    fn expand_times(written: &str) -> Result<String, String> {
+        let rule: serde_json::Value =
+            serde_json::from_str(&format!(r#"{{"repeat": "a", "times": {written}}}"#)).unwrap();
+        expand(&rule)
+    }
+
+    #[test]
+    fn a_times_written_as_a_plain_integer_is_accepted() {
+        assert_eq!(expand_times("2").unwrap(), "aa");
+        assert_eq!(expand_times("0").unwrap(), "");
+    }
+
+    #[test]
+    fn a_times_written_with_a_decimal_point_or_exponent_is_an_error() {
+        // The window's loader refuses these spellings too (names.test.js).
+        for written in ["2.0", "2e0", "1e1", "1.5", "-0", "-1"] {
+            assert!(expand_times(written).is_err(), "{written}");
+        }
+    }
+
+    /// The characters of `text` that are not printable ASCII or a line break.
+    fn not_printable_ascii(text: &str) -> Vec<char> {
+        text.chars()
+            .filter(|c| !(' '..='~').contains(c) && *c != '\n')
+            .collect()
+    }
+
+    #[test]
+    fn the_fixture_file_is_printable_ascii_only() {
+        // Every other character is a \uXXXX escape, so an editor cannot change
+        // an invisible or look-alike one unnoticed.
+        assert_eq!(not_printable_ascii(&save_names::raw()), Vec::<char>::new());
+    }
+
+    #[test]
+    fn a_character_outside_printable_ascii_in_a_fixture_text_is_found() {
+        assert_eq!(
+            not_printable_ascii("a\u{E9}\u{A0}\u{FEFF}\t\"x\"\n"),
+            ['\u{E9}', '\u{A0}', '\u{FEFF}', '\t']
+        );
+        assert!(not_printable_ascii("{\"a\": \"\\u00E9\"}\n").is_empty());
+    }
+
+    #[test]
+    fn the_fixture_keeps_composed_and_decomposed_accents_apart() {
+        let names = save_names::load();
+        let composed = "vakantie-caf\u{E9}";
+        let decomposed = "vakantie-cafe\u{301}";
+        assert_ne!(composed, decomposed);
+        assert!(names.accepted.iter().any(|s| s == composed));
+        assert!(names.accepted.iter().any(|s| s == decomposed));
     }
 
     #[test]

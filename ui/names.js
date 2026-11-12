@@ -24,7 +24,9 @@ export const NAME_PROBLEM_TEXTS = Object.freeze({
 // the same set as Rust's char::is_whitespace plus U+FEFF in names.rs.
 const BLANK = /^[\s\u0085]*$/;
 const FORBIDDEN = /[/\\:*?"<>|\u0000-\u001F\u007F]/;
-const RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/;
+// Windows also reserves com and lpt followed by the superscript digits
+// U+00B9, U+00B2, U+00B3, so they are in the same class as 1-9.
+const RESERVED = /^(con|prn|aux|nul|com[1-9\u00B9\u00B2\u00B3]|lpt[1-9\u00B9\u00B2\u00B3])(\.|$)/;
 
 const encoder = new TextEncoder();
 
