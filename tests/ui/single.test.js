@@ -213,6 +213,27 @@ test('a_preview_started_while_batch_shows_is_dropped', () => {
   assert.equal(reduce(reduce(away, setView('single')), started('7', 1)).single.compressing, true);
 });
 
+test('an_outcome_sent_before_the_switch_to_batch_is_still_taken', () => {
+  // Unlike preview-started, an outcome is not dropped because Batch shows:
+  // one sent just before the switch stopped the request is the version the
+  // backend keeps, so it passes on the image + version guard alone.
+  const away = apply(
+    withVersion('7'),
+    setQuality('60'),
+    requested('lossy', 60),
+    started('7', 2),
+    setView('batch'),
+  );
+  const readyLate = reduce(away, ready('7', 2, { quality: 60 }));
+  assert.equal(readyLate.single.ready.key, '7-2');
+  const failedLate = reduce(away, failedPreview('7', 2));
+  assert.equal(failedLate.single.failed, 'the optimiser crashed on this file (it gave no valid result)');
+  // The guard still applies while Batch shows: other versions are dropped.
+  assert.equal(reduce(away, ready('7', 3)), away);
+  assert.equal(reduce(away, failedPreview('7', 1)), away);
+  assert.equal(reduce(away, ready('6', 2)), away);
+});
+
 // image events
 
 test('a_new_key_sets_the_image_the_suggested_name_and_resets_typing_and_the_version', () => {
@@ -340,6 +361,17 @@ test('the_offer_cannot_be_used_while_a_save_is_going', () => {
   assert.deepEqual(offerView(offered), { notice, canMove: true });
   const saving = reduce(offered, saveStarted('optimized-holiday', '8-1'));
   assert.deepEqual(offerView(saving), { notice, canMove: false });
+});
+
+test('the_offer_cannot_be_used_while_a_run_is_going', () => {
+  // Run lives in Batch, so a run does not start while Single image shows;
+  // if a run-started arrived there anyway, the switch lock still holds.
+  const notice = 'Single image mode takes one image; 1 other was left out.';
+  const offered = reduce(initialState(), imageChanged(holiday('8'), 1, notice));
+  assert.deepEqual(offerView(offered), { notice, canMove: true });
+  const running = reduce(offered, runStarted);
+  assert.deepEqual(offerView(running), { notice, canMove: false });
+  assert.deepEqual(offerView(reduce(running, runFinished)), { notice, canMove: true });
 });
 
 // preview requests
