@@ -1,4 +1,6 @@
-/* Lunaepix window. BBEM class names, shared with index.html and app.js.
+/* Lunaepix window. BBEM class names, shared with index.html and with the
+   scripts that add or toggle them: table.js (the results rows), single-view.js
+   and window.js (the modifier classes).
    Sizes are in rem so the layout follows the user's text size. */
 
 :root {
