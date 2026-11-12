@@ -18,6 +18,10 @@ Decided in conversation (2026-11-11). The user's words are quoted as they were s
 - **Renaming:** asked "Should renaming be part of this work, or stay its own roadmap item?" The user answered "Part of this work, single mode only". This absorbs the roadmap item "Export rename (single file only)".
 - **More than one file dropped:** the user asked "Only 1 image allowed, what do most programs do in that case?" I recommended: load the first image and show a note that the others were left out, with a "Switch to Batch" button that takes all the dropped files into batch mode; a dropped folder loads nothing and gets the same kind of note and button; the file picker picks one file. The user answered "Yes".
 - **When the preview updates:** I proposed that the compressed side and the sizes update a moment after the slider is let go (not while dragging), with a "Compressing…" note while the old picture stays until the new one is ready. The user answered "Yes that is fine".
+- **After the first Linux build (2026-11-12), the user asked:** "Why is this not a preference setting like I asked? Settings under or settings beside"; "Why is the max width limited? This makes the Before/After slider pointless"; "Why is the Before/After slider limited to a certain height? I rather have a scrollbar to see the other options, the Before/After slider only needs to keep the header (Lunaepix) in mind, and that header needs to be fixed." Answers to the follow-up questions: where the layout preference lives: "Keep it in the page"; Batch width: "Keep Batch at 768 px (Recommended)"; the proposed change (fixed full-width header, Single image full width, picture as tall as the window minus the header, the page scrolls to the rest, version 0.1.3): "Yes, as written (Recommended)". This replaces the earlier rule that the settings never scroll out of sight. Built as plan Task 11.
+- **Compression over the picture (2026-11-12), later superseded:** "Also, the quality of lossy/lossless can be sitting on top of the beer slider"; answer to "a row above or a bar over it": "Over the picture".
+- **Example screenshot (2026-11-12):** "example of a website with the same functionality", then "This is just an example of: -> Seeing it does not work, so look for a better option". Answers: "Like the example (Recommended)"; under/beside: "Drop it, one layout (Recommended)"; narrow: "Panels go under the picture (Recommended)"; "Mock-up first (Recommended)". From the two-option mock-up: "Option 1, the docked column". The Layout section below is rewritten to that; the mock-up `docs/in-progress/specs/2026-11-12-lunaepix-single-image-layout-mockup.html` (Option 1) is binding for it and replaces the first mock-up for Single image. Plan Task 11.
+- **Task 11 approved (user, 2026-11-12):** after the full docked-column design was shown (Task 11 in the plan), the user answered: "approved".
 - **Not objected to, but my guesses rather than the user's words** (listed under "Calls I made" below): the expected size is exact because the image is really compressed; Save writes exactly that result; each mode keeps its own content when switching; the layout choice is remembered; the name box starts with today's name; a name the user typed that is taken gets a warning instead of a number.
 
 ## Intent
@@ -30,7 +34,7 @@ Most images in this app end up on websites, where the picture is shown smaller t
 
 - A switch at the top of the window between **Single image** and **Batch**. The window opens in Single image on every launch.
 - In Single image: pick one file or drop one; see original and compressed side by side with a draggable divider; see original size, compressed size and the saving; change Lossless/Lossy and Quality and see the result update; zoom in and move around; save under a chosen name.
-- Two layouts for Single image: settings under the picture (B, the default) and beside it (A). The user switches between them.
+- ~~Two layouts for Single image: settings under the picture (B, the default) and beside it (A). The user switches between them.~~ Replaced 2026-11-12 by one layout, the docked column (see Layout, plan Task 11).
 - Batch keeps working exactly as today.
 
 ## Non-goals
@@ -105,7 +109,7 @@ Most images in this app end up on websites, where the picture is shown smaller t
 
 ### Sizes
 
-- A size box beside the settings (layout B) or under them (layout A): **Original** (bytes, shown like Batch shows sizes), **Compressed**, and **Saves** (percentage and bytes).
+- A size box (since Task 11 at the bottom of the column, above Save): **Original** (bytes, shown like Batch shows sizes), **Compressed**, and **Saves** (percentage and bytes).
 - The numbers are exact: the backend really compresses the image, and Save writes those bytes.
 - A file that grows (possible in Lossless) shows the negative saving, not clamped, like Batch.
 - A note shows when the file was handled differently from the setting, with Batch's texts ("kept lossless: animated PNG", "original kept: lossy was not smaller", …).
@@ -204,17 +208,19 @@ The existing `open_output_folder` opens the folder of the last save or the last 
 
 ## Layout
 
-The mock-up `docs/in-progress/specs/2026-11-11-lunaepix-single-image-mockup.html` is binding for the **arrangement** of both layouts. Its picture, colours and numbers are made up; colours, fonts and control styles come from the window as it is today.
+Amended 2026-11-12 (plan Task 11). The mock-up `docs/in-progress/specs/2026-11-12-lunaepix-single-image-layout-mockup.html`, **Option 1 (docked column)**, is binding for the arrangement; its picture, blur and numbers are stand-ins, and colours, fonts and control styles come from the window as it is today. The first mock-up (`2026-11-11-lunaepix-single-image-mockup.html`) no longer applies to Single image.
 
-- **Header:** logo and "Lunaepix" on the left, the Single image / Batch switch on the right.
-- **Under the header (single image, image loaded):** a row with the file name, the pixel size and "Choose other"; then the layout switch ("Settings under" / "Settings beside") and the zoom buttons (Zoom out, Zoom in, 100%, Fit).
-- **Layout B (default):** the picture at full width; below it a row of two blocks, the settings on the left (Compression, Quality, Save to, Save as) and the size box on the right; Save at the bottom right, under both.
-- **Layout A:** the picture on the left taking the remaining width; a column on the right (about 16rem) with the settings, then the size box; Save at the bottom right of the window.
-- **Narrow window:** below the width where layout A leaves the picture less room than its column (the builder picks it, around 40rem), A shows as B. The choice itself is kept, so A comes back when the window is wider. In B, below about 30rem, the size box goes under the settings.
-- **The picture area** keeps the image's proportions and is never taller than the window allows with the settings in view (B) — the settings never scroll out of sight to show the picture.
-- **Empty state (no image):** the drop area takes the picture's place ("Drop an image here", "PNG · JPG · SVG · WebP", Choose image); settings show, Save and the size box do not.
-- **The status line** (the existing `role="status"` region) carries the notes: left out, folders, saved, reasons.
-- **Batch:** unchanged, under the same header.
+- **Header:** logo and "Lunaepix" on the left, the Single image / Batch switch on the right; fixed at the top, full window width, in both modes.
+- **Single image (wider than about 40rem):** the work area fills the window under the header and the page does not scroll.
+  - The picture takes the remaining width and the full height; a neutral dark area surrounds the image; the divider runs the full height; "Original" and "Compressed" in the top corners.
+  - Zoom controls float over the picture at the bottom centre: "−" (Zoom out), the zoom as a percentage, "+" (Zoom in), "100%", "Fit".
+  - A column on the right (about 21rem), labelled "Settings": "Hide settings" at the top; a part that scrolls on its own with the file (name, pixel size, "Choose other"), Compression, Quality, Save to and Save as; and a bottom part that stays visible with the size box, the status line (and "Switch to Batch") and "Open folder" / "Save".
+  - "Hide settings" folds the column to a strip with "Show settings"; not remembered between launches.
+- **Narrow window (about 40rem and less):** the picture (its own proportions, at most the window height minus the header), then the column's contents under it; the page scrolls.
+- **No under/beside choice:** one layout; nothing is remembered between launches.
+- **Empty state (no image):** the drop area takes the picture's place ("Drop an image here", "PNG · JPG · SVG · WebP", Choose image); the column shows only the settings (Compression, Quality, Save to); Save, Save as and the size box do not show.
+- **The status line** (the existing `role="status"` region) carries the notes; in Single image it sits in the column above Save.
+- **Batch:** unchanged (at most 48rem wide, centred), under the same fixed, full-width header.
 
 ## Tests
 
