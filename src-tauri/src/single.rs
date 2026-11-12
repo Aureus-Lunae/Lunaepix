@@ -1,13 +1,16 @@
 //! Single image mode's state: which view shows, the loaded image (a private
-//! copy taken at load), the last drop that left items out, and the slot for
-//! an in-flight preview's stop handle. No Tauri here: the probe comes in as a
-//! closure, so all of it is tested without a window or a worker.
+//! copy taken at load), the last drop that left items out, and the preview:
+//! the latest request for a compressed version, its worker's stop handle and
+//! the version kept. No Tauri here: the probe comes in as a closure and the
+//! preview's worker result is handed in, so all of it is tested without a
+//! window or a worker.
 //!
 //! The private folder is made once per launch, the first time an image is
 //! loaded, with `tempfile` (mode 0700 on Unix, in the user's own temp folder
 //! on Windows), and removed by [`Single::shutdown`] when the window closes. Each
-//! image gets a subfolder `image-<key>` holding its copy, `original<.ext>`.
-//! Keys start at 1 and only go up during a launch.
+//! image gets a subfolder `image-<key>` holding its copy, `original<.ext>`,
+//! and its compressed versions, `v<n><.ext>`: the kept one and the one being
+//! made. Keys and version numbers start at 1 and only go up during a launch.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -16,14 +19,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use lunaepix_core::{
-    Crash, MAX_FILE_BYTES, ProbeAnswer, RunError, Skip, StopHandle, batch_output_name,
-    first_free_name, has_supported_extension,
+    Compression, Crash, FileResult, Job, MAX_FILE_BYTES, Options, ProbeAnswer, RunError, Skip,
+    StopHandle, WriteMode, batch_output_name, first_free_name, has_supported_extension,
 };
 use serde_json::Value;
 use tempfile::TempDir;
 
-use crate::events::{ImageChanged, ImageInfo, NameSuggested};
+use crate::events::{Event, ImageChanged, ImageInfo, NameSuggested, PreviewFailed, preview_ready};
 use crate::session::{CommandError, lock};
+use crate::thumbs::digits;
 
 /// Which mode the window shows, so a drop goes there.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -237,6 +241,94 @@ fn remove_folder(path: &Path) -> bool {
     }
 }
 
+/// One request for a compressed version: version `version` of image `key`,
+/// made from the copy `src` into `dest` (`image-<key>/v<version><.ext>`),
+/// stopped through `stop`.
+#[derive(Debug, Clone)]
+pub struct PreviewJob {
+    pub key: u64,
+    pub version: u64,
+    pub src: PathBuf,
+    pub dest: PathBuf,
+    pub compression: Compression,
+    pub stop: StopHandle,
+}
+
+impl PreviewJob {
+    /// The one job the worker runs: the copy into the version file.
+    pub fn job(&self) -> Job {
+        Job::Optimize {
+            src: self.src.clone(),
+            dest: self.dest.clone(),
+        }
+    }
+
+    /// The worker's options: the request's compression, never replacing.
+    pub fn options(&self) -> Options {
+        Options {
+            compression: self.compression,
+            write: WriteMode::NoReplace,
+        }
+    }
+}
+
+/// The most digits of a version number in a file name, as in a key.
+const VERSION_DIGITS: usize = 10;
+
+/// The version number in a version file's name, `v<n>` or `v<n>.<ext>`
+/// with `n` 1 to 10 ASCII digits and an extension without a further dot;
+/// `None` for any other name.
+pub(crate) fn version_of(name: &OsStr) -> Option<u64> {
+    let rest = name.to_str()?.strip_prefix('v')?;
+    let number = match rest.split_once('.') {
+        Some((_, extension)) if extension.contains('.') => return None,
+        Some((number, _)) => number,
+        None => rest,
+    };
+    digits(number, VERSION_DIGITS)
+}
+
+/// The kept version: the latest request whose worker succeeded.
+#[derive(Debug)]
+struct Ready {
+    key: u64,
+    version: u64,
+    path: PathBuf,
+}
+
+/// Remove the file at `path`; a file that is not there counts as removed,
+/// any other failure is logged and otherwise ignored.
+fn remove_version(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!("lunaepix: could not remove a compressed version: {error}"),
+    }
+}
+
+/// Remove every version file beside `kept` whose number is below
+/// `version`; other files (the copy, a version being made) stay. A folder
+/// that cannot be listed is logged and left as it is.
+fn remove_older_versions(kept: &Path, version: u64) {
+    let Some(folder) = kept.parent() else {
+        return;
+    };
+    let entries = match fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("lunaepix: could not list a private image folder: {error}");
+            return;
+        }
+    };
+    // An entry that cannot be read is skipped; the next load or the window
+    // closing removes the whole folder anyway.
+    for entry in entries.flatten() {
+        if version_of(&entry.file_name()).is_some_and(|older| older < version) {
+            remove_version(&entry.path());
+        }
+    }
+}
+
 /// The reason a load is refused once the window has closed. The window is
 /// gone by then, so nobody reads it.
 const CLOSED: &str = "the window has closed";
@@ -264,15 +356,158 @@ struct State {
     /// Every item of the last drop that left something out, for Switch to
     /// Batch; gone at the next load attempt and at a switch by hand.
     offer: Option<Vec<PathBuf>>,
-    /// Stops the preview being made. Filled by the preview (Task 5); taken
-    /// and used when the view goes to Batch, a run starts, a new image is
-    /// loaded and the window closes.
+    /// Stops the preview being made: the latest request's worker. Taken and
+    /// used when a newer request comes, the view goes to Batch, a run
+    /// starts, a new image is loaded and the window closes.
     preview: Option<StopHandle>,
+    /// The number of the last version asked for; 0 before the first. One
+    /// count for the whole launch, so a `(key, version)` pair is never
+    /// given twice.
+    last_version: u64,
+    /// The latest request, `(key, version)`, while its result may still be
+    /// sent: only its result is. Cleared whenever the preview is stopped.
+    latest: Option<(u64, u64)>,
+    /// The kept version of the current image, if one is ready.
+    ready: Option<Ready>,
+}
+
+impl State {
+    /// Take the preview's stop handle and forget the latest request, so the
+    /// result of the job it stops is never sent.
+    fn take_preview(&mut self) -> Option<StopHandle> {
+        self.latest = None;
+        self.preview.take()
+    }
 }
 
 impl Single {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A state whose current image is `image`, as no load would give it (an
+    /// extension the loader refuses): for the scheme's tests.
+    #[cfg(test)]
+    pub(crate) fn with_image(image: LoadedImage) -> Self {
+        let single = Single::default();
+        lock(&single.state).image = Some(image);
+        single
+    }
+
+    /// A new request for a compressed version of the current image with
+    /// `compression` ([`CommandError::NoImage`] without one): the next
+    /// version number, the latest request from now on. The previous
+    /// request's worker is stopped, after the lock is let go.
+    pub(crate) fn begin_preview(
+        &self,
+        compression: Compression,
+    ) -> Result<PreviewJob, CommandError> {
+        let (job, previous) = {
+            let mut state = lock(&self.state);
+            let image = state.image.as_ref().ok_or(CommandError::NoImage)?;
+            let (key, src) = (image.key, image.copy.clone());
+            let version = state.last_version + 1;
+            let dest = src.with_file_name(format!("v{version}{}", image.extension));
+            state.last_version = version;
+            state.latest = Some((key, version));
+            let stop = StopHandle::new();
+            let previous = state.preview.replace(stop.clone());
+            let job = PreviewJob {
+                key,
+                version,
+                src,
+                dest,
+                compression,
+                stop,
+            };
+            (job, previous)
+        };
+        if let Some(previous) = previous {
+            previous.stop();
+        }
+        Ok(job)
+    }
+
+    /// What `job`'s worker gave (`None`: it was stopped before it started)
+    /// becomes the window's event, but only while `job` is the latest
+    /// request. Then a success is the kept version, its older version files
+    /// are removed, and `preview-ready` goes out; any failure gives
+    /// `preview-failed` with Batch's reason and keeps the version kept
+    /// before. A job that is no longer the latest (a newer request, a new
+    /// image, a stop) sends nothing and its file is removed. The lock is
+    /// held for the decision only, never for a file delete.
+    pub(crate) fn settle_preview(
+        &self,
+        job: &PreviewJob,
+        result: Option<FileResult>,
+    ) -> Option<Event> {
+        let latest = {
+            let mut state = lock(&self.state);
+            let latest = state.latest == Some((job.key, job.version));
+            if latest && let Some(FileResult::Optimized(_)) = &result {
+                state.ready = Some(Ready {
+                    key: job.key,
+                    version: job.version,
+                    path: job.dest.clone(),
+                });
+            }
+            latest
+        };
+        if !latest {
+            remove_version(&job.dest);
+            return None;
+        }
+        let failed = |reason: String| {
+            Some(Event::PreviewFailed(PreviewFailed {
+                image: job.key.to_string(),
+                version: job.version,
+                reason,
+            }))
+        };
+        match result {
+            Some(FileResult::Optimized(outcome)) => {
+                remove_older_versions(&job.dest, job.version);
+                Some(Event::PreviewReady(preview_ready(
+                    job.key,
+                    job.version,
+                    job.compression,
+                    &outcome,
+                )))
+            }
+            Some(FileResult::Failed(error)) => failed(error.reason()),
+            // The runner never skips an `Optimize` job; its text if it did.
+            Some(FileResult::Skipped(skip)) => failed(skip.to_string()),
+            None => failed(
+                RunError::Stopped {
+                    path: PathBuf::new(),
+                }
+                .reason(),
+            ),
+        }
+    }
+
+    /// The kept version, `(key, version)`: the version a save may write.
+    pub fn latest_ready(&self) -> Option<(u64, u64)> {
+        lock(&self.state)
+            .ready
+            .as_ref()
+            .map(|ready| (ready.key, ready.version))
+    }
+
+    /// The file the `preview` scheme serves: for `version` `None` the copy
+    /// of the current image when it has `key`, else the kept version when
+    /// it is `(key, version)`. `None` for anything else.
+    pub(crate) fn served_file(&self, key: u64, version: Option<u64>) -> Option<PathBuf> {
+        let state = lock(&self.state);
+        let image = state.image.as_ref().filter(|image| image.key == key)?;
+        match version {
+            None => Some(image.copy.clone()),
+            Some(version) => state
+                .ready
+                .as_ref()
+                .filter(|ready| (ready.key, ready.version) == (key, version))
+                .map(|ready| ready.path.clone()),
+        }
     }
 
     /// A state whose private folder is made inside `root`.
@@ -290,14 +525,14 @@ impl Single {
     }
 
     /// Show `view`. The Switch to Batch offer goes; a switch to Batch stops
-    /// the preview being made.
+    /// the preview being made, and its result is never sent.
     pub(crate) fn set_view(&self, view: View) {
         let preview = {
             let mut state = lock(&self.state);
             state.view = view;
             state.offer = None;
             match view {
-                View::Batch => state.preview.take(),
+                View::Batch => state.take_preview(),
                 View::Single => None,
             }
         };
@@ -343,9 +578,11 @@ impl Single {
 
     /// Load `src`: check its extension and size, copy it into the private
     /// folder and ask `prober` about the copy. On success it is the current
-    /// image, the old image's folder is removed and its preview stopped. On
-    /// failure the current image stays, the attempt's folder is removed, and
-    /// the reason (Batch's) is returned.
+    /// image, the old image's preview is stopped (its result never sent),
+    /// its kept version forgotten and its folder (copy and versions)
+    /// removed. On failure the current image, its preview and its kept
+    /// version stay, the attempt's folder is removed, and the reason
+    /// (Batch's) is returned.
     pub(crate) fn load(
         &self,
         src: &Path,
@@ -398,7 +635,8 @@ impl Single {
         };
         let (old, preview) = {
             let mut state = lock(&self.state);
-            (state.image.replace(image), state.preview.take())
+            state.ready = None;
+            (state.image.replace(image), state.take_preview())
         };
         if let Some(preview) = preview {
             preview.stop();
@@ -446,23 +684,25 @@ impl Single {
         lock(&self.state).offer.take()
     }
 
-    /// Stop the preview being made, if one is.
+    /// Stop the preview being made, if one is; its result is never sent.
     pub(crate) fn stop_preview(&self) {
-        let preview = lock(&self.state).preview.take();
+        let preview = lock(&self.state).take_preview();
         if let Some(preview) = preview {
             preview.stop();
         }
     }
 
-    /// The window closes: stop the preview, forget the image and the offer,
-    /// and remove the private folder. No private folder is made after this.
+    /// The window closes: stop the preview (its result never sent), forget
+    /// the image, its kept version and the offer, and remove the private
+    /// folder. No private folder is made after this.
     pub fn shutdown(&self) {
         let (folder, preview) = {
             let mut state = lock(&self.state);
             state.closed = true;
             state.image = None;
+            state.ready = None;
             state.offer = None;
-            (state.folder.take(), state.preview.take())
+            (state.folder.take(), state.take_preview())
         };
         if let Some(preview) = preview {
             preview.stop();
@@ -799,5 +1039,534 @@ mod tests {
         assert!(single.load(&png, one_pixel).is_err());
 
         fs::set_permissions(&image_folder, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    // --- previews: versions, settling, clean-up ---------------------------------
+
+    use std::time::Duration;
+
+    use lunaepix_core::{OptimizeError, Outcome, Quality};
+
+    use crate::events::{Mode, PreviewFailed, PreviewReady};
+
+    fn lossy(quality: u8) -> Compression {
+        Compression::Lossy(Quality::new(quality).unwrap())
+    }
+
+    /// A state in a fresh folder with `a.png` loaded as image 1, and that
+    /// folder (which also holds `b.png` and `notes.txt`).
+    fn with_an_image() -> (TempDir, Single) {
+        let dir = TempDir::new().unwrap();
+        for name in ["a.png", "b.png", "notes.txt"] {
+            fs::write(dir.path().join(name), b"png").unwrap();
+        }
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let single = Single::with_root(root);
+        single.load(&dir.path().join("a.png"), one_pixel).unwrap();
+        (dir, single)
+    }
+
+    fn load_b(dir: &TempDir, single: &Single) {
+        single.load(&dir.path().join("b.png"), one_pixel).unwrap();
+    }
+
+    fn success() -> FileResult {
+        FileResult::Optimized(Outcome {
+            before: 3,
+            after: 2,
+            millis: 5,
+            note: None,
+        })
+    }
+
+    fn src() -> PathBuf {
+        PathBuf::from("/private/image-1/original.png")
+    }
+
+    fn optimiser_error() -> FileResult {
+        FileResult::Failed(RunError::Optimize(OptimizeError::Invalid {
+            path: src(),
+            message: "damaged".to_owned(),
+        }))
+    }
+
+    fn crash() -> FileResult {
+        FileResult::Failed(RunError::Crashed {
+            path: src(),
+            cause: Crash::NoValidResult,
+            stderr: "secret stderr".to_owned(),
+        })
+    }
+
+    fn timeout() -> FileResult {
+        FileResult::Failed(RunError::TimedOut {
+            path: src(),
+            limit: Duration::from_millis(300),
+        })
+    }
+
+    fn stopped() -> FileResult {
+        FileResult::Failed(RunError::Stopped { path: src() })
+    }
+
+    fn skipped() -> FileResult {
+        FileResult::Skipped(Skip::TooLarge)
+    }
+
+    /// The version file `job` writes, written as its worker would.
+    fn write_version(job: &PreviewJob) {
+        fs::write(&job.dest, b"v").unwrap();
+    }
+
+    /// A ready version 1 of image 1: its job.
+    fn ready_first(single: &Single) -> PreviewJob {
+        let job = single.begin_preview(lossy(40)).unwrap();
+        write_version(&job);
+        assert!(single.settle_preview(&job, Some(success())).is_some());
+        job
+    }
+
+    fn failed(key: u64, version: u64, reason: &str) -> Option<Event> {
+        Some(Event::PreviewFailed(PreviewFailed {
+            image: key.to_string(),
+            version,
+            reason: reason.to_owned(),
+        }))
+    }
+
+    #[test]
+    fn versions_start_at_1_and_only_go_up_across_images() {
+        let (dir, single) = with_an_image();
+        let first = single.begin_preview(lossy(40)).unwrap();
+        let second = single.begin_preview(Compression::Lossless).unwrap();
+        load_b(&dir, &single);
+        let third = single.begin_preview(lossy(75)).unwrap();
+        let pairs: Vec<_> = [&first, &second, &third]
+            .iter()
+            .map(|job| (job.key, job.version))
+            .collect();
+        assert_eq!(pairs, [(1, 1), (1, 2), (2, 3)]);
+        // No version file is named twice.
+        assert_ne!(first.dest, second.dest);
+        assert_ne!(second.dest, third.dest);
+    }
+
+    #[test]
+    fn a_job_reads_the_copy_and_writes_its_version_beside_it() {
+        let dir = TempDir::new().unwrap();
+        let png = dir.path().join("Holiday.PNG");
+        fs::write(&png, b"png").unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let single = Single::with_root(root);
+        single.load(&png, one_pixel).unwrap();
+        let copy = single.current().unwrap().copy;
+        let job = single.begin_preview(lossy(40)).unwrap();
+        assert_eq!(job.src, copy);
+        assert_eq!(job.dest, copy.parent().unwrap().join("v1.PNG"));
+        assert_eq!(
+            job.job(),
+            Job::Optimize {
+                src: copy.clone(),
+                dest: job.dest.clone()
+            }
+        );
+        assert_eq!(
+            job.options(),
+            Options {
+                compression: lossy(40),
+                write: WriteMode::NoReplace
+            }
+        );
+        assert!(!job.stop.is_stopped());
+    }
+
+    // The latest request: settled whatever its result.
+
+    #[test]
+    fn the_latest_success_sends_ready_and_is_kept() {
+        let (_dir, single) = with_an_image();
+        let job = single.begin_preview(lossy(40)).unwrap();
+        write_version(&job);
+        let event = single.settle_preview(&job, Some(success()));
+        assert_eq!(
+            event,
+            Some(Event::PreviewReady(PreviewReady {
+                image: "1".to_owned(),
+                version: 1,
+                key: "1-1".to_owned(),
+                mode: Mode::Lossy,
+                quality: Some(40),
+                before: 3,
+                after: 2,
+                note: None,
+            }))
+        );
+        assert_eq!(single.latest_ready(), Some((1, 1)));
+        assert!(job.dest.exists());
+    }
+
+    #[test]
+    fn the_latest_optimiser_error_sends_failed_with_its_reason() {
+        let (_dir, single) = with_an_image();
+        let job = single.begin_preview(lossy(40)).unwrap();
+        let event = single.settle_preview(&job, Some(optimiser_error()));
+        assert_eq!(event, failed(1, 1, "damaged"));
+        assert_eq!(single.latest_ready(), None);
+    }
+
+    #[test]
+    fn the_latest_crash_sends_failed_with_its_reason() {
+        let (_dir, single) = with_an_image();
+        let job = single.begin_preview(lossy(40)).unwrap();
+        let event = single.settle_preview(&job, Some(crash()));
+        assert_eq!(
+            event,
+            failed(
+                1,
+                1,
+                "the optimiser crashed on this file (it gave no valid result)"
+            )
+        );
+    }
+
+    #[test]
+    fn the_latest_timeout_sends_failed_with_its_reason() {
+        let (_dir, single) = with_an_image();
+        let job = single.begin_preview(lossy(40)).unwrap();
+        let event = single.settle_preview(&job, Some(timeout()));
+        assert_eq!(
+            event,
+            failed(1, 1, "the optimiser timed out after 300ms and was stopped")
+        );
+    }
+
+    #[test]
+    fn the_latest_skip_sends_failed_with_the_skip_text() {
+        let (_dir, single) = with_an_image();
+        let job = single.begin_preview(lossy(40)).unwrap();
+        let event = single.settle_preview(&job, Some(skipped()));
+        assert_eq!(event, failed(1, 1, "File is too large"));
+    }
+
+    #[test]
+    fn the_latest_empty_result_sends_failed_stopped() {
+        let (_dir, single) = with_an_image();
+        let job = single.begin_preview(lossy(40)).unwrap();
+        let event = single.settle_preview(&job, None);
+        assert_eq!(event, failed(1, 1, "the run was stopped"));
+    }
+
+    // A stale result for an older version: discarded, its file deleted, the
+    // kept version untouched.
+
+    /// Ready version 1, then requests 2 and 3; request 2 settles with
+    /// `result` (its file written first when `wrote` is set).
+    fn stale_by_version(result: Option<FileResult>, wrote: bool) {
+        let (_dir, single) = with_an_image();
+        let kept = ready_first(&single);
+        let old = single.begin_preview(lossy(40)).unwrap();
+        let _new = single.begin_preview(lossy(60)).unwrap();
+        if wrote {
+            write_version(&old);
+        }
+        assert_eq!(single.settle_preview(&old, result), None);
+        assert!(!old.dest.exists(), "the stale file is deleted");
+        assert_eq!(single.latest_ready(), Some((1, 1)));
+        assert!(kept.dest.exists(), "the kept version stays");
+    }
+
+    #[test]
+    fn a_stale_success_for_an_older_version_is_discarded_and_its_file_deleted() {
+        stale_by_version(Some(success()), true);
+    }
+
+    #[test]
+    fn a_stale_optimiser_error_for_an_older_version_is_discarded() {
+        stale_by_version(Some(optimiser_error()), false);
+    }
+
+    #[test]
+    fn a_stale_crash_for_an_older_version_is_discarded() {
+        stale_by_version(Some(crash()), false);
+    }
+
+    #[test]
+    fn a_stale_timeout_for_an_older_version_is_discarded() {
+        stale_by_version(Some(timeout()), false);
+    }
+
+    #[test]
+    fn a_stale_stop_for_an_older_version_is_discarded() {
+        stale_by_version(Some(stopped()), false);
+    }
+
+    #[test]
+    fn a_stale_skip_for_an_older_version_is_discarded() {
+        stale_by_version(Some(skipped()), false);
+    }
+
+    #[test]
+    fn a_stale_empty_result_for_an_older_version_is_discarded() {
+        stale_by_version(None, false);
+    }
+
+    // A stale result for an older image.
+
+    /// A request on image 1, then image 2 loaded (with a request of its own
+    /// when `request_on_new`); image 1's job settles with `result`.
+    fn stale_by_image(result: Option<FileResult>, wrote: bool, request_on_new: bool) {
+        let (dir, single) = with_an_image();
+        let old = single.begin_preview(lossy(40)).unwrap();
+        load_b(&dir, &single);
+        if request_on_new {
+            let new = single.begin_preview(lossy(40)).unwrap();
+            assert_eq!(new.key, 2);
+        }
+        if wrote {
+            // As a worker that outlived the load would leave it.
+            fs::create_dir_all(old.dest.parent().unwrap()).unwrap();
+            write_version(&old);
+        }
+        assert_eq!(single.settle_preview(&old, result), None);
+        assert!(!old.dest.exists());
+        assert_eq!(single.latest_ready(), None);
+    }
+
+    #[test]
+    fn a_stale_success_for_an_older_image_is_discarded_and_its_file_deleted() {
+        stale_by_image(Some(success()), true, false);
+    }
+
+    #[test]
+    fn a_stale_failure_for_an_older_image_is_discarded() {
+        stale_by_image(Some(crash()), false, false);
+    }
+
+    #[test]
+    fn a_stale_empty_result_for_an_older_image_is_discarded() {
+        stale_by_image(None, false, false);
+    }
+
+    #[test]
+    fn a_stale_success_for_an_older_image_with_a_request_on_the_new_one_is_discarded() {
+        stale_by_image(Some(success()), true, true);
+    }
+
+    // Every stop makes the running job stale; other calls do not.
+
+    /// A request on image 1; `trigger` runs; then the job settles as a
+    /// killed worker would. What the window hears, and whether the job's
+    /// stop handle was used.
+    fn after(trigger: impl FnOnce(&TempDir, &Single)) -> (Option<Event>, bool) {
+        let (dir, single) = with_an_image();
+        let job = single.begin_preview(lossy(40)).unwrap();
+        trigger(&dir, &single);
+        let used = job.stop.is_stopped();
+        (single.settle_preview(&job, Some(stopped())), used)
+    }
+
+    #[test]
+    fn set_view_batch_makes_the_running_preview_stale() {
+        assert_eq!(
+            after(|_, single| single.set_view(View::Batch)),
+            (None, true)
+        );
+    }
+
+    #[test]
+    fn stop_preview_makes_the_running_preview_stale() {
+        assert_eq!(after(|_, single| single.stop_preview()), (None, true));
+    }
+
+    #[test]
+    fn a_new_load_makes_the_running_preview_stale() {
+        assert_eq!(after(load_b), (None, true));
+    }
+
+    #[test]
+    fn shutdown_makes_the_running_preview_stale() {
+        assert_eq!(after(|_, single| single.shutdown()), (None, true));
+    }
+
+    #[test]
+    fn set_view_single_keeps_the_running_preview_latest() {
+        assert_eq!(
+            after(|_, single| single.set_view(View::Single)),
+            (failed(1, 1, "the run was stopped"), false)
+        );
+    }
+
+    #[test]
+    fn a_refused_load_keeps_the_running_preview_latest() {
+        let refused = |dir: &TempDir, single: &Single| {
+            assert!(
+                single
+                    .load(&dir.path().join("notes.txt"), one_pixel)
+                    .is_err()
+            );
+        };
+        assert_eq!(after(refused), (failed(1, 1, "the run was stopped"), false));
+    }
+
+    // Clean-up of version files.
+
+    #[test]
+    fn a_ready_version_deletes_every_older_version_file_and_keeps_the_rest() {
+        let (_dir, single) = with_an_image();
+        let folder = single
+            .current()
+            .unwrap()
+            .copy
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let jobs: Vec<_> = (0..3)
+            .map(|_| single.begin_preview(lossy(40)).unwrap())
+            .collect();
+        for name in [
+            "v1.png",
+            "v2.png",
+            "v4.png",
+            "v.png",
+            "vx.png",
+            "v1.png.tmp",
+            "notes",
+        ] {
+            fs::write(folder.join(name), b"x").unwrap();
+        }
+        write_version(&jobs[2]);
+        assert!(single.settle_preview(&jobs[2], Some(success())).is_some());
+        let mut left: Vec<_> = fs::read_dir(&folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "notes",
+                "original.png",
+                "v.png",
+                "v1.png.tmp",
+                "v3.png",
+                "v4.png",
+                "vx.png"
+            ]
+        );
+    }
+
+    #[test]
+    fn version_of_reads_v_and_digits_names() {
+        for (name, version) in [
+            ("v1.png", 1),
+            ("v10.PNG", 10),
+            ("v7", 7),
+            ("v9999999999.jpg", 9_999_999_999),
+        ] {
+            assert_eq!(version_of(OsStr::new(name)), Some(version), "{name}");
+        }
+    }
+
+    #[test]
+    fn version_of_is_none_for_other_names() {
+        for name in [
+            "v",
+            "v.png",
+            "vx.png",
+            "v1x.png",
+            "V1.png",
+            "v1.png.tmp",
+            "original.png",
+            "v12345678901.png",
+            "v-1.png",
+            "v+1.png",
+            " v1.png",
+            "v1 .png",
+            "v\u{661}.png",
+        ] {
+            assert_eq!(version_of(OsStr::new(name)), None, "{name}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(version_of(OsStr::from_bytes(b"v1\xff.png")), None);
+        }
+    }
+
+    #[test]
+    fn a_stale_file_that_cannot_be_deleted_is_logged_and_skipped() {
+        let (_dir, single) = with_an_image();
+        let old = single.begin_preview(lossy(40)).unwrap();
+        let _new = single.begin_preview(lossy(40)).unwrap();
+        // A folder with something in it where the file should be.
+        fs::create_dir(&old.dest).unwrap();
+        fs::write(old.dest.join("x"), b"x").unwrap();
+        assert_eq!(single.settle_preview(&old, Some(success())), None);
+        assert!(old.dest.is_dir());
+    }
+
+    #[test]
+    fn an_older_version_that_cannot_be_deleted_is_logged_and_skipped() {
+        let (_dir, single) = with_an_image();
+        let old = single.begin_preview(lossy(40)).unwrap();
+        let new = single.begin_preview(lossy(40)).unwrap();
+        fs::create_dir(&old.dest).unwrap();
+        fs::write(old.dest.join("x"), b"x").unwrap();
+        write_version(&new);
+        assert!(matches!(
+            single.settle_preview(&new, Some(success())),
+            Some(Event::PreviewReady(_))
+        ));
+        assert!(old.dest.is_dir());
+        assert_eq!(single.latest_ready(), Some((1, 2)));
+    }
+
+    #[test]
+    fn a_missing_image_folder_is_logged_and_the_version_still_kept() {
+        let (_dir, single) = with_an_image();
+        let job = single.begin_preview(lossy(40)).unwrap();
+        fs::remove_dir_all(job.dest.parent().unwrap()).unwrap();
+        assert!(matches!(
+            single.settle_preview(&job, Some(success())),
+            Some(Event::PreviewReady(_))
+        ));
+        assert_eq!(single.latest_ready(), Some((1, 1)));
+    }
+
+    #[test]
+    fn a_failed_latest_keeps_the_previous_ready_version() {
+        let (_dir, single) = with_an_image();
+        let kept = ready_first(&single);
+        let next = single.begin_preview(lossy(60)).unwrap();
+        assert_eq!(
+            single.settle_preview(&next, Some(crash())),
+            failed(
+                1,
+                2,
+                "the optimiser crashed on this file (it gave no valid result)"
+            )
+        );
+        assert_eq!(single.latest_ready(), Some((1, 1)));
+        assert!(kept.dest.exists());
+    }
+
+    #[test]
+    fn a_new_load_forgets_the_ready_version() {
+        let (dir, single) = with_an_image();
+        ready_first(&single);
+        assert_eq!(single.latest_ready(), Some((1, 1)));
+        load_b(&dir, &single);
+        assert_eq!(single.latest_ready(), None);
+    }
+
+    #[test]
+    fn shutdown_forgets_the_ready_version() {
+        let (_dir, single) = with_an_image();
+        ready_first(&single);
+        assert_eq!(single.latest_ready(), Some((1, 1)));
+        single.shutdown();
+        assert_eq!(single.latest_ready(), None);
     }
 }

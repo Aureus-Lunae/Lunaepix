@@ -31,13 +31,19 @@ pub struct RunStarted {
     pub quality: Option<u8>,
 }
 
+/// `compression` as the window names it: the mode, and the lossy quality
+/// (`None` for lossless). `run-started` and `preview-ready` both carry it.
+pub fn mode_and_quality(compression: Compression) -> (Mode, Option<u8>) {
+    match compression {
+        Compression::Lossless => (Mode::Lossless, None),
+        Compression::Lossy(quality) => (Mode::Lossy, Some(quality.get())),
+    }
+}
+
 impl RunStarted {
     /// The payload for a run of `total` rows with `compression`.
     pub fn new(total: usize, compression: Compression) -> Self {
-        let (mode, quality) = match compression {
-            Compression::Lossless => (Mode::Lossless, None),
-            Compression::Lossy(quality) => (Mode::Lossy, Some(quality.get())),
-        };
+        let (mode, quality) = mode_and_quality(compression);
         RunStarted {
             total,
             mode,
@@ -193,6 +199,66 @@ pub struct NameSuggested {
     pub suggested: String,
 }
 
+/// A compressed version of the loaded image is being made: the latest
+/// request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreviewStarted {
+    /// The image's key (`"7"`).
+    pub image: String,
+    /// The version number: 1 for the first of a launch, then one more for
+    /// each request.
+    pub version: u64,
+}
+
+/// The latest request's version is ready and served as `key`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreviewReady {
+    pub image: String,
+    pub version: u64,
+    /// The version's key for the `preview` scheme, `<image>-<version>`.
+    pub key: String,
+    pub mode: Mode,
+    /// The lossy quality; `null` for lossless.
+    pub quality: Option<u8>,
+    /// The size of the copy and of the version, in bytes.
+    pub before: u64,
+    pub after: u64,
+    /// Batch's note when the file was handled differently from the mode;
+    /// `null` otherwise (the key is always there).
+    pub note: Option<String>,
+}
+
+/// The latest request failed; the previous ready version (if any) stays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreviewFailed {
+    pub image: String,
+    pub version: u64,
+    /// Batch's reason, a sentence for the user, never with a path.
+    pub reason: String,
+}
+
+/// The `preview-ready` payload for version `version` of image `key`, made
+/// with `compression`, whose worker gave `outcome`.
+pub fn preview_ready(
+    key: u64,
+    version: u64,
+    compression: Compression,
+    outcome: &lunaepix_core::Outcome,
+) -> PreviewReady {
+    let (mode, quality) = mode_and_quality(compression);
+    PreviewReady {
+        image: key.to_string(),
+        version,
+        key: format!("{key}-{version}"),
+        mode,
+        quality,
+        before: outcome.before,
+        after: outcome.after,
+        // The same text `file_done` gives the note.
+        note: outcome.note.map(|note| note.to_string()),
+    }
+}
+
 /// One event for the window: its name ([`Event::name`]) and its payload
 /// (the `Serialize` output; the two unit events have `null`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -211,6 +277,9 @@ pub enum Event {
     DragState(DragState),
     ImageChanged(ImageChanged),
     NameSuggested(NameSuggested),
+    PreviewStarted(PreviewStarted),
+    PreviewReady(PreviewReady),
+    PreviewFailed(PreviewFailed),
 }
 
 impl Event {
@@ -228,6 +297,9 @@ impl Event {
             Event::DragState(_) => "drag-state",
             Event::ImageChanged(_) => "image-changed",
             Event::NameSuggested(_) => "name-suggested",
+            Event::PreviewStarted(_) => "preview-started",
+            Event::PreviewReady(_) => "preview-ready",
+            Event::PreviewFailed(_) => "preview-failed",
         }
     }
 }
@@ -642,5 +714,98 @@ mod tests {
             value(&event),
             parsed(r#"{ "image": { "key": "7" }, "suggested": "holiday" }"#)
         );
+    }
+
+    // --- the preview's events -------------------------------------------------
+
+    fn outcome(before: u64, after: u64, note: Option<lunaepix_core::Note>) -> Outcome {
+        Outcome {
+            before,
+            after,
+            millis: 9,
+            note,
+        }
+    }
+
+    fn quality(value: u8) -> Compression {
+        Compression::Lossy(lunaepix_core::Quality::new(value).unwrap())
+    }
+
+    #[test]
+    fn preview_events_serialise_exactly_as_the_spec_examples() {
+        let started = Event::PreviewStarted(PreviewStarted {
+            image: "7".to_owned(),
+            version: 3,
+        });
+        assert_eq!(value(&started), parsed(r#"{ "image": "7", "version": 3 }"#));
+        let ready = Event::PreviewReady(preview_ready(
+            7,
+            3,
+            quality(75),
+            &outcome(2_400_000, 612_000, None),
+        ));
+        assert_eq!(
+            value(&ready),
+            parsed(
+                r#"{ "image": "7", "version": 3, "key": "7-3", "mode": "lossy", "quality": 75,
+                     "before": 2400000, "after": 612000, "note": null }"#
+            )
+        );
+        let failed = Event::PreviewFailed(PreviewFailed {
+            image: "7".to_owned(),
+            version: 3,
+            reason: "the optimiser crashed on this file (it gave no valid result)".to_owned(),
+        });
+        assert_eq!(
+            value(&failed),
+            parsed(
+                r#"{ "image": "7", "version": 3,
+                     "reason": "the optimiser crashed on this file (it gave no valid result)" }"#
+            )
+        );
+    }
+
+    #[test]
+    fn a_lossless_ready_has_quality_null() {
+        let ready = preview_ready(1, 2, Compression::Lossless, &outcome(10, 12, None));
+        assert_eq!(
+            value(&ready),
+            parsed(
+                r#"{ "image": "1", "version": 2, "key": "1-2", "mode": "lossless", "quality": null,
+                     "before": 10, "after": 12, "note": null }"#
+            )
+        );
+    }
+
+    #[test]
+    fn a_ready_with_a_note_carries_batchs_text() {
+        let note = lunaepix_core::Note::KeptLosslessAnimatedPng;
+        let ready = preview_ready(4, 9, quality(0), &outcome(10, 9, Some(note)));
+        assert_eq!(ready.note.as_deref(), Some("kept lossless: animated PNG"));
+        // The same text as a `file-done` row gets for that outcome.
+        let row = file_done(
+            0,
+            Path::new("a.png"),
+            &FileResult::Optimized(outcome(10, 9, Some(note))),
+        );
+        assert_eq!(ready.note, row.note);
+        assert_eq!(ready.quality, Some(0));
+    }
+
+    #[test]
+    fn preview_event_names_are_started_ready_failed() {
+        let started = Event::PreviewStarted(PreviewStarted {
+            image: "1".to_owned(),
+            version: 1,
+        });
+        let ready = Event::PreviewReady(preview_ready(1, 1, quality(40), &outcome(2, 1, None)));
+        let failed = Event::PreviewFailed(PreviewFailed {
+            image: "1".to_owned(),
+            version: 1,
+            reason: "x".to_owned(),
+        });
+        assert_eq!(started.name(), "preview-started");
+        assert_eq!(ready.name(), "preview-ready");
+        assert_eq!(failed.name(), "preview-failed");
     }
 }

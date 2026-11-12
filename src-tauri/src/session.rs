@@ -16,18 +16,18 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use lunaepix_core::{
     Compression, FileResult, Job, Options, ProbeAnswer, Quality, Skip, StopHandle, Worker,
-    WriteMode, images_in_folder, plan_files_to, run_probe,
+    WriteMode, images_in_folder, plan_files_to, run_probe, run_until_stopped,
 };
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::events::{
-    Event, FileStarted, ListChanged, ListRow, OVER_LIMIT_NAME, RunFinished, RunStarted, file_done,
-    file_name_of, output_changed, over_limit_reason, over_limit_row,
+    Event, FileStarted, ListChanged, ListRow, OVER_LIMIT_NAME, PreviewStarted, RunFinished,
+    RunStarted, file_done, file_name_of, output_changed, over_limit_reason, over_limit_row,
 };
 use crate::single::{
-    FOLDERS_GO_IN_BATCH_NOTICE, NOT_AN_IMAGE_NOTICE, Single, View, left_out_notice, parse_view,
-    plan_drop,
+    FOLDERS_GO_IN_BATCH_NOTICE, NOT_AN_IMAGE_NOTICE, PreviewJob, Single, View, left_out_notice,
+    parse_view, plan_drop,
 };
 use crate::thumbs::Thumbs;
 
@@ -762,6 +762,49 @@ impl Session {
         self.single.set_view(View::Batch);
         self.add_paths(ticket, Some(paths), emit);
         Ok(())
+    }
+
+    /// `preview_image`: busy check, `settings` (as `start_run` checks them,
+    /// [`parse_settings`]), then an image ([`CommandError::NoImage`]), in
+    /// that order. Then the previous request's worker is stopped, the new
+    /// version is the latest request ([`Single::begin_preview`]),
+    /// `preview-started` goes out, and `start` gets the job, to hand to
+    /// [`Session::run_preview`] on a thread of its own. Making a version is
+    /// not busy: the guard is held through the checks and the new version
+    /// only (so a run cannot start in between and miss the new worker), and
+    /// is given back before `start`.
+    pub fn preview_image(
+        &self,
+        settings: Option<&Value>,
+        emit: &mut impl FnMut(Event),
+        start: impl FnOnce(PreviewJob),
+    ) -> Result<(), CommandError> {
+        // Every early return drops the ticket, which frees the guard.
+        let ticket = claim_run(&self.guard, emit)?;
+        // A call without settings is refused like any badly shaped one.
+        let settings = settings.ok_or(CommandError::InvalidSettings)?;
+        let compression = parse_settings(settings)?;
+        let job = self.single.begin_preview(compression)?;
+        emit(Event::PreviewStarted(PreviewStarted {
+            image: job.key.to_string(),
+            version: job.version,
+        }));
+        drop(ticket);
+        start(job);
+        Ok(())
+    }
+
+    /// Make `job`'s version with `worker` (its options from the job: the
+    /// request's compression, never replacing) until the job is stopped,
+    /// and send what [`Single::settle_preview`] makes of the result: for
+    /// the latest request `preview-ready` or `preview-failed`, otherwise
+    /// nothing.
+    pub fn run_preview(&self, job: PreviewJob, worker: &Worker, emit: &mut impl FnMut(Event)) {
+        let worker = worker.with_options(&job.options());
+        let result = run_until_stopped(&[job.job()], &worker, &job.stop, |_, _, _| {}).pop();
+        if let Some(event) = self.single.settle_preview(&job, result) {
+            emit(event);
+        }
     }
 
     /// The window closes: stop the preview and remove Single image mode's
@@ -4968,5 +5011,266 @@ mod tests {
         session.shutdown();
         assert!(!private.exists());
         assert_eq!(session.single().current(), None);
+    }
+
+    // --- preview_image ----------------------------------------------------------
+
+    /// `preview_image` with `settings`: its answer and the job handed to
+    /// `start` (only when it started).
+    fn preview(
+        session: &Session,
+        window: &Window,
+        settings: Option<&Value>,
+    ) -> (Result<(), CommandError>, Option<PreviewJob>) {
+        let mut job = None;
+        let answer =
+            session.preview_image(settings, &mut window.emit(), |started| job = Some(started));
+        (answer, job)
+    }
+
+    /// A session with `a.png` loaded as image 1, the window's events taken.
+    fn with_an_image() -> (TempDir, Vec<PathBuf>, Session, Window) {
+        let (dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+        window.take();
+        (dir, paths, session, window)
+    }
+
+    /// `preview_image` refused with `error`: nothing started, nothing sent
+    /// but `run-busy` for busy, the guard free afterwards.
+    fn preview_refused(
+        session: &Session,
+        window: &Window,
+        settings: Option<&Value>,
+        error: CommandError,
+    ) {
+        let (answer, job) = preview(session, window, settings);
+        assert_eq!(answer, Err(error), "{settings:?}");
+        assert!(job.is_none(), "a refused preview must not start");
+        let expected: Vec<&str> = if error == CommandError::Busy {
+            vec!["run-busy"]
+        } else {
+            vec![]
+        };
+        let heard: Vec<&str> = window.take().iter().map(Event::name).collect();
+        assert_eq!(heard, expected);
+    }
+
+    #[test]
+    fn a_preview_without_an_image_is_no_image() {
+        let session = Session::new();
+        let window = Window::default();
+        preview_refused(&session, &window, Some(&lossy(40)), CommandError::NoImage);
+        assert!(guard_is_free(&session));
+        // A refused request takes no version: the first one is still 1.
+        let (_dir, paths) = files(&[("a.png", b"png")]);
+        choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+        window.take();
+        let (_, job) = preview(&session, &window, Some(&lossy(40)));
+        assert_eq!(job.unwrap().version, 1);
+    }
+
+    #[test]
+    fn a_preview_after_shutdown_is_no_image() {
+        let (_dir, _paths, session, window) = with_an_image();
+        session.shutdown();
+        preview_refused(&session, &window, Some(&lossy(40)), CommandError::NoImage);
+    }
+
+    #[test]
+    fn a_preview_with_an_image_starts_and_sends_preview_started() {
+        let (_dir, _paths, session, window) = with_an_image();
+        let (answer, job) = preview(&session, &window, Some(&lossy(40)));
+        assert_eq!(answer, Ok(()));
+        let job = job.expect("start got the job");
+        assert_eq!((job.key, job.version), (1, 1));
+        let events = window.take();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].name(), "preview-started");
+        assert_eq!(value(&events[0]), json!({ "image": "1", "version": 1 }));
+        // The guard is not held while the version is made.
+        assert!(guard_is_free(&session));
+    }
+
+    #[test]
+    fn lossy_0_lossy_100_and_lossless_settings_start_a_preview() {
+        let (_dir, _paths, session, window) = with_an_image();
+        for (settings, compression) in [
+            (lossy(0), Compression::Lossy(Quality::new(0).unwrap())),
+            (lossy(100), Compression::Lossy(Quality::new(100).unwrap())),
+            (lossless(), Compression::Lossless),
+        ] {
+            let (answer, job) = preview(&session, &window, Some(&settings));
+            assert_eq!(answer, Ok(()), "{settings}");
+            assert_eq!(job.unwrap().compression, compression);
+        }
+    }
+
+    /// Every shape `parse_settings` refuses, as `start_run` refuses them.
+    fn bad_settings() -> Vec<Value> {
+        let from_text = |text: &str| -> Value { serde_json::from_str(text).unwrap() };
+        vec![
+            json!({ "mode": "lossy", "quality": -1 }),
+            json!({ "mode": "lossy", "quality": 101 }),
+            json!({ "mode": "lossy", "quality": 75.5 }),
+            from_text(r#"{ "mode": "lossy", "quality": 75.0 }"#),
+            json!({ "mode": "lossy", "quality": "75" }),
+            json!({ "mode": "lossy", "quality": null }),
+            json!({ "mode": "lossy" }),
+            json!({ "quality": 75 }),
+            json!({ "mode": "lossy", "quality": 75, "extra": 1 }),
+            json!({ "mode": "fast", "quality": 75 }),
+            json!({ "mode": "Lossy", "quality": 75 }),
+            json!({ "mode": "lossless", "quality": 101 }),
+            json!({}),
+            json!(null),
+            json!(75),
+            json!(["lossy", 75]),
+        ]
+    }
+
+    #[test]
+    fn bad_settings_are_invalid_settings() {
+        let (_dir, _paths, session, window) = with_an_image();
+        for settings in bad_settings() {
+            preview_refused(
+                &session,
+                &window,
+                Some(&settings),
+                CommandError::InvalidSettings,
+            );
+        }
+        assert!(guard_is_free(&session));
+    }
+
+    #[test]
+    fn a_preview_without_settings_is_invalid_settings() {
+        let (_dir, _paths, session, window) = with_an_image();
+        preview_refused(&session, &window, None, CommandError::InvalidSettings);
+    }
+
+    #[test]
+    fn bad_settings_without_an_image_are_invalid_settings() {
+        let session = Session::new();
+        let window = Window::default();
+        preview_refused(
+            &session,
+            &window,
+            Some(&json!({ "mode": "lossy", "quality": 75.5 })),
+            CommandError::InvalidSettings,
+        );
+    }
+
+    #[test]
+    fn a_preview_during_a_save_is_busy() {
+        // A save holds the guard as every command does (`claim_run`).
+        let session = Session::new();
+        let window = Window::default();
+        let saving = session.guard.try_start().expect("a free guard");
+        // Busy comes first: bad settings and no image are not looked at.
+        preview_refused(
+            &session,
+            &window,
+            Some(&json!({ "mode": "lossy" })),
+            CommandError::Busy,
+        );
+        drop(saving);
+        preview_refused(
+            &session,
+            &window,
+            Some(&json!({ "mode": "lossy" })),
+            CommandError::InvalidSettings,
+        );
+    }
+
+    #[test]
+    fn a_preview_during_a_run_is_busy() {
+        let (_dir, paths, session, window) = with_an_image();
+        pick(&session, &window, &paths);
+        window.take();
+        let running = started(&session, &window, &lossless());
+        preview_refused(&session, &window, Some(&lossy(40)), CommandError::Busy);
+        drop(running);
+        let (answer, _) = preview(&session, &window, Some(&lossy(40)));
+        assert_eq!(answer, Ok(()));
+    }
+
+    #[test]
+    fn a_preview_while_a_dialog_is_open_is_busy() {
+        let (_dir, _paths, session, window) = with_an_image();
+        let mut open = None;
+        session
+            .choose_image(&mut window.emit(), |ticket| open = Some(ticket))
+            .unwrap();
+        preview_refused(&session, &window, Some(&lossy(40)), CommandError::Busy);
+        drop(open);
+        let (answer, _) = preview(&session, &window, Some(&lossy(40)));
+        assert_eq!(answer, Ok(()));
+    }
+
+    #[test]
+    fn a_preview_running_does_not_make_choose_image_set_view_drop_or_choose_output_folder_busy() {
+        let (dir, paths, session, window) = with_an_image();
+        let (answer, job) = preview(&session, &window, Some(&lossy(40)));
+        assert_eq!(answer, Ok(()));
+        // Begun and not settled: the version is being made.
+        let _running = job.unwrap();
+        window.take();
+
+        assert_eq!(
+            session.set_view(Some(&json!({ "view": "single" })), &mut window.emit()),
+            Ok(())
+        );
+        let mut dialogs = 0;
+        session
+            .choose_image(&mut window.emit(), |_ticket| dialogs += 1)
+            .unwrap();
+        session
+            .choose_output_folder(&mut window.emit(), |_ticket| dialogs += 1)
+            .unwrap();
+        assert_eq!(dialogs, 2);
+        let mut dropped = Vec::new();
+        session.drop_paths(paths.clone(), &mut window.emit(), |_ticket, paths| {
+            dropped = paths
+        });
+        assert_eq!(dropped, paths);
+        assert_eq!(window.take(), []);
+        drop(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lossy_preview_worker_gets_lossy_no_replace_the_copy_and_the_version_file() {
+        let (_dir, _paths, session, window) = with_an_image();
+        let logs = TempDir::new().unwrap();
+        let log = logs.path().join("args");
+        let (_, job) = preview(&session, &window, Some(&lossy(40)));
+        session.run_preview(job.unwrap(), &recording_worker(&log), &mut window.emit());
+        let copy = loaded(&session).copy;
+        let expected = format!(
+            "--lossy\n40\n--no-replace\n{}\n{}\n",
+            copy.display(),
+            copy.with_file_name("v1.png").display()
+        );
+        assert_eq!(fs::read_to_string(&log).unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lossless_preview_worker_gets_no_replace_and_no_lossy() {
+        let (_dir, _paths, session, window) = with_an_image();
+        let logs = TempDir::new().unwrap();
+        let log = logs.path().join("args");
+        let (_, job) = preview(&session, &window, Some(&lossless()));
+        session.run_preview(job.unwrap(), &recording_worker(&log), &mut window.emit());
+        let copy = loaded(&session).copy;
+        let expected = format!(
+            "--no-replace\n{}\n{}\n",
+            copy.display(),
+            copy.with_file_name("v1.png").display()
+        );
+        assert_eq!(fs::read_to_string(&log).unwrap(), expected);
     }
 }

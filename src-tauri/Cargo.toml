@@ -33,6 +33,9 @@ tempfile = "3.27.0"
 [dev-dependencies]
 # Test fixtures for the worker-mode smoke test, as in the CLI's tests.
 png = "0.17.16"
+# Encodes the JPEG fixture of the preview's EXIF orientation test. The
+# version the core's tests already use (in Cargo.lock), so no new package.
+image = { version = "=0.25.10", default-features = false, features = ["jpeg"] }
 yaml-rust2 = "0.13.0"
 # Reads about.toml (the licence policy) as TOML in the config checks. The
 # version already in Cargo.lock (tauri's build tools use it), so no new package.

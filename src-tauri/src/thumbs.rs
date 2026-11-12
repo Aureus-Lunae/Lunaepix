@@ -48,14 +48,15 @@ pub fn parse_key(uri_path: &str) -> Option<(u64, usize)> {
 }
 
 /// `text` as a number, if it is 1 to `most` ASCII digits and nothing else.
-fn digits<T: FromStr>(text: &str, most: usize) -> Option<T> {
+pub(crate) fn digits<T: FromStr>(text: &str, most: usize) -> Option<T> {
     let all_digits = (1..=most).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit());
     // At most 10 digits always fit a `u64`, and 4 a `usize`.
     all_digits.then(|| text.parse().ok()).flatten()
 }
 
 /// The answer to one `thumb://` request: `200 image/png`, `200
-/// image/svg+xml`, or `404` with no type and an empty body.
+/// image/svg+xml`, or `404` with no type and an empty body. The `preview`
+/// scheme answers in the same shape (`previews::PreviewResponse`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThumbResponse {
     pub status: u16,
@@ -73,20 +74,21 @@ impl ThumbResponse {
         }
     }
 
-    fn png(body: Vec<u8>) -> Self {
+    /// `200` with `body` of `content_type`.
+    pub(crate) fn found(content_type: &'static str, body: Vec<u8>) -> Self {
         ThumbResponse {
             status: 200,
-            content_type: Some("image/png"),
+            content_type: Some(content_type),
             body,
         }
     }
 
+    fn png(body: Vec<u8>) -> Self {
+        Self::found("image/png", body)
+    }
+
     fn svg(body: Vec<u8>) -> Self {
-        ThumbResponse {
-            status: 200,
-            content_type: Some("image/svg+xml"),
-            body,
-        }
+        Self::found("image/svg+xml", body)
     }
 
     /// This answer as the webview's response: the status, a `Content-Type`

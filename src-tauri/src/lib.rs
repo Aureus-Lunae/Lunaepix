@@ -1,8 +1,9 @@
 //! Thin Tauri shell over `lunaepix-core`: the commands, the window's drag
-//! and drop, events back to the window, and the `thumb` scheme that serves
-//! the list's thumbnails. `INTERFACE.md` is the contract for the window;
-//! `session` holds what the commands do, `single` Single image mode's state,
-//! `thumbs` what the scheme answers.
+//! and drop, events back to the window, the `thumb` scheme that serves the
+//! list's thumbnails and the `preview` scheme that serves Single image
+//! mode's image and its compressed version. `INTERFACE.md` is the contract
+//! for the window; `session` holds what the commands do, `single` Single
+//! image mode's state, `thumbs` and `previews` what the schemes answer.
 //!
 //! The window never hands the backend a path. Paths come only from a native
 //! dialog opened here, or from a drop that Tauri delivers here as a window
@@ -11,6 +12,7 @@
 
 pub mod events;
 pub mod names;
+pub mod previews;
 pub mod session;
 pub mod single;
 pub mod thumbs;
@@ -28,6 +30,7 @@ use tauri::{
 use tauri_plugin_dialog::{DialogExt, FileDialogBuilder, FilePath};
 
 use events::{DragState, Event};
+use previews::PreviewResponse;
 use session::{CommandError, Session};
 use thumbs::ThumbResponse;
 
@@ -110,6 +113,40 @@ fn thumb_protocol(
         },
         spawn_thumbnail_thread,
         |(_, _, responder)| responder.respond(ThumbResponse::not_found().into_http()),
+    );
+}
+
+/// Start `job` on a thread of its own named `preview`: it reads a file the
+/// `preview` scheme serves, or makes a compressed version in a worker and
+/// waits for it.
+fn spawn_preview_thread(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("preview".to_owned())
+        .spawn(job)
+        .map(drop)
+}
+
+/// The `preview` scheme: a request is answered by [`previews::serve`] on a
+/// thread of its own, which reads the file, so the webview's thread never
+/// waits. The request's path and query go along unchanged: `previews::serve`
+/// decides what of them counts. If no thread can be started, the request
+/// gets `404`.
+fn preview_protocol(
+    context: UriSchemeContext<'_, Wry>,
+    request: tauri::http::Request<Vec<u8>>,
+    responder: UriSchemeResponder,
+) {
+    let app = context.app_handle().clone();
+    session::on_own_thread_or_else(
+        (app, request, responder),
+        |(app, request, responder)| {
+            let state = app.state::<AppState>();
+            let uri = request.uri();
+            let answer = previews::serve(state.session.single(), uri.path(), uri.query());
+            responder.respond(answer.into_http());
+        },
+        spawn_preview_thread,
+        |(_, _, responder)| responder.respond(PreviewResponse::not_found().into_http()),
     );
 }
 
@@ -202,6 +239,25 @@ fn choose_image(app: AppHandle) -> Result<(), CommandError> {
                 &mut |event| emit(&answer, event),
             );
         });
+    })
+}
+
+/// Make the compressed version of the loaded image with the window's
+/// `settings` (checked by [`session::parse_settings`]), replacing any
+/// request still going. Returns once it has started; the outcome arrives as
+/// `preview-ready` or `preview-failed`. The worker runs on a thread of its
+/// own.
+#[tauri::command]
+fn preview_image(app: AppHandle, settings: Option<serde_json::Value>) -> Result<(), CommandError> {
+    session(&app).preview_image(settings.as_ref(), &mut |event| emit(&app, event), |job| {
+        let app = app.clone();
+        let make = move |job| {
+            let state = app.state::<AppState>();
+            state
+                .session
+                .run_preview(job, &state.worker, &mut |event| emit(&app, event));
+        };
+        session::on_own_thread_or_here(job, make, spawn_preview_thread);
     })
 }
 
@@ -401,11 +457,13 @@ pub fn run() -> ExitCode {
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .register_asynchronous_uri_scheme_protocol("thumb", thumb_protocol)
-        // `preview_image` and `save_image` are declared in `build.rs` and
-        // granted already; their handlers come with the preview and the save.
+        .register_asynchronous_uri_scheme_protocol("preview", preview_protocol)
+        // `save_image` is declared in `build.rs` and granted already; its
+        // handler comes with the save.
         .invoke_handler(tauri::generate_handler![
             set_view,
             choose_image,
+            preview_image,
             move_drop_to_batch,
             choose_files,
             clear_list,
