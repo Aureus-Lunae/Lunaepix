@@ -438,7 +438,7 @@ test('classifyRejection says "busy" for a busy rejection, which run-busy already
   assert.equal(classifyRejection('busy'), 'busy');
 });
 
-test('classifyRejection says "known" for the other two rejections of the interface', () => {
+test('classifyRejection says "known" for no-output and open-failed', () => {
   assert.equal(classifyRejection('no-output'), 'known');
   assert.equal(classifyRejection('open-failed'), 'known');
 });
@@ -949,6 +949,39 @@ test('a_run_rejection_spelled_differently_stays_unknown', () => {
   }
   // Control: the exact spelling is known.
   assert.equal(classifyRejection('empty-list'), 'known');
+});
+
+// Single image mode's rejections (src-tauri/INTERFACE.md, Commands)
+
+test('each_new_rejection_gives_its_message', () => {
+  for (const [reason, message] of [
+    ['no-image', 'Load an image first.'],
+    ['not-ready', 'The compressed version is not ready yet.'],
+    ['nothing-to-move', 'There is nothing to move to Batch any more.'],
+    ['save-failed', 'The file could not be saved.'],
+    // save_image's output-missing gets today's text, unchanged.
+    ['output-missing', MESSAGES.outputMissing],
+  ]) {
+    assert.equal(reduce(initialState(), { type: 'command-rejected', payload: reason }).message, message, reason);
+    assert.deepEqual(afterRejection(reason), { log: false, action: { type: 'command-rejected', payload: reason } }, reason);
+  }
+});
+
+test('the_new_known_rejections_are_not_logged', () => {
+  for (const reason of ['no-image', 'not-ready', 'nothing-to-move', 'save-failed', 'invalid-name', 'name-taken']) {
+    assert.equal(classifyRejection(reason), 'known', reason);
+    assert.equal(afterRejection(reason).log, false, reason);
+  }
+});
+
+test('invalid_view_and_an_unknown_string_are_logged_with_the_generic_message', () => {
+  // invalid-view means the window sent a view the backend does not have: a
+  // bug, so it is logged and the user gets the generic message.
+  for (const reason of ['invalid-view', 'name_taken', 'Not-ready']) {
+    assert.equal(classifyRejection(reason), 'unknown', reason);
+    assert.equal(afterRejection(reason).log, true, reason);
+    assert.equal(reduce(initialState(), { type: 'command-rejected', payload: reason }).message, MESSAGES.unknown, reason);
+  }
 });
 
 // the drop area
