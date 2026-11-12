@@ -59,11 +59,72 @@ lossy run. Run lossy on your originals, not on earlier lossy outputs.
   one in the `optimized/` folder). With `--out` it numbers like the app.
 - A file that is already as small as it gets is copied as it is, so the output
   is never larger than the input.
+- Single image mode's Save writes to the folder you chose or, with none, next
+  to the original, under the name you type. It never replaces a file and never
+  numbers a name you typed (see "The window").
 
 One run handles at most 2000 files, and each file has its own limits (100 MiB,
 100 megapixels, 10 minutes).
 
 ## The window
+
+The window has two modes, chosen with the switch at the top: **Single image**
+and **Batch**. It opens in Single image mode every time. Single image mode
+compresses one picture and shows the result before anything is written. Batch
+mode runs a list of files in one go, as before.
+
+### Single image mode
+
+Use it to see what a setting does to one picture, and to save the result
+under a name you choose.
+
+1. Drop one image on the window, or press "Choose image" (the file picker
+   picks one file). It can be a PNG, JPG, SVG or WebP. "Choose other" picks
+   another one later. The picture is copied into a private folder when it is
+   loaded and the original is never touched; the copy is removed when the
+   window closes. The same limits as in Batch apply (100 MiB, 100
+   megapixels, 10 minutes).
+2. The picture shows the original and the compressed version in one frame,
+   split by a divider: the original on the left, the compressed one on the
+   right. Drag the handle, or tab to it and use the arrow keys. A new picture
+   starts shrunk to fit the window ("Fit"); a small picture is not enlarged
+   to fill it. "Zoom in" and "Zoom out", the mouse wheel and "100%" zoom up
+   to 800% (an SVG up to eight times its fitted size); "Fit" goes back. Drag
+   the picture to move it, or tab to it and use the arrow keys. Both sides
+   always show the same spot at the same zoom.
+3. Choose **Lossless** or **Lossy**, and the quality, as in Batch; "Save to"
+   works the same way too. The compressed side updates a moment after you let
+   go of the slider (about 0.4 seconds after the last key when you type a
+   number), not while you drag. "Compressing…" shows meanwhile and the old
+   picture stays until the new one is ready. A box next to the picture shows
+   the original size, the compressed size and how much it saves, with a note
+   when the file was handled differently from the setting (for example
+   "original kept: lossy was not smaller").
+4. "Save as" starts with the name Batch would give the file
+   (`optimized-holiday` next to the original, `holiday` in a chosen folder),
+   or the first free numbered form of it. Change it if you like; the
+   original's extension is added. Press **Save**. Save never replaces a file
+   and never numbers a name you typed: when the name is taken, it says so and
+   writes nothing, and you choose another. After a save the box offers the
+   next free name (`optimized-holiday-1`), so a second save works. A name may
+   not contain `/ \ : * ? " < > |` or control characters, may not end in a
+   space or a dot, may not be a name Windows reserves (`CON`, `NUL`, `COM1`,
+   and so on), and is at most 200 characters and 255 bytes. "Open folder"
+   opens the folder of the last save.
+5. Drop several files, or a folder, and the first image is loaded. A note says
+   how many were left out, and **Switch to Batch** puts all the dropped files
+   in the Batch list. A dropped folder loads nothing ("Folders go in Batch.")
+   and offers the same button. The offer ends at the next picture you load
+   and when you change mode by hand.
+
+Two layouts are available: **Settings under** the picture (the default) and
+**Settings beside** it. In a window narrower than about 640 pixels (at the
+normal text size) "beside" looks like "under"; the choice is kept. The choice
+is the one thing the app remembers between launches. Changing mode and coming
+back leaves the picture, the settings and the preview as they were. The switch
+cannot be used while a Batch run is going.
+
+### Batch mode
 
 1. Drop images on the window, or press "Choose files". A dropped folder adds
    the PNG, JPG, SVG and WebP files directly inside it (not its subfolders).
@@ -89,13 +150,14 @@ One run handles at most 2000 files, and each file has its own limits (100 MiB,
    - Without Re-add, the next drop or pick starts a new list.
    - "Clear" empties the list, before or after a run.
 
-Nothing is remembered between launches but one choice, where Single image mode
-shows the settings: every start is Lossless, quality 75, next to the
-originals.
+Nothing is remembered between launches except one choice: where Single image
+mode shows the settings (under the picture or beside it), kept in the
+window's own storage. Every start is in Single image mode, Lossless, quality
+75, next to the originals.
 
 ### Thumbnails
 
-Every row starts with a small picture of the file, 32 pixels square (made
+Every row of the Batch list starts with a small picture of the file, 32 pixels square (made
 from a 64 pixel image, so it stays sharp on a high-resolution screen). It
 shows for a PNG, JPG, WebP and SVG; an animated PNG or WebP shows its first
 picture, and a photo that carries a rotation is shown the right way up. A
@@ -177,9 +239,10 @@ cargo test --workspace                                        # the Rust tests
 node --test "tests/ui/*.test.js"                              # the window script tests
 ```
 
-The `--config` file adds the small worker program that optimises each file
-and makes each thumbnail, and builds it first; without it the app still
-works, but starts each file about ten times slower.
+The `--config` file adds the small worker program that optimises each file,
+makes each thumbnail and reads the header of each image Single image mode
+loads, and builds it first; without it the app still works, but starts each
+file about ten times slower.
 
 `cargo tauri dev` runs the window app from the source without bundling.
 

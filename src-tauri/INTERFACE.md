@@ -2,10 +2,18 @@
 
 The contract between the window (`ui/`, vanilla JS) and the Rust backend
 (`src-tauri/src/lib.rs`, with the logic in `session.rs` and the payloads in
-`events.rs`; Single image mode's state in `single.rs`; the thumbnails in
-`thumbs.rs`). The window never sends a path, and it never receives one: it
-gets file names, the output folder's name, numbers, thumbnail keys and image
-keys.
+`events.rs`; Single image mode's state in `single.rs` and its save-name rules
+in `names.rs`; the `thumb` scheme's answers in `thumbs.rs` and the `preview`
+scheme's in `previews.rs`). The window never sends a path, and it never
+receives one: it gets file names, the output folder's name, numbers,
+thumbnail keys and image keys.
+
+In the window, `ui/app.js` is only the entry: it hands the real page, Tauri
+API, timers, storage, `ResizeObserver` and log to `startWindow` in
+`ui/window.js`, which is the wiring (every listener, every command sent, every
+event handled). `state.js` and `single.js` turn events and actions into the
+next state, `table.js` and `single-view.js` write it into the page, and
+`zoom.js`, `prefs.js`, `names.js` and `format.js` are the small pure helpers.
 
 The window has two modes, Single image and Batch, and opens in Single image
 at every launch. The backend is told which one shows (`set_view`), because a
@@ -30,10 +38,11 @@ list and the output folder.
 | Quality | integer 0–100 | 75 (used only when mode is `"lossy"`) |
 | Output | next to the originals, or one chosen folder | next to the originals |
 
-Nothing is remembered between launches, except one choice the window keeps
-itself: where Single image mode shows the settings (under or beside the
-picture), in the window's own storage (`localStorage`, key
-`lunaepix.layout`). The backend stores nothing.
+Only one choice is remembered between launches: where Single image mode
+shows the settings (under or beside the picture). The window keeps it itself,
+in its own storage (`localStorage`, key `lunaepix.layout`, value `"under"` or
+`"beside"`); a storage that is missing or blocked gives `"under"`. The
+backend stores nothing.
 
 ## Commands
 
@@ -47,7 +56,7 @@ Each resolves to `null` or rejects with one bare string. Only `start_run`,
 | `readd_list` | none | After a run, puts the files that were in the list back: sends `list-changed` with the list as it was added, planned again now. It adds nothing and removes nothing; it only ends the "run has finished" state, so the next add appends. | `"busy"` |
 | `choose_output_folder` | none | Opens a native folder dialog; the folder picked becomes the output folder. Resolves as soon as the dialog is open. | `"busy"` |
 | `clear_output_folder` | none | Back to "next to the originals". | `"busy"` |
-| `start_run` | `{ "settings": { "mode": "lossy", "quality": 75 } }` | Runs the list with these settings and the output setting. It writes next to the originals (`optimized-a.png`) or into the chosen folder (`a.png`), and never replaces an existing output: a taken name gets a number before the extension, from `-1` (`optimized-a-1.png`, `a-1.png`), then `-2`, up to `-9999`; when all of those are taken the file fails ("no free name in the output folder"). Resolves once the run has started; its progress arrives as events. | `"busy"`, `"invalid-settings"`, `"empty-list"`, `"output-missing"` |
+| `start_run` | `{ "settings": { "mode": "lossy", "quality": 75 } }` | Runs the list with these settings and the output setting. It writes next to the originals (`optimized-a.png`) or into the chosen folder (`a.png`), and never replaces an existing output: a taken name gets a number before the extension, from `-1` (`optimized-a-1.png`, `a-1.png`), then `-2`, up to `-9999`; when all of those are taken the file fails ("no free name in the output folder"). A version being made in Single image mode is stopped when the run starts. Resolves once the run has started; its progress arrives as events. | `"busy"`, `"invalid-settings"`, `"empty-list"`, `"output-missing"` |
 | `open_output_folder` | none | Opens, in the file manager, the folder of the last save or the output folder of the last completed run, whichever came last. For a run that is the chosen output folder, or, with none, the folder of the first file written; for a save, the folder it wrote to. | `"no-output"`, `"open-failed"` |
 | `set_view` | `{ "view": "single" }` or `{ "view": "batch" }` | Tells the backend which mode shows, so a drop goes there. Ends the Switch to Batch offer (see [Single image mode](#single-image-mode)). Sends no event of its own; when it answers `"busy"`, `run-busy` goes out as for every command. | `"busy"`, `"invalid-view"` |
 | `choose_image` | none | Opens a native one-file dialog with the same filters as `choose_files`; the file picked is loaded in Single image mode. Resolves as soon as the dialog is open; the outcome arrives as `image-changed`. | `"busy"` |
@@ -62,12 +71,12 @@ await invoke('preview_image', { settings: { mode: 'lossless', quality: 75 } });
 await invoke('save_image', { name: 'optimized-holiday', preview: '7-3' });
 ```
 
-- `"busy"`: a run is active, a dialog for one is open, an image is being
-  loaded, or an image is being saved. A `run-busy` event goes out as well. Every command but
-  `open_output_folder` can be busy. Accepting a `preview_image` request
-  also holds the guard for a moment (through stopping the previous
-  request's worker and sending `preview-started`), so a command in that
-  moment answers `"busy"` too; a retry works.
+- `"busy"`: a run is active, a file, folder or image dialog is open, an image
+  is being loaded, or an image is being saved. A `run-busy` event goes out as
+  well. Every command but `open_output_folder` can be busy. Accepting a
+  `preview_image` request also holds the guard for a moment (through stopping
+  the previous request's worker and sending `preview-started`), so a command
+  in that moment answers `"busy"` too; a retry works.
 - `"invalid-view"`: the argument is not exactly `{ "view": "single" }` or
   `{ "view": "batch" }`: another spelling (`"Single"`), another type, `null`,
   a missing or an extra key is refused, and the view stays as it was.
@@ -223,9 +232,10 @@ is `"name-taken"`, also when a file appears there at the last moment, and
 the name is never numbered. The name rules are the window's (`ui/names.js`),
 checked again here: not empty or only spaces; none of `/ \ : * ? " < > |`
 and no control character; not ending in a space or a dot; not a name
-Windows reserves (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`,
-any case, with or without an extension); at most 200 characters and 255
-bytes (UTF-8) with the extension. The name is written exactly as typed
+Windows reserves (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`
+and the same with `¹ ² ³` for the digit, any case, with or without an
+extension); at most 200 characters and 255 bytes (UTF-8) with the extension.
+The name is written exactly as typed
 (`vakantie-café` is not normalised). Saving is busy: the guard is held
 until `image-saved` has gone out, so no other command, drop or run starts
 meanwhile; a version still being made goes on and may become ready. After a
@@ -493,7 +503,7 @@ command is in its short checked moment (see `"busy"` under
 
 ### `run-cancelled`
 
-A file or folder dialog was closed without a choice. Nothing changes.
+A file, folder or image dialog was closed without a choice. Nothing changes.
 Payload `null`.
 
 ### `drag-state`
