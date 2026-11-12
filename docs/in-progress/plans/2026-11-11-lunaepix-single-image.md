@@ -9,7 +9,7 @@
 **Architecture:**
 - **Core.** A third worker mode, `--lunaepix-probe <src>`, reads a file's header in a worker process and answers its shown pixel size or Batch's refusal. Two small public helpers: write a file only under exactly this name (`save_new`), and find the first free name beside a taken one (`first_free_name`).
 - **Backend.** A new `single.rs` holds the Single image state behind the session: the view, the loaded image (a private copy taken at load), the compressed versions, the in-flight preview's stop handle and the last drop's left-out items. Five new commands, six new events, and a `preview` URI scheme beside `thumb`. Preview runs one job through the existing runner (`run_until_stopped`) with `WriteMode::NoReplace` into the private folder.
-- **Window.** New pure modules `ui/names.js`, `ui/zoom.js`, `ui/prefs.js`, `ui/single.js` (state, gates, messages) and `ui/single-view.js` (writes to the page); `app.js` only wires. One `#settings` block is moved between the two views.
+- **Window.** New pure modules `ui/names.js`, `ui/zoom.js`, `ui/prefs.js`, `ui/single.js` (state, gates, messages) and `ui/single-view.js` (writes to the page); `ui/window.js` wires (`startWindow`, tested) and `ui/app.js` only starts it (see Handoff, "Window wiring"). One `#settings` block is moved between the two views.
 
 **Tech Stack:** Rust 2024 (MSRV 1.90), Tauri 2 (custom URI schemes, `tauri-plugin-dialog`), `tempfile 3.27`, `serde_json`, vanilla JS (`node --test`).
 
@@ -39,6 +39,13 @@ Copied verbatim from the spec's Handoff, plus the standing process rules and the
   - "No 'glue' exemption": code that decides what is sent or shown is moved into a function a test can reach; only true pass-through calls may stay untested.
 - **Controller gate (user, 2026-11-11):** before each review the controller reads the failure-branch table, and any "untested" row on a branch that decides what the caller gets goes back to the implementer unless it names how a test could reach it and why that does not work.
 - **Pass-through means unchanged (user, 2026-11-11):** a call counts as untested pass-through only if it hands its input on unchanged; picking a field (path rather than path + query, one request field, a default) is a decision and must be moved into a tested function. The controller checks pass-through rows line by line before review.
+- **Decisions made during execution (user, 2026-11-12), each the answer to a repeated defect class or a question:**
+  - Trigger coverage: "Trigger column (Recommended)": the test table gets a "reached by" column, every trigger its own test; the controller checks rows with a single trigger before review.
+  - Atomicity: "Seam + one section (Recommended)": a decision and its event or commit sit in one critical section, with a Shared-state table, a test hook between decide and act, and a race test that injects the competing call.
+  - Windows: "Windows check here (Recommended)": every Rust task runs `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings`.
+  - Stale docs: "Widen the rule (Recommended)": the comment rule also covers docs of types, enum variants, guards, constants and INTERFACE sections whose use a change widens.
+  - Window wiring: "A: test app.js itself (Recommended)": the wiring lives in `ui/window.js` (`startWindow`, taking the page, Tauri, timers, storage, ResizeObserver and a log); `ui/app.js` is only the entry that passes the real globals. Node tests drive every listener with strict fakes. This replaces "`app.js` only wires" below.
+  - New text: "The picture could not be shown." (status line, a picture the webview cannot decode): "Keep it (Recommended)".
 
 Calls made while planning (not user decisions; flagged for the plan review):
 
