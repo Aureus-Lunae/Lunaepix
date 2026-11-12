@@ -20,6 +20,8 @@
 //   request records nothing, so the next trigger asks again; one for an
 //   image that is no longer the current one records nothing either.
 // - `layout-changed` ('under' or 'beside').
+// - `picture-failed` (no payload): the window could not decode a picture it
+//   was served; the picture shown before stays, and the status line says so.
 // - `save-started` (the `saveArgs` sent) and `save-ended` (whatever the
 //   answer): a save is going between the two. When `save_image` rejects,
 //   dispatch the rejection (and call `afterRejection` with the state) BEFORE
@@ -324,6 +326,9 @@ export function reduceSingle(state, action) {
       const name = sentenceOrNull(saved.name);
       return name === null ? next : withMessage(next, `Saved as ${name}`);
     }
+
+    case 'picture-failed':
+      return withMessage(state, MESSAGES.pictureFailed);
 
     case 'command-rejected':
       return payload === 'invalid-name' || payload === 'name-taken' ? nameRejected(state, payload) : state;

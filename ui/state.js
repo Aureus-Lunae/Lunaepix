@@ -36,6 +36,8 @@ export const MESSAGES = Object.freeze({
   notReady: 'The compressed version is not ready yet.',
   nothingToMove: 'There is nothing to move to Batch any more.',
   saveFailed: 'The file could not be saved.',
+  // The window's engine could not decode a picture the backend served.
+  pictureFailed: 'The picture could not be shown.',
   unknown: 'Something went wrong.',
 });
 
@@ -385,6 +387,7 @@ export function reduce(state, action) {
     case 'preview-ready':
     case 'preview-failed':
     case 'image-saved':
+    case 'picture-failed':
       return reduceSingle(state, action);
 
     case 'command-rejected':

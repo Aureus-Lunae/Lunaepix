@@ -71,13 +71,78 @@ body {
   margin-inline: auto;
 }
 
-/* The moon logo sits to the left of the heading, centred on its line. The row
-   is on the header; the heading keeps its own margin-free box. */
+/* The moon logo sits to the left of the heading, centred on its line, and the
+   Single image / Batch switch on the right. The row is on the header; the
+   heading keeps its own margin-free box. On a narrow window the switch wraps
+   under the title. */
 .lunaepixHeader {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.75rem;
   margin-bottom: 1rem;
+}
+
+/* The Single image / Batch switch: a radio group drawn as two joined
+   buttons. The picked one is filled, the other outlined, so the choice does
+   not rest on colour alone. The radios themselves are visually hidden; their
+   focus shows on the label. */
+.lunaepixHeader__views {
+  display: flex;
+  margin: 0 0 0 auto;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.lunaepixHeader__view {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+  padding: 0.5rem 1rem;
+  border: 2px solid var(--accent);
+  background: var(--surface);
+  color: var(--accent);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.lunaepixHeader__view:first-of-type {
+  border-radius: 0.375rem 0 0 0.375rem;
+}
+
+.lunaepixHeader__view:last-of-type {
+  margin-left: -2px;
+  border-radius: 0 0.375rem 0.375rem 0;
+}
+
+.lunaepixHeader__view:has(.lunaepixHeader__viewRadio:checked) {
+  background: var(--accent);
+  color: var(--onAccent);
+}
+
+.lunaepixHeader__view:has(.lunaepixHeader__viewRadio:focus-visible) {
+  z-index: 1;
+  outline: 3px solid var(--focus);
+  outline-offset: 3px;
+}
+
+/* A run or a save is going: the switch stays focusable but cannot be used. */
+.lunaepixHeader__view:has(.lunaepixHeader__viewRadio[aria-disabled="true"]) {
+  border-style: dashed;
+  cursor: not-allowed;
+}
+
+.lunaepixHeader__viewRadio {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: inherit;
 }
 
 /* Decorative (alt=""), about 32 px tall; rem so it follows the text size. */
@@ -144,7 +209,11 @@ body {
 .lunaepixSummary__button,
 .lunaepixPanel__button,
 .lunaepixPanel__run,
-.lunaepixSettings__button {
+.lunaepixSettings__button,
+.lunaepixStatus__action,
+.lunaepixSingle__toolButton,
+.lunaepixSingle__openFolder,
+.lunaepixSingle__save {
   min-width: 2.75rem;
   min-height: 2.75rem;
   padding: 0.5rem 1.25rem;
@@ -158,10 +227,14 @@ body {
   transition: background-color 0.15s ease, color 0.15s ease;
 }
 
-/* The secondary buttons (Clear, the output folder): outlined, so Run stays
-   the one filled button in the panel. */
+/* The secondary buttons (Clear, the output folder, and in Single image Choose
+   other, the zoom buttons, Open folder and Switch to Batch): outlined, so Run
+   and Save stay the one filled button of their view. */
 .lunaepixPanel__button,
-.lunaepixSettings__button {
+.lunaepixSettings__button,
+.lunaepixStatus__action,
+.lunaepixSingle__toolButton,
+.lunaepixSingle__openFolder {
   background: var(--surface);
   color: var(--accent);
 }
@@ -170,7 +243,11 @@ body {
 .lunaepixSummary__button[aria-disabled="true"],
 .lunaepixPanel__button[aria-disabled="true"],
 .lunaepixPanel__run[aria-disabled="true"],
-.lunaepixSettings__button[aria-disabled="true"] {
+.lunaepixSettings__button[aria-disabled="true"],
+.lunaepixStatus__action[aria-disabled="true"],
+.lunaepixSingle__toolButton[aria-disabled="true"],
+.lunaepixSingle__openFolder[aria-disabled="true"],
+.lunaepixSingle__save[aria-disabled="true"] {
   border-style: dashed;
   border-color: var(--border);
   background: transparent;
@@ -189,6 +266,11 @@ body {
    reader notices when text arrives. */
 .lunaepixStatus:empty {
   margin: 0;
+}
+
+/* Switch to Batch, under the note that offers it. */
+.lunaepixStatus__action {
+  margin-top: 0.5rem;
 }
 
 /* The panel: the heading with Clear, the table, the settings and Run (or,
@@ -235,10 +317,15 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* Visually hidden, still read by screen readers. */
+/* Visually hidden, still read by screen readers. The compare divider is
+   hidden this way too: it stays focusable, and its focus shows on the
+   handle drawn on the picture. */
 .lunaepixResults__caption,
 .lunaepixResults__hiddenText,
-.lunaepixSettings__hiddenText {
+.lunaepixSettings__hiddenText,
+.lunaepixHeader__hiddenText,
+.lunaepixSingle__hiddenText,
+.lunaepixSingle__divider {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -445,6 +532,355 @@ body {
   color: var(--muted);
 }
 
+/* Single image mode. The mock-up
+   (docs/in-progress/specs/2026-11-11-lunaepix-single-image-mockup.html) sets
+   the arrangement: the file row, the tools row, then the body. */
+
+.lunaepixSingle {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+/* The loaded file: its name (it wraps, however long), its pixel size and
+   Choose other. */
+.lunaepixSingle__file {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.75rem;
+}
+
+.lunaepixSingle__fileName {
+  flex: 1 1 12rem;
+  min-width: 0;
+  margin: 0;
+  font-size: 1.125rem;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.lunaepixSingle__fileSize {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The layout switch on the left, the zoom buttons on the right; both wrap. */
+.lunaepixSingle__tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+}
+
+/* The layout switch looks like the Compression choice. */
+.lunaepixSingle__layouts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 1rem;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.lunaepixSingle__layout {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-height: 2.75rem;
+  cursor: pointer;
+}
+
+.lunaepixSingle__layoutRadio {
+  width: 1.25rem;
+  height: 1.25rem;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.lunaepixSingle__zoom {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.lunaepixSingle__toolButton {
+  padding-inline: 0.75rem;
+}
+
+/* The body. Layout B (-under, the default): the picture (or the drop area)
+   at full width; under it the settings with Save as on the left and the size
+   box on the right; Save at the bottom right, under both. */
+.lunaepixSingle__body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-areas:
+    "picture picture"
+    "settings sizes"
+    "foot foot";
+  align-items: start;
+  gap: 1rem;
+}
+
+.lunaepixSingle__drop,
+.lunaepixSingle__picture {
+  grid-area: picture;
+}
+
+.lunaepixSingle__settingsSlot {
+  grid-area: settings;
+  display: grid;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.lunaepixSingle__sizes {
+  grid-area: sizes;
+}
+
+.lunaepixSingle__foot {
+  grid-area: foot;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.75rem;
+}
+
+/* In Single image the settings sit in their own column; Batch's line above
+   them (between the table and the settings) has no place here. */
+.lunaepixSingle__settingsSlot .lunaepixSettings {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+/* Layout A (-beside): the picture on the left takes the remaining width; a
+   column of about 16rem on the right holds the settings with Save as, then
+   the size box; Save at the bottom right. Below 40rem the picture would get
+   less room than the column, so A shows as B (the choice itself is kept). */
+@media (min-width: 40rem) {
+  .lunaepixSingle__body.-beside {
+    grid-template-columns: minmax(0, 1fr) 16rem;
+    grid-template-rows: auto 1fr auto;
+    grid-template-areas:
+      "picture settings"
+      "picture sizes"
+      "foot foot";
+  }
+
+  .lunaepixSingle__body.-beside .lunaepixSingle__picture {
+    max-height: max(12rem, 100vh - 14rem);
+  }
+}
+
+/* The compare picture: the image's proportions, never so tall that the
+   settings under it (layout B) leave the window. Two layers: the original's
+   stage, and over it an area-sized layer clipped at the divider (--split)
+   that holds the compressed version's stage. Only the stages are zoomed, by
+   the same transform, so the seam stays under the handle. */
+.lunaepixSingle__picture {
+  --split: 50%;
+  position: relative;
+  width: 100%;
+  aspect-ratio: var(--ratio, 4 / 3);
+  max-height: max(12rem, 100vh - 30rem);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+/* Files are being dragged over the window: a thicker, accent border, so the
+   change is not colour alone. */
+.lunaepixSingle__picture.-over {
+  border-width: 3px;
+  border-color: var(--accent);
+}
+
+/* A stage is the picture at its own size, centred in the area by the
+   `translate` property; JS sets `transform` (pan and zoom) about its centre. */
+.lunaepixSingle__stage {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: max-content;
+  height: max-content;
+  translate: -50% -50%;
+  transform-origin: center;
+}
+
+.lunaepixSingle__layer {
+  position: absolute;
+  inset: 0;
+  clip-path: inset(0 0 0 var(--split));
+}
+
+.lunaepixSingle__image {
+  display: block;
+  max-width: none;
+}
+
+/* "Original" and "Compressed" in the top corners. */
+.lunaepixSingle__label,
+.lunaepixSingle__busy {
+  position: absolute;
+  margin: 0;
+  padding: 0.125rem 0.5rem;
+  border-radius: 0.25rem;
+  background: rgb(0 0 0 / 0.75);
+  color: #ffffff;
+  font-size: 0.875rem;
+  pointer-events: none;
+}
+
+.lunaepixSingle__label {
+  top: 0.5rem;
+}
+
+.lunaepixSingle__label.-original {
+  left: 0.5rem;
+}
+
+.lunaepixSingle__label.-compressed {
+  right: 0.5rem;
+}
+
+/* "Compressing…" or "Loading picture…", over the compressed side. */
+.lunaepixSingle__busy {
+  right: 0.5rem;
+  bottom: 0.5rem;
+}
+
+/* The handle: a line at the divider with a round grip in the middle. The
+   strip is 28 px wide, so it is easy to grab. */
+.lunaepixSingle__handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--split);
+  width: 1.75rem;
+  margin-left: -0.875rem;
+  cursor: ew-resize;
+}
+
+.lunaepixSingle__handle::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  margin-left: -1px;
+  background: #ffffff;
+  box-shadow: 0 0 3px rgb(0 0 0 / 0.6);
+}
+
+.lunaepixSingle__handle::after {
+  content: "\27F7";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  place-items: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  translate: -50% -50%;
+  border: 2px solid #15181e;
+  border-radius: 50%;
+  background: #ffffff;
+  color: #15181e;
+  font-size: 0.875rem;
+}
+
+/* The hidden divider input has focus: it shows on the grip. */
+.lunaepixSingle__divider:focus-visible + .lunaepixSingle__handle::after {
+  outline: 3px solid var(--focus);
+  outline-offset: 3px;
+}
+
+/* Save as: the label, the name box and the extension after it; the problem
+   under them, in words, tied to the box with aria-describedby. */
+.lunaepixSingle__saveAs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+}
+
+.lunaepixSingle__saveAsLabel {
+  min-width: 6.5rem;
+  font-weight: 600;
+}
+
+.lunaepixSingle__name {
+  flex: 1 1 8rem;
+  min-width: 0;
+  min-height: 2.75rem;
+  padding: 0.25rem 0.5rem;
+  border: 2px solid var(--border);
+  border-radius: 0.375rem;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+.lunaepixSingle__name[aria-invalid="true"] {
+  border-color: var(--danger);
+  border-style: dashed;
+}
+
+.lunaepixSingle__extension {
+  overflow-wrap: anywhere;
+}
+
+.lunaepixSingle__nameError {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--danger);
+  font-size: 0.875rem;
+}
+
+/* The size box: Original, Compressed and Saves, with the note under them. */
+.lunaepixSingle__sizes {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--rowLine);
+  border-radius: 0.375rem;
+  background: var(--surface);
+}
+
+.lunaepixSingle__sizeList {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.125rem 0.75rem;
+  margin: 0;
+}
+
+.lunaepixSingle__sizeTerm {
+  font-weight: 600;
+}
+
+.lunaepixSingle__sizeValue {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.lunaepixSingle__sizeValue.-saves {
+  font-weight: 700;
+}
+
+.lunaepixSingle__note {
+  margin: 0.5rem 0 0;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
 /* Narrow windows: tighter cells, no horizontal scroll at 320 px. Long names
    and values wrap instead. */
 @media (max-width: 30rem) {
@@ -481,24 +917,46 @@ body {
   .lunaepixSummary__button,
   .lunaepixPanel__button,
   .lunaepixPanel__run,
-  .lunaepixSettings__button {
+  .lunaepixSettings__button,
+  .lunaepixStatus__action,
+  .lunaepixSingle__openFolder,
+  .lunaepixSingle__save,
+  .lunaepixHeader__view {
     padding-inline: 0.75rem;
   }
 
   /* The label goes above its controls. */
-  .lunaepixSettings__label {
+  .lunaepixSettings__label,
+  .lunaepixSingle__saveAsLabel {
     flex-basis: 100%;
+  }
+
+  /* Layout B: the size box goes under the settings. */
+  .lunaepixSingle__body {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "picture"
+      "settings"
+      "sizes"
+      "foot";
   }
 }
 
-/* No transitions for people who ask for less motion. */
+/* No transitions for people who ask for less motion. The picture never
+   animates its zoom or pan: the transform is set at once. */
 @media (prefers-reduced-motion: reduce) {
   .lunaepixDrop,
   .lunaepixDrop__button,
   .lunaepixSummary__button,
   .lunaepixPanel__button,
   .lunaepixPanel__run,
-  .lunaepixSettings__button {
+  .lunaepixSettings__button,
+  .lunaepixStatus__action,
+  .lunaepixSingle__toolButton,
+  .lunaepixSingle__openFolder,
+  .lunaepixSingle__save,
+  .lunaepixHeader__view,
+  .lunaepixSingle__stage {
     transition: none;
   }
 }
@@ -521,17 +979,33 @@ body {
   .lunaepixSummary__button,
   .lunaepixPanel__button,
   .lunaepixPanel__run,
-  .lunaepixSettings__button {
+  .lunaepixSettings__button,
+  .lunaepixStatus__action,
+  .lunaepixSingle__toolButton,
+  .lunaepixSingle__openFolder,
+  .lunaepixSingle__save,
+  .lunaepixHeader__view {
     border-color: ButtonText;
     background: ButtonFace;
     color: ButtonText;
+  }
+
+  /* The picked mode: the system's selection colours. */
+  .lunaepixHeader__view:has(.lunaepixHeader__viewRadio:checked) {
+    border-color: Highlight;
+    background: Highlight;
+    color: HighlightText;
   }
 
   .lunaepixDrop__button[aria-disabled="true"],
   .lunaepixSummary__button[aria-disabled="true"],
   .lunaepixPanel__button[aria-disabled="true"],
   .lunaepixPanel__run[aria-disabled="true"],
-  .lunaepixSettings__button[aria-disabled="true"] {
+  .lunaepixSettings__button[aria-disabled="true"],
+  .lunaepixStatus__action[aria-disabled="true"],
+  .lunaepixSingle__toolButton[aria-disabled="true"],
+  .lunaepixSingle__openFolder[aria-disabled="true"],
+  .lunaepixSingle__save[aria-disabled="true"] {
     border-color: GrayText;
     background: ButtonFace;
     color: GrayText;
@@ -542,12 +1016,42 @@ body {
   .lunaepixResults__row.-skipped .lunaepixResults__cell,
   .lunaepixResults__row.-failed .lunaepixResults__cell,
   .lunaepixResults__note,
-  .lunaepixSettings__error {
+  .lunaepixSettings__error,
+  .lunaepixSingle__nameError,
+  .lunaepixSingle__note {
     color: CanvasText;
   }
 
-  .lunaepixSettings__number[aria-invalid="true"] {
+  .lunaepixSettings__number[aria-invalid="true"],
+  .lunaepixSingle__name[aria-invalid="true"] {
     border-color: Highlight;
+  }
+
+  .lunaepixSingle__picture,
+  .lunaepixSingle__sizes,
+  .lunaepixSingle__name {
+    border-color: CanvasText;
+  }
+
+  .lunaepixSingle__picture.-over {
+    border-color: Highlight;
+  }
+
+  .lunaepixSingle__label,
+  .lunaepixSingle__busy {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+  }
+
+  .lunaepixSingle__handle::before {
+    background: CanvasText;
+  }
+
+  .lunaepixSingle__handle::after {
+    border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
   }
 
   :focus-visible {
