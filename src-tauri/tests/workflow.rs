@@ -1,10 +1,14 @@
-//! Guards on the Windows build workflow (`.github/workflows/windows.yml`).
-//! It cannot be run here, and it builds the installer people download, so
-//! the rules that keep it safe are checked in a test: every action pinned to
-//! a commit, read-only permissions, no secrets, no way to start it from a
-//! pull request, the test and build commands present, and NASM installed
-//! before cargo runs. Each check has fixtures it must catch, so it is known
-//! to fail when it should.
+//! Guards on the build workflows: `.github/workflows/windows.yml` and, from
+//! the Mac build on, `.github/workflows/macos.yml`. They cannot be run here,
+//! and they build the installers people download, so the rules that keep them
+//! safe are checked in a test: every action pinned to a commit, read-only
+//! permissions, no secrets, no way to start one from a pull request, the test
+//! and build commands present, NASM installed before cargo runs, and the
+//! uploaded artifact named, filled and kept as agreed. The rules are the same
+//! for both; what differs per platform (the file, the runner, the cache and
+//! NASM policy, the artifact) is one `Platform` profile that every check
+//! reads. Each check has fixtures it must catch, so it is known to fail when
+//! it should.
 //!
 //! The workflow is parsed as YAML 1.2 (so the key `on` is a name, not
 //! boolean true) and every check reads the parsed tree, so quoting, spacing
@@ -18,8 +22,51 @@ use std::path::Path;
 
 use yaml_rust2::{Yaml, YamlLoader};
 
-fn workflow() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/windows.yml");
+/// Whether the Installer job may restore a build cache.
+enum BuildCache {
+    /// No cache: the test job's cache is a debug-profile cache, which a
+    /// release build cannot use, and one of its own would only add upload time.
+    Forbidden,
+}
+
+/// How a job gets NASM, which mozjpeg's SIMD code is assembled with.
+enum NasmInstall {
+    /// `choco install nasm --version=<x.y.z>`, with NASM's folder added to
+    /// `GITHUB_PATH` (Chocolatey does not put it on the path).
+    ChocolateyPinned,
+}
+
+/// What differs between the platforms' workflow files. Every check reads the
+/// profile it is given, so the same rules guard each file.
+struct Platform {
+    /// The file in `.github/workflows/`.
+    file: &'static str,
+    /// The exact `runs-on` of every job.
+    runner: &'static str,
+    build_cache: BuildCache,
+    nasm: NasmInstall,
+    /// The `name` of the uploaded artifact.
+    artifact: &'static str,
+    /// The `path` lines of the upload, in any order.
+    artifact_paths: &'static [&'static str],
+}
+
+const WINDOWS: Platform = Platform {
+    file: "windows.yml",
+    runner: "windows-latest",
+    build_cache: BuildCache::Forbidden,
+    nasm: NasmInstall::ChocolateyPinned,
+    artifact: "lunaepix-windows-installer",
+    artifact_paths: &[
+        "target/release/bundle/nsis/*.exe",
+        "target/release/bundle/msi/*.msi",
+    ],
+};
+
+fn workflow(platform: &Platform) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../.github/workflows")
+        .join(platform.file);
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
@@ -345,12 +392,13 @@ fn release_hits(text: &str) -> Vec<String> {
     words.filter(release).map(str::to_owned).collect()
 }
 
-/// Every job has a `runs-on` that is `windows-latest`; the jobs `test` and
-/// `build` exist; `build` needs `test`, uploads with `actions/upload-artifact@`
-/// and restores no cache (a debug-profile cache does not serve a release
-/// build); runs are queued per workflow and ref; and no key or value anywhere
-/// (`uses` and `run` included) names a release.
-fn structure_problems(text: &str) -> Vec<String> {
+/// Every job has a `runs-on` that is the platform's runner; the jobs `test`
+/// and `build` exist; `build` needs `test`, uploads with
+/// `actions/upload-artifact@` (what it uploads is `upload_problems`' business)
+/// and follows the platform's cache policy; runs are queued per workflow and
+/// ref; and no key or value anywhere (`uses` and `run` included) names a
+/// release.
+fn structure_problems(text: &str, platform: &Platform) -> Vec<String> {
     on_tree(text, |doc| {
         let jobs = jobs(doc);
         let mut problems = Vec::new();
@@ -364,8 +412,9 @@ fn structure_problems(text: &str) -> Vec<String> {
                 None => problems.push(format!(
                     "job {name}: runs-on is not a single runner name: {runner:?}"
                 )),
-                Some(runner) if runner != "windows-latest" => problems.push(format!(
-                    "job {name}: runner is not windows-latest: {runner}"
+                Some(runner) if runner != platform.runner => problems.push(format!(
+                    "job {name}: runner is not {}: {runner}",
+                    platform.runner
                 )),
                 Some(_) => {}
             }
@@ -386,11 +435,17 @@ fn structure_problems(text: &str) -> Vec<String> {
             if !steps_of(build).into_iter().any(uploads_artifact) {
                 problems.push("the build job does not upload an artifact".to_owned());
             }
-            let caches = steps_of(build)
-                .into_iter()
-                .filter_map(uses_of)
-                .filter(|uses| uses.to_ascii_lowercase().contains("cache"));
-            problems.extend(caches.map(|uses| format!("the build job restores a cache: {uses}")));
+            match platform.build_cache {
+                BuildCache::Forbidden => {
+                    let caches = steps_of(build)
+                        .into_iter()
+                        .filter_map(uses_of)
+                        .filter(|uses| uses.to_ascii_lowercase().contains("cache"));
+                    problems.extend(
+                        caches.map(|uses| format!("the build job restores a cache: {uses}")),
+                    );
+                }
+            }
         } else {
             problems.push("no build job".to_owned());
         }
@@ -411,9 +466,8 @@ fn structure_problems(text: &str) -> Vec<String> {
 
 /// `defaults.run.shell` is `bash` (so the quoting in the scripts means the
 /// same on every step); every `node-version` is a number of at least 22 (so
-/// the quoted glob of `node --test` is expanded by node), and there is one;
-/// every upload step sets `if-no-files-found: error` (the action's default
-/// only warns), and there is one.
+/// the quoted glob of `node --test` is expanded by node), and there is one.
+/// What an upload sets is `upload_problems`' business.
 fn setting_problems(text: &str) -> Vec<String> {
     on_tree(text, |doc| {
         let mut problems = Vec::new();
@@ -421,7 +475,7 @@ fn setting_problems(text: &str) -> Vec<String> {
         if shell.as_deref() != Some("bash") {
             problems.push(format!("defaults.run.shell is {shell:?}, not bash"));
         }
-        let (mut versions, mut uploads) = (0, 0);
+        let mut versions = 0;
         for step in all_steps(doc) {
             let version = &step["with"]["node-version"];
             if !version.is_badvalue() {
@@ -432,9 +486,38 @@ fn setting_problems(text: &str) -> Vec<String> {
                     problems.push(format!("node-version is not 22 or newer: {version}"));
                 }
             }
-            let found = &step["with"]["if-no-files-found"];
-            uploads += usize::from(uploads_artifact(step));
-            if uploads_artifact(step) || !found.is_badvalue() {
+        }
+        problems.extend((versions == 0).then(|| "no node-version".to_owned()));
+        problems
+    })
+}
+
+/// The days an uploaded artifact is kept; the action's default is 90.
+const RETENTION_DAYS: &str = "30";
+
+/// There is an upload step, and every one (in any job) matches the platform:
+/// - `name` is the platform's artifact;
+/// - `path` is a text whose trimmed, non-empty lines are exactly the platform's
+///   `artifact_paths`, as a set (`str::lines` and `trim`, so order, blank
+///   lines, trailing spaces, tabs and Windows line endings do not matter, and a
+///   `!` exclusion line or a folded single line does);
+/// - `if-no-files-found` is `error` (the action's default only warns);
+/// - `retention-days` is 30. The parser reads `30` as an integer and `"30"` as
+///   a string, and `scalar` turns both into the text `30`, so both are
+///   accepted; `30.0`, `"030"` and every other number are refused.
+///
+/// Any other step that sets `if-no-files-found` must set it to `error` too.
+fn upload_problems(text: &str, platform: &Platform) -> Vec<String> {
+    on_tree(text, |doc| {
+        let mut problems = Vec::new();
+        let mut uploads = 0;
+        let wanted: BTreeSet<&str> = platform.artifact_paths.iter().copied().collect();
+        for step in all_steps(doc) {
+            let with = &step["with"];
+            let found = &with["if-no-files-found"];
+            let upload = uploads_artifact(step);
+            uploads += usize::from(upload);
+            if upload || !found.is_badvalue() {
                 match scalar(found).as_deref() {
                     Some("error") => {}
                     Some(value) => {
@@ -443,8 +526,52 @@ fn setting_problems(text: &str) -> Vec<String> {
                     None => problems.push("an upload does not set if-no-files-found".to_owned()),
                 }
             }
+            if !upload {
+                continue;
+            }
+            let (name, path, days) = (&with["name"], &with["path"], &with["retention-days"]);
+            match scalar(name) {
+                None if name.is_badvalue() => {
+                    problems.push("an upload does not set a name".to_owned())
+                }
+                None => problems.push(format!("an upload's name is not a single value: {name:?}")),
+                Some(name) if name != platform.artifact => problems.push(format!(
+                    "an upload is named {name}, not {}",
+                    platform.artifact
+                )),
+                Some(_) => {}
+            }
+            match scalar(path) {
+                None if path.is_badvalue() => {
+                    problems.push("an upload does not set a path".to_owned())
+                }
+                None => problems.push(format!(
+                    "an upload's path is not a block of lines: {path:?}"
+                )),
+                Some(path) => {
+                    let lines: BTreeSet<&str> = path
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .collect();
+                    if lines != wanted {
+                        problems.push(format!("an upload's paths are {lines:?}, not {wanted:?}"));
+                    }
+                }
+            }
+            match scalar(days) {
+                None if days.is_badvalue() => {
+                    problems.push("an upload does not set retention-days".to_owned());
+                }
+                None => problems.push(format!(
+                    "an upload's retention-days is not a number: {days:?}"
+                )),
+                Some(days) if days != RETENTION_DAYS => problems.push(format!(
+                    "an upload's retention-days is {days}, not {RETENTION_DAYS}"
+                )),
+                Some(_) => {}
+            }
         }
-        problems.extend((versions == 0).then(|| "no node-version".to_owned()));
         problems.extend((uploads == 0).then(|| "no upload-artifact step".to_owned()));
         problems
     })
@@ -506,7 +633,7 @@ fn bundle_build_problems(text: &str) -> Vec<String> {
 // ---- NASM ----
 
 /// Whether the line of a script that runs `choco install nasm` carries a
-/// `--version=<x.y.z>` pin: the workflow pins every action by hash, so the
+/// `--version=<x.y.z>` pin (`NasmInstall::ChocolateyPinned`): the workflow pins every action by hash, so the
 /// build tool is pinned too.
 fn nasm_install_is_pinned(script: &str) -> bool {
     script
@@ -520,15 +647,17 @@ fn nasm_install_is_pinned(script: &str) -> bool {
         })
 }
 
-/// Every job with a cargo step installs NASM in an earlier step, which also
-/// puts NASM's folder on the path through `GITHUB_PATH`: mozjpeg's SIMD code
-/// is assembled with it when lunaepix-core builds. The install step is found
-/// by `choco install nasm` outside shell comments; a cargo step is any step
-/// whose script has the word `cargo` outside shell comments. The install must
-/// also carry a `--version=` pin.
-fn nasm_problems(text: &str) -> Vec<String> {
+/// Every job with a cargo step installs NASM in an earlier step, the way the
+/// platform's `NasmInstall` says: mozjpeg's SIMD code is assembled with it
+/// when lunaepix-core builds. For `ChocolateyPinned` the install step is found
+/// by `choco install nasm` outside shell comments, it also puts NASM's folder
+/// on the path through `GITHUB_PATH`, and it carries a `--version=` pin. A
+/// cargo step is any step whose script has the word `cargo` outside shell
+/// comments.
+fn nasm_problems(text: &str, platform: &Platform) -> Vec<String> {
     on_tree(text, |doc| {
         let mut problems = Vec::new();
+        let NasmInstall::ChocolateyPinned = platform.nasm;
         for (name, job) in jobs(doc) {
             let code = steps_of(job)
                 .into_iter()
@@ -616,8 +745,12 @@ const NASM_STEP: &str = r#"      - run: |
 
 const UPLOAD_STEP: &str = "      - uses: actions/upload-artifact@PIN # v7
         with:
-          path: target/release/bundle/nsis/*.exe
+          name: lunaepix-windows-installer
+          path: |
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/msi/*.msi
           if-no-files-found: error
+          retention-days: 30
 ";
 
 /// A workflow every check accepts. It holds a `--release` build and a
@@ -682,7 +815,7 @@ fn steps_doc(steps: &str) -> String {
     format!("{head}{}\n", steps.replace("PIN", PIN))
 }
 
-fn every_check(text: &str) -> Vec<(&'static str, Vec<String>)> {
+fn every_check(text: &str, platform: &Platform) -> Vec<(&'static str, Vec<String>)> {
     vec![
         ("unpinned_actions", unpinned_actions(text)),
         ("permission_problems", permission_problems(text)),
@@ -693,10 +826,11 @@ fn every_check(text: &str) -> Vec<(&'static str, Vec<String>)> {
             "missing_commands",
             missing_commands(text, REQUIRED_COMMANDS),
         ),
-        ("structure_problems", structure_problems(text)),
+        ("structure_problems", structure_problems(text, platform)),
         ("setting_problems", setting_problems(text)),
+        ("upload_problems", upload_problems(text, platform)),
         ("bundle_build_problems", bundle_build_problems(text)),
-        ("nasm_problems", nasm_problems(text)),
+        ("nasm_problems", nasm_problems(text, platform)),
         ("node_step_problems", node_step_problems(text)),
     ]
 }
@@ -715,7 +849,7 @@ fn assert_problem(problems: &[String], start: &str, what: &str) {
 }
 
 /// `check` reports a problem that starts with `start` on every text.
-fn assert_all_caught(check: fn(&str) -> Vec<String>, start: &str, texts: &[String]) {
+fn assert_all_caught(check: impl Fn(&str) -> Vec<String>, start: &str, texts: &[String]) {
     texts
         .iter()
         .for_each(|text| assert_problem(&check(text), start, text));
@@ -725,7 +859,7 @@ fn assert_all_caught(check: fn(&str) -> Vec<String>, start: &str, texts: &[Strin
 
 #[test]
 fn the_workflow_parses_as_one_yaml_mapping_and_on_is_a_name() {
-    let doc = parse(&workflow()).unwrap_or_else(|e| panic!("{e}"));
+    let doc = parse(&workflow(&WINDOWS)).unwrap_or_else(|e| panic!("{e}"));
     let hash = doc.as_hash().expect("a mapping");
     // YAML 1.2: `on` is the name `on`. A YAML 1.1 reader makes it boolean true.
     assert!(hash.contains_key(&Yaml::String("on".to_owned())));
@@ -735,7 +869,7 @@ fn the_workflow_parses_as_one_yaml_mapping_and_on_is_a_name() {
 
 #[test]
 fn the_workflow_passes_every_check() {
-    for (name, problems) in every_check(&workflow()) {
+    for (name, problems) in every_check(&workflow(&WINDOWS), &WINDOWS) {
         assert_eq!(problems, Vec::<String>::new(), "{name}");
     }
 }
@@ -745,21 +879,21 @@ fn the_checks_of_the_real_file_are_not_vacuous() {
     // Checkout, toolchain, cache, node and upload; two line-ending steps,
     // fmt, clippy, test, node, install and build; the installer folder.
     let (refs, scripts) = (
-        action_references(&workflow()).len(),
-        run_scripts(&workflow()).len(),
+        action_references(&workflow(&WINDOWS)).len(),
+        run_scripts(&workflow(&WINDOWS)).len(),
     );
     assert!(
         refs >= 5 && scripts >= 8,
         "{refs} action references, {scripts} run scripts"
     );
-    assert!(workflow().contains("target/release/bundle/"));
+    assert!(workflow(&WINDOWS).contains("target/release/bundle/"));
 }
 
 // ---- parsing ----
 
 #[test]
 fn a_well_formed_workflow_passes_every_check_in_a_fixture() {
-    for (name, problems) in every_check(&good()) {
+    for (name, problems) in every_check(&good(), &WINDOWS) {
         assert_eq!(problems, Vec::<String>::new(), "{name}");
     }
 }
@@ -773,7 +907,7 @@ fn a_workflow_that_does_not_parse_is_reported_by_every_check_in_a_fixture() {
         "- a\n- b\n",
         "a: 1\na: 2\n",
     ] {
-        for (name, problems) in every_check(bad) {
+        for (name, problems) in every_check(bad, &WINDOWS) {
             assert_problem(&problems, "the workflow", &format!("{name} on {bad:?}"));
         }
     }
@@ -1167,11 +1301,11 @@ fn a_command_only_in_a_comment_inside_a_block_script_is_not_present_in_a_fixture
 #[test]
 #[rustfmt::skip]
 fn a_runner_that_is_not_windows_latest_is_caught_in_a_fixture() {
-    let one = structure_problems(&with("runs-on: windows-latest", "runs-on: ubuntu-latest"));
+    let one = structure_problems(&with("runs-on: windows-latest", "runs-on: ubuntu-latest"), &WINDOWS);
     assert_eq!(one.len(), 1, "{one:?}");
     assert_problem(&one, "job test: runner is not windows-latest", "ubuntu");
-    assert_eq!(structure_problems(&good().replace("windows-latest", "ubuntu-latest")).len(), 2);
-    let list = structure_problems(&with("runs-on: windows-latest", "runs-on: [windows-latest]"));
+    assert_eq!(structure_problems(&good().replace("windows-latest", "ubuntu-latest"), &WINDOWS).len(), 2);
+    let list = structure_problems(&with("runs-on: windows-latest", "runs-on: [windows-latest]"), &WINDOWS);
     assert_problem(&list, "job test: runs-on is not", "list");
 }
 
@@ -1180,14 +1314,17 @@ fn a_runner_that_is_not_windows_latest_is_caught_in_a_fixture() {
 fn a_job_without_runs_on_is_caught_in_a_fixture() {
     // Checked per job: the other job still has its runner.
     let one = with("  test:\n    runs-on: windows-latest\n", "  test:\n");
-    assert_eq!(structure_problems(&one), ["job test: no runs-on"]);
-    assert_eq!(structure_problems(&good().replace("    runs-on: windows-latest\n", "")).len(), 2);
+    assert_eq!(structure_problems(&one, &WINDOWS), ["job test: no runs-on"]);
+    assert_eq!(structure_problems(&good().replace("    runs-on: windows-latest\n", ""), &WINDOWS).len(), 2);
 }
 
 #[test]
 fn a_build_job_without_needs_test_is_caught_in_a_fixture() {
     let missing = ["the build job does not have needs: test"];
-    assert_eq!(structure_problems(&with("    needs: test\n", "")), missing);
+    assert_eq!(
+        structure_problems(&with("    needs: test\n", ""), &WINDOWS),
+        missing
+    );
 }
 
 #[test]
@@ -1196,13 +1333,16 @@ fn needs_test_on_the_wrong_job_is_caught_in_a_fixture() {
     let text = with("    needs: test\n", "").replacen("  test:\n", "  test:\n    needs: test\n", 1);
     assert!(text.contains("needs: test"));
     assert_eq!(
-        structure_problems(&text),
+        structure_problems(&text, &WINDOWS),
         ["the build job does not have needs: test"]
     );
     // A list that holds the job is fine, a list without it is not.
-    assert_clean(structure_problems(&with("needs: test", "needs: [test]")));
+    assert_clean(structure_problems(
+        &with("needs: test", "needs: [test]"),
+        &WINDOWS,
+    ));
     assert_eq!(
-        structure_problems(&with("needs: test", "needs: [lint]")).len(),
+        structure_problems(&with("needs: test", "needs: [lint]"), &WINDOWS).len(),
         1
     );
 }
@@ -1212,10 +1352,14 @@ fn a_renamed_or_missing_test_job_is_caught_in_a_fixture() {
     let renamed = good()
         .replace("  test:\n", "  checks:\n")
         .replace("needs: test", "needs: checks");
-    assert_problem(&structure_problems(&renamed), "no test job", "renamed");
+    assert_problem(
+        &structure_problems(&renamed, &WINDOWS),
+        "no test job",
+        "renamed",
+    );
     let package = good().replace("  build:\n", "  package:\n");
     assert_problem(
-        &structure_problems(&package),
+        &structure_problems(&package, &WINDOWS),
         "no build job",
         "renamed build",
     );
@@ -1224,21 +1368,24 @@ fn a_renamed_or_missing_test_job_is_caught_in_a_fixture() {
 #[test]
 fn a_build_job_without_an_artifact_upload_is_caught_in_a_fixture() {
     let none = with("actions/upload-artifact@", "actions/download-artifact@");
-    assert_eq!(structure_problems(&none).len(), 1);
+    assert_eq!(structure_problems(&none, &WINDOWS).len(), 1);
     // An upload in the test job does not count for the build job.
     let build_line = "      - run: cargo build --release\n";
     let wrong_job =
         with(UPLOAD_STEP, "").replacen(build_line, &format!("{build_line}{UPLOAD_STEP}"), 1);
-    assert_eq!(structure_problems(&wrong_job.replace("PIN", PIN)).len(), 1);
+    assert_eq!(
+        structure_problems(&wrong_job.replace("PIN", PIN), &WINDOWS).len(),
+        1
+    );
 }
 
 #[test]
 #[rustfmt::skip]
 fn a_missing_concurrency_or_a_group_without_the_workflow_name_is_caught_in_a_fixture() {
     let none = with("concurrency:\n  group: ${{ github.workflow }}-${{ github.ref }}\n", "");
-    assert_eq!(structure_problems(&none), ["no concurrency"]);
+    assert_eq!(structure_problems(&none, &WINDOWS), ["no concurrency"]);
     let group = with("${{ github.workflow }}-", "windows-");
-    assert_problem(&structure_problems(&group), "the concurrency group", "group");
+    assert_problem(&structure_problems(&group, &WINDOWS), "the concurrency group", "group");
 }
 
 #[test]
@@ -1247,7 +1394,7 @@ fn a_build_job_that_restores_a_cache_is_caught_in_a_fixture() {
     let build = BUILD_STEP;
     for cache in ["Swatinem/rust-cache@PIN # v2", "actions/cache@PIN # v4", "actions/cache/restore@v4", "actions/cache/save@PIN # v4"] {
         let text = with(build, &format!("{build}      - uses: {cache}\n"));
-        assert_problem(&structure_problems(&text), "the build job restores a cache", cache);
+        assert_problem(&structure_problems(&text, &WINDOWS), "the build job restores a cache", cache);
     }
 }
 
@@ -1258,7 +1405,7 @@ fn a_release_flag_and_a_release_path_in_a_run_script_pass_a_fixture() {
         "      - run: cargo build --release", "      - run: cargo tauri build --release", "      - run: 'cargo build \"--release\"'",
         "      - run: ./target/release/lunaepix.exe --version", "      - run: ls \"target/release/bundle\"",
     ] {
-        assert_clean(structure_problems(&add_step(ok)));
+        assert_clean(structure_problems(&add_step(ok), &WINDOWS));
     }
 }
 
@@ -1270,7 +1417,7 @@ fn a_release_word_that_is_not_the_flag_or_the_path_is_caught_in_a_fixture() {
         "      - run: echo target/release/;gh release create v1", "      - run: gh release create v1 --release",
         "      - run: ls target/release/x; curl $U/releases",
     ];
-    assert_all_caught(structure_problems, "release step", &bad.map(add_step));
+    assert_all_caught(|text| structure_problems(text, &WINDOWS), "release step", &bad.map(add_step));
 }
 
 #[test]
@@ -1287,10 +1434,10 @@ fn a_release_step_is_caught_in_a_fixture() {
         "      - run: |\n          # gh release create v1",
         "      - run: gh api repos/o/r/releases -f tag_name=v1", "      - run: curl -X POST https://example.com/releases",
     ];
-    assert_all_caught(structure_problems, "release step", &steps.map(add_step));
+    assert_all_caught(|text| structure_problems(text, &WINDOWS), "release step", &steps.map(add_step));
     // A job that calls a reusable release workflow.
     let job = format!("{}  publish:\n    uses: org/repo/.github/workflows/release.yml@{PIN} # v1\n", good());
-    assert_problem(&structure_problems(&job), "release step", "reusable workflow");
+    assert_problem(&structure_problems(&job, &WINDOWS), "release step", "reusable workflow");
 }
 
 #[test]
@@ -1301,7 +1448,7 @@ fn a_release_id_input_is_caught_in_a_fixture() {
         "      - run: ls\n        env:\n          RELEASE_ID: 1",
         "      - run: echo $releaseId",
     ];
-    assert_all_caught(structure_problems, "release step", &bad.map(add_step));
+    assert_all_caught(|text| structure_problems(text, &WINDOWS), "release step", &bad.map(add_step));
 }
 
 // ---- settings ----
@@ -1315,10 +1462,10 @@ fn settings_that_are_right_pass_a_fixture() {
             &format!("node-version: {version}"),
         )));
     }
-    assert_clean(setting_problems(&with(
-        "if-no-files-found: error",
-        "if-no-files-found: 'error'",
-    )));
+    assert_clean(upload_problems(
+        &with("if-no-files-found: error", "if-no-files-found: 'error'"),
+        &WINDOWS,
+    ));
 }
 
 #[test]
@@ -1343,11 +1490,203 @@ fn an_old_or_unreadable_node_version_is_caught_in_a_fixture() {
 fn an_upload_that_ignores_missing_files_is_caught_in_a_fixture() {
     for value in ["warn", "ignore", "'warn'"] {
         let text = with("if-no-files-found: error", &format!("if-no-files-found: {value}"));
-        assert_eq!(setting_problems(&text).len(), 1, "{value}");
+        assert_eq!(upload_problems(&text, &WINDOWS).len(), 1, "{value}");
     }
     // The action's default is to warn, so an upload that sets nothing is wrong.
-    assert_eq!(setting_problems(&with("          if-no-files-found: error\n", "")).len(), 1);
-    assert_eq!(setting_problems(&with(UPLOAD_STEP, "")).len(), 1);
+    assert_eq!(upload_problems(&with("          if-no-files-found: error\n", ""), &WINDOWS).len(), 1);
+    assert_eq!(upload_problems(&with(UPLOAD_STEP, ""), &WINDOWS).len(), 1);
+}
+
+#[test]
+fn a_step_that_is_not_an_upload_but_ignores_missing_files_is_caught_in_a_fixture() {
+    let step =
+        "      - uses: other/action@PIN # v1\n        with:\n          if-no-files-found: warn\n";
+    assert_problem(
+        &upload_problems(&add_step(step), &WINDOWS),
+        "if-no-files-found is warn",
+        "other action",
+    );
+    let fine =
+        "      - uses: other/action@PIN # v1\n        with:\n          if-no-files-found: error\n";
+    assert_clean(upload_problems(&add_step(fine), &WINDOWS));
+}
+
+// ---- the upload ----
+
+/// The two path lines of the upload step in `good()`.
+const UPLOAD_PATHS: &str =
+    "            target/release/bundle/nsis/*.exe\n            target/release/bundle/msi/*.msi\n";
+
+#[test]
+#[rustfmt::skip]
+fn the_upload_names_the_platform_artifact_its_paths_and_thirty_days_in_a_fixture() {
+    assert_clean(upload_problems(&good(), &WINDOWS));
+    // The paths are a set of trimmed lines: order, trailing spaces, blank
+    // lines, tabs, Windows line endings, `|-` and `|+` change nothing.
+    let swapped = "            target/release/bundle/msi/*.msi\n            target/release/bundle/nsis/*.exe\n";
+    let spaced = "            target/release/bundle/nsis/*.exe   \n\n            target/release/bundle/msi/*.msi \t\n";
+    for paths in [swapped, spaced] {
+        assert_clean(upload_problems(&with(UPLOAD_PATHS, paths), &WINDOWS));
+    }
+    assert_clean(upload_problems(&with("path: |\n", "path: |-\n"), &WINDOWS));
+    assert_clean(upload_problems(&with("path: |\n", "path: |+\n"), &WINDOWS));
+    let quoted = "path: \"target/release/bundle/nsis/*.exe\\ntarget/release/bundle/msi/*.msi\"\n";
+    let flat = with(UPLOAD_PATHS, "").replace("path: |\n", quoted);
+    assert_clean(upload_problems(&flat, &WINDOWS));
+    assert_clean(upload_problems(&good().replace('\n', "\r\n"), &WINDOWS));
+    // The name may be quoted; the retention is the number 30 however it is
+    // written: the parser reads `30`, `030` and `+30` as integers and `"30"` as
+    // a string, and `scalar` turns each into the text 30. A quoted `'030'` is
+    // the text 030, which is refused below.
+    for name in ["'lunaepix-windows-installer'", "\"lunaepix-windows-installer\""] {
+        assert_clean(upload_problems(&with("name: lunaepix-windows-installer", &format!("name: {name}")), &WINDOWS));
+    }
+    for days in ["'30'", "\"30\"", "30", "030", "+30"] {
+        assert_clean(upload_problems(&with("retention-days: 30", &format!("retention-days: {days}")), &WINDOWS));
+    }
+}
+
+#[test]
+#[rustfmt::skip]
+fn an_upload_with_another_name_path_or_retention_is_caught_in_a_fixture() {
+    let name = upload_problems(&with("name: lunaepix-windows-installer", "name: lunaepix"), &WINDOWS);
+    assert_eq!(name.len(), 1, "{name:?}");
+    assert_problem(&name, "an upload is named lunaepix, not lunaepix-windows-installer", "name");
+    let no_msi = upload_problems(&with("            target/release/bundle/msi/*.msi\n", ""), &WINDOWS);
+    assert_eq!(no_msi.len(), 1, "{no_msi:?}");
+    assert_problem(&no_msi, "an upload's paths are", "missing .msi");
+    let extra = with(UPLOAD_PATHS, &format!("{UPLOAD_PATHS}            target/release/lunaepix.exe\n"));
+    assert_problem(&upload_problems(&extra, &WINDOWS), "an upload's paths are", "extra path");
+    let days = upload_problems(&with("retention-days: 30", "retention-days: 90"), &WINDOWS);
+    assert_eq!(days.len(), 1, "{days:?}");
+    assert_problem(&days, "an upload's retention-days is 90, not 30", "90");
+    // The action's default retention is 90 days, so an upload that sets nothing is wrong.
+    let none = upload_problems(&with("          retention-days: 30\n", ""), &WINDOWS);
+    assert_eq!(none.len(), 1, "{none:?}");
+    assert_problem(&none, "an upload does not set retention-days", "none");
+}
+
+#[test]
+#[rustfmt::skip]
+fn an_upload_with_a_shape_the_rule_does_not_expect_is_caught_in_a_fixture() {
+    // Other spellings of the same three inputs.
+    for days in ["'90'", "29", "31", "3", "300", "30.0", "'30 '", "'30d'", "[30]", "{a: 30}", "'030'", "0", "''", "null"] {
+        let text = with("retention-days: 30", &format!("retention-days: {days}"));
+        assert_eq!(upload_problems(&text, &WINDOWS).len(), 1, "retention-days: {days}");
+    }
+    for name in ["lunaepix-windows-installer-2", "Lunaepix-Windows-Installer", "'lunaepix-windows-installer '", "[lunaepix-windows-installer]", "''", "null"] {
+        let text = with("name: lunaepix-windows-installer", &format!("name: {name}"));
+        assert_eq!(upload_problems(&text, &WINDOWS).len(), 1, "name: {name}");
+    }
+    let no_name = with("          name: lunaepix-windows-installer\n", "");
+    assert_problem(&upload_problems(&no_name, &WINDOWS), "an upload does not set a name", "no name");
+    let one_line = with("path: |\n", "path: >\n");
+    assert_problem(&upload_problems(&one_line, &WINDOWS), "an upload's paths are", "folded into one line");
+    let list = with(UPLOAD_PATHS, "").replace("path: |\n", "path:\n            - target/release/bundle/nsis/*.exe\n            - target/release/bundle/msi/*.msi\n");
+    assert_problem(&upload_problems(&list, &WINDOWS), "an upload's path is not", "a YAML list");
+    let no_path = with("          path: |\n", "          x: |\n");
+    assert_problem(&upload_problems(&no_path, &WINDOWS), "an upload does not set a path", "no path");
+    let negated = with(UPLOAD_PATHS, &format!("{UPLOAD_PATHS}            !target/release/bundle/msi/x.msi\n"));
+    assert_problem(&upload_problems(&negated, &WINDOWS), "an upload's paths are", "exclusion line");
+    let bare = with("        with:\n          name: lunaepix-windows-installer\n          path: |\n            target/release/bundle/nsis/*.exe\n            target/release/bundle/msi/*.msi\n          if-no-files-found: error\n          retention-days: 30\n", "");
+    assert_eq!(upload_problems(&bare, &WINDOWS).len(), 4, "{:?}", upload_problems(&bare, &WINDOWS));
+}
+
+#[test]
+fn every_upload_in_the_workflow_is_checked_not_only_the_build_jobs_in_a_fixture() {
+    let upload = UPLOAD_STEP.replace("lunaepix-windows-installer", "lunaepix");
+    let second = add_step(&upload);
+    assert_problem(
+        &upload_problems(&second, &WINDOWS),
+        "an upload is named lunaepix",
+        "a second upload",
+    );
+    // The same upload twice is fine.
+    assert_clean(upload_problems(&add_step(UPLOAD_STEP), &WINDOWS));
+}
+
+#[test]
+fn a_workflow_without_an_upload_is_reported_by_the_upload_check_in_a_fixture() {
+    let none = with("actions/upload-artifact@", "actions/download-artifact@");
+    assert_problem(
+        &upload_problems(&none, &WINDOWS),
+        "no upload-artifact step",
+        "download instead",
+    );
+    assert_problem(
+        &upload_problems(&steps_doc("      - run: cargo test\n"), &WINDOWS),
+        "no upload-artifact step",
+        "no step",
+    );
+}
+
+// ---- the platform profile ----
+
+/// A profile that differs from `WINDOWS` in everything a check reads.
+const OTHER: Platform = Platform {
+    file: "other.yml",
+    runner: "other-runner",
+    artifact: "other-artifact",
+    artifact_paths: &["out/*.pkg"],
+    ..WINDOWS
+};
+
+#[test]
+fn the_runner_comes_from_the_profile_in_a_fixture() {
+    let other = good().replace("windows-latest", "other-runner");
+    assert_clean(structure_problems(&other, &OTHER));
+    // Under the other profile the Windows runner is the wrong one, in both jobs,
+    // and under the Windows profile the other runner is.
+    let wrong = structure_problems(&good(), &OTHER);
+    assert_eq!(wrong.len(), 2, "{wrong:?}");
+    assert_problem(
+        &wrong,
+        "job test: runner is not other-runner",
+        "windows under other",
+    );
+    assert_eq!(structure_problems(&other, &WINDOWS).len(), 2);
+}
+
+#[test]
+fn the_artifact_and_its_paths_come_from_the_profile_in_a_fixture() {
+    let other = with("name: lunaepix-windows-installer", "name: other-artifact")
+        .replace(UPLOAD_PATHS, "            out/*.pkg\n");
+    assert_clean(upload_problems(&other, &OTHER));
+    let wrong = upload_problems(&good(), &OTHER);
+    assert_eq!(wrong.len(), 2, "{wrong:?}");
+    assert_problem(
+        &wrong,
+        "an upload is named lunaepix-windows-installer, not other-artifact",
+        "name",
+    );
+    assert_problem(&wrong, "an upload's paths are", "paths");
+    assert_eq!(upload_problems(&other, &WINDOWS).len(), 2);
+}
+
+#[test]
+fn the_artifact_name_and_the_paths_are_each_read_from_the_profile_in_a_fixture() {
+    // Only the name is the other profile's: the paths alone are wrong.
+    let name_only = with("name: lunaepix-windows-installer", "name: other-artifact");
+    let paths = upload_problems(&name_only, &OTHER);
+    assert_eq!(paths.len(), 1, "{paths:?}");
+    assert_problem(&paths, "an upload's paths are", "paths only");
+    // Only the paths are the other profile's: the name alone is wrong.
+    let paths_only = with(UPLOAD_PATHS, "            out/*.pkg\n");
+    let name = upload_problems(&paths_only, &OTHER);
+    assert_eq!(name.len(), 1, "{name:?}");
+    assert_problem(
+        &name,
+        "an upload is named lunaepix-windows-installer",
+        "name only",
+    );
+}
+
+#[test]
+#[should_panic(expected = "other.yml")]
+fn the_workflow_file_comes_from_the_profile() {
+    // `workflow(&WINDOWS)` reads windows.yml in the real-file tests; a profile
+    // that names a file that does not exist cannot be read.
+    workflow(&OTHER);
 }
 
 // ---- the bundle build ----
@@ -1397,12 +1736,15 @@ fn a_bundle_build_without_the_config_file_is_caught_in_a_fixture() {
 
 #[test]
 fn nasm_before_cargo_in_every_job_passes_a_fixture() {
-    assert_clean(nasm_problems(&good()));
+    assert_clean(nasm_problems(&good(), &WINDOWS));
     // A job without a cargo step needs no NASM.
-    assert_clean(nasm_problems(&steps_doc("      - run: node --version")));
+    assert_clean(nasm_problems(
+        &steps_doc("      - run: node --version"),
+        &WINDOWS,
+    ));
     // The install and the path line may be separate lines of one script.
     let one_line = "      - run: choco install nasm --version=2.16.3 --no-progress -y && echo x >> \"$GITHUB_PATH\"\n";
-    assert_clean(nasm_problems(&with(NASM_STEP, one_line)));
+    assert_clean(nasm_problems(&with(NASM_STEP, one_line), &WINDOWS));
 }
 
 #[test]
@@ -1410,10 +1752,10 @@ fn nasm_before_cargo_in_every_job_passes_a_fixture() {
 fn a_job_without_nasm_or_with_nasm_after_cargo_is_caught_in_a_fixture() {
     // Without it in the test job (the first one), in the build job, in both.
     let test_job = with(NASM_STEP, "");
-    assert_eq!(nasm_problems(&test_job), ["job test: does not install nasm"]);
+    assert_eq!(nasm_problems(&test_job, &WINDOWS), ["job test: does not install nasm"]);
     let neither = good().replace(NASM_STEP, "");
     assert_eq!(
-        nasm_problems(&neither),
+        nasm_problems(&neither, &WINDOWS),
         ["job test: does not install nasm", "job build: does not install nasm"]
     );
     let build_missing = {
@@ -1422,23 +1764,23 @@ fn a_job_without_nasm_or_with_nasm_after_cargo_is_caught_in_a_fixture() {
         text.replace_range(at..at + NASM_STEP.len(), "");
         text
     };
-    assert_eq!(nasm_problems(&build_missing), ["job build: does not install nasm"]);
+    assert_eq!(nasm_problems(&build_missing, &WINDOWS), ["job build: does not install nasm"]);
     // After the first cargo step.
     let late = with(NASM_STEP, "").replacen(
         "      - run: cargo clippy",
         &format!("{NASM_STEP}      - run: cargo clippy"),
         1,
     );
-    assert_eq!(nasm_problems(&late), ["job test: installs nasm after its first cargo step"]);
+    assert_eq!(nasm_problems(&late, &WINDOWS), ["job test: installs nasm after its first cargo step"]);
     // Only in a shell comment, or only as a step name.
     let commented = "      - run: |\n          # choco install nasm\n          echo x >> \"$GITHUB_PATH\"\n";
-    assert_eq!(nasm_problems(&with(NASM_STEP, commented)), ["job test: does not install nasm"]);
+    assert_eq!(nasm_problems(&with(NASM_STEP, commented), &WINDOWS), ["job test: does not install nasm"]);
     let named = "      - name: choco install nasm\n        run: echo x >> \"$GITHUB_PATH\"\n";
-    assert_eq!(nasm_problems(&with(NASM_STEP, named)), ["job test: does not install nasm"]);
+    assert_eq!(nasm_problems(&with(NASM_STEP, named), &WINDOWS), ["job test: does not install nasm"]);
     // Installed, but its folder never reaches the path.
     let no_path = "      - run: choco install nasm --version=2.16.3 --no-progress -y\n";
     assert_eq!(
-        nasm_problems(&with(NASM_STEP, no_path)),
+        nasm_problems(&with(NASM_STEP, no_path), &WINDOWS),
         ["job test: the nasm step does not add NASM to GITHUB_PATH"]
     );
 }
@@ -1451,7 +1793,7 @@ fn a_nasm_install_without_a_version_pin_is_caught_in_a_fixture() {
     // No pin at all, in the test job (the first one) and in the build job.
     let unpinned = step("choco install nasm --no-progress -y");
     assert_eq!(
-        nasm_problems(&with(NASM_STEP, &unpinned)),
+        nasm_problems(&with(NASM_STEP, &unpinned), &WINDOWS),
         ["job test: the nasm install is not pinned with --version="]
     );
     let build_unpinned = {
@@ -1461,24 +1803,24 @@ fn a_nasm_install_without_a_version_pin_is_caught_in_a_fixture() {
         text
     };
     assert_eq!(
-        nasm_problems(&build_unpinned),
+        nasm_problems(&build_unpinned, &WINDOWS),
         ["job build: the nasm install is not pinned with --version="]
     );
     // A pin flag with no version after it.
     let empty = step("choco install nasm --version= --no-progress -y");
     assert_eq!(
-        nasm_problems(&with(NASM_STEP, &empty)),
+        nasm_problems(&with(NASM_STEP, &empty), &WINDOWS),
         ["job test: the nasm install is not pinned with --version="]
     );
     // A pin on another line of the script does not pin the nasm install.
     let elsewhere = "      - run: |\n          choco install nasm --no-progress -y\n          choco install other --version=1.0.0\n          echo x >> \"$GITHUB_PATH\"\n";
     assert_eq!(
-        nasm_problems(&with(NASM_STEP, elsewhere)),
+        nasm_problems(&with(NASM_STEP, elsewhere), &WINDOWS),
         ["job test: the nasm install is not pinned with --version="]
     );
     // A pinned install is not reported (the positive case), wherever the flag sits.
     assert_clean(nasm_problems(&with(
         NASM_STEP,
         &step("choco install nasm --no-progress -y --version=2.16.3"),
-    )));
+    ), &WINDOWS));
 }
