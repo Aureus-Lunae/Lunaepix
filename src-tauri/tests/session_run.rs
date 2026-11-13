@@ -245,19 +245,13 @@ fn lock(folder: &Path) -> bool {
     true
 }
 
-/// `reason` names no part of `path` and no temporary file: the window never
-/// receives a path. Used on every platform: the probe test that is not
-/// Unix-only calls it too.
-fn assert_no_path(reason: &str, path: &Path) {
-    assert!(!reason.contains("at path"), "{reason:?}");
-    assert!(!reason.contains(".tmp"), "{reason:?}");
-    for part in path.components() {
-        if let std::path::Component::Normal(name) = part {
-            let name = name.to_string_lossy();
-            assert!(!reason.contains(&*name), "{name:?} in {reason:?}");
-        }
-    }
-}
+// `reason` names no part of `path` below the temp folder and no temporary
+// file: the window never receives a path. The check is the core's, shared
+// with its tests (and tested there). Used on every platform: the probe test
+// that is not Unix-only calls it too.
+#[path = "../../crates/core/tests/common/no_path.rs"]
+mod no_path;
+use no_path::assert_no_path;
 
 /// What the system calls a refused write: `EACCES` is 13 on Linux and macOS.
 #[cfg(unix)]

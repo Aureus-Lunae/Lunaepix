@@ -2046,8 +2046,12 @@ mod tests {
                     &mut |event| events.lock().unwrap().push(event),
                 );
             });
+            // The shell creates the file before `echo` writes into it, so wait
+            // for the finished line, not for the file.
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !pids.exists() && Instant::now() < deadline {
+            while fs::read_to_string(&pids).map_or(0, |text| text.lines().count()) < 1
+                && Instant::now() < deadline
+            {
                 std::thread::sleep(Duration::from_millis(10));
             }
             // What the close handler does.

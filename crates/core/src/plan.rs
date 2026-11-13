@@ -629,7 +629,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // Linux only: APFS and NTFS store only valid Unicode names, so such a name cannot exist there.
+    #[cfg(target_os = "linux")]
     #[test]
     fn plans_a_name_that_is_not_valid_utf8_without_altering_it() {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};

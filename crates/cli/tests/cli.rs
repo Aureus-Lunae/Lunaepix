@@ -279,7 +279,8 @@ fn works_on_a_name_with_spaces_and_non_ascii_characters() {
     );
 }
 
-#[cfg(unix)]
+// Linux only: APFS and NTFS store only valid Unicode names, so such a name cannot exist there.
+#[cfg(target_os = "linux")]
 #[test]
 fn works_on_a_name_that_is_not_valid_utf8() {
     use std::os::unix::ffi::OsStringExt;

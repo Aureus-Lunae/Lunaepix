@@ -546,7 +546,8 @@ fn a_file_name_with_spaces_and_e_acute_is_probed() {
     assert_eq!(probe(&missing), Err(Skip::NotAFile.to_string()));
 }
 
-#[cfg(unix)]
+// Linux only: APFS and NTFS store only valid Unicode names, so such a name cannot exist there.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_non_utf8_file_name_is_probed() {
     use std::os::unix::ffi::OsStrExt;
@@ -725,18 +726,55 @@ fn run_probe_with_a_program_that_is_not_there_is_failed() {
     );
 }
 
+/// What `program` does when it is started the way `run_probe` starts it, on
+/// `src`: its exit code and what it printed. Panics when it cannot be
+/// started, so a test that is about a program that ran cannot pass because
+/// the program is missing (`run_probe` answers `Failed` for both).
+#[cfg(unix)]
+fn run_like_the_probe(program: &str, src: &Path) -> (i32, Vec<u8>) {
+    let output = Command::new(program)
+        .arg(PROBE_FLAG)
+        .arg(src)
+        .output()
+        .unwrap_or_else(|error| panic!("{program} cannot be started: {error}"));
+    (
+        output.status.code().expect("exited on its own"),
+        output.stdout,
+    )
+}
+
 #[cfg(unix)]
 #[test]
 fn run_probe_with_a_program_that_answers_nothing_is_failed() {
     // `true` and `false` ignore their arguments and print nothing: exit 0 and
-    // exit 1 without a record are no answer.
+    // exit 1 without a record are no answer. They are named without a
+    // directory so that the system finds them: `/bin/true` is not there on
+    // macOS (it has `/usr/bin/true`).
     let tmp = TempDir::new().unwrap();
     let src = write(tmp.path(), "a.png", &png_of(8, 8));
-    for program in ["/bin/true", "/bin/false"] {
+    for (program, code) in [("true", 0), ("false", 1)] {
+        // The program really runs and answers nothing; a missing program would
+        // also be `Failed`, so this is what makes the test about the record.
+        assert_eq!(
+            run_like_the_probe(program, &src),
+            (code, Vec::new()),
+            "{program}"
+        );
         assert_eq!(
             run_probe(Path::new(program), &src),
             ProbeAnswer::Failed,
             "{program}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "no-such-lunaepix-program cannot be started")]
+fn a_program_that_is_missing_is_not_taken_for_one_that_ran() {
+    // The pair of the test above: where the program does not exist, the check
+    // that it ran refuses instead of passing.
+    let tmp = TempDir::new().unwrap();
+    let src = write(tmp.path(), "a.png", &png_of(8, 8));
+    run_like_the_probe("no-such-lunaepix-program", &src);
 }
