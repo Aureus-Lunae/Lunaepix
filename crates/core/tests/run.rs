@@ -346,6 +346,14 @@ fn a_running_child_is_not_gone() {
     assert!(!gone);
 }
 
+/// Pid 1 exists and is not ours: `kill(1, 0)` answers `EPERM` to a user and
+/// 0 to root. Either way the process is there, so it is not gone.
+#[cfg(unix)]
+#[test]
+fn pid_1_is_not_gone() {
+    assert!(!process_is_gone(1));
+}
+
 #[cfg(unix)]
 #[test]
 fn a_killed_child_that_was_not_waited_for_is_not_gone() {
