@@ -82,8 +82,10 @@ jobs:
       - name: Rust tests
         run: cargo test --workspace --no-fail-fast
 
-      # The glob is quoted so that node expands it, not the shell.
+      # The glob is quoted so that node expands it, not the shell. Runs even
+      # when the Rust tests failed, so one run reports the failures of both.
       - name: Window script tests
+        if: success() || failure()
         run: node --test "tests/ui/*.test.js"
 
   build:

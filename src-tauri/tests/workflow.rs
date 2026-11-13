@@ -566,6 +566,32 @@ fn nasm_problems(text: &str) -> Vec<String> {
     })
 }
 
+/// The condition that lets a step run after an earlier step failed, but not
+/// after the run was cancelled.
+const AFTER_FAILURE: &str = "success() || failure()";
+
+/// Every step that runs the window script tests (`node --test` outside a
+/// shell comment) must have `if: success() || failure()`, so it still runs
+/// when the Rust tests before it failed and one run reports both.
+fn node_step_problems(text: &str) -> Vec<String> {
+    on_tree(text, |doc| {
+        all_steps(doc)
+            .into_iter()
+            .filter(|step| {
+                scalar(&step["run"])
+                    .is_some_and(|run| without_comments(&run).contains("node --test"))
+            })
+            .filter(|step| scalar(&step["if"]).as_deref() != Some(AFTER_FAILURE))
+            .map(|step| {
+                format!(
+                    "a node test step without `if: {AFTER_FAILURE}`: {:?}",
+                    step["if"]
+                )
+            })
+            .collect()
+    })
+}
+
 const REQUIRED_COMMANDS: &[&str] = &[
     "cargo fmt --all --check",
     "cargo clippy --workspace --all-targets -- -D warnings",
@@ -625,6 +651,7 @@ NASM      - run: cargo fmt --all --check
       - run: cargo test --workspace --no-fail-fast
       - run: cargo build --release
       - run: node --test \"tests/ui/*.test.js\"
+        if: success() || failure()
   build:
     needs: test
     runs-on: windows-latest
@@ -670,6 +697,7 @@ fn every_check(text: &str) -> Vec<(&'static str, Vec<String>)> {
         ("setting_problems", setting_problems(text)),
         ("bundle_build_problems", bundle_build_problems(text)),
         ("nasm_problems", nasm_problems(text)),
+        ("node_step_problems", node_step_problems(text)),
     ]
 }
 
@@ -1079,6 +1107,31 @@ fn a_missing_command_is_caught_in_a_fixture() {
 fn commands_in_one_line_and_block_scripts_are_found_in_a_fixture() {
     let steps = "      - run: cargo test --workspace\n      - name: x\n        shell: bash\n        run: |\n          node --test \"tests/ui/*.test.js\"";
     assert_clean(missing_commands(&steps_doc(steps), &["cargo test --workspace", "node --test \"tests/ui/*.test.js\""]));
+}
+
+// The window script tests run even when the Rust tests failed, so one
+// Windows run reports the failures of both.
+#[test]
+#[rustfmt::skip]
+fn a_node_step_that_runs_after_a_failed_step_passes_in_a_fixture() {
+    assert_clean(node_step_problems(&good()));
+    let block = "      - name: x\n        if: success() || failure()\n        run: |\n          node --test \"tests/ui/*.test.js\"";
+    assert_clean(node_step_problems(&steps_doc(block)));
+}
+
+#[test]
+#[rustfmt::skip]
+fn a_node_step_skipped_after_a_failed_step_is_caught_in_a_fixture() {
+    let node = "      - run: node --test \"tests/ui/*.test.js\"\n        if: success() || failure()\n";
+    let texts = [
+        // No condition: skipped once a step before it failed.
+        with(node, "      - run: node --test \"tests/ui/*.test.js\"\n"),
+        // Only after success.
+        with(node, "      - run: node --test \"tests/ui/*.test.js\"\n        if: success()\n"),
+        // The condition only in a comment.
+        with(node, "      - run: node --test \"tests/ui/*.test.js\"\n        # if: success() || failure()\n"),
+    ];
+    assert_all_caught(node_step_problems, "a node test step without", &texts);
 }
 
 // The Rust tests run every test binary even after one fails, so a single
