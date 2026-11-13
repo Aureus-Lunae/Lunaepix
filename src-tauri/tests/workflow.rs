@@ -1664,6 +1664,24 @@ fn the_artifact_and_its_paths_come_from_the_profile_in_a_fixture() {
 }
 
 #[test]
+fn the_artifact_name_and_the_paths_are_each_read_from_the_profile_in_a_fixture() {
+    // Only the name is the other profile's: the paths alone are wrong.
+    let name_only = with("name: lunaepix-windows-installer", "name: other-artifact");
+    let paths = upload_problems(&name_only, &OTHER);
+    assert_eq!(paths.len(), 1, "{paths:?}");
+    assert_problem(&paths, "an upload's paths are", "paths only");
+    // Only the paths are the other profile's: the name alone is wrong.
+    let paths_only = with(UPLOAD_PATHS, "            out/*.pkg\n");
+    let name = upload_problems(&paths_only, &OTHER);
+    assert_eq!(name.len(), 1, "{name:?}");
+    assert_problem(
+        &name,
+        "an upload is named lunaepix-windows-installer",
+        "name only",
+    );
+}
+
+#[test]
 #[should_panic(expected = "other.yml")]
 fn the_workflow_file_comes_from_the_profile() {
     // `workflow(&WINDOWS)` reads windows.yml in the real-file tests; a profile
