@@ -31,13 +31,19 @@ pub struct RunStarted {
     pub quality: Option<u8>,
 }
 
+/// `compression` as the window names it: the mode, and the lossy quality
+/// (`None` for lossless). `run-started` and `preview-ready` both carry it.
+pub fn mode_and_quality(compression: Compression) -> (Mode, Option<u8>) {
+    match compression {
+        Compression::Lossless => (Mode::Lossless, None),
+        Compression::Lossy(quality) => (Mode::Lossy, Some(quality.get())),
+    }
+}
+
 impl RunStarted {
     /// The payload for a run of `total` rows with `compression`.
     pub fn new(total: usize, compression: Compression) -> Self {
-        let (mode, quality) = match compression {
-            Compression::Lossless => (Mode::Lossless, None),
-            Compression::Lossy(quality) => (Mode::Lossy, Some(quality.get())),
-        };
+        let (mode, quality) = mode_and_quality(compression);
         RunStarted {
             total,
             mode,
@@ -149,6 +155,122 @@ pub struct DragState {
     pub over: bool,
 }
 
+/// The image Single image mode shows, as the window may know it: names,
+/// numbers and its key, never a path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImageInfo {
+    /// The original's file name alone, lossily decoded.
+    pub name: String,
+    /// The size of the copy taken at load, in bytes.
+    pub size: u64,
+    /// The size it is shown at, in pixels; `null` for an SVG.
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// The image's key, a whole number as text (`"7"`); a new key is a new
+    /// image.
+    pub key: String,
+    /// The name Save as starts with, without the extension.
+    pub suggested: String,
+    /// The original's extension with its dot (`".jpg"`), as it is spelled.
+    pub extension: String,
+}
+
+/// The outcome of a load attempt in Single image mode: a choice, or a drop
+/// while Single image shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImageChanged {
+    /// The image that shows now: the new one, or the one that was there
+    /// when nothing was loaded; `null` when there is none.
+    pub image: Option<ImageInfo>,
+    /// How many dropped items were left out that Batch can take; above 0,
+    /// Switch to Batch is offered.
+    pub left_out: usize,
+    /// A sentence for the status line, or `null`.
+    pub notice: Option<String>,
+}
+
+/// The output setting changed while an image is loaded: the name Save as
+/// starts with for it now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NameSuggested {
+    /// The image's key.
+    pub image: String,
+    /// The name, without the extension.
+    pub suggested: String,
+}
+
+/// A compressed version of the loaded image is being made: the latest
+/// request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreviewStarted {
+    /// The image's key (`"7"`).
+    pub image: String,
+    /// The version number: 1 for the first of a launch, then one more for
+    /// each request.
+    pub version: u64,
+}
+
+/// The latest request's version is ready and served as `key`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreviewReady {
+    pub image: String,
+    pub version: u64,
+    /// The version's key for the `preview` scheme, `<image>-<version>`.
+    pub key: String,
+    pub mode: Mode,
+    /// The lossy quality; `null` for lossless.
+    pub quality: Option<u8>,
+    /// The size of the copy and of the version, in bytes.
+    pub before: u64,
+    pub after: u64,
+    /// Batch's note when the file was handled differently from the mode;
+    /// `null` otherwise (the key is always there).
+    pub note: Option<String>,
+}
+
+/// The latest request failed; the previous ready version (if any) stays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreviewFailed {
+    pub image: String,
+    pub version: u64,
+    /// Batch's reason, a sentence for the user, never with a path.
+    pub reason: String,
+}
+
+/// A save in Single image mode wrote a file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImageSaved {
+    /// The saved file's name with its extension (`"optimized-holiday.jpg"`).
+    pub name: String,
+    /// The chosen output folder's name, or `null` for next to the original.
+    pub folder: Option<String>,
+    /// The name Save as offers next, without the extension: the first free
+    /// numbered form of the saved name (`"optimized-holiday-1"`).
+    pub suggested: String,
+}
+
+/// The `preview-ready` payload for version `version` of image `key`, made
+/// with `compression`, whose worker gave `outcome`.
+pub fn preview_ready(
+    key: u64,
+    version: u64,
+    compression: Compression,
+    outcome: &lunaepix_core::Outcome,
+) -> PreviewReady {
+    let (mode, quality) = mode_and_quality(compression);
+    PreviewReady {
+        image: key.to_string(),
+        version,
+        key: format!("{key}-{version}"),
+        mode,
+        quality,
+        before: outcome.before,
+        after: outcome.after,
+        // The same text `file_done` gives the note.
+        note: outcome.note.map(|note| note.to_string()),
+    }
+}
+
 /// One event for the window: its name ([`Event::name`]) and its payload
 /// (the `Serialize` output; the two unit events have `null`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -160,11 +282,19 @@ pub enum Event {
     FileStarted(FileStarted),
     FileDone(FileDone),
     RunFinished(RunFinished),
-    /// A drop or a command was refused because a run, or a dialog, is active.
+    /// A drop or a command was refused because the busy guard is held (a run,
+    /// a dialog, a load, a save, or another command's short checked section).
     RunBusy,
-    /// A file or folder dialog was closed without a choice.
+    /// A file or folder dialog was closed without a choice: Batch's files and
+    /// output folder dialogs, and Single image mode's image dialog.
     RunCancelled,
     DragState(DragState),
+    ImageChanged(ImageChanged),
+    NameSuggested(NameSuggested),
+    PreviewStarted(PreviewStarted),
+    PreviewReady(PreviewReady),
+    PreviewFailed(PreviewFailed),
+    ImageSaved(ImageSaved),
 }
 
 impl Event {
@@ -180,6 +310,12 @@ impl Event {
             Event::RunBusy => "run-busy",
             Event::RunCancelled => "run-cancelled",
             Event::DragState(_) => "drag-state",
+            Event::ImageChanged(_) => "image-changed",
+            Event::NameSuggested(_) => "name-suggested",
+            Event::PreviewStarted(_) => "preview-started",
+            Event::PreviewReady(_) => "preview-ready",
+            Event::PreviewFailed(_) => "preview-failed",
+            Event::ImageSaved(_) => "image-saved",
         }
     }
 }
@@ -246,13 +382,154 @@ pub fn file_done(index: usize, src: &Path, result: &FileResult) -> FileDone {
 }
 
 #[cfg(test)]
+#[path = "../tests/common/contract_names.rs"]
+mod contract_names;
+
+#[cfg(test)]
 mod tests {
     use std::io;
     use std::path::PathBuf;
 
     use lunaepix_core::{Crash, OptimizeError, Outcome, RunError, Skip};
 
+    use super::contract_names;
     use super::*;
+
+    /// How many variants [`Event`] has; [`variant_number`] numbers them
+    /// `0..EVENT_VARIANTS`.
+    const EVENT_VARIANTS: usize = 15;
+
+    /// Each variant's own number. The match has no `_` arm, so a new variant
+    /// does not compile until it is numbered here, and then
+    /// `every_event_name_is_in_the_contract_fixture_and_back` fails until
+    /// [`one_of_each_event`] makes one of it.
+    fn variant_number(event: &Event) -> usize {
+        match event {
+            Event::ListChanged(_) => 0,
+            Event::OutputChanged(_) => 1,
+            Event::RunStarted(_) => 2,
+            Event::FileStarted(_) => 3,
+            Event::FileDone(_) => 4,
+            Event::RunFinished(_) => 5,
+            Event::RunBusy => 6,
+            Event::RunCancelled => 7,
+            Event::DragState(_) => 8,
+            Event::ImageChanged(_) => 9,
+            Event::NameSuggested(_) => 10,
+            Event::PreviewStarted(_) => 11,
+            Event::PreviewReady(_) => 12,
+            Event::PreviewFailed(_) => 13,
+            Event::ImageSaved(_) => 14,
+        }
+    }
+
+    /// One event of every variant, with plain payloads.
+    fn one_of_each_event() -> Vec<Event> {
+        vec![
+            Event::ListChanged(ListChanged {
+                files: Vec::new(),
+                notice: None,
+            }),
+            Event::OutputChanged(OutputChanged { folder: None }),
+            Event::RunStarted(RunStarted::new(1, Compression::Lossless)),
+            Event::FileStarted(FileStarted { index: 0 }),
+            Event::FileDone(over_limit_row(0, 1)),
+            Event::RunFinished(RunFinished {
+                optimised: 0,
+                saved_bytes: 0,
+                has_output: false,
+            }),
+            Event::RunBusy,
+            Event::RunCancelled,
+            Event::DragState(DragState { over: false }),
+            Event::ImageChanged(ImageChanged {
+                image: None,
+                left_out: 0,
+                notice: None,
+            }),
+            Event::NameSuggested(NameSuggested {
+                image: "1".to_owned(),
+                suggested: "a".to_owned(),
+            }),
+            Event::PreviewStarted(PreviewStarted {
+                image: "1".to_owned(),
+                version: 1,
+            }),
+            Event::PreviewReady(PreviewReady {
+                image: "1".to_owned(),
+                version: 1,
+                key: "1-1".to_owned(),
+                mode: Mode::Lossless,
+                quality: None,
+                before: 2,
+                after: 1,
+                note: None,
+            }),
+            Event::PreviewFailed(PreviewFailed {
+                image: "1".to_owned(),
+                version: 1,
+                reason: "a reason".to_owned(),
+            }),
+            Event::ImageSaved(ImageSaved {
+                name: "a.png".to_owned(),
+                folder: None,
+                suggested: "a-1".to_owned(),
+            }),
+        ]
+    }
+
+    #[test]
+    fn every_event_name_is_in_the_contract_fixture_and_back() {
+        let events = one_of_each_event();
+        let mut numbers: Vec<usize> = events.iter().map(variant_number).collect();
+        numbers.sort_unstable();
+        assert_eq!(
+            numbers,
+            (0..EVENT_VARIANTS).collect::<Vec<_>>(),
+            "one event of each variant"
+        );
+        let names: Vec<&str> = events.iter().map(Event::name).collect();
+        let fixture = contract_names::load();
+        assert_eq!(
+            contract_names::problems(&fixture.events, &names),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_names_list_missing_or_adding_an_event_is_flagged() {
+        let names: Vec<&str> = one_of_each_event().iter().map(Event::name).collect();
+        let fixture = contract_names::load();
+        // The window listens to one name the backend never sends.
+        let mut with_extra = fixture.events.clone();
+        with_extra.push("preview-progress".to_owned());
+        assert_eq!(
+            contract_names::problems(&with_extra, &names),
+            ["missing preview-progress"]
+        );
+        // The backend sends one name the window does not listen to.
+        let without_busy: Vec<&String> = fixture
+            .events
+            .iter()
+            .filter(|name| *name != "run-busy")
+            .collect();
+        assert_eq!(
+            contract_names::problems(&without_busy, &names),
+            ["extra run-busy"]
+        );
+        // A name sent twice by two variants.
+        assert_eq!(
+            contract_names::problems(&["a", "b"], &["a", "b", "a"]),
+            ["a given twice"]
+        );
+        // Control: the same names in another order are no problem.
+        let mut reversed = names.clone();
+        reversed.reverse();
+        assert_eq!(
+            contract_names::problems(&fixture.events, &reversed),
+            Vec::<String>::new()
+        );
+    }
 
     fn optimized(before: u64, after: u64) -> FileResult {
         FileResult::Optimized(Outcome {
@@ -504,5 +781,221 @@ mod tests {
             assert_eq!(event.name(), *name);
             assert_eq!(value(event), parsed(payload));
         }
+    }
+
+    // --- Single image ---------------------------------------------------------
+
+    fn holiday(key: &str) -> ImageInfo {
+        ImageInfo {
+            name: "holiday.jpg".to_owned(),
+            size: 2_400_000,
+            width: Some(4032),
+            height: Some(3024),
+            key: key.to_owned(),
+            suggested: "optimized-holiday".to_owned(),
+            extension: ".jpg".to_owned(),
+        }
+    }
+
+    #[test]
+    fn image_changed_serialises_exactly_as_the_spec_examples() {
+        let events = [
+            (
+                Event::ImageChanged(ImageChanged {
+                    image: Some(holiday("7")),
+                    left_out: 0,
+                    notice: None,
+                }),
+                r#"{ "image": { "name": "holiday.jpg", "size": 2400000, "width": 4032, "height": 3024,
+                     "key": "7", "suggested": "optimized-holiday", "extension": ".jpg" },
+                     "left_out": 0, "notice": null }"#,
+            ),
+            (
+                Event::ImageChanged(ImageChanged {
+                    image: Some(holiday("8")),
+                    left_out: 3,
+                    notice: Some(
+                        "Single image mode takes one image; 3 others were left out.".to_owned(),
+                    ),
+                }),
+                r#"{ "image": { "name": "holiday.jpg", "size": 2400000, "width": 4032, "height": 3024,
+                     "key": "8", "suggested": "optimized-holiday", "extension": ".jpg" },
+                     "left_out": 3, "notice": "Single image mode takes one image; 3 others were left out." }"#,
+            ),
+            (
+                Event::ImageChanged(ImageChanged {
+                    image: None,
+                    left_out: 1,
+                    notice: Some("Folders go in Batch.".to_owned()),
+                }),
+                r#"{ "image": null, "left_out": 1, "notice": "Folders go in Batch." }"#,
+            ),
+            (
+                Event::ImageChanged(ImageChanged {
+                    image: Some(ImageInfo {
+                        name: "logo.svg".to_owned(),
+                        size: 4100,
+                        width: None,
+                        height: None,
+                        key: "9".to_owned(),
+                        suggested: "optimized-logo".to_owned(),
+                        extension: ".svg".to_owned(),
+                    }),
+                    left_out: 0,
+                    notice: None,
+                }),
+                r#"{ "image": { "name": "logo.svg", "size": 4100, "width": null, "height": null,
+                     "key": "9", "suggested": "optimized-logo", "extension": ".svg" },
+                     "left_out": 0, "notice": null }"#,
+            ),
+        ];
+        for (event, payload) in &events {
+            assert_eq!(event.name(), "image-changed");
+            assert_eq!(value(event), parsed(payload));
+        }
+    }
+
+    #[test]
+    fn name_suggested_serialises_as_image_and_suggested_only() {
+        let event = Event::NameSuggested(NameSuggested {
+            image: "7".to_owned(),
+            suggested: "holiday".to_owned(),
+        });
+        assert_eq!(event.name(), "name-suggested");
+        assert_eq!(
+            value(&event),
+            parsed(r#"{ "image": "7", "suggested": "holiday" }"#)
+        );
+        // Not the image-changed shape: no other key, and not a nested image.
+        assert_ne!(
+            value(&event),
+            parsed(r#"{ "image": { "key": "7" }, "suggested": "holiday" }"#)
+        );
+    }
+
+    #[test]
+    fn image_saved_serialises_exactly_as_the_spec_examples() {
+        let next_to = Event::ImageSaved(ImageSaved {
+            name: "optimized-holiday.jpg".to_owned(),
+            folder: None,
+            suggested: "optimized-holiday-1".to_owned(),
+        });
+        let chosen = Event::ImageSaved(ImageSaved {
+            name: "holiday.jpg".to_owned(),
+            folder: Some("exports".to_owned()),
+            suggested: "holiday-1".to_owned(),
+        });
+        assert_eq!(next_to.name(), "image-saved");
+        assert_eq!(chosen.name(), "image-saved");
+        assert_eq!(
+            value(&next_to),
+            parsed(
+                r#"{ "name": "optimized-holiday.jpg", "folder": null,
+                     "suggested": "optimized-holiday-1" }"#
+            )
+        );
+        assert_eq!(
+            value(&chosen),
+            parsed(r#"{ "name": "holiday.jpg", "folder": "exports", "suggested": "holiday-1" }"#)
+        );
+        // Exactly those keys: not the `image-changed` shape, nothing more.
+        assert_ne!(
+            value(&chosen),
+            parsed(r#"{ "image": { "name": "holiday.jpg" }, "folder": "exports" }"#)
+        );
+        assert_eq!(value(&chosen).as_object().unwrap().len(), 3);
+    }
+
+    // --- the preview's events -------------------------------------------------
+
+    fn outcome(before: u64, after: u64, note: Option<lunaepix_core::Note>) -> Outcome {
+        Outcome {
+            before,
+            after,
+            millis: 9,
+            note,
+        }
+    }
+
+    fn quality(value: u8) -> Compression {
+        Compression::Lossy(lunaepix_core::Quality::new(value).unwrap())
+    }
+
+    #[test]
+    fn preview_events_serialise_exactly_as_the_spec_examples() {
+        let started = Event::PreviewStarted(PreviewStarted {
+            image: "7".to_owned(),
+            version: 3,
+        });
+        assert_eq!(value(&started), parsed(r#"{ "image": "7", "version": 3 }"#));
+        let ready = Event::PreviewReady(preview_ready(
+            7,
+            3,
+            quality(75),
+            &outcome(2_400_000, 612_000, None),
+        ));
+        assert_eq!(
+            value(&ready),
+            parsed(
+                r#"{ "image": "7", "version": 3, "key": "7-3", "mode": "lossy", "quality": 75,
+                     "before": 2400000, "after": 612000, "note": null }"#
+            )
+        );
+        let failed = Event::PreviewFailed(PreviewFailed {
+            image: "7".to_owned(),
+            version: 3,
+            reason: "the optimiser crashed on this file (it gave no valid result)".to_owned(),
+        });
+        assert_eq!(
+            value(&failed),
+            parsed(
+                r#"{ "image": "7", "version": 3,
+                     "reason": "the optimiser crashed on this file (it gave no valid result)" }"#
+            )
+        );
+    }
+
+    #[test]
+    fn a_lossless_ready_has_quality_null() {
+        let ready = preview_ready(1, 2, Compression::Lossless, &outcome(10, 12, None));
+        assert_eq!(
+            value(&ready),
+            parsed(
+                r#"{ "image": "1", "version": 2, "key": "1-2", "mode": "lossless", "quality": null,
+                     "before": 10, "after": 12, "note": null }"#
+            )
+        );
+    }
+
+    #[test]
+    fn a_ready_with_a_note_carries_batchs_text() {
+        let note = lunaepix_core::Note::KeptLosslessAnimatedPng;
+        let ready = preview_ready(4, 9, quality(0), &outcome(10, 9, Some(note)));
+        assert_eq!(ready.note.as_deref(), Some("kept lossless: animated PNG"));
+        // The same text as a `file-done` row gets for that outcome.
+        let row = file_done(
+            0,
+            Path::new("a.png"),
+            &FileResult::Optimized(outcome(10, 9, Some(note))),
+        );
+        assert_eq!(ready.note, row.note);
+        assert_eq!(ready.quality, Some(0));
+    }
+
+    #[test]
+    fn preview_event_names_are_started_ready_failed() {
+        let started = Event::PreviewStarted(PreviewStarted {
+            image: "1".to_owned(),
+            version: 1,
+        });
+        let ready = Event::PreviewReady(preview_ready(1, 1, quality(40), &outcome(2, 1, None)));
+        let failed = Event::PreviewFailed(PreviewFailed {
+            image: "1".to_owned(),
+            version: 1,
+            reason: "x".to_owned(),
+        });
+        assert_eq!(started.name(), "preview-started");
+        assert_eq!(ready.name(), "preview-ready");
+        assert_eq!(failed.name(), "preview-failed");
     }
 }

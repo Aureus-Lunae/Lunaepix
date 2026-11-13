@@ -297,7 +297,7 @@ unsafe fn write_jpeg(decoded: &Decoded, quality: Quality) -> Vec<u8> {
 }
 
 /// The size in a JPEG's header, read by libjpeg without decoding the image:
-/// a lossy result's, and a thumbnail source's ([`super::check_header`]).
+/// a lossy result's, and a thumbnail or probe source's ([`super::header_size`]).
 pub(super) fn read_shape(bytes: &[u8]) -> Result<Shape, String> {
     let len = source_len(bytes)?;
     run_libjpeg(|| {

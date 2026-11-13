@@ -20,10 +20,17 @@ use std::str::FromStr;
 use std::sync::{Condvar, Mutex, PoisonError};
 
 use lunaepix_core::{ThumbAnswer, run_thumb};
-use tauri::http::header::CONTENT_TYPE;
+use tauri::http::header::{
+    CONTENT_SECURITY_POLICY, CONTENT_TYPE, HeaderValue, X_CONTENT_TYPE_OPTIONS,
+};
 use tauri::http::{Request, Response, StatusCode};
 
 use crate::session::lock;
+
+/// The policy of every `thumb` and `preview` answer: nothing loads or runs
+/// from it (no scripts, no fetches, no frames); inline styles stay, so an SVG
+/// opened by itself still draws as it should.
+const POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'";
 
 /// At most this many thumbnail workers run at a time; other requests wait.
 pub const MAX_THUMB_WORKERS: usize = 2;
@@ -48,14 +55,15 @@ pub fn parse_key(uri_path: &str) -> Option<(u64, usize)> {
 }
 
 /// `text` as a number, if it is 1 to `most` ASCII digits and nothing else.
-fn digits<T: FromStr>(text: &str, most: usize) -> Option<T> {
+pub(crate) fn digits<T: FromStr>(text: &str, most: usize) -> Option<T> {
     let all_digits = (1..=most).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit());
     // At most 10 digits always fit a `u64`, and 4 a `usize`.
     all_digits.then(|| text.parse().ok()).flatten()
 }
 
 /// The answer to one `thumb://` request: `200 image/png`, `200
-/// image/svg+xml`, or `404` with no type and an empty body.
+/// image/svg+xml`, or `404` with no type and an empty body. The `preview`
+/// scheme answers in the same shape (`previews::PreviewResponse`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThumbResponse {
     pub status: u16,
@@ -73,33 +81,41 @@ impl ThumbResponse {
         }
     }
 
-    fn png(body: Vec<u8>) -> Self {
+    /// `200` with `body` of `content_type`.
+    pub(crate) fn found(content_type: &'static str, body: Vec<u8>) -> Self {
         ThumbResponse {
             status: 200,
-            content_type: Some("image/png"),
+            content_type: Some(content_type),
             body,
         }
+    }
+
+    fn png(body: Vec<u8>) -> Self {
+        Self::found("image/png", body)
     }
 
     fn svg(body: Vec<u8>) -> Self {
-        ThumbResponse {
-            status: 200,
-            content_type: Some("image/svg+xml"),
-            body,
-        }
+        Self::found("image/svg+xml", body)
     }
 
     /// This answer as the webview's response: the status, a `Content-Type`
-    /// only when there is a type, and the body. A status the HTTP types
-    /// refuse (none of ours) gives an empty `404`.
+    /// only when there is a type, the two headers every answer carries
+    /// ([`POLICY`] and `nosniff`), and the body. A status the HTTP types
+    /// refuse (none of ours) gives an empty `404` with those two headers.
     pub fn into_http(self) -> Response<Vec<u8>> {
-        let mut builder = Response::builder().status(self.status);
+        let mut builder = Response::builder()
+            .status(self.status)
+            .header(CONTENT_SECURITY_POLICY, POLICY)
+            .header(X_CONTENT_TYPE_OPTIONS, "nosniff");
         if let Some(content_type) = self.content_type {
             builder = builder.header(CONTENT_TYPE, content_type);
         }
         builder.body(self.body).unwrap_or_else(|_| {
             let mut response = Response::new(Vec::new());
             *response.status_mut() = StatusCode::NOT_FOUND;
+            let headers = response.headers_mut();
+            headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(POLICY));
+            headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
             response
         })
     }
@@ -1213,7 +1229,7 @@ mod tests {
     fn a_response_becomes_http_with_its_status_type_and_body() {
         let png = png_response(vec![1, 2, 3]).into_http();
         assert_eq!(png.status().as_u16(), 200);
-        assert_eq!(png.headers().len(), 1);
+        assert_eq!(png.headers().len(), 3, "the type, the policy, nosniff");
         assert_eq!(png.headers()[CONTENT_TYPE], "image/png");
         assert_eq!(png.body(), &[1, 2, 3]);
 
@@ -1224,9 +1240,30 @@ mod tests {
 
         let missing = not_found().into_http();
         assert_eq!(missing.status().as_u16(), 404);
-        assert!(missing.headers().is_empty());
+        assert_eq!(missing.headers().len(), 2, "the policy and nosniff only");
+        assert!(missing.headers().get(CONTENT_TYPE).is_none());
         assert!(missing.body().is_empty());
         assert_eq!(ThumbResponse::not_found(), not_found());
+    }
+
+    /// The two headers every answer carries, with exactly these values.
+    fn has_policy_and_nosniff(response: &Response<Vec<u8>>) {
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            "default-src 'none'; style-src 'unsafe-inline'"
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    }
+
+    #[test]
+    fn a_thumb_200_carries_the_csp_and_nosniff() {
+        has_policy_and_nosniff(&png_response(vec![1]).into_http());
+        has_policy_and_nosniff(&svg_response(b"<svg/>".to_vec()).into_http());
+    }
+
+    #[test]
+    fn a_thumb_404_carries_the_csp_and_nosniff() {
+        has_policy_and_nosniff(&not_found().into_http());
     }
 
     #[test]
@@ -1238,7 +1275,8 @@ mod tests {
         }
         .into_http();
         assert_eq!(impossible.status().as_u16(), 404);
-        assert!(impossible.headers().is_empty());
+        assert_eq!(impossible.headers().len(), 2, "the policy and nosniff only");
+        has_policy_and_nosniff(&impossible);
         assert!(impossible.body().is_empty());
     }
 }

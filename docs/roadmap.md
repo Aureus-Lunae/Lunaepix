@@ -8,10 +8,10 @@ plan (in `docs/pending-approval/` until approved) when it starts.
 |---|---|
 | Image lossless compression | Done |
 | Lossy image compression | Done |
-| Preview single image compression before compressing (before/after slider) | Not started |
+| Preview single image compression before compressing (before/after slider) | Done |
 | Apple support: a brew formula, and a plain download with one awkward step | Not started |
 | Choose how much it can get compressed (quality, like JPEG 70%) on lossy | Part of lossy compression |
-| Export rename (single file only) | Not started |
+| Export rename (single file only) | Part of single image mode; done |
 | Re-add after a run, and thumbnails | Done |
 | Clean and clear UI | Not started |
 | Automated draft release | Not started |
@@ -37,7 +37,16 @@ a Run button, an output folder and the same options on the command line.
 Spec: `docs/finished/specs/2026-11-09-lunaepix-lossy-design.md`.
 Plan: `docs/finished/plans/2026-11-09-lunaepix-lossy.md`.
 
-## Preview single image compression before compressing
+## Preview single image compression before compressing — Done
+
+Single image mode: a Single image / Batch switch at the top, a before/after
+divider with zoom, exact sizes, and Save under a chosen name. One layout:
+the picture fills the window, with the settings in a column on its right
+that "Hide settings" folds away (the status line then floats over the top of
+the picture).
+Spec: `docs/finished/specs/2026-11-11-lunaepix-single-image-design.md`.
+Plan: `docs/finished/plans/2026-11-11-lunaepix-single-image.md`.
+Built as version 0.1.3; tested by hand on Linux and Windows.
 
 A before/after slider on one image, so the result can be judged before the
 files are written. Needs lossy compression for there to be a visible
@@ -69,6 +78,10 @@ A setting for how far lossy compression may go, like JPEG 70%. Delivered as
 part of lossy compression (quality 0–100, starting at 75).
 
 ## Export rename (single file only)
+
+Part of single image mode: the user chose "Part of this work, single mode only".
+Built there as "Save as" (version 0.1.2; still part of Single image mode in
+0.1.3).
 
 Give the output file a different name when one file is compressed. For a
 batch job: "that is a prefix / postfix, as it is not good to rename all files

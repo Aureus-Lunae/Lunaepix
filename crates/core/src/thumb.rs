@@ -16,7 +16,7 @@ use std::path::Path;
 use crate::MAX_FILE_BYTES;
 use crate::plan::{self, Format};
 
-mod decode;
+pub(crate) mod decode;
 
 use decode::Picture;
 
@@ -96,24 +96,46 @@ pub fn thumbnail(src: &Path) -> Result<Thumbnail, CannotShow> {
         .map_err(CannotShow)
 }
 
+/// Why [`read_regular`] gave no bytes.
+#[derive(Debug)]
+pub(crate) enum SourceError {
+    /// Its type and size could not be looked at (a missing file, say).
+    NotThere(std::io::Error),
+    /// Not a regular file (a folder, a FIFO, a device, a socket).
+    NotRegular,
+    /// More than the limit: by its size, or because it grew while read.
+    TooLarge,
+    /// It could not be opened or read.
+    Unreadable(std::io::Error),
+}
+
 /// The bytes of `src`, if it is a regular file of at most `limit` bytes.
 /// The type and size are checked before it is opened, so a FIFO is never
-/// opened (which would block) and a large file is never read.
-fn read_source(src: &Path, limit: u64) -> Result<Vec<u8>, String> {
-    let unreadable = |cause: std::io::Error| format!("could not read the file: {cause}");
-    let metadata = fs::metadata(src).map_err(unreadable)?;
+/// opened (which would block) and a large file is never read. At most one
+/// byte past `limit` is read if the file grows in between.
+pub(crate) fn read_regular(src: &Path, limit: u64) -> Result<Vec<u8>, SourceError> {
+    let metadata = fs::metadata(src).map_err(SourceError::NotThere)?;
     if !metadata.is_file() {
-        return Err("not a regular file".to_owned());
+        return Err(SourceError::NotRegular);
     }
-    let too_large = || format!("too large: more than {limit} bytes");
     if metadata.len() > limit {
-        return Err(too_large());
+        return Err(SourceError::TooLarge);
     }
-    // It may have grown since; read one byte past the limit at most.
-    let file = fs::File::open(src).map_err(unreadable)?;
+    let file = fs::File::open(src).map_err(SourceError::Unreadable)?;
     crate::read_at_most(file, limit)
-        .map_err(unreadable)?
-        .ok_or_else(too_large)
+        .map_err(SourceError::Unreadable)?
+        .ok_or(SourceError::TooLarge)
+}
+
+/// [`read_regular`], with the reason as the thumbnail's text.
+fn read_source(src: &Path, limit: u64) -> Result<Vec<u8>, String> {
+    read_regular(src, limit).map_err(|error| match error {
+        SourceError::NotRegular => "not a regular file".to_owned(),
+        SourceError::TooLarge => format!("too large: more than {limit} bytes"),
+        SourceError::NotThere(cause) | SourceError::Unreadable(cause) => {
+            format!("could not read the file: {cause}")
+        }
+    })
 }
 
 /// Whether `bytes` are UTF-8 text whose first character, after one
@@ -474,5 +496,83 @@ mod tests {
             let got = orient(wrong.clone(), width, height, 6);
             assert_eq!(got, (wrong, 3, 2), "length {len}");
         }
+    }
+
+    // --- read_regular -----------------------------------------------------------
+
+    #[test]
+    fn read_regular_reads_a_regular_file_within_the_limit_and_one_of_exactly_the_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("a.png");
+        fs::write(&path, b"0123456789").unwrap();
+        assert_eq!(read_regular(&path, 10).unwrap(), b"0123456789");
+        assert_eq!(read_regular(&path, 100).unwrap(), b"0123456789");
+    }
+
+    #[test]
+    fn read_regular_says_too_large_for_a_file_over_the_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("a.png");
+        fs::write(&path, b"0123456789A").unwrap();
+        assert!(matches!(
+            read_regular(&path, 10),
+            Err(SourceError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn read_regular_says_not_regular_for_a_folder_and_not_unreadable_or_too_large() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(matches!(
+            read_regular(tmp.path(), 10),
+            Err(SourceError::NotRegular)
+        ));
+    }
+
+    #[test]
+    fn read_regular_says_not_there_with_the_os_error_for_a_missing_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        match read_regular(&tmp.path().join("gone.png"), 10) {
+            Err(SourceError::NotThere(cause)) => {
+                assert_eq!(cause.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected NotThere, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_regular_says_unreadable_with_the_os_error_for_a_file_it_cannot_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("a.png");
+        fs::write(&path, b"0123456789").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&path).is_ok() {
+            // Running as root: the file opens whatever its mode says.
+            return;
+        }
+        match read_regular(&path, 100) {
+            Err(SourceError::Unreadable(cause)) => {
+                assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
+    }
+
+    /// A file that says it is empty and then reads as more than the limit:
+    /// what a file that grows after its size was looked at does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_regular_says_too_large_for_a_file_that_grows_past_the_limit_after_its_size_was_read() {
+        let status = Path::new("/proc/self/status");
+        assert_eq!(fs::metadata(status).unwrap().len(), 0);
+        assert!(matches!(
+            read_regular(status, 10),
+            Err(SourceError::TooLarge)
+        ));
+        // The pair: with room for it, the same file is read.
+        assert!(read_regular(status, 1 << 20).unwrap().len() > 10);
     }
 }

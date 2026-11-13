@@ -120,7 +120,7 @@ pub fn plan_files_to(inputs: &[PathBuf], out: Option<&Path>) -> Vec<Job> {
         match fs::metadata(input) {
             Ok(meta) if meta.is_dir() => plan.add_folder(input),
             Ok(meta) if meta.is_file() => {
-                let dest = input.with_file_name(prefixed_name(input));
+                let dest = input.with_file_name(batch_output_name(input, false));
                 plan.add_file(input, dest, meta.len());
             }
             _ => plan.jobs.push(Job::Skip {
@@ -209,18 +209,16 @@ impl OutputFolder {
         }
     }
 
-    /// `name`, or its first numbered form up to `MAX_NAME_NUMBER` that is not
-    /// taken. When all are taken, `name` itself: the write then tries every
-    /// number again and fails with "no free name in the output folder".
-    fn free_name(&self, name: &OsStr) -> OsString {
+    /// `name`, or its first numbered form up to `last` that is not taken;
+    /// `None` when all of them are taken.
+    fn free_name(&self, name: &OsStr, last: u32) -> Option<OsString> {
         let is_free = |candidate: &OsStr| !self.taken.contains(&fold_name(candidate));
         if is_free(name) {
-            return name.to_owned();
+            return Some(name.to_owned());
         }
-        (1..=MAX_NAME_NUMBER)
+        (1..=last)
             .map(|n| numbered(name, n))
             .find(|candidate| is_free(candidate))
-            .unwrap_or_else(|| name.to_owned())
     }
 }
 
@@ -265,9 +263,13 @@ impl Plan {
             return;
         }
         let dest = match &self.out {
-            Some(out) => out
-                .path
-                .join(out.free_name(src.file_name().unwrap_or_default())),
+            // When all are taken, the name itself: the write then tries every
+            // number again and fails with "no free name in the output folder".
+            Some(out) => {
+                let name = batch_output_name(src, true);
+                let free = out.free_name(&name, MAX_NAME_NUMBER).unwrap_or(name);
+                out.path.join(free)
+            }
             None => next_to,
         };
         let src = src.to_path_buf();
@@ -296,6 +298,35 @@ impl Plan {
             }
         }
     }
+}
+
+/// The name Batch gives the output for `src`: `optimized-<name>` next to the
+/// original (`in_chosen_folder` false), `<name>` in a chosen output folder
+/// (true). Built from the `OsStr`, so a name that is not valid UTF-8 keeps its
+/// bytes. One case does not use it: a file found in a folder given as input,
+/// with no output folder chosen, goes to `<folder>/optimized/<name>` under its
+/// own name ([`plan_folder`]).
+pub fn batch_output_name(src: &Path, in_chosen_folder: bool) -> OsString {
+    if in_chosen_folder {
+        src.file_name().unwrap_or_default().to_owned()
+    } else {
+        prefixed_name(src)
+    }
+}
+
+/// `name` if nothing in `folder` has it, else the first of `name-1` ...
+/// `name-9999` (the number before the last extension, see `atomic::numbered`)
+/// that is free; `None` when all are taken. Names are compared as the planner
+/// compares them (case-insensitively, see [`plan_files_to`]), so a suggested
+/// name is one Batch would also treat as free. A missing or unreadable
+/// `folder` has no entries.
+pub fn first_free_name(folder: &Path, name: &OsStr) -> Option<OsString> {
+    first_free_name_with(folder, name, MAX_NAME_NUMBER)
+}
+
+/// [`first_free_name`] with the highest number given; the tests shrink it.
+fn first_free_name_with(folder: &Path, name: &OsStr, last: u32) -> Option<OsString> {
+    OutputFolder::read(folder).free_name(name, last)
 }
 
 /// `optimized-<file name>`, built from the `OsStr` so that nothing is lost on
@@ -334,7 +365,10 @@ pub(crate) fn format_of(path: &Path) -> Option<Format> {
     }
 }
 
-fn has_supported_extension(path: &Path) -> bool {
+/// Whether `path` has a PNG, JPG, SVG or WebP extension, in any case: the
+/// planner's test for a file it can optimise, also used by Single image mode
+/// to pick the image out of a drop.
+pub fn has_supported_extension(path: &Path) -> bool {
     format_of(path).is_some()
 }
 
@@ -1068,6 +1102,71 @@ mod tests {
                 skip(big, Skip::TooLarge),
                 optimize(small, out.join("logo.png")),
             ]
+        );
+    }
+
+    // --- first_free_name and the planner's free_name, with the bound shrunk ---
+
+    #[test]
+    fn first_free_name_with_is_none_when_all_are_taken() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["a.png", "a-1.png", "a-2.png", "a-3.png"] {
+            touch(tmp.path(), name);
+        }
+
+        assert_eq!(
+            first_free_name_with(tmp.path(), OsStr::new("a.png"), 3),
+            None
+        );
+    }
+
+    #[test]
+    fn first_free_name_with_gives_the_last_number_when_only_it_is_free() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["a.png", "a-1.png", "a-2.png"] {
+            touch(tmp.path(), name);
+        }
+
+        assert_eq!(
+            first_free_name_with(tmp.path(), OsStr::new("a.png"), 3),
+            Some(OsString::from("a-3.png"))
+        );
+    }
+
+    #[test]
+    fn free_name_falls_back_to_the_name_when_all_are_taken() {
+        // The planner plans the name itself; the write then fails with "no
+        // free name in the output folder".
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        touch(&out, "logo.png");
+        for n in 1..=MAX_NAME_NUMBER {
+            touch(&out, &format!("logo-{n}.png"));
+        }
+        let src_dir = tmp.path().join("src");
+        fs::create_dir(&src_dir).unwrap();
+        let src = touch(&src_dir, "logo.png");
+
+        assert_eq!(
+            plan_files_to(std::slice::from_ref(&src), Some(&out)),
+            vec![optimize(src, out.join("logo.png"))]
+        );
+    }
+
+    #[test]
+    fn free_name_gives_the_first_free_number() {
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        touch(&out, "logo.png");
+        let src_dir = tmp.path().join("src");
+        fs::create_dir(&src_dir).unwrap();
+        let src = touch(&src_dir, "logo.png");
+
+        assert_eq!(
+            plan_files_to(std::slice::from_ref(&src), Some(&out)),
+            vec![optimize(src, out.join("logo-1.png"))]
         );
     }
 }

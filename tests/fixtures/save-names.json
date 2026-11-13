@@ -1,0 +1,61 @@
+{
+  "_about": "Names for Save as, read by src-tauri/src/names.rs (via src-tauri/tests/common/save_names.rs) and by tests/ui/names.test.js. A name is a string, or a rule {\"before\": text, \"repeat\": text, \"times\": n, \"then\": text} for a long name, which is the optional before text, then the repeat text n times, then the optional then text. \"refused\" is keyed by the NameProblem variant a name must give. Each name is the stem; the extension is added to it. Every character outside printable ASCII is a \\uXXXX escape, so an editor cannot change one unnoticed (a test checks it).",
+  "extension": ".jpg",
+  "accepted": [
+    "optimized-holiday",
+    "holiday 2",
+    "vakantie-caf\u00E9",
+    "vakantie-cafe\u0301",
+    ".hidden",
+    "\u200B",
+    "con-x",
+    "com0",
+    "COM\u2074",
+    { "repeat": "a", "times": 196 },
+    { "repeat": "\uD83D\uDE00", "times": 62, "then": "abc" },
+    { "repeat": "\u00E9", "times": 125 }
+  ],
+  "refused": {
+    "Empty": ["", "   ", "\u00A0", "\uFEFF", "\u0085", "\u3000", "\t"],
+    "ForbiddenCharacter": [
+      "a/b",
+      "a\\b",
+      "a:b",
+      "a*b",
+      "a?b",
+      "a\"b",
+      "a<b",
+      "a>b",
+      "a|b",
+      "a\u0001b",
+      "a\u007Fb",
+      "con:",
+      "a/ ",
+      { "repeat": "a", "times": 250, "then": "/" }
+    ],
+    "TrailingSpaceOrDot": [
+      "a ",
+      "a.",
+      "nul.",
+      { "repeat": "a", "times": 250, "then": " " },
+      { "repeat": "a", "times": 250, "then": "." }
+    ],
+    "Reserved": [
+      "CON",
+      "con",
+      "Con.txt",
+      "COM1",
+      "lpt9",
+      "nul.tar",
+      "COM\u00B9",
+      "lpt\u00B3.txt",
+      "com\u00B2",
+      { "before": "con.", "repeat": "a", "times": 250 }
+    ],
+    "TooLong": [
+      { "repeat": "a", "times": 197 },
+      { "repeat": "\uD83D\uDE00", "times": 63 },
+      { "repeat": "\u00E9", "times": 126 }
+    ]
+  }
+}

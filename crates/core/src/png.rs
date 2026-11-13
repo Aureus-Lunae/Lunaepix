@@ -15,6 +15,24 @@ pub(crate) fn check_header(bytes: &[u8]) -> Result<(), String> {
     check_chunks(bytes).map(drop)
 }
 
+/// The width and height the IHDR declares, after [`check_header`]'s checks
+/// and with the same messages. An animated PNG's canvas is its IHDR too.
+/// A file with no IHDR data to read (the signature alone, or an IHDR cut
+/// short) has no size and is refused: [`check_chunks`] leaves such a
+/// truncation to oxipng, which a size-only reader cannot.
+pub(crate) fn header_size(bytes: &[u8]) -> Result<(u32, u32), String> {
+    check_header(bytes)?;
+    // The signature, then the first chunk: its length and type, then its data.
+    let ihdr = bytes
+        .get(SIGNATURE.len() + 4..SIGNATURE.len() + 16)
+        .filter(|chunk| &chunk[..4] == b"IHDR")
+        .ok_or_else(|| {
+            "could not read the PNG data: the IHDR chunk is missing or cut short".to_owned()
+        })?;
+    let side = |at: usize| u32::from_be_bytes([ihdr[at], ihdr[at + 1], ihdr[at + 2], ihdr[at + 3]]);
+    Ok((side(4), side(8)))
+}
+
 /// The eight bytes every PNG file starts with.
 const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
@@ -383,5 +401,49 @@ pub(crate) mod tests {
         // MAX_PIXELS (one pixel wide).
         let worst = 8 * MAX_PIXELS + MAX_PIXELS * 15 / 8 + 7;
         assert!(MAX_DECOMPRESSED_BYTES as u64 >= worst);
+    }
+
+    // --- header_size ------------------------------------------------------------
+
+    #[test]
+    fn header_size_gives_the_ihdr_size_of_a_whole_png_and_of_a_bare_header() {
+        assert_eq!(header_size(&real_png()), Ok((32, 32)));
+        assert_eq!(header_size(&header(300, 200)), Ok((300, 200)));
+        // An animated PNG's canvas is its IHDR.
+        let animated = file(&[ihdr(20, 10, 8, 6), actl()]);
+        assert_eq!(header_size(&animated), Ok((20, 10)));
+    }
+
+    #[test]
+    fn header_size_refuses_what_check_header_refuses_with_the_same_message() {
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("not a png", b"not a png at all".to_vec()),
+            ("two ihdr", file(&[ihdr(8, 8, 8, 6), ihdr(8, 8, 8, 6)])),
+            ("first chunk not ihdr", file(&[actl(), ihdr(8, 8, 8, 6)])),
+            ("over the pixel limit", header(10_000, 10_001)),
+        ];
+        for (what, bytes) in cases {
+            let expected = check_header(&bytes).unwrap_err();
+            assert_eq!(header_size(&bytes), Err(expected), "{what}");
+        }
+        // The control: within the limit both succeed.
+        assert_eq!(check_header(&header(10_000, 10_000)), Ok(()));
+        assert_eq!(header_size(&header(10_000, 10_000)), Ok((10_000, 10_000)));
+    }
+
+    #[test]
+    fn header_size_refuses_a_file_without_ihdr_data() {
+        // Only the signature: `check_header` passes (there is nothing to
+        // walk), but there is no size to give.
+        assert_eq!(check_header(&SIGNATURE), Ok(()));
+        let none = header_size(&SIGNATURE).unwrap_err();
+        assert!(none.contains("IHDR"), "{none}");
+        // An IHDR whose data is cut short.
+        let mut cut = header(8, 8);
+        cut.truncate(8 + 8 + 5);
+        let short = header_size(&cut).unwrap_err();
+        assert!(short.contains("IHDR"), "{short}");
+        // The same file whole is answered.
+        assert_eq!(header_size(&header(8, 8)), Ok((8, 8)));
     }
 }

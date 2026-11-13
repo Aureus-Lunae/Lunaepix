@@ -145,6 +145,16 @@ impl WebpFile<'_> {
         }
     }
 
+    /// The size the file declares first: the `VP8X` canvas (always the first
+    /// chunk when there is one), else the header of the first `VP8L` or
+    /// `VP8 ` chunk. `parse` read every header already, so it is well-formed;
+    /// `None` only for chunks that declare none.
+    pub(crate) fn size(&self) -> Option<(u32, u32)> {
+        self.chunks
+            .iter()
+            .find_map(|chunk| declared_size(chunk).ok().flatten())
+    }
+
     /// The largest width or height any size header of the file declares:
     /// the `VP8X` canvas and the `VP8L` and `VP8 ` image headers. Nothing is
     /// decoded. `parse` read every header already, so each is there and
@@ -2242,5 +2252,59 @@ pub(super) mod tests {
                 error
             );
         }
+    }
+
+    // --- size -----------------------------------------------------------------
+
+    /// A `WebpFile` of exactly these chunks, as `parse` would hand it back for
+    /// a file that has them (`parse` itself refuses a file with no image
+    /// chunk, so a file with no size chunk can only be built by hand).
+    fn file_of<'a>(chunks: &[(&[u8; 4], &'a [u8])], kind: Kind) -> WebpFile<'a> {
+        WebpFile {
+            chunks: chunks
+                .iter()
+                .map(|&(fourcc, data)| Chunk {
+                    fourcc: *fourcc,
+                    data,
+                })
+                .collect(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn size_is_the_vp8x_canvas_when_there_is_one_and_the_image_header_when_not() {
+        let vp8x_payload = [0, 0, 0, 0, 19, 0, 0, 9, 0, 0];
+        let vp8l_payload = vp8l_payload(30, 20);
+        let with_canvas = file_of(
+            &[(b"VP8X", &vp8x_payload), (b"VP8L", &vp8l_payload)],
+            Kind::Lossless,
+        );
+        assert_eq!(with_canvas.size(), Some((20, 10)));
+        let without = file_of(&[(b"VP8L", &vp8l_payload)], Kind::Lossless);
+        assert_eq!(without.size(), Some((30, 20)));
+        let vp8_payload = vp8_payload(7, 5);
+        let lossy = file_of(&[(b"VP8 ", &vp8_payload)], Kind::Lossy);
+        assert_eq!(lossy.size(), Some((7, 5)));
+    }
+
+    #[test]
+    fn size_is_none_for_chunks_that_declare_no_size() {
+        let icc = [0; 12];
+        let none = file_of(&[(b"ICCP", &icc), (b"EXIF", &icc)], Kind::Lossless);
+        assert_eq!(none.size(), None);
+        assert_eq!(file_of(&[], Kind::Lossless).size(), None);
+        // The control: add a chunk that declares one and it is found.
+        let vp8l_payload = vp8l_payload(3, 2);
+        let found = file_of(&[(b"ICCP", &icc), (b"VP8L", &vp8l_payload)], Kind::Lossless);
+        assert_eq!(found.size(), Some((3, 2)));
+    }
+
+    #[test]
+    fn size_skips_a_chunk_whose_header_is_malformed() {
+        // A VP8L that is too short to declare anything gives no size by
+        // itself (`parse` refuses such a file before `size` is asked).
+        let short = [0x2F, 1];
+        assert_eq!(file_of(&[(b"VP8L", &short)], Kind::Lossless).size(), None);
     }
 }

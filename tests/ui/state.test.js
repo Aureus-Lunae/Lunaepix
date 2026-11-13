@@ -438,7 +438,7 @@ test('classifyRejection says "busy" for a busy rejection, which run-busy already
   assert.equal(classifyRejection('busy'), 'busy');
 });
 
-test('classifyRejection says "known" for the other two rejections of the interface', () => {
+test('classifyRejection says "known" for no-output and open-failed', () => {
   assert.equal(classifyRejection('no-output'), 'known');
   assert.equal(classifyRejection('open-failed'), 'known');
 });
@@ -792,6 +792,20 @@ test('switching_to_lossless_puts_back_the_last_valid_quality', () => {
   assert.equal(canRun(state), true);
 });
 
+test('run_in_lossless_is_not_blocked_by_an_invalid_hidden_quality_text', () => {
+  // Not reachable through `reduce` (set-mode puts back the last valid
+  // quality), so the state is built: the hidden text must never block
+  // Lossless, which sends the last valid quality.
+  const lossless = { ...apply(initialState(), threeFiles(), setMode('lossy'), setQuality('60'), setMode('lossless')), qualityText: 'abc' };
+  assert.deepEqual(runSettings(lossless), { mode: 'lossless', quality: 60 });
+  assert.equal(canRun(lossless), true);
+  assert.deepEqual(startRunArgs(lossless), { settings: { mode: 'lossless', quality: 60 } });
+  // The same text in Lossy blocks Run.
+  const lossy = { ...lossless, mode: 'lossy' };
+  assert.equal(runSettings(lossy), null);
+  assert.equal(canRun(lossy), false);
+});
+
 test('switching_to_lossless_keeps_a_valid_quality_text_as_typed', () => {
   const state = apply(initialState(), threeFiles(), setMode('lossy'), setQuality('075'), setMode('lossless'));
   assert.equal(state.qualityText, '075');
@@ -949,6 +963,39 @@ test('a_run_rejection_spelled_differently_stays_unknown', () => {
   }
   // Control: the exact spelling is known.
   assert.equal(classifyRejection('empty-list'), 'known');
+});
+
+// Single image mode's rejections (src-tauri/INTERFACE.md, Commands)
+
+test('each_new_rejection_gives_its_message', () => {
+  for (const [reason, message] of [
+    ['no-image', 'Load an image first.'],
+    ['not-ready', 'The compressed version is not ready yet.'],
+    ['nothing-to-move', 'There is nothing to move to Batch any more.'],
+    ['save-failed', 'The file could not be saved.'],
+    // save_image's output-missing gets today's text, unchanged.
+    ['output-missing', MESSAGES.outputMissing],
+  ]) {
+    assert.equal(reduce(initialState(), { type: 'command-rejected', payload: reason }).message, message, reason);
+    assert.deepEqual(afterRejection(reason), { log: false, action: { type: 'command-rejected', payload: reason } }, reason);
+  }
+});
+
+test('the_new_known_rejections_are_not_logged', () => {
+  for (const reason of ['no-image', 'not-ready', 'nothing-to-move', 'save-failed', 'invalid-name', 'name-taken']) {
+    assert.equal(classifyRejection(reason), 'known', reason);
+    assert.equal(afterRejection(reason).log, false, reason);
+  }
+});
+
+test('invalid_view_and_an_unknown_string_are_logged_with_the_generic_message', () => {
+  // invalid-view means the window sent a view the backend does not have: a
+  // bug, so it is logged and the user gets the generic message.
+  for (const reason of ['invalid-view', 'name_taken', 'Not-ready']) {
+    assert.equal(classifyRejection(reason), 'unknown', reason);
+    assert.equal(afterRejection(reason).log, true, reason);
+    assert.equal(reduce(initialState(), { type: 'command-rejected', payload: reason }).message, MESSAGES.unknown, reason);
+  }
 });
 
 // the drop area

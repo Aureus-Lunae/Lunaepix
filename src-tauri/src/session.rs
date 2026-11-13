@@ -1,40 +1,55 @@
 //! The backend's state and what each command does with it: the file list,
-//! the output setting, the busy guard, the run itself with its events, and
-//! the output folder a run leaves behind. No Tauri here: the side effects
-//! (the window's events, the dialogs, the run thread, the system opener, the
-//! runner) come in as closures, so all of it is tested without a window,
-//! failures included.
+//! the output setting, the busy guard, the run itself with its events, the
+//! output folder a run or a save leaves behind, and Single image mode's
+//! view, loading, drops and save (its state in `single`). No Tauri here: the
+//! side effects (the window's events, the dialogs, the run thread, the
+//! system opener, the runner, the probe, the save's writer) come in as
+//! closures, so all of it is tested without a window, failures included.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs;
+use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use lunaepix_core::{
-    Compression, FileResult, Job, Options, Quality, Skip, StopHandle, Worker, WriteMode,
-    images_in_folder, plan_files_to,
+    Compression, FileResult, Job, Options, ProbeAnswer, Quality, Skip, StopHandle, Worker,
+    WriteMode, first_free_name, images_in_folder, plan_files_to, run_probe, run_until_stopped,
+    save_new,
 };
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::events::{
-    Event, FileStarted, ListChanged, ListRow, OVER_LIMIT_NAME, RunFinished, RunStarted, file_done,
-    file_name_of, output_changed, over_limit_reason, over_limit_row,
+    Event, FileStarted, ImageSaved, ListChanged, ListRow, OVER_LIMIT_NAME, RunFinished, RunStarted,
+    file_done, file_name_of, output_changed, over_limit_reason, over_limit_row,
+};
+use crate::names::check_save_name;
+use crate::single::{
+    FOLDERS_GO_IN_BATCH_NOTICE, NOT_AN_IMAGE_NOTICE, PreviewJob, SaveArgs, Single, View, free_stem,
+    left_out_notice, parse_save_args, parse_view, plan_drop,
 };
 use crate::thumbs::Thumbs;
 
 /// Why a command did nothing. Serialised as a bare string: `"busy"`,
-/// `"no-output"`, `"open-failed"`, `"invalid-settings"`, `"empty-list"` or
-/// `"output-missing"`.
+/// `"no-output"`, `"open-failed"`, `"invalid-settings"`, `"empty-list"`,
+/// `"output-missing"`, `"invalid-view"`, `"no-image"`, `"nothing-to-move"`,
+/// `"not-ready"`, `"invalid-name"`, `"name-taken"` or `"save-failed"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CommandError {
-    /// A run (or a dialog for one) is already active.
+    /// The guard ([`RunGuard`]) is held: a run, a dialog (for files, a
+    /// folder or an image), a load of a chosen or dropped image, or a save
+    /// is active, or another command is in its short checked section (a
+    /// preview request, a list or output change).
     Busy,
-    /// No completed run has written output yet.
+    /// `open_output_folder` has no folder: nothing was saved and no
+    /// completed run wrote output yet, or the last completed run (after any
+    /// save) wrote nothing. A save sets the folder as a run does.
     NoOutput,
     /// The system could not open the folder (for example, it was removed).
     OpenFailed,
@@ -43,8 +58,74 @@ pub enum CommandError {
     InvalidSettings,
     /// No file in the list can be compressed.
     EmptyList,
-    /// The chosen output folder is gone or cannot be written to.
+    /// The chosen output folder is gone or cannot be written to. For a save
+    /// with no chosen folder it is the original's own folder; for a save it
+    /// is also a folder that went away just before the write.
     OutputMissing,
+    /// `set_view` was given anything but `{ "view": "single" }` or
+    /// `{ "view": "batch" }`.
+    InvalidView,
+    /// Single image mode has no image loaded.
+    NoImage,
+    /// `move_drop_to_batch` with no drop to move: none left items out, or
+    /// its offer is gone (a later load attempt, or a switch by hand).
+    NothingToMove,
+    /// `save_image` named a version that is not the kept version of the
+    /// current image: none is ready yet, the last attempt failed, a newer
+    /// one has replaced it, or the key is another image's. Also when a newer
+    /// version or the window closing removed the named version's file
+    /// before the save read it (after the read the save goes on).
+    NotReady,
+    /// `save_image` was given a name the rules refuse
+    /// ([`crate::names::check_save_name`]), or an argument that is not
+    /// exactly `{ "name": <string>, "preview": <string> }`.
+    InvalidName,
+    /// `save_image`'s name is taken (by a file or a folder) in the folder it
+    /// would write to. Nothing is replaced, and the name is not numbered.
+    NameTaken,
+    /// `save_image`'s write failed for another reason (a full disk, a
+    /// folder that refused it); nothing was written.
+    SaveFailed,
+}
+
+/// Where [`Session::save_image_with`] lets a test step in: after every
+/// check passed (the version's path taken in [`Single::save_source`]'s
+/// section) and before the version is read; and after it was read, before
+/// the write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveSeam {
+    AfterCheck,
+    BeforeWrite,
+}
+
+/// The folder a save writes to: the chosen output folder `out`, or else
+/// `original_folder`, the one the original is in.
+fn save_folder(out: Option<&Path>, original_folder: &Path) -> PathBuf {
+    out.unwrap_or(original_folder).to_path_buf()
+}
+
+/// The bytes of the version file at `path`. A file that is gone (a newer
+/// version became ready and removed it, or the window closed) is
+/// [`CommandError::NotReady`]; any other failure is
+/// [`CommandError::SaveFailed`].
+fn read_version(path: &Path) -> Result<Vec<u8>, CommandError> {
+    fs::read(path).map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound => CommandError::NotReady,
+        _ => CommandError::SaveFailed,
+    })
+}
+
+/// What a failed save write ([`save_new`]) means for the window: a taken
+/// name is [`CommandError::NameTaken`]; a folder that is gone (`save_new`
+/// creates none: `NotFound`), also one removed after [`can_write_in`]
+/// passed, is [`CommandError::OutputMissing`]; anything else is
+/// [`CommandError::SaveFailed`].
+fn save_error(error: &io::Error) -> CommandError {
+    match error.kind() {
+        io::ErrorKind::AlreadyExists => CommandError::NameTaken,
+        io::ErrorKind::NotFound => CommandError::OutputMissing,
+        _ => CommandError::SaveFailed,
+    }
 }
 
 /// The `notice` of an add that changed nothing because a dropped or picked
@@ -278,9 +359,9 @@ fn can_write_in(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Run `work(value)` on a thread that `spawn` starts. If no thread can be
-/// started, run it on this thread instead, so that `value` (a run, or a
-/// drop with its ticket) is never lost and the window never waits for
-/// events that cannot come.
+/// started, run it on this thread instead, so that `value` (a run, a drop
+/// with its ticket, or a preview job) is never lost and the window never
+/// waits for events that cannot come.
 pub fn on_own_thread_or_here<T: Send + 'static>(
     value: T,
     work: impl FnOnce(T) + Clone + Send + 'static,
@@ -349,10 +430,15 @@ pub struct Session {
     list: Mutex<FileList>,
     /// The chosen output folder; `None` for next to the originals.
     output: Mutex<Option<PathBuf>>,
-    /// Output folder of the last completed run, if it wrote anything.
+    /// The folder of the last save, or the output folder of the last
+    /// completed run (`None` if it wrote nothing), whichever came last. Both
+    /// set it while holding the guard, so they never interleave.
     last_output: Mutex<Option<PathBuf>>,
     /// The thumbnail keys of the list sent last, and their thumbnails.
     thumbs: Thumbs,
+    /// Single image mode: the view, the loaded image, the preview state (the
+    /// version being made and the one kept), and the Switch to Batch offer.
+    single: Single,
 }
 
 /// `mutex`'s value, also after a panic elsewhere poisoned it.
@@ -381,7 +467,8 @@ impl Session {
         Ok(())
     }
 
-    /// A file dialog's answer, or a drop: add the paths and send the list.
+    /// A file dialog's answer, a drop while Batch shows, or Switch to Batch:
+    /// add the paths and send the list.
     /// `None` or no paths (a closed dialog) gives the ticket back and then
     /// sends `run-cancelled` instead. Otherwise the ticket is given back
     /// after `list-changed` has gone out. The first add after a finished run
@@ -422,19 +509,19 @@ impl Session {
     }
 
     /// A drop on the window: nothing for no paths; `run-busy` while busy;
-    /// otherwise `add_later` gets the ticket and the paths, to call
-    /// [`Session::add_paths`] off the main thread.
+    /// otherwise `receive_later` gets the ticket and the paths, to call
+    /// [`Session::receive_drop`] off the main thread.
     pub fn drop_paths(
         &self,
         paths: Vec<PathBuf>,
         emit: &mut impl FnMut(Event),
-        add_later: impl FnOnce(RunTicket, Vec<PathBuf>),
+        receive_later: impl FnOnce(RunTicket, Vec<PathBuf>),
     ) {
         if paths.is_empty() {
             return;
         }
         if let Ok(ticket) = claim_run(&self.guard, emit) {
-            add_later(ticket, paths);
+            receive_later(ticket, paths);
         }
     }
 
@@ -473,8 +560,9 @@ impl Session {
     }
 
     /// A folder dialog's answer: the new output folder, announced by its
-    /// name; or, for a closed dialog, `run-cancelled` with the setting left
-    /// as it was.
+    /// name, then, with an image loaded in Single image mode, the name Save
+    /// as starts with there (`name-suggested`); or, for a closed dialog,
+    /// `run-cancelled` with the setting left as it was.
     pub fn set_output(
         &self,
         ticket: RunTicket,
@@ -489,22 +577,30 @@ impl Session {
         let changed = output_changed(Some(&folder));
         *lock(&self.output) = Some(folder);
         emit(Event::OutputChanged(changed));
+        if let Some(suggested) = self.name_suggested() {
+            emit(suggested);
+        }
         drop(ticket);
     }
 
-    /// `clear_output_folder`: back to next to the originals.
+    /// `clear_output_folder`: back to next to the originals, then
+    /// `name-suggested` as [`Session::set_output`] sends it.
     pub fn clear_output_folder(&self, emit: &mut impl FnMut(Event)) -> Result<(), CommandError> {
         let ticket = claim_run(&self.guard, emit)?;
         *lock(&self.output) = None;
         emit(Event::OutputChanged(output_changed(None)));
+        if let Some(suggested) = self.name_suggested() {
+            emit(suggested);
+        }
         drop(ticket);
         Ok(())
     }
 
     /// `start_run`: busy check, `settings`, the output folder, the list
     /// planned now, then at least one compressible row, in that order. On
-    /// success `start` gets the run, to hand to [`Session::run_with_worker`]
-    /// on the run thread.
+    /// success a Single image preview being made is stopped and `start`
+    /// gets the run, to hand to [`Session::run_with_worker`] on the run
+    /// thread.
     pub fn start_run(
         &self,
         settings: Option<&Value>,
@@ -525,6 +621,8 @@ impl Session {
         if !has_optimize(&jobs) {
             return Err(CommandError::EmptyList);
         }
+        // A run and a Single image worker never run at the same time.
+        self.single.stop_preview();
         start(PreparedRun {
             ticket,
             jobs,
@@ -593,8 +691,276 @@ impl Session {
         }
     }
 
-    /// `open_output_folder`: the last completed run's output folder, which
-    /// is the chosen output folder when the run had one.
+    /// Single image mode's state, for the `preview` scheme and the save.
+    pub fn single(&self) -> &Single {
+        &self.single
+    }
+
+    /// The view that shows.
+    pub fn view(&self) -> View {
+        self.single.view()
+    }
+
+    /// `set_view`: busy check, then `args` must be exactly
+    /// `{ "view": "single" }` or `{ "view": "batch" }` (see
+    /// [`crate::single::parse_view`]). The Switch to Batch offer goes; a
+    /// switch to Batch stops the preview being made. The guard is claimed
+    /// and freed at once.
+    pub fn set_view(
+        &self,
+        args: Option<&Value>,
+        emit: &mut impl FnMut(Event),
+    ) -> Result<(), CommandError> {
+        // Every early return drops the ticket, which frees the guard.
+        let ticket = claim_run(&self.guard, emit)?;
+        let view = parse_view(args)?;
+        self.single.set_view(view);
+        drop(ticket);
+        Ok(())
+    }
+
+    /// `choose_image`: claim the guard and hand the ticket to `open_dialog`,
+    /// a one-file dialog whose answer goes to [`Session::load_image`].
+    pub fn choose_image(
+        &self,
+        emit: &mut impl FnMut(Event),
+        open_dialog: impl FnOnce(RunTicket),
+    ) -> Result<(), CommandError> {
+        open_dialog(claim_run(&self.guard, emit)?);
+        Ok(())
+    }
+
+    /// The one-file dialog's answer: `None` (closed) gives the ticket back
+    /// and sends `run-cancelled`, changing nothing. A file is a load
+    /// attempt: the Switch to Batch offer goes, the file is loaded through
+    /// `prober` (see [`Single::load`]), and `image-changed` goes out before
+    /// the ticket is given back.
+    pub fn load_image(
+        &self,
+        ticket: RunTicket,
+        picked: Option<PathBuf>,
+        prober: impl Fn(&Path) -> ProbeAnswer,
+        emit: &mut impl FnMut(Event),
+    ) {
+        let Some(path) = picked else {
+            drop(ticket);
+            emit(Event::RunCancelled);
+            return;
+        };
+        self.single.set_offer(None);
+        let notice = self.single.load(&path, prober).err();
+        emit(self.image_changed(0, notice));
+        drop(ticket);
+    }
+
+    /// The `image-changed` event for the image that shows now, with the
+    /// name suggested for the output setting as it is now.
+    fn image_changed(&self, left_out: usize, notice: Option<String>) -> Event {
+        let out = lock(&self.output).clone();
+        Event::ImageChanged(self.single.image_changed(left_out, notice, out.as_deref()))
+    }
+
+    /// `name-suggested` for the output setting as it is now, when an image
+    /// is loaded.
+    fn name_suggested(&self) -> Option<Event> {
+        let out = lock(&self.output).clone();
+        self.single
+            .name_suggested(out.as_deref())
+            .map(Event::NameSuggested)
+    }
+
+    /// A drop's paths, with the ticket [`Session::drop_paths`] claimed, off
+    /// the main thread: to [`Session::load_drop`] while Single image shows,
+    /// to [`Session::add_paths`] while Batch shows. The view cannot change
+    /// in between: `set_view` needs the ticket this drop holds.
+    pub fn receive_drop(
+        &self,
+        ticket: RunTicket,
+        paths: Vec<PathBuf>,
+        prober: impl Fn(&Path) -> ProbeAnswer,
+        emit: &mut impl FnMut(Event),
+    ) {
+        match self.single.view() {
+            View::Single => self.load_drop(ticket, paths, prober, emit),
+            View::Batch => self.add_paths(ticket, Some(paths), emit),
+        }
+    }
+
+    /// A drop in Single image mode: the first PNG, JPG, SVG or WebP file is
+    /// loaded ([`crate::single::plan_drop`]); the folders and other images
+    /// are left out. A drop that left items out is kept for Switch to
+    /// Batch, any earlier one is forgotten. The notice says how many were
+    /// left out; or, when nothing could be loaded, why (Batch's reason for
+    /// the image tried, "Folders go in Batch." for only folders, else that
+    /// no image was dropped). `image-changed` goes out before the ticket is
+    /// given back.
+    pub fn load_drop(
+        &self,
+        ticket: RunTicket,
+        paths: Vec<PathBuf>,
+        prober: impl Fn(&Path) -> ProbeAnswer,
+        emit: &mut impl FnMut(Event),
+    ) {
+        let plan = plan_drop(&paths);
+        self.single.set_offer(None);
+        let notice = match &plan.load {
+            Some(src) => match self.single.load(src, prober) {
+                Ok(()) => (plan.left_out > 0).then(|| left_out_notice(plan.left_out)),
+                Err(reason) => Some(reason),
+            },
+            None if plan.left_out > 0 => Some(FOLDERS_GO_IN_BATCH_NOTICE.to_owned()),
+            None => Some(NOT_AN_IMAGE_NOTICE.to_owned()),
+        };
+        if plan.left_out > 0 {
+            self.single.set_offer(Some(paths));
+        }
+        emit(self.image_changed(plan.left_out, notice));
+        drop(ticket);
+    }
+
+    /// `move_drop_to_batch`: busy check, then the last drop that left items
+    /// out (else [`CommandError::NothingToMove`]). The view goes to Batch
+    /// (which stops a preview being made) and every item of that drop is
+    /// added to the list, as [`Session::add_paths`] adds them. Not on the
+    /// main thread: adding reads folders.
+    pub fn move_drop_to_batch(&self, emit: &mut impl FnMut(Event)) -> Result<(), CommandError> {
+        let ticket = claim_run(&self.guard, emit)?;
+        let paths = self
+            .single
+            .take_offer()
+            .ok_or(CommandError::NothingToMove)?;
+        self.single.set_view(View::Batch);
+        self.add_paths(ticket, Some(paths), emit);
+        Ok(())
+    }
+
+    /// `preview_image`: busy check, `settings` (as `start_run` checks them,
+    /// [`parse_settings`]), then an image ([`CommandError::NoImage`]), in
+    /// that order. Then the new version is the latest request and
+    /// `preview-started` goes out, in one lock section
+    /// ([`Single::begin_preview`]), the previous request's worker is
+    /// stopped, and `start` gets the job, to hand to [`Session::run_preview`]
+    /// on a thread of its own. Making a version is not busy: the guard is
+    /// held through the checks and the new version only (so a run cannot
+    /// start in between and miss the new worker), and is given back before
+    /// `start`.
+    pub fn preview_image(
+        &self,
+        settings: Option<&Value>,
+        emit: &mut impl FnMut(Event),
+        start: impl FnOnce(PreviewJob),
+    ) -> Result<(), CommandError> {
+        // Every early return drops the ticket, which frees the guard.
+        let ticket = claim_run(&self.guard, emit)?;
+        // A call without settings is refused like any badly shaped one.
+        let settings = settings.ok_or(CommandError::InvalidSettings)?;
+        let compression = parse_settings(settings)?;
+        let job = self.single.begin_preview(compression, emit)?;
+        drop(ticket);
+        start(job);
+        Ok(())
+    }
+
+    /// Make `job`'s version with `worker` (its options from the job: the
+    /// request's compression, never replacing) until the job is stopped,
+    /// and send what [`Single::settle_preview`] makes of the result: for
+    /// the latest request `preview-ready` or `preview-failed`, otherwise
+    /// nothing. The worker runs while this holds the worker gate
+    /// ([`Single::worker_gate`]), so it never starts while a version folder
+    /// is being cleaned up.
+    pub fn run_preview(&self, job: PreviewJob, worker: &Worker, emit: &mut impl FnMut(Event)) {
+        let worker = worker.with_options(&job.options());
+        let result = {
+            let _gate = self.single.worker_gate();
+            run_until_stopped(&[job.job()], &worker, &job.stop, |_, _, _| {}).pop()
+        };
+        self.single.settle_preview(&job, result, emit);
+    }
+
+    /// `save_image`: write the version the window shows under the name
+    /// typed in Save as, never replacing a file. The guard is held for the
+    /// whole save. Checks, in this order: busy; `args` exactly
+    /// `{ "name": <string>, "preview": <string> }`
+    /// ([`crate::single::parse_save_args`], else
+    /// [`CommandError::InvalidName`]); an image
+    /// ([`CommandError::NoImage`]); `preview` the key of the kept version
+    /// ([`Single::save_source`], else [`CommandError::NotReady`]); the name
+    /// rules with the original's extension ([`check_save_name`], else
+    /// `InvalidName`); the target folder (the chosen output folder, or the
+    /// original's own) writable now ([`can_write_in`], else
+    /// [`CommandError::OutputMissing`]). Then the version's bytes go to
+    /// `<folder>/<name><ext>` with the original's permissions through
+    /// [`save_new`]: a taken name (a file or a folder) is
+    /// [`CommandError::NameTaken`], a folder gone by then
+    /// [`CommandError::OutputMissing`], any other failure
+    /// [`CommandError::SaveFailed`]; nothing is written then. On success
+    /// the folder becomes the one `open_output_folder` opens, and
+    /// `image-saved` goes out, both before the guard is given back.
+    ///
+    /// Closing the window does not wait for a save: [`Session::shutdown`]
+    /// neither stops nor waits for it, so a save that has read its bytes
+    /// completes while the process runs on. If the process exits during the
+    /// write, the file may be missing and `save_new`'s hidden staging file
+    /// (`.tmp` and six characters) may be left in the target folder. Waiting
+    /// at close is not done: the close handler runs on the main thread,
+    /// and the guard it would wait for may be held by an open dialog.
+    pub fn save_image(
+        &self,
+        args: Option<&Value>,
+        emit: &mut impl FnMut(Event),
+    ) -> Result<(), CommandError> {
+        self.save_image_with(args, emit, save_new, &mut |_| {})
+    }
+
+    /// [`Session::save_image`] with the writer given (`save_new` outside the
+    /// tests) and `seam` called at each [`SaveSeam`].
+    pub(crate) fn save_image_with(
+        &self,
+        args: Option<&Value>,
+        emit: &mut impl FnMut(Event),
+        write: impl FnOnce(&Path, &[u8], fs::Permissions) -> io::Result<()>,
+        seam: &mut dyn FnMut(SaveSeam),
+    ) -> Result<(), CommandError> {
+        // Every early return drops the ticket, which frees the guard. While
+        // it is held no load, view change, preview request, run or output
+        // change can start; a preview already running can still finish.
+        let ticket = claim_run(&self.guard, emit)?;
+        let SaveArgs { name, preview } = parse_save_args(args)?;
+        let source = self.single.save_source(&preview)?;
+        check_save_name(&name, &source.image.extension).map_err(|_| CommandError::InvalidName)?;
+        let out = lock(&self.output).clone();
+        let folder = save_folder(out.as_deref(), &source.image.folder);
+        can_write_in(&folder).map_err(|_| CommandError::OutputMissing)?;
+        seam(SaveSeam::AfterCheck);
+        let bytes = read_version(&source.version)?;
+        seam(SaveSeam::BeforeWrite);
+        let file_name = format!("{name}{}", source.image.extension);
+        write(&folder.join(&file_name), &bytes, source.image.permissions)
+            .map_err(|error| save_error(&error))?;
+        // Stored before the event, as a run stores its folder before
+        // `run-finished`, so "Open folder" works as soon as the window
+        // hears it. A run stores it only while holding the guard too.
+        *lock(&self.last_output) = Some(folder.clone());
+        emit(Event::ImageSaved(ImageSaved {
+            folder: output_changed(out.as_deref()).folder,
+            suggested: free_stem(&folder, OsStr::new(&file_name), first_free_name),
+            name: file_name,
+        }));
+        drop(ticket);
+        Ok(())
+    }
+
+    /// The window closes: stop the preview and remove Single image mode's
+    /// private folder ([`Single::shutdown`]). A save that has not read its
+    /// version yet then answers [`CommandError::NotReady`]; one that has goes
+    /// on, and nothing here waits for it (see [`Session::save_image`]).
+    pub fn shutdown(&self) {
+        self.single.shutdown();
+    }
+
+    /// `open_output_folder`: the folder of the last save, or the last
+    /// completed run's output folder (the chosen output folder when the run
+    /// had one), whichever came last.
     pub fn open_output_folder<E>(
         &self,
         open: impl FnOnce(&Path) -> Result<(), E>,
@@ -603,13 +969,18 @@ impl Session {
     }
 }
 
-/// Allows one run at a time. A run holds a [`RunTicket`] from the moment it
-/// is asked for (before a dialog opens) until it is over.
+/// Allows one guarded action at a time (the busy guard). A run holds a
+/// [`RunTicket`] from the moment it is asked for (before a dialog opens)
+/// until it is over; so do a load of a chosen or dropped image (from the
+/// dialog or the drop until `image-changed` has gone out), a save (until
+/// `image-saved` has gone out) and a dialog for files or a folder. Every
+/// other command except `open_output_folder` holds one through its own
+/// checks and changes, a preview request only until its job is registered.
 #[derive(Debug, Clone, Default)]
 pub struct RunGuard(Arc<AtomicBool>);
 
-/// Proof that the holder may run. Dropping it frees the guard, also when the
-/// run panics.
+/// Proof that the holder may act (run, load, save, change the list or the
+/// output). Dropping it frees the guard, also when the holder panics.
 #[derive(Debug)]
 pub struct RunTicket(Arc<AtomicBool>);
 
@@ -633,8 +1004,9 @@ impl Drop for RunTicket {
     }
 }
 
-/// A ticket for a new run; or, while a run is active, `run-busy` to the
-/// window and [`CommandError::Busy`] to the caller.
+/// A ticket for the caller (a run, a dialog, a load, a save or another
+/// command); or, while another ticket is alive, `run-busy` to the window and
+/// [`CommandError::Busy`] to the caller.
 pub fn claim_run(
     guard: &RunGuard,
     emit: &mut impl FnMut(Event),
@@ -645,10 +1017,17 @@ pub fn claim_run(
     })
 }
 
-/// Open the output folder of the last completed run with `open` (the system
-/// file manager). [`CommandError::NoOutput`] without calling `open` if there
-/// is none; [`CommandError::OpenFailed`] if `open` fails. The lock is not
-/// held while `open` runs.
+/// The prober Single image mode loads with: [`run_probe`] with `worker`'s
+/// program, the same program the runs and the thumbnails use.
+pub fn worker_prober(worker: &Worker) -> impl Fn(&Path) -> ProbeAnswer + '_ {
+    move |src| run_probe(&worker.program, src)
+}
+
+/// Open the folder in `last_output` (the last save's, or the last completed
+/// run's output folder) with `open` (the system file manager).
+/// [`CommandError::NoOutput`] without calling `open` if there is none;
+/// [`CommandError::OpenFailed`] if `open` fails. The lock is not held while
+/// `open` runs.
 pub fn open_last_output<E>(
     last_output: &Mutex<Option<PathBuf>>,
     open: impl FnOnce(&Path) -> Result<(), E>,
@@ -663,7 +1042,8 @@ pub fn open_last_output<E>(
 
 /// What a run has done so far, kept up to date file by file so that a run
 /// that ends early still has a summary. The output folder it records is the
-/// one source of both `has_output` and the folder "Open folder" opens.
+/// one source of both `has_output` and the folder "Open folder" opens after
+/// the run (until a later save).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tally {
     optimised: usize,
@@ -936,12 +1316,33 @@ mod tests {
             CommandError::Busy,
             CommandError::NoOutput,
             CommandError::OpenFailed,
+            CommandError::InvalidView,
+            CommandError::NoImage,
+            CommandError::NothingToMove,
+            CommandError::NotReady,
+            CommandError::InvalidName,
+            CommandError::NameTaken,
+            CommandError::SaveFailed,
         ];
         let json: Vec<String> = errors
             .iter()
             .map(|error| serde_json::to_string(error).unwrap())
             .collect();
-        assert_eq!(json, [r#""busy""#, r#""no-output""#, r#""open-failed""#]);
+        assert_eq!(
+            json,
+            [
+                r#""busy""#,
+                r#""no-output""#,
+                r#""open-failed""#,
+                r#""invalid-view""#,
+                r#""no-image""#,
+                r#""nothing-to-move""#,
+                r#""not-ready""#,
+                r#""invalid-name""#,
+                r#""name-taken""#,
+                r#""save-failed""#
+            ]
+        );
     }
 
     // --- open the last output -----------------------------------------------
@@ -3902,5 +4303,2500 @@ mod tests {
         );
         assert!(ran.lock().unwrap().is_empty());
         assert_eq!(fell_back.get(), Some(7));
+    }
+
+    // --- Single image mode ----------------------------------------------------
+
+    use crate::events::ImageChanged;
+    use crate::single::LoadedImage;
+    use lunaepix_core::{MAX_FILE_BYTES, Probe};
+
+    /// A prober double: answers `answer` and records every path it is given.
+    struct Prober {
+        answer: ProbeAnswer,
+        asked: RefCell<Vec<PathBuf>>,
+    }
+
+    impl Prober {
+        fn new(answer: ProbeAnswer) -> Self {
+            Prober {
+                answer,
+                asked: RefCell::default(),
+            }
+        }
+
+        /// A 640 × 480 picture.
+        fn sized() -> Self {
+            Self::new(ProbeAnswer::Size(Probe {
+                width: Some(640),
+                height: Some(480),
+            }))
+        }
+
+        fn probe(&self) -> impl Fn(&Path) -> ProbeAnswer + '_ {
+            |path| {
+                self.asked.borrow_mut().push(path.to_path_buf());
+                self.answer.clone()
+            }
+        }
+
+        fn asked(&self) -> Vec<PathBuf> {
+            self.asked.borrow().clone()
+        }
+    }
+
+    /// `choose_image`, answered with `picked`.
+    fn choose_image(session: &Session, window: &Window, picked: Option<&Path>, prober: &Prober) {
+        session
+            .choose_image(&mut window.emit(), |ticket| {
+                session.load_image(
+                    ticket,
+                    picked.map(Path::to_path_buf),
+                    prober.probe(),
+                    &mut window.emit(),
+                );
+            })
+            .unwrap();
+    }
+
+    /// A drop of `paths` as `lib.rs` makes it, received at once instead of
+    /// on another thread.
+    fn drop_routed(session: &Session, window: &Window, paths: &[PathBuf], prober: &Prober) {
+        session.drop_paths(paths.to_vec(), &mut window.emit(), |ticket, paths| {
+            session.receive_drop(ticket, paths, prober.probe(), &mut window.emit());
+        });
+    }
+
+    fn set_view(session: &Session, window: &Window, view: &str) {
+        session
+            .set_view(Some(&json!({ "view": view })), &mut window.emit())
+            .unwrap();
+    }
+
+    /// Every `image-changed` among `events`.
+    fn images(events: &[Event]) -> Vec<&ImageChanged> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ImageChanged(changed) => Some(changed),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The one event the window heard: an `image-changed`, as JSON.
+    fn only_image_changed(window: &Window) -> Value {
+        let events = window.take();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].name(), "image-changed");
+        value(&events[0])
+    }
+
+    fn loaded(session: &Session) -> LoadedImage {
+        session.single().current().expect("an image is loaded")
+    }
+
+    /// The folder of the image with `key`, beside the current image's.
+    fn image_folder(session: &Session, key: u64) -> PathBuf {
+        let private = loaded(session)
+            .copy
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        private.join(format!("image-{key}"))
+    }
+
+    fn guard_is_free(session: &Session) -> bool {
+        session.guard.try_start().is_some()
+    }
+
+    // The view.
+
+    #[test]
+    fn single_is_the_view_at_start() {
+        let session = Session::new();
+        assert_eq!(session.view(), View::Single);
+        assert_ne!(session.view(), View::Batch);
+    }
+
+    #[test]
+    fn set_view_refuses_anything_but_single_or_batch() {
+        let session = Session::new();
+        let window = Window::default();
+        set_view(&session, &window, "batch");
+        assert_eq!(session.view(), View::Batch);
+        set_view(&session, &window, "single");
+        assert_eq!(session.view(), View::Single);
+        assert!(window.take().is_empty(), "no event for a switch");
+
+        let bad = [
+            Some(json!({ "view": "Single" })),
+            Some(json!({ "view": "BATCH" })),
+            Some(json!({ "view": 1 })),
+            Some(json!({ "view": null })),
+            Some(json!({})),
+            Some(json!({ "view": "batch", "extra": 1 })),
+            Some(json!("batch")),
+            Some(json!(["batch"])),
+            Some(Value::Null),
+            None,
+        ];
+        for args in &bad {
+            assert_eq!(
+                session.set_view(args.as_ref(), &mut window.emit()),
+                Err(CommandError::InvalidView),
+                "{args:?}"
+            );
+            assert_eq!(session.view(), View::Single, "{args:?}");
+            assert!(guard_is_free(&session));
+        }
+        assert!(window.take().is_empty());
+        assert_eq!(error_json(CommandError::InvalidView), json!("invalid-view"));
+    }
+
+    #[test]
+    fn set_view_is_busy_during_a_run() {
+        let session = Session::new();
+        let window = Window::default();
+        let run = session.guard.try_start().unwrap();
+        assert_eq!(
+            session.set_view(Some(&json!({ "view": "batch" })), &mut window.emit()),
+            Err(CommandError::Busy)
+        );
+        assert_eq!(window.take(), [Event::RunBusy]);
+        assert_eq!(session.view(), View::Single);
+        drop(run);
+        set_view(&session, &window, "batch");
+        assert_eq!(session.view(), View::Batch);
+    }
+
+    #[test]
+    fn a_drop_in_single_view_loads_and_does_not_touch_the_list() {
+        let (_dir, paths) = files(&[("a.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        let prober = Prober::sized();
+        drop_routed(&session, &window, &paths, &prober);
+        let events = window.take();
+        assert_eq!(images(&events).len(), 1, "{events:?}");
+        assert!(
+            !events.iter().any(|event| event.name() == "list-changed"),
+            "{events:?}"
+        );
+        assert_eq!(prober.asked().len(), 1);
+        assert!(lock(&session.list).rows(None).is_empty());
+        assert!(guard_is_free(&session));
+    }
+
+    #[test]
+    fn a_drop_in_batch_view_adds_to_the_list_and_does_not_load() {
+        let (_dir, paths) = files(&[("a.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        set_view(&session, &window, "batch");
+        let prober = Prober::sized();
+        drop_routed(&session, &window, &paths, &prober);
+        let events = window.take();
+        assert_eq!(row_names(last_list(&events)), ["a.png"]);
+        assert!(images(&events).is_empty(), "{events:?}");
+        assert!(prober.asked().is_empty());
+        assert_eq!(session.single().current(), None);
+        assert!(guard_is_free(&session));
+    }
+
+    // Loading.
+
+    #[test]
+    fn loading_copies_the_file_and_probes_the_copy() {
+        let (_dir, paths) = files(&[("holiday.png", b"the picture")]);
+        let session = Session::new();
+        let window = Window::default();
+        let prober = Prober::sized();
+        choose_image(&session, &window, Some(&paths[0]), &prober);
+        assert_eq!(
+            only_image_changed(&window),
+            json!({ "image": { "name": "holiday.png", "size": 11, "width": 640, "height": 480,
+                               "key": "1", "suggested": "optimized-holiday", "extension": ".png" },
+                    "left_out": 0, "notice": null })
+        );
+        let image = loaded(&session);
+        assert_eq!(image.copy.file_name().unwrap(), "original.png");
+        assert_eq!(image.copy.parent().unwrap().file_name().unwrap(), "image-1");
+        assert_eq!(fs::read(&image.copy).unwrap(), b"the picture");
+        // The prober got the copy, never the original.
+        assert_eq!(prober.asked(), std::slice::from_ref(&image.copy));
+        assert_ne!(prober.asked(), std::slice::from_ref(&paths[0]));
+        assert_eq!(image.original(), paths[0]);
+        assert_eq!(image.extension, ".png");
+        assert_eq!(image.size, 11);
+        assert!(guard_is_free(&session));
+    }
+
+    #[test]
+    fn a_new_load_gives_a_new_key_and_removes_the_old_images_folder() {
+        let (_dir, paths) = files(&[("a.png", b"one")]);
+        let session = Session::new();
+        let window = Window::default();
+        let prober = Prober::sized();
+        choose_image(&session, &window, Some(&paths[0]), &prober);
+        let first = loaded(&session);
+        assert_eq!(first.key, 1);
+        // The file as it is at the next load is the one taken.
+        fs::write(&paths[0], b"two!").unwrap();
+        choose_image(&session, &window, Some(&paths[0]), &prober);
+        let second = loaded(&session);
+        assert_eq!(second.key, 2);
+        assert_eq!(fs::read(&second.copy).unwrap(), b"two!");
+        assert!(!image_folder(&session, 1).exists());
+        assert!(image_folder(&session, 2).is_dir());
+        let keys: Vec<Value> = images(&window.take())
+            .iter()
+            .map(|changed| value(&Event::ImageChanged((*changed).clone()))["image"]["key"].clone())
+            .collect();
+        assert_eq!(keys, [json!("1"), json!("2")]);
+    }
+
+    #[test]
+    fn a_refused_probe_keeps_the_current_image_and_sends_its_reason() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"broken")]);
+        let session = Session::new();
+        let window = Window::default();
+        choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+        window.take();
+        let refusing = Prober::new(ProbeAnswer::Refused("Batch's reason".to_owned()));
+        choose_image(&session, &window, Some(&paths[1]), &refusing);
+        let changed = only_image_changed(&window);
+        assert_eq!(changed["image"]["key"], json!("1"));
+        assert_eq!(changed["image"]["name"], json!("a.png"));
+        assert_eq!(changed["notice"], json!("Batch's reason"));
+        assert_eq!(changed["left_out"], json!(0));
+        assert_eq!(loaded(&session).key, 1);
+        assert!(image_folder(&session, 1).is_dir());
+        // The refused attempt's copy is gone.
+        assert_eq!(refusing.asked().len(), 1);
+        assert!(!refusing.asked()[0].exists());
+        assert!(!image_folder(&session, 2).exists());
+    }
+
+    #[test]
+    fn a_failed_probe_keeps_the_current_image_with_a_reason() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+        window.take();
+        choose_image(
+            &session,
+            &window,
+            Some(&paths[1]),
+            &Prober::new(ProbeAnswer::Failed),
+        );
+        let changed = only_image_changed(&window);
+        assert_eq!(changed["image"]["key"], json!("1"));
+        assert_eq!(
+            changed["notice"],
+            json!("the optimiser crashed on this file (it gave no valid result)")
+        );
+        assert_eq!(loaded(&session).key, 1);
+        assert!(!image_folder(&session, 2).exists());
+    }
+
+    #[test]
+    fn a_non_image_choice_keeps_the_current_image_with_the_not_an_image_notice() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("notes.txt", b"text")]);
+        let session = Session::new();
+        let window = Window::default();
+        // Without an image: `image` is null.
+        let prober = Prober::sized();
+        choose_image(&session, &window, Some(&paths[1]), &prober);
+        assert_eq!(
+            only_image_changed(&window),
+            json!({ "image": null, "left_out": 0, "notice": "Not a PNG, JPG, SVG or WebP file." })
+        );
+        assert!(prober.asked().is_empty());
+        // With one: it stays.
+        choose_image(&session, &window, Some(&paths[0]), &prober);
+        window.take();
+        choose_image(&session, &window, Some(&paths[1]), &prober);
+        let changed = only_image_changed(&window);
+        assert_eq!(changed["image"]["key"], json!("1"));
+        assert_eq!(
+            changed["notice"],
+            json!("Not a PNG, JPG, SVG or WebP file.")
+        );
+        assert_eq!(prober.asked().len(), 1, "only a.png was probed");
+    }
+
+    #[test]
+    fn a_closed_dialog_sends_run_cancelled_and_changes_nothing() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        let prober = Prober::sized();
+        // An image, and a drop that left one out.
+        drop_routed(&session, &window, &paths, &prober);
+        window.take();
+        let before = loaded(&session);
+
+        choose_image(&session, &window, None, &prober);
+        assert_eq!(window.take(), [Event::RunCancelled]);
+        assert_eq!(loaded(&session), before);
+        assert_eq!(prober.asked().len(), 1);
+        assert!(guard_is_free(&session));
+        // The offer is still there.
+        assert_eq!(session.move_drop_to_batch(&mut window.emit()), Ok(()));
+    }
+
+    #[test]
+    fn choose_image_is_busy_during_a_run() {
+        let session = Session::new();
+        let window = Window::default();
+        let run = session.guard.try_start().unwrap();
+        let opened = Cell::new(false);
+        assert_eq!(
+            session.choose_image(&mut window.emit(), |_| opened.set(true)),
+            Err(CommandError::Busy)
+        );
+        assert!(!opened.get());
+        assert_eq!(window.take(), [Event::RunBusy]);
+        drop(run);
+        assert_eq!(
+            session.choose_image(&mut window.emit(), |_| opened.set(true)),
+            Ok(())
+        );
+        assert!(opened.get());
+    }
+
+    /// Every file named `original*` under `root`, two levels down.
+    fn copies_under(root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for private in fs::read_dir(root).unwrap().flatten() {
+            let Ok(images) = fs::read_dir(private.path()) else {
+                continue;
+            };
+            for image in images.flatten() {
+                for file in fs::read_dir(image.path()).into_iter().flatten().flatten() {
+                    found.push(file.path());
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn a_file_over_max_file_bytes_is_refused_before_it_is_copied() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("private");
+        fs::create_dir(&root).unwrap();
+        let session = Session {
+            single: Single::with_root(root.clone()),
+            ..Session::default()
+        };
+        let window = Window::default();
+        let prober = Prober::sized();
+        let big = dir.path().join("big.png");
+        // Sparse: no 100 MiB is written.
+        fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
+        choose_image(&session, &window, Some(&big), &prober);
+        assert_eq!(
+            only_image_changed(&window),
+            json!({ "image": null, "left_out": 0, "notice": "File is too large" })
+        );
+        assert!(prober.asked().is_empty());
+        assert!(copies_under(&root).is_empty());
+
+        // A small file in the same session is copied there.
+        let small = dir.path().join("small.png");
+        fs::write(&small, b"png").unwrap();
+        choose_image(&session, &window, Some(&small), &prober);
+        assert_eq!(copies_under(&root).len(), 1);
+    }
+
+    #[test]
+    fn changing_the_original_after_load_does_not_change_the_copy() {
+        let (_dir, paths) = files(&[("a.png", b"as loaded")]);
+        let session = Session::new();
+        let window = Window::default();
+        choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+        fs::write(&paths[0], b"changed on disk").unwrap();
+        let image = loaded(&session);
+        assert_eq!(fs::read(&image.copy).unwrap(), b"as loaded");
+        assert_eq!(image.size, 9);
+    }
+
+    #[test]
+    fn deleting_the_original_after_load_keeps_the_copy() {
+        let (_dir, paths) = files(&[("a.png", b"as loaded")]);
+        let session = Session::new();
+        let window = Window::default();
+        choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+        fs::remove_file(&paths[0]).unwrap();
+        let image = loaded(&session);
+        assert_eq!(fs::read(&image.copy).unwrap(), b"as loaded");
+        assert_eq!(image.key, 1);
+    }
+
+    // Drops in Single image mode.
+
+    #[test]
+    fn one_image_loads_with_left_out_0_and_no_notice() {
+        let (_dir, paths) = files(&[("a.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        drop_routed(&session, &window, &paths, &Prober::sized());
+        assert_eq!(
+            only_image_changed(&window),
+            json!({ "image": { "name": "a.png", "size": 3, "width": 640, "height": 480,
+                               "key": "1", "suggested": "optimized-a", "extension": ".png" },
+                    "left_out": 0, "notice": null })
+        );
+        assert_eq!(
+            session.move_drop_to_batch(&mut window.emit()),
+            Err(CommandError::NothingToMove)
+        );
+    }
+
+    #[test]
+    fn three_images_load_the_first_with_left_out_2_and_the_plural_notice() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.jpg", b"jpg"), ("c.webp", b"webp")]);
+        let session = Session::new();
+        let window = Window::default();
+        let prober = Prober::sized();
+        drop_routed(&session, &window, &paths, &prober);
+        let changed = only_image_changed(&window);
+        assert_eq!(changed["image"]["name"], json!("a.png"));
+        assert_eq!(changed["left_out"], json!(2));
+        assert_eq!(
+            changed["notice"],
+            json!("Single image mode takes one image; 2 others were left out.")
+        );
+        assert_eq!(prober.asked().len(), 1);
+    }
+
+    #[test]
+    fn two_images_give_the_singular_notice() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.svg", b"<svg/>")]);
+        let session = Session::new();
+        let window = Window::default();
+        drop_routed(&session, &window, &paths, &Prober::sized());
+        let changed = only_image_changed(&window);
+        assert_eq!(changed["left_out"], json!(1));
+        assert_eq!(
+            changed["notice"],
+            json!("Single image mode takes one image; 1 other was left out.")
+        );
+    }
+
+    #[test]
+    fn a_non_image_then_an_image_loads_the_image() {
+        let (_dir, paths) = files(&[("notes.txt", b"text"), ("a.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        let prober = Prober::sized();
+        drop_routed(&session, &window, &paths, &prober);
+        let changed = only_image_changed(&window);
+        assert_eq!(changed["image"]["name"], json!("a.png"));
+        assert_eq!(changed["left_out"], json!(0));
+        assert_eq!(changed["notice"], Value::Null);
+        assert_eq!(prober.asked().len(), 1);
+    }
+
+    #[test]
+    fn an_image_and_a_text_file_have_left_out_0_and_no_notice() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("notes.txt", b"text")]);
+        let session = Session::new();
+        let window = Window::default();
+        drop_routed(&session, &window, &paths, &Prober::sized());
+        let changed = only_image_changed(&window);
+        assert_eq!(changed["image"]["name"], json!("a.png"));
+        assert_eq!(changed["left_out"], json!(0));
+        assert_eq!(changed["notice"], Value::Null);
+        assert_eq!(
+            session.move_drop_to_batch(&mut window.emit()),
+            Err(CommandError::NothingToMove)
+        );
+    }
+
+    #[test]
+    fn a_folder_loads_nothing_keeps_the_image_and_says_folders_go_in_batch() {
+        let (dir, paths) = files(&[("a.png", b"png")]);
+        let folder = dir.path().join("photos");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("c.png"), b"png").unwrap();
+        // Without an image: the spec's example, exactly.
+        let session = Session::new();
+        let window = Window::default();
+        let prober = Prober::sized();
+        drop_routed(&session, &window, std::slice::from_ref(&folder), &prober);
+        assert_eq!(
+            only_image_changed(&window),
+            json!({ "image": null, "left_out": 1, "notice": "Folders go in Batch." })
+        );
+        assert!(prober.asked().is_empty());
+        // With one: it stays.
+        drop_routed(&session, &window, &paths, &prober);
+        window.take();
+        drop_routed(&session, &window, &[folder], &prober);
+        let changed = only_image_changed(&window);
+        assert_eq!(changed["image"]["key"], json!("1"));
+        assert_eq!(changed["left_out"], json!(1));
+        assert_eq!(changed["notice"], json!("Folders go in Batch."));
+        assert_eq!(prober.asked().len(), 1);
+        assert!(lock(&session.list).rows(None).is_empty(), "nothing listed");
+    }
+
+    #[test]
+    fn only_text_files_load_nothing_with_left_out_0() {
+        let (_dir, paths) = files(&[("a.txt", b"text"), ("b.gif", b"gif")]);
+        let session = Session::new();
+        let window = Window::default();
+        let prober = Prober::sized();
+        drop_routed(&session, &window, &paths, &prober);
+        assert_eq!(
+            only_image_changed(&window),
+            json!({ "image": null, "left_out": 0, "notice": "Not a PNG, JPG, SVG or WebP file." })
+        );
+        assert!(prober.asked().is_empty());
+        assert_eq!(
+            session.move_drop_to_batch(&mut window.emit()),
+            Err(CommandError::NothingToMove)
+        );
+    }
+
+    #[test]
+    fn a_refused_first_image_of_three_keeps_the_offer_with_the_reason() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png"), ("c.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        let refusing = Prober::new(ProbeAnswer::Refused("Batch's reason".to_owned()));
+        drop_routed(&session, &window, &paths, &refusing);
+        assert_eq!(
+            only_image_changed(&window),
+            json!({ "image": null, "left_out": 2, "notice": "Batch's reason" })
+        );
+        assert_eq!(refusing.asked().len(), 1, "only the first is tried");
+        assert_eq!(session.move_drop_to_batch(&mut window.emit()), Ok(()));
+        assert_eq!(
+            row_names(last_list(&window.take())),
+            ["a.png", "b.png", "c.png"]
+        );
+    }
+
+    // Switch to Batch.
+
+    #[test]
+    fn move_drop_to_batch_adds_every_item_of_that_drop_and_switches_to_batch() {
+        let (dir, mut paths) = files(&[("a.png", b"png"), ("b.jpg", b"jpg")]);
+        let folder = dir.path().join("photos");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("c.png"), b"png").unwrap();
+        fs::write(folder.join("d.webp"), b"webp").unwrap();
+        fs::write(folder.join("notes.txt"), b"text").unwrap();
+        paths.push(folder);
+        let session = Session::new();
+        let window = Window::default();
+        drop_routed(&session, &window, &paths, &Prober::sized());
+        assert_eq!(only_image_changed(&window)["left_out"], json!(2));
+
+        assert_eq!(session.move_drop_to_batch(&mut window.emit()), Ok(()));
+        assert_eq!(session.view(), View::Batch);
+        let events = window.take();
+        assert_eq!(events.len(), 1, "{events:?}");
+        // The loaded image included; the folder adds its images.
+        assert_eq!(
+            row_names(last_list(&events)),
+            ["a.png", "b.jpg", "c.png", "d.webp"]
+        );
+        assert!(guard_is_free(&session));
+        // The image stays loaded for when Single image shows again.
+        assert_eq!(loaded(&session).key, 1);
+        // Once: the offer is used up.
+        assert_eq!(
+            session.move_drop_to_batch(&mut window.emit()),
+            Err(CommandError::NothingToMove)
+        );
+    }
+
+    #[test]
+    fn move_drop_to_batch_after_a_finished_run_starts_a_fresh_list() {
+        let (_dir, paths) = files(&[("old.png", b"png"), ("a.png", b"png"), ("b.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        set_view(&session, &window, "batch");
+        pick(&session, &window, &paths[..1]);
+        let prepared = started(&session, &window, &lossless());
+        run_fake(&session, &window, prepared);
+        set_view(&session, &window, "single");
+        drop_routed(&session, &window, &paths[1..], &Prober::sized());
+        window.take();
+
+        assert_eq!(session.move_drop_to_batch(&mut window.emit()), Ok(()));
+        let list = last_list(&window.take()).clone();
+        assert_eq!(row_names(&list), ["a.png", "b.png"]);
+        assert_eq!(thumbs_of(&list), [key(2, 0), key(2, 1)]);
+    }
+
+    #[test]
+    fn move_drop_to_batch_without_a_left_out_drop_is_nothing_to_move() {
+        let (_dir, paths) = files(&[("a.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        assert_eq!(
+            session.move_drop_to_batch(&mut window.emit()),
+            Err(CommandError::NothingToMove)
+        );
+        assert!(window.take().is_empty());
+        assert!(guard_is_free(&session));
+        drop_routed(&session, &window, &paths, &Prober::sized());
+        window.take();
+        assert_eq!(
+            session.move_drop_to_batch(&mut window.emit()),
+            Err(CommandError::NothingToMove)
+        );
+        assert_eq!(session.view(), View::Single);
+        assert!(lock(&session.list).rows(None).is_empty());
+        assert_eq!(
+            error_json(CommandError::NothingToMove),
+            json!("nothing-to-move")
+        );
+    }
+
+    #[test]
+    fn move_drop_to_batch_is_busy_during_a_run() {
+        let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        drop_routed(&session, &window, &paths, &Prober::sized());
+        window.take();
+        let run = session.guard.try_start().unwrap();
+        assert_eq!(
+            session.move_drop_to_batch(&mut window.emit()),
+            Err(CommandError::Busy)
+        );
+        assert_eq!(window.take(), [Event::RunBusy]);
+        assert_eq!(session.view(), View::Single);
+        drop(run);
+        // The refusal kept the offer.
+        assert_eq!(session.move_drop_to_batch(&mut window.emit()), Ok(()));
+    }
+
+    /// A session that has just had a drop of two images, so Switch to Batch
+    /// is offered.
+    fn with_an_offer() -> (TempDir, Vec<PathBuf>, Session, Window) {
+        let (dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png"), ("c.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        drop_routed(&session, &window, &paths[..2], &Prober::sized());
+        assert_eq!(only_image_changed(&window)["left_out"], json!(1));
+        (dir, paths, session, window)
+    }
+
+    #[test]
+    fn the_offer_is_gone_after_the_next_drop() {
+        let (_dir, paths, session, window) = with_an_offer();
+        drop_routed(&session, &window, &paths[2..], &Prober::sized());
+        window.take();
+        assert_eq!(
+            session.move_drop_to_batch(&mut window.emit()),
+            Err(CommandError::NothingToMove)
+        );
+        assert!(lock(&session.list).rows(None).is_empty());
+    }
+
+    #[test]
+    fn the_offer_is_gone_after_a_choice() {
+        let (_dir, paths, session, window) = with_an_offer();
+        choose_image(&session, &window, Some(&paths[2]), &Prober::sized());
+        window.take();
+        assert_eq!(
+            session.move_drop_to_batch(&mut window.emit()),
+            Err(CommandError::NothingToMove)
+        );
+    }
+
+    #[test]
+    fn the_offer_is_gone_after_set_view_by_hand() {
+        let (_dir, _paths, session, window) = with_an_offer();
+        set_view(&session, &window, "batch");
+        assert_eq!(
+            session.move_drop_to_batch(&mut window.emit()),
+            Err(CommandError::NothingToMove)
+        );
+        assert!(lock(&session.list).rows(None).is_empty());
+    }
+
+    // The suggested name.
+
+    #[test]
+    fn suggested_is_optimized_name_next_to_the_original() {
+        let (_dir, paths) = files(&[("holiday.jpg", b"jpg")]);
+        let session = Session::new();
+        let window = Window::default();
+        choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+        let changed = only_image_changed(&window);
+        assert_eq!(changed["image"]["suggested"], json!("optimized-holiday"));
+        assert_eq!(changed["image"]["extension"], json!(".jpg"));
+    }
+
+    #[test]
+    fn suggested_is_the_plain_name_in_a_chosen_folder() {
+        let (dir, paths) = files(&[("holiday.jpg", b"jpg")]);
+        let session = Session::new();
+        let window = Window::default();
+        // Not made yet: a missing folder has no names taken.
+        choose_output(&session, &window, &dir.path().join("exports"));
+        window.take();
+        choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+        let changed = only_image_changed(&window);
+        assert_eq!(changed["image"]["suggested"], json!("holiday"));
+    }
+
+    #[test]
+    fn suggested_is_numbered_when_taken() {
+        let (dir, paths) = files(&[("holiday.jpg", b"jpg"), ("optimized-holiday.jpg", b"jpg")]);
+        let session = Session::new();
+        let window = Window::default();
+        choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+        assert_eq!(
+            only_image_changed(&window)["image"]["suggested"],
+            json!("optimized-holiday-1")
+        );
+        // The original's own folder chosen as the output: its own name is
+        // taken by the original.
+        let other = Session::new();
+        choose_output(&other, &window, dir.path());
+        window.take();
+        choose_image(&other, &window, Some(&paths[0]), &Prober::sized());
+        assert_eq!(
+            only_image_changed(&window)["image"]["suggested"],
+            json!("holiday-1")
+        );
+    }
+
+    #[test]
+    fn name_suggested_follows_output_changed_with_an_image_loaded() {
+        let (dir, paths) = files(&[("holiday.jpg", b"jpg")]);
+        let exports = dir.path().join("exports");
+        let session = Session::new();
+        let window = Window::default();
+        choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+        window.take();
+
+        choose_output(&session, &window, &exports);
+        let events = window.take();
+        let names: Vec<&str> = events.iter().map(Event::name).collect();
+        assert_eq!(names, ["output-changed", "name-suggested"]);
+        assert_eq!(
+            value(&events[1]),
+            json!({ "image": "1", "suggested": "holiday" })
+        );
+
+        session.clear_output_folder(&mut window.emit()).unwrap();
+        let events = window.take();
+        let names: Vec<&str> = events.iter().map(Event::name).collect();
+        assert_eq!(names, ["output-changed", "name-suggested"]);
+        assert_eq!(
+            value(&events[1]),
+            json!({ "image": "1", "suggested": "optimized-holiday" })
+        );
+    }
+
+    #[test]
+    fn no_name_suggested_without_an_image() {
+        let dir = TempDir::new().unwrap();
+        let session = Session::new();
+        let window = Window::default();
+        choose_output(&session, &window, dir.path());
+        session.clear_output_folder(&mut window.emit()).unwrap();
+        let names: Vec<&str> = window.take().iter().map(Event::name).collect();
+        assert_eq!(names, ["output-changed", "output-changed"]);
+    }
+
+    #[test]
+    fn name_suggested_keeps_the_key() {
+        let (dir, paths) = files(&[("holiday.jpg", b"jpg")]);
+        let session = Session::new();
+        let window = Window::default();
+        choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+        let before = loaded(&session);
+        choose_output(&session, &window, dir.path());
+        assert_eq!(loaded(&session), before);
+        assert!(before.copy.is_file());
+        // A cancelled folder dialog sends none.
+        window.take();
+        session
+            .choose_output_folder(&mut window.emit(), |ticket| {
+                session.set_output(ticket, None, &mut window.emit());
+            })
+            .unwrap();
+        assert_eq!(window.take(), [Event::RunCancelled]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_non_utf8_original_name_gives_a_lossy_suggested_name() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(OsStr::from_bytes(b"caf\xe9.png"));
+        fs::write(&path, b"png").unwrap();
+        let session = Session::new();
+        let window = Window::default();
+        choose_image(&session, &window, Some(&path), &Prober::sized());
+        let changed = only_image_changed(&window);
+        assert_eq!(changed["image"]["name"], json!("caf\u{FFFD}.png"));
+        assert_eq!(
+            changed["image"]["suggested"],
+            json!("optimized-caf\u{FFFD}")
+        );
+        assert_eq!(changed["notice"], Value::Null);
+        // The original's own bytes are kept for the save.
+        assert_eq!(
+            loaded(&session).file_name,
+            OsStr::from_bytes(b"caf\xe9.png")
+        );
+    }
+
+    #[test]
+    fn the_session_shutdown_removes_the_private_folder() {
+        let (_dir, paths) = files(&[("a.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+        let private = image_folder(&session, 1).parent().unwrap().to_path_buf();
+        assert!(private.is_dir());
+        session.shutdown();
+        assert!(!private.exists());
+        assert_eq!(session.single().current(), None);
+    }
+
+    // --- preview_image ----------------------------------------------------------
+
+    /// `preview_image` with `settings`: its answer and the job handed to
+    /// `start` (only when it started).
+    fn preview(
+        session: &Session,
+        window: &Window,
+        settings: Option<&Value>,
+    ) -> (Result<(), CommandError>, Option<PreviewJob>) {
+        let mut job = None;
+        let answer =
+            session.preview_image(settings, &mut window.emit(), |started| job = Some(started));
+        (answer, job)
+    }
+
+    /// A session with `a.png` loaded as image 1, the window's events taken.
+    fn with_an_image() -> (TempDir, Vec<PathBuf>, Session, Window) {
+        let (dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png")]);
+        let session = Session::new();
+        let window = Window::default();
+        choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+        window.take();
+        (dir, paths, session, window)
+    }
+
+    /// `preview_image` refused with `error`: nothing started, nothing sent
+    /// but `run-busy` for busy, the guard free afterwards.
+    fn preview_refused(
+        session: &Session,
+        window: &Window,
+        settings: Option<&Value>,
+        error: CommandError,
+    ) {
+        let (answer, job) = preview(session, window, settings);
+        assert_eq!(answer, Err(error), "{settings:?}");
+        assert!(job.is_none(), "a refused preview must not start");
+        let expected: Vec<&str> = if error == CommandError::Busy {
+            vec!["run-busy"]
+        } else {
+            vec![]
+        };
+        let heard: Vec<&str> = window.take().iter().map(Event::name).collect();
+        assert_eq!(heard, expected);
+    }
+
+    #[test]
+    fn a_preview_without_an_image_is_no_image() {
+        let session = Session::new();
+        let window = Window::default();
+        preview_refused(&session, &window, Some(&lossy(40)), CommandError::NoImage);
+        assert!(guard_is_free(&session));
+        // A refused request takes no version: the first one is still 1.
+        let (_dir, paths) = files(&[("a.png", b"png")]);
+        choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+        window.take();
+        let (_, job) = preview(&session, &window, Some(&lossy(40)));
+        assert_eq!(job.unwrap().version, 1);
+    }
+
+    #[test]
+    fn a_preview_after_shutdown_is_no_image() {
+        let (_dir, _paths, session, window) = with_an_image();
+        session.shutdown();
+        preview_refused(&session, &window, Some(&lossy(40)), CommandError::NoImage);
+    }
+
+    #[test]
+    fn a_preview_with_an_image_starts_and_sends_preview_started() {
+        let (_dir, _paths, session, window) = with_an_image();
+        let (answer, job) = preview(&session, &window, Some(&lossy(40)));
+        assert_eq!(answer, Ok(()));
+        let job = job.expect("start got the job");
+        assert_eq!((job.key, job.version), (1, 1));
+        let events = window.take();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].name(), "preview-started");
+        assert_eq!(value(&events[0]), json!({ "image": "1", "version": 1 }));
+        // The guard is not held while the version is made.
+        assert!(guard_is_free(&session));
+    }
+
+    #[test]
+    fn lossy_0_lossy_100_and_lossless_settings_start_a_preview() {
+        let (_dir, _paths, session, window) = with_an_image();
+        for (settings, compression) in [
+            (lossy(0), Compression::Lossy(Quality::new(0).unwrap())),
+            (lossy(100), Compression::Lossy(Quality::new(100).unwrap())),
+            (lossless(), Compression::Lossless),
+        ] {
+            let (answer, job) = preview(&session, &window, Some(&settings));
+            assert_eq!(answer, Ok(()), "{settings}");
+            assert_eq!(job.unwrap().compression, compression);
+        }
+    }
+
+    /// Every shape `parse_settings` refuses, as `start_run` refuses them.
+    fn bad_settings() -> Vec<Value> {
+        let from_text = |text: &str| -> Value { serde_json::from_str(text).unwrap() };
+        vec![
+            json!({ "mode": "lossy", "quality": -1 }),
+            json!({ "mode": "lossy", "quality": 101 }),
+            json!({ "mode": "lossy", "quality": 75.5 }),
+            from_text(r#"{ "mode": "lossy", "quality": 75.0 }"#),
+            json!({ "mode": "lossy", "quality": "75" }),
+            json!({ "mode": "lossy", "quality": null }),
+            json!({ "mode": "lossy" }),
+            json!({ "quality": 75 }),
+            json!({ "mode": "lossy", "quality": 75, "extra": 1 }),
+            json!({ "mode": "fast", "quality": 75 }),
+            json!({ "mode": "Lossy", "quality": 75 }),
+            json!({ "mode": "lossless", "quality": 101 }),
+            json!({}),
+            json!(null),
+            json!(75),
+            json!(["lossy", 75]),
+        ]
+    }
+
+    #[test]
+    fn bad_settings_are_invalid_settings() {
+        let (_dir, _paths, session, window) = with_an_image();
+        for settings in bad_settings() {
+            preview_refused(
+                &session,
+                &window,
+                Some(&settings),
+                CommandError::InvalidSettings,
+            );
+        }
+        assert!(guard_is_free(&session));
+    }
+
+    #[test]
+    fn a_preview_without_settings_is_invalid_settings() {
+        let (_dir, _paths, session, window) = with_an_image();
+        preview_refused(&session, &window, None, CommandError::InvalidSettings);
+    }
+
+    #[test]
+    fn bad_settings_without_an_image_are_invalid_settings() {
+        let session = Session::new();
+        let window = Window::default();
+        preview_refused(
+            &session,
+            &window,
+            Some(&json!({ "mode": "lossy", "quality": 75.5 })),
+            CommandError::InvalidSettings,
+        );
+    }
+
+    #[test]
+    fn a_preview_during_a_save_is_busy() {
+        // A save holds the guard as every command does (`claim_run`).
+        let session = Session::new();
+        let window = Window::default();
+        let saving = session.guard.try_start().expect("a free guard");
+        // Busy comes first: bad settings and no image are not looked at.
+        preview_refused(
+            &session,
+            &window,
+            Some(&json!({ "mode": "lossy" })),
+            CommandError::Busy,
+        );
+        drop(saving);
+        preview_refused(
+            &session,
+            &window,
+            Some(&json!({ "mode": "lossy" })),
+            CommandError::InvalidSettings,
+        );
+    }
+
+    #[test]
+    fn a_preview_during_a_run_is_busy() {
+        let (_dir, paths, session, window) = with_an_image();
+        pick(&session, &window, &paths);
+        window.take();
+        let running = started(&session, &window, &lossless());
+        preview_refused(&session, &window, Some(&lossy(40)), CommandError::Busy);
+        drop(running);
+        let (answer, _) = preview(&session, &window, Some(&lossy(40)));
+        assert_eq!(answer, Ok(()));
+    }
+
+    #[test]
+    fn a_preview_while_a_dialog_is_open_is_busy() {
+        let (_dir, _paths, session, window) = with_an_image();
+        let mut open = None;
+        session
+            .choose_image(&mut window.emit(), |ticket| open = Some(ticket))
+            .unwrap();
+        preview_refused(&session, &window, Some(&lossy(40)), CommandError::Busy);
+        drop(open);
+        let (answer, _) = preview(&session, &window, Some(&lossy(40)));
+        assert_eq!(answer, Ok(()));
+    }
+
+    #[test]
+    fn a_preview_running_does_not_make_choose_image_set_view_drop_or_choose_output_folder_busy() {
+        let (dir, paths, session, window) = with_an_image();
+        let (answer, job) = preview(&session, &window, Some(&lossy(40)));
+        assert_eq!(answer, Ok(()));
+        // Begun and not settled: the version is being made.
+        let _running = job.unwrap();
+        window.take();
+
+        assert_eq!(
+            session.set_view(Some(&json!({ "view": "single" })), &mut window.emit()),
+            Ok(())
+        );
+        let mut dialogs = 0;
+        session
+            .choose_image(&mut window.emit(), |_ticket| dialogs += 1)
+            .unwrap();
+        session
+            .choose_output_folder(&mut window.emit(), |_ticket| dialogs += 1)
+            .unwrap();
+        assert_eq!(dialogs, 2);
+        let mut dropped = Vec::new();
+        session.drop_paths(paths.clone(), &mut window.emit(), |_ticket, paths| {
+            dropped = paths
+        });
+        assert_eq!(dropped, paths);
+        assert_eq!(window.take(), []);
+        drop(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lossy_preview_worker_gets_lossy_no_replace_the_copy_and_the_version_file() {
+        let (_dir, _paths, session, window) = with_an_image();
+        let logs = TempDir::new().unwrap();
+        let log = logs.path().join("args");
+        let (_, job) = preview(&session, &window, Some(&lossy(40)));
+        session.run_preview(job.unwrap(), &recording_worker(&log), &mut window.emit());
+        let copy = loaded(&session).copy;
+        let expected = format!(
+            "--lossy\n40\n--no-replace\n{}\n{}\n",
+            copy.display(),
+            copy.with_file_name("v1.png").display()
+        );
+        assert_eq!(fs::read_to_string(&log).unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lossless_preview_worker_gets_no_replace_and_no_lossy() {
+        let (_dir, _paths, session, window) = with_an_image();
+        let logs = TempDir::new().unwrap();
+        let log = logs.path().join("args");
+        let (_, job) = preview(&session, &window, Some(&lossless()));
+        session.run_preview(job.unwrap(), &recording_worker(&log), &mut window.emit());
+        let copy = loaded(&session).copy;
+        let expected = format!(
+            "--no-replace\n{}\n{}\n",
+            copy.display(),
+            copy.with_file_name("v1.png").display()
+        );
+        assert_eq!(fs::read_to_string(&log).unwrap(), expected);
+    }
+
+    /// Fix round 1: a call that competes with a preview's outcome, the
+    /// offer after a failed attempt, the suggested name on clearing the
+    /// output folder.
+    mod fix1 {
+        use std::cell::Cell;
+
+        use lunaepix_core::{Crash, Outcome, RunError};
+
+        use super::*;
+        use crate::single::SettleSeam;
+
+        /// A call that can land while a preview's outcome is settled.
+        #[derive(Debug, Clone, Copy)]
+        enum Call {
+            Choice,
+            Drop,
+            BatchView,
+            MoveDrop,
+            StartRun,
+            Shutdown,
+            NewerRequest,
+        }
+
+        fn ready() -> FileResult {
+            FileResult::Optimized(Outcome {
+                before: 3,
+                after: 2,
+                millis: 5,
+                note: None,
+            })
+        }
+
+        fn failure() -> FileResult {
+            FileResult::Failed(RunError::Crashed {
+                path: PathBuf::new(),
+                cause: Crash::NoValidResult,
+                stderr: String::new(),
+            })
+        }
+
+        fn is_outcome(event: &Event) -> bool {
+            matches!(event, Event::PreviewReady(_) | Event::PreviewFailed(_))
+        }
+
+        /// The event the call itself sends, if it sends one.
+        fn own_event(call: Call) -> Option<&'static str> {
+            match call {
+                Call::Choice | Call::Drop => Some("image-changed"),
+                Call::MoveDrop => Some("list-changed"),
+                Call::StartRun => Some("run-started"),
+                Call::NewerRequest => Some("preview-started"),
+                Call::BatchView | Call::Shutdown => None,
+            }
+        }
+
+        fn compete(session: &Session, window: &Window, paths: &[PathBuf], call: Call) {
+            match call {
+                Call::Choice => choose_image(session, window, Some(&paths[1]), &Prober::sized()),
+                Call::Drop => drop_routed(session, window, &paths[1..2], &Prober::sized()),
+                Call::BatchView => set_view(session, window, "batch"),
+                Call::MoveDrop => session.move_drop_to_batch(&mut window.emit()).unwrap(),
+                Call::StartRun => {
+                    let prepared = started(session, window, &lossy(40));
+                    run_fake(session, window, prepared);
+                }
+                Call::Shutdown => session.shutdown(),
+                Call::NewerRequest => {
+                    let (answer, _newer) = preview(session, window, Some(&lossy(60)));
+                    answer.unwrap();
+                }
+            }
+        }
+
+        /// `a.png` loaded by a drop that left `b.png` out, `c.png` in the
+        /// list, and version 1 asked for; it settles with `result` while
+        /// `call` lands at `at`. The outcome never follows the call's own
+        /// events: before the decision it is not sent at all, right after
+        /// the send it came first, once.
+        fn race(call: Call, at: SettleSeam, result: FileResult) {
+            let (_dir, paths) = files(&[("a.png", b"png"), ("b.png", b"png"), ("c.png", b"png")]);
+            let session = Session::new();
+            let window = Window::default();
+            drop_routed(&session, &window, &paths[..2], &Prober::sized());
+            pick(&session, &window, &paths[2..]);
+            let (answer, job) = preview(&session, &window, Some(&lossy(40)));
+            answer.unwrap();
+            let job = job.unwrap();
+            fs::write(&job.dest, b"v").unwrap();
+            window.take();
+
+            let from = Cell::new(None);
+            session.single().settle_preview_with(
+                &job,
+                Some(result),
+                &mut window.emit(),
+                &mut |seam| {
+                    if seam == at {
+                        from.set(Some(window.0.borrow().len()));
+                        compete(&session, &window, &paths, call);
+                    }
+                },
+            );
+            let from = from.get().expect("the seam was reached");
+            let events = window.take();
+            let names: Vec<&str> = events.iter().map(Event::name).collect();
+            if let Some(own) = own_event(call) {
+                assert!(names[from..].contains(&own), "{names:?}");
+            }
+            assert!(!events[from..].iter().any(is_outcome), "{names:?}");
+            let sent = events[..from]
+                .iter()
+                .filter(|event| is_outcome(event))
+                .count();
+            let expected = match at {
+                SettleSeam::BeforeDecision => 0,
+                SettleSeam::AfterSend => 1,
+            };
+            assert_eq!(sent, expected, "{names:?}");
+        }
+
+        macro_rules! races {
+            ($($name:ident: $call:ident, $seam:ident, $result:ident;)*) => {
+                $(
+                    #[test]
+                    fn $name() {
+                        race(Call::$call, SettleSeam::$seam, $result());
+                    }
+                )*
+            };
+        }
+
+        races! {
+            race_choice_before_ready: Choice, BeforeDecision, ready;
+            race_choice_before_failed: Choice, BeforeDecision, failure;
+            race_choice_after_ready: Choice, AfterSend, ready;
+            race_choice_after_failed: Choice, AfterSend, failure;
+            race_drop_before_ready: Drop, BeforeDecision, ready;
+            race_drop_before_failed: Drop, BeforeDecision, failure;
+            race_drop_after_ready: Drop, AfterSend, ready;
+            race_drop_after_failed: Drop, AfterSend, failure;
+            race_batch_view_before_ready: BatchView, BeforeDecision, ready;
+            race_batch_view_before_failed: BatchView, BeforeDecision, failure;
+            race_batch_view_after_ready: BatchView, AfterSend, ready;
+            race_batch_view_after_failed: BatchView, AfterSend, failure;
+            race_move_drop_before_ready: MoveDrop, BeforeDecision, ready;
+            race_move_drop_before_failed: MoveDrop, BeforeDecision, failure;
+            race_move_drop_after_ready: MoveDrop, AfterSend, ready;
+            race_move_drop_after_failed: MoveDrop, AfterSend, failure;
+            race_start_run_before_ready: StartRun, BeforeDecision, ready;
+            race_start_run_before_failed: StartRun, BeforeDecision, failure;
+            race_start_run_after_ready: StartRun, AfterSend, ready;
+            race_start_run_after_failed: StartRun, AfterSend, failure;
+            race_shutdown_before_ready: Shutdown, BeforeDecision, ready;
+            race_shutdown_before_failed: Shutdown, BeforeDecision, failure;
+            race_shutdown_after_ready: Shutdown, AfterSend, ready;
+            race_shutdown_after_failed: Shutdown, AfterSend, failure;
+            race_newer_request_before_ready: NewerRequest, BeforeDecision, ready;
+            race_newer_request_before_failed: NewerRequest, BeforeDecision, failure;
+            race_newer_request_after_ready: NewerRequest, AfterSend, ready;
+            race_newer_request_after_failed: NewerRequest, AfterSend, failure;
+        }
+
+        // Every load attempt ends the offer, also one that fails.
+
+        fn nothing_to_move(session: &Session, window: &Window) {
+            window.take();
+            assert_eq!(
+                session.move_drop_to_batch(&mut window.emit()),
+                Err(CommandError::NothingToMove)
+            );
+            assert!(lock(&session.list).rows(None).is_empty());
+        }
+
+        #[test]
+        fn the_offer_is_gone_after_a_refused_choice() {
+            let (_dir, paths, session, window) = with_an_offer();
+            let refusing = Prober::new(ProbeAnswer::Refused("damaged".to_owned()));
+            choose_image(&session, &window, Some(&paths[2]), &refusing);
+            assert_eq!(refusing.asked().len(), 1, "the probe refused it");
+            nothing_to_move(&session, &window);
+        }
+
+        #[test]
+        fn the_offer_is_gone_after_a_non_image_choice() {
+            let (dir, _paths, session, window) = with_an_offer();
+            let text = dir.path().join("notes.txt");
+            fs::write(&text, b"text").unwrap();
+            choose_image(&session, &window, Some(&text), &Prober::sized());
+            nothing_to_move(&session, &window);
+        }
+
+        #[test]
+        fn the_offer_is_gone_after_a_text_only_drop() {
+            let (dir, _paths, session, window) = with_an_offer();
+            let text = dir.path().join("notes.txt");
+            fs::write(&text, b"text").unwrap();
+            drop_routed(&session, &window, &[text], &Prober::sized());
+            nothing_to_move(&session, &window);
+        }
+
+        #[test]
+        fn the_offer_is_gone_after_a_folder_only_drop() {
+            let (dir, _paths, session, window) = with_an_offer();
+            let folder = dir.path().join("more");
+            fs::create_dir(&folder).unwrap();
+            fs::write(folder.join("d.png"), b"png").unwrap();
+            drop_routed(
+                &session,
+                &window,
+                std::slice::from_ref(&folder),
+                &Prober::sized(),
+            );
+            window.take();
+            // A folder-only drop leaves its folder out, so it is the offer
+            // now (INTERFACE.md: a drop with `left_out` above 0 is kept); the
+            // earlier drop's images are not.
+            assert_eq!(session.move_drop_to_batch(&mut window.emit()), Ok(()));
+            let rows = lock(&session.list).rows(None);
+            assert_eq!(sources(&rows), [folder.join("d.png")]);
+        }
+
+        // Clearing the output folder lists the original's folder.
+
+        #[test]
+        fn clear_output_folder_suggests_the_first_free_name_next_to_the_original() {
+            let (dir, paths) = files(&[("holiday.jpg", b"jpg"), ("optimized-holiday.jpg", b"jpg")]);
+            let session = Session::new();
+            let window = Window::default();
+            choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+            choose_output(&session, &window, &dir.path().join("exports"));
+            window.take();
+            session.clear_output_folder(&mut window.emit()).unwrap();
+            let events = window.take();
+            let names: Vec<&str> = events.iter().map(Event::name).collect();
+            assert_eq!(names, ["output-changed", "name-suggested"]);
+            assert_eq!(
+                value(&events[1]),
+                json!({ "image": "1", "suggested": "optimized-holiday-1" })
+            );
+        }
+    }
+
+    // --- save_image -------------------------------------------------------------
+
+    mod save {
+        use std::ffi::OsString;
+
+        use lunaepix_core::{Crash, Outcome, RunError, save_new};
+
+        use super::*;
+        use crate::names::save_names;
+
+        /// The bytes every ready version in these tests has: not the copy's.
+        const VERSION: &[u8] = b"the compressed version";
+
+        /// The bytes of every original in these tests.
+        const ORIGINAL: &[u8] = b"the original";
+
+        fn ready_result() -> FileResult {
+            FileResult::Optimized(Outcome {
+                before: ORIGINAL.len() as u64,
+                after: VERSION.len() as u64,
+                millis: 5,
+                note: None,
+            })
+        }
+
+        fn failed_result() -> FileResult {
+            FileResult::Failed(RunError::Crashed {
+                path: PathBuf::new(),
+                cause: Crash::NoValidResult,
+                stderr: String::new(),
+            })
+        }
+
+        /// A preview request on the current image, which must start: its job.
+        fn request(session: &Session) -> PreviewJob {
+            let (answer, job) = preview(session, &Window::default(), Some(&lossy(40)));
+            answer.unwrap();
+            job.expect("the preview started")
+        }
+
+        /// `job`'s version file holding `bytes`, settled ready: its key.
+        fn settle_ready(session: &Session, job: &PreviewJob, bytes: &[u8]) -> String {
+            fs::write(&job.dest, bytes).unwrap();
+            session
+                .single()
+                .settle_preview(job, Some(ready_result()), &mut |_| {});
+            format!("{}-{}", job.key, job.version)
+        }
+
+        /// A new version of the current image holding `bytes`, ready: its key.
+        fn make_ready(session: &Session, bytes: &[u8]) -> String {
+            let job = request(session);
+            settle_ready(session, &job, bytes)
+        }
+
+        /// An image loaded with a ready version.
+        struct Saving {
+            dir: TempDir,
+            original: PathBuf,
+            session: Session,
+            window: Window,
+            /// The ready version's key, `"1-1"`.
+            key: String,
+        }
+
+        /// `name` (holding [`ORIGINAL`]) in a new folder, loaded as image 1,
+        /// with version 1 ready (holding [`VERSION`]); the window's events
+        /// taken.
+        fn ready_image(name: &str) -> Saving {
+            let (dir, paths) = files(&[(name, ORIGINAL)]);
+            let session = Session::new();
+            let window = Window::default();
+            choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+            let key = make_ready(&session, VERSION);
+            assert_eq!(key, "1-1");
+            window.take();
+            Saving {
+                dir,
+                original: paths[0].clone(),
+                session,
+                window,
+                key,
+            }
+        }
+
+        /// [`ready_image`] of `holiday.jpg` with the output folder
+        /// `<dir>/exports` chosen (and made): the folder.
+        fn ready_with_exports() -> (Saving, PathBuf) {
+            let s = ready_image("holiday.jpg");
+            let out = s.dir.path().join("exports");
+            fs::create_dir(&out).unwrap();
+            choose_output(&s.session, &s.window, &out);
+            s.window.take();
+            (s, out)
+        }
+
+        fn args(name: &str, preview: &str) -> Value {
+            json!({ "name": name, "preview": preview })
+        }
+
+        /// Save the ready version as `name`.
+        fn save(s: &Saving, name: &str) -> Result<(), CommandError> {
+            s.session
+                .save_image(Some(&args(name, &s.key)), &mut s.window.emit())
+        }
+
+        /// [`save`] through the real `save_new`, with `seam`.
+        fn save_with(
+            s: &Saving,
+            name: &str,
+            seam: &mut dyn FnMut(SaveSeam),
+        ) -> Result<(), CommandError> {
+            s.session.save_image_with(
+                Some(&args(name, &s.key)),
+                &mut s.window.emit(),
+                save_new,
+                seam,
+            )
+        }
+
+        /// The names in `folder`, sorted.
+        fn entries(folder: &Path) -> Vec<OsString> {
+            let mut names: Vec<OsString> = fs::read_dir(folder)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        }
+
+        /// Every path under `folder`, and each file's bytes.
+        fn snapshot(folder: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+            let mut all = Vec::new();
+            let mut pending = vec![folder.to_path_buf()];
+            while let Some(next) = pending.pop() {
+                for entry in fs::read_dir(&next).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        pending.push(path.clone());
+                        all.push((path, None));
+                    } else {
+                        let bytes = fs::read(&path).ok();
+                        all.push((path, bytes));
+                    }
+                }
+            }
+            all.sort();
+            all
+        }
+
+        /// The one event the window heard: an `image-saved`, as JSON.
+        fn only_saved(window: &Window) -> Value {
+            let events = window.take();
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_eq!(events[0].name(), "image-saved");
+            value(&events[0])
+        }
+
+        fn last_output(session: &Session) -> Option<PathBuf> {
+            lock(&session.last_output).clone()
+        }
+
+        /// A save with `args` refused with `error`: nothing heard but
+        /// `run-busy` for busy, nothing changed in the folder, `last_output`
+        /// as it was, the guard free afterwards (unless it is held by the
+        /// test).
+        fn refused_save(s: &Saving, args: Option<&Value>, error: CommandError) {
+            let before = snapshot(s.dir.path());
+            let output = last_output(&s.session);
+            let answer = s.session.save_image(args, &mut s.window.emit());
+            assert_eq!(answer, Err(error), "{args:?}");
+            let heard: Vec<&str> = s.window.take().iter().map(Event::name).collect();
+            let expected: Vec<&str> = if error == CommandError::Busy {
+                vec!["run-busy"]
+            } else {
+                vec![]
+            };
+            assert_eq!(heard, expected, "{args:?}");
+            assert_eq!(snapshot(s.dir.path()), before, "{args:?}");
+            assert_eq!(last_output(&s.session), output);
+            if error != CommandError::Busy {
+                assert!(guard_is_free(&s.session));
+            }
+        }
+
+        /// What `open_output_folder` opens.
+        fn opened(session: &Session) -> Result<PathBuf, CommandError> {
+            let mut got = None;
+            session
+                .open_output_folder(|folder| {
+                    got = Some(folder.to_path_buf());
+                    Ok::<(), io::Error>(())
+                })
+                .map(|()| got.expect("opened"))
+        }
+
+        /// Make `folder` read-only; `false` when running as root, where it
+        /// stays writable and the test has nothing to check.
+        #[cfg(unix)]
+        fn read_only(folder: &Path) -> bool {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(folder, fs::Permissions::from_mode(0o555)).unwrap();
+            let probe = folder.join("probe");
+            if fs::write(&probe, b"").is_ok() {
+                fs::remove_file(probe).unwrap();
+                writable(folder);
+                eprintln!("skipped: the folder stays writable (running as root)");
+                return false;
+            }
+            true
+        }
+
+        #[cfg(unix)]
+        fn writable(folder: &Path) {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(folder, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Writing.
+
+        #[test]
+        fn save_writes_exactly_the_shown_versions_bytes_under_name_plus_extension() {
+            let s = ready_image("holiday.jpg");
+            assert_eq!(save(&s, "beach"), Ok(()));
+            let saved = fs::read(s.dir.path().join("beach.jpg")).unwrap();
+            assert_eq!(saved, VERSION);
+            assert_ne!(saved, ORIGINAL);
+            assert_eq!(entries(s.dir.path()), ["beach.jpg", "holiday.jpg"]);
+            assert_eq!(
+                only_saved(&s.window),
+                json!({ "name": "beach.jpg", "folder": null, "suggested": "beach-1" })
+            );
+            assert!(guard_is_free(&s.session));
+        }
+
+        #[test]
+        fn the_extension_is_the_originals_as_spelled() {
+            let s = ready_image("HOLIDAY.JPG");
+            assert_eq!(save(&s, "beach"), Ok(()));
+            assert_eq!(entries(s.dir.path()), ["HOLIDAY.JPG", "beach.JPG"]);
+            assert_eq!(only_saved(&s.window)["name"], json!("beach.JPG"));
+        }
+
+        #[test]
+        fn save_next_to_the_original_writes_in_the_originals_folder() {
+            let s = ready_image("holiday.jpg");
+            assert_eq!(save(&s, "optimized-holiday"), Ok(()));
+            assert_eq!(
+                entries(s.dir.path()),
+                ["holiday.jpg", "optimized-holiday.jpg"]
+            );
+            assert_eq!(only_saved(&s.window)["folder"], Value::Null);
+            assert_eq!(last_output(&s.session), Some(s.dir.path().to_path_buf()));
+        }
+
+        #[test]
+        fn save_in_a_chosen_folder_writes_there_and_not_beside_the_original() {
+            let (s, out) = ready_with_exports();
+            assert_eq!(save(&s, "holiday"), Ok(()));
+            assert_eq!(entries(&out), ["holiday.jpg"]);
+            assert_eq!(fs::read(out.join("holiday.jpg")).unwrap(), VERSION);
+            assert_eq!(entries(s.dir.path()), ["exports", "holiday.jpg"]);
+            assert_eq!(fs::read(&s.original).unwrap(), ORIGINAL);
+            assert_eq!(
+                only_saved(&s.window),
+                json!({ "name": "holiday.jpg", "folder": "exports", "suggested": "holiday-1" })
+            );
+            assert_eq!(last_output(&s.session), Some(out));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn the_saved_file_gets_the_originals_permissions() {
+            use std::os::unix::fs::PermissionsExt;
+            for mode in [0o640, 0o600] {
+                let (dir, paths) = files(&[("holiday.jpg", ORIGINAL)]);
+                fs::set_permissions(&paths[0], fs::Permissions::from_mode(mode)).unwrap();
+                let session = Session::new();
+                choose_image(
+                    &session,
+                    &Window::default(),
+                    Some(&paths[0]),
+                    &Prober::sized(),
+                );
+                let key = make_ready(&session, VERSION);
+                session
+                    .save_image(Some(&args("beach", &key)), &mut |_| {})
+                    .unwrap();
+                let saved = fs::metadata(dir.path().join("beach.jpg")).unwrap();
+                assert_eq!(saved.permissions().mode() & 0o777, mode);
+            }
+        }
+
+        #[test]
+        fn the_writer_gets_the_target_path_the_version_bytes_and_the_originals_permissions() {
+            let (dir, paths) = files(&[("holiday.jpg", ORIGINAL)]);
+            // A mode the version file does not have, so the two cannot be
+            // mistaken for each other.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&paths[0], fs::Permissions::from_mode(0o640)).unwrap();
+            }
+            let session = Session::new();
+            let window = Window::default();
+            choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+            let job = request(&session);
+            let key = settle_ready(&session, &job, VERSION);
+            window.take();
+            let calls = RefCell::new(Vec::new());
+            let answer = session.save_image_with(
+                Some(&args("beach", &key)),
+                &mut window.emit(),
+                |dest, bytes, permissions| {
+                    calls
+                        .borrow_mut()
+                        .push((dest.to_path_buf(), bytes.to_vec(), permissions));
+                    Ok(())
+                },
+                &mut |_| {},
+            );
+            assert_eq!(answer, Ok(()));
+            let calls = calls.into_inner();
+            assert_eq!(calls.len(), 1);
+            let (dest, bytes, permissions) = &calls[0];
+            assert_eq!(dest, &dir.path().join("beach.jpg"));
+            assert_eq!(bytes, VERSION);
+            assert_eq!(permissions, &fs::metadata(&paths[0]).unwrap().permissions());
+            #[cfg(unix)]
+            assert_ne!(permissions, &fs::metadata(&job.dest).unwrap().permissions());
+        }
+
+        // Never replacing.
+
+        #[test]
+        fn a_taken_name_is_name_taken_and_the_existing_file_is_unchanged() {
+            let s = ready_image("holiday.jpg");
+            let theirs = s.dir.path().join("beach.jpg");
+            fs::write(&theirs, b"theirs").unwrap();
+            refused_save(&s, Some(&args("beach", &s.key)), CommandError::NameTaken);
+            assert_eq!(fs::read(&theirs).unwrap(), b"theirs");
+            assert_eq!(last_output(&s.session), None);
+        }
+
+        #[test]
+        fn a_name_taken_by_a_folder_is_name_taken() {
+            let s = ready_image("holiday.jpg");
+            let folder = s.dir.path().join("beach.jpg");
+            fs::create_dir(&folder).unwrap();
+            refused_save(&s, Some(&args("beach", &s.key)), CommandError::NameTaken);
+            assert!(folder.is_dir());
+            assert!(entries(&folder).is_empty());
+        }
+
+        #[test]
+        fn a_name_taken_in_a_chosen_folder_is_name_taken() {
+            let (s, out) = ready_with_exports();
+            fs::write(out.join("holiday.jpg"), b"theirs").unwrap();
+            refused_save(&s, Some(&args("holiday", &s.key)), CommandError::NameTaken);
+            assert_eq!(fs::read(out.join("holiday.jpg")).unwrap(), b"theirs");
+        }
+
+        #[test]
+        fn the_originals_own_name_is_name_taken_and_the_original_is_unchanged() {
+            let s = ready_image("holiday.jpg");
+            refused_save(&s, Some(&args("holiday", &s.key)), CommandError::NameTaken);
+            assert_eq!(fs::read(&s.original).unwrap(), ORIGINAL);
+        }
+
+        #[test]
+        fn a_file_appearing_just_before_the_write_is_name_taken_and_kept() {
+            let s = ready_image("holiday.jpg");
+            let late = s.dir.path().join("beach.jpg");
+            let answer = save_with(&s, "beach", &mut |seam| {
+                if seam == SaveSeam::BeforeWrite {
+                    fs::write(&late, b"late").unwrap();
+                }
+            });
+            assert_eq!(answer, Err(CommandError::NameTaken));
+            assert_eq!(fs::read(&late).unwrap(), b"late");
+            // No staging file is left behind.
+            assert_eq!(entries(s.dir.path()), ["beach.jpg", "holiday.jpg"]);
+            assert!(s.window.take().is_empty());
+            assert_eq!(last_output(&s.session), None);
+        }
+
+        // Refusals.
+
+        #[test]
+        fn every_refused_fixture_name_is_invalid_name_and_writes_nothing() {
+            let names = save_names::load();
+            assert_eq!(names.extension, ".jpg");
+            let s = ready_image("holiday.jpg");
+            let kinds: Vec<&str> = names
+                .refused
+                .iter()
+                .map(|(kind, _)| kind.as_str())
+                .collect();
+            assert_eq!(
+                kinds,
+                [
+                    "Empty",
+                    "ForbiddenCharacter",
+                    "Reserved",
+                    "TooLong",
+                    "TrailingSpaceOrDot"
+                ]
+            );
+            for (_, stems) in &names.refused {
+                assert!(!stems.is_empty());
+                for stem in stems {
+                    refused_save(&s, Some(&args(stem, &s.key)), CommandError::InvalidName);
+                }
+            }
+        }
+
+        #[test]
+        fn every_accepted_fixture_name_saves() {
+            let names = save_names::load();
+            assert_eq!(names.extension, ".jpg");
+            let s = ready_image("holiday.jpg");
+            assert!(!names.accepted.is_empty());
+            for stem in &names.accepted {
+                assert_eq!(save(&s, stem), Ok(()), "{stem:?}");
+                let file = format!("{stem}.jpg");
+                assert_eq!(fs::read(s.dir.path().join(&file)).unwrap(), VERSION);
+                assert_eq!(only_saved(&s.window)["name"], json!(file));
+            }
+        }
+
+        #[test]
+        fn a_badly_shaped_argument_is_invalid_name() {
+            let s = ready_image("holiday.jpg");
+            let key = s.key.clone();
+            refused_save(&s, None, CommandError::InvalidName);
+            for shape in [
+                Value::Null,
+                json!("beach"),
+                json!(["beach", key]),
+                json!({}),
+                json!({ "preview": key }),
+                json!({ "name": "beach" }),
+                json!({ "name": "beach", "preview": key, "folder": "exports" }),
+                json!({ "Name": "beach", "preview": key }),
+                json!({ "name": 7, "preview": key }),
+                json!({ "name": null, "preview": key }),
+                json!({ "name": ["beach"], "preview": key }),
+                json!({ "name": "beach", "preview": 1 }),
+                json!({ "name": "beach", "preview": null }),
+            ] {
+                refused_save(&s, Some(&shape), CommandError::InvalidName);
+            }
+            assert_eq!(save(&s, "beach"), Ok(()));
+        }
+
+        #[test]
+        fn a_stale_or_foreign_preview_key_is_not_ready_older_version() {
+            let s = ready_image("holiday.jpg");
+            let newer = make_ready(&s.session, b"newer");
+            assert_eq!(newer, "1-2");
+            refused_save(&s, Some(&args("beach", "1-1")), CommandError::NotReady);
+            assert_eq!(
+                s.session
+                    .save_image(Some(&args("beach", &newer)), &mut s.window.emit()),
+                Ok(())
+            );
+            assert_eq!(fs::read(s.dir.path().join("beach.jpg")).unwrap(), b"newer");
+        }
+
+        #[test]
+        fn a_stale_or_foreign_preview_key_is_not_ready_other_image() {
+            let s = ready_image("holiday.jpg");
+            refused_save(&s, Some(&args("beach", "2-1")), CommandError::NotReady);
+            // A second image, with nothing ready: the first image's key is
+            // foreign now.
+            let other = s.dir.path().join("other.jpg");
+            fs::write(&other, ORIGINAL).unwrap();
+            choose_image(&s.session, &s.window, Some(&other), &Prober::sized());
+            s.window.take();
+            refused_save(&s, Some(&args("beach", "1-1")), CommandError::NotReady);
+        }
+
+        #[test]
+        fn a_stale_or_foreign_preview_key_is_not_ready_not_the_key_text() {
+            let s = ready_image("holiday.jpg");
+            for text in [
+                "1", "01-1", "1-01", "x", "", "1-1 ", " 1-1", "1-1-1", "1-", "-1",
+            ] {
+                refused_save(&s, Some(&args("beach", text)), CommandError::NotReady);
+            }
+            assert_eq!(save(&s, "beach"), Ok(()));
+        }
+
+        /// `holiday.jpg` loaded as image 1, nothing ready yet.
+        fn loaded_only() -> Saving {
+            let (dir, paths) = files(&[("holiday.jpg", ORIGINAL)]);
+            let session = Session::new();
+            let window = Window::default();
+            choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+            window.take();
+            Saving {
+                dir,
+                original: paths[0].clone(),
+                session,
+                window,
+                key: "1-1".to_owned(),
+            }
+        }
+
+        #[test]
+        fn a_save_before_any_ready_version_is_not_ready_none_asked() {
+            let s = loaded_only();
+            refused_save(&s, Some(&args("beach", "1-1")), CommandError::NotReady);
+        }
+
+        #[test]
+        fn a_save_before_any_ready_version_is_not_ready_one_running() {
+            let s = loaded_only();
+            let job = request(&s.session);
+            // Its worker has even written the file; it is not settled.
+            fs::write(&job.dest, VERSION).unwrap();
+            refused_save(&s, Some(&args("beach", "1-1")), CommandError::NotReady);
+        }
+
+        #[test]
+        fn a_save_before_any_ready_version_is_not_ready_one_failed() {
+            let s = loaded_only();
+            let job = request(&s.session);
+            s.session
+                .single()
+                .settle_preview(&job, Some(failed_result()), &mut |_| {});
+            refused_save(&s, Some(&args("beach", "1-1")), CommandError::NotReady);
+        }
+
+        #[test]
+        fn a_failed_newer_version_keeps_the_older_ready_one_saveable() {
+            let s = ready_image("holiday.jpg");
+            let job = request(&s.session);
+            s.session
+                .single()
+                .settle_preview(&job, Some(failed_result()), &mut |_| {});
+            refused_save(&s, Some(&args("beach", "1-2")), CommandError::NotReady);
+            assert_eq!(save(&s, "beach"), Ok(()));
+            assert_eq!(fs::read(s.dir.path().join("beach.jpg")).unwrap(), VERSION);
+        }
+
+        #[test]
+        fn a_save_without_an_image_is_no_image() {
+            let session = Session::new();
+            let window = Window::default();
+            assert_eq!(
+                session.save_image(Some(&args("beach", "1-1")), &mut window.emit()),
+                Err(CommandError::NoImage)
+            );
+            assert!(window.take().is_empty());
+            assert!(guard_is_free(&session));
+        }
+
+        #[test]
+        fn a_save_after_shutdown_is_no_image() {
+            let s = ready_image("holiday.jpg");
+            s.session.shutdown();
+            refused_save(&s, Some(&args("beach", &s.key)), CommandError::NoImage);
+        }
+
+        #[test]
+        fn a_deleted_chosen_folder_is_output_missing() {
+            let (s, out) = ready_with_exports();
+            fs::remove_dir(&out).unwrap();
+            refused_save(
+                &s,
+                Some(&args("holiday", &s.key)),
+                CommandError::OutputMissing,
+            );
+            assert!(!out.exists(), "the folder is not made again");
+        }
+
+        #[test]
+        fn a_deleted_original_folder_is_output_missing() {
+            let dir = TempDir::new().unwrap();
+            let photos = dir.path().join("photos");
+            fs::create_dir(&photos).unwrap();
+            let original = photos.join("holiday.jpg");
+            fs::write(&original, ORIGINAL).unwrap();
+            let session = Session::new();
+            let window = Window::default();
+            choose_image(&session, &window, Some(&original), &Prober::sized());
+            let key = make_ready(&session, VERSION);
+            window.take();
+            fs::remove_dir_all(&photos).unwrap();
+            let s = Saving {
+                dir,
+                original,
+                session,
+                window,
+                key,
+            };
+            refused_save(
+                &s,
+                Some(&args("beach", &s.key)),
+                CommandError::OutputMissing,
+            );
+            assert!(!photos.exists(), "the folder is not made again");
+        }
+
+        #[test]
+        fn a_chosen_folder_replaced_by_a_file_is_output_missing() {
+            let (s, out) = ready_with_exports();
+            fs::remove_dir(&out).unwrap();
+            fs::write(&out, b"a file").unwrap();
+            refused_save(
+                &s,
+                Some(&args("holiday", &s.key)),
+                CommandError::OutputMissing,
+            );
+            assert_eq!(fs::read(&out).unwrap(), b"a file");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_read_only_chosen_folder_is_output_missing() {
+            let (s, out) = ready_with_exports();
+            if !read_only(&out) {
+                return;
+            }
+            refused_save(
+                &s,
+                Some(&args("holiday", &s.key)),
+                CommandError::OutputMissing,
+            );
+            writable(&out);
+            assert!(entries(&out).is_empty());
+        }
+
+        #[test]
+        fn the_order_of_checks_is_busy_shape_image_preview_name_then_folder() {
+            let (dir, paths) = files(&[("holiday.jpg", ORIGINAL)]);
+            let out = dir.path().join("exports");
+            fs::create_dir(&out).unwrap();
+            let session = Session::new();
+            let window = Window::default();
+            choose_output(&session, &window, &out);
+            fs::remove_dir(&out).unwrap();
+            window.take();
+            let ask = |args: &Value| session.save_image(Some(args), &mut |_| {});
+            let bad_shape = json!({ "name": 7, "preview": "1-1" });
+            let bad_name = args("a/b", "1-1");
+            // Busy before a bad shape.
+            let held = session.guard.try_start().expect("a free guard");
+            assert_eq!(ask(&bad_shape), Err(CommandError::Busy));
+            drop(held);
+            // A bad shape before no image.
+            assert_eq!(ask(&bad_shape), Err(CommandError::InvalidName));
+            // No image before no ready version and a bad name.
+            assert_eq!(ask(&bad_name), Err(CommandError::NoImage));
+            choose_image(&session, &window, Some(&paths[0]), &Prober::sized());
+            // No ready version before a bad name.
+            assert_eq!(ask(&bad_name), Err(CommandError::NotReady));
+            let key = make_ready(&session, VERSION);
+            assert_eq!(key, "1-1");
+            // A bad name before a missing folder.
+            assert_eq!(ask(&bad_name), Err(CommandError::InvalidName));
+            // The missing folder.
+            assert_eq!(ask(&args("beach", "1-1")), Err(CommandError::OutputMissing));
+            fs::create_dir(&out).unwrap();
+            assert_eq!(ask(&args("beach", "1-1")), Ok(()));
+            assert_eq!(fs::read(out.join("beach.jpg")).unwrap(), VERSION);
+        }
+
+        // Failures.
+
+        /// The writer here fails without touching the disk, so this test
+        /// claims only the answer and that nothing is sent or stored. That
+        /// `save_new` removes its staging file on a failure is core's
+        /// `save_new_leaves_no_temporary_file_after_a_refusal` and
+        /// `save_new_returns_a_rename_error_that_is_not_a_taken_name_and_leaves_no_temp_file`;
+        /// the real staging case is
+        /// `a_folder_made_read_only_before_the_write_is_save_failed_and_leaves_no_file`.
+        #[test]
+        fn a_failing_write_is_save_failed_and_sends_nothing() {
+            let s = ready_image("holiday.jpg");
+            let before = snapshot(s.dir.path());
+            let answer = s.session.save_image_with(
+                Some(&args("beach", &s.key)),
+                &mut s.window.emit(),
+                |_, _, _| Err(io::Error::other("no space left")),
+                &mut |_| {},
+            );
+            assert_eq!(answer, Err(CommandError::SaveFailed));
+            assert!(s.window.take().is_empty());
+            assert_eq!(snapshot(s.dir.path()), before);
+            assert_eq!(last_output(&s.session), None);
+            assert!(guard_is_free(&s.session));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_folder_made_read_only_before_the_write_is_save_failed_and_leaves_no_file() {
+            let (s, out) = ready_with_exports();
+            let mut locked = true;
+            let answer = save_with(&s, "holiday", &mut |seam| {
+                if seam == SaveSeam::BeforeWrite {
+                    locked = read_only(&out);
+                }
+            });
+            if !locked {
+                return;
+            }
+            writable(&out);
+            assert_eq!(answer, Err(CommandError::SaveFailed));
+            assert!(entries(&out).is_empty());
+            assert!(s.window.take().is_empty());
+            assert_eq!(last_output(&s.session), None);
+        }
+
+        #[test]
+        fn a_folder_removed_before_the_write_is_output_missing() {
+            let (s, out) = ready_with_exports();
+            let answer = save_with(&s, "holiday", &mut |seam| {
+                if seam == SaveSeam::BeforeWrite {
+                    fs::remove_dir(&out).unwrap();
+                }
+            });
+            assert_eq!(answer, Err(CommandError::OutputMissing));
+            assert!(!out.exists(), "the folder is not made again");
+            assert!(s.window.take().is_empty());
+            assert_eq!(last_output(&s.session), None);
+        }
+
+        #[test]
+        fn an_unreadable_version_is_save_failed() {
+            let s = ready_image("holiday.jpg");
+            let version = s.session.single().served_file(1, Some(1)).unwrap();
+            let answer = save_with(&s, "beach", &mut |seam| {
+                if seam == SaveSeam::AfterCheck {
+                    fs::remove_file(&version).unwrap();
+                    fs::create_dir(&version).unwrap();
+                }
+            });
+            assert_eq!(answer, Err(CommandError::SaveFailed));
+            assert_eq!(entries(s.dir.path()), ["holiday.jpg"]);
+            assert!(s.window.take().is_empty());
+        }
+
+        #[test]
+        fn a_save_during_a_run_is_busy() {
+            let s = ready_image("holiday.jpg");
+            pick(&s.session, &s.window, std::slice::from_ref(&s.original));
+            s.window.take();
+            let running = started(&s.session, &s.window, &lossless());
+            s.window.take();
+            refused_save(&s, Some(&args("beach", &s.key)), CommandError::Busy);
+            drop(running);
+            assert_eq!(save(&s, "beach"), Ok(()));
+        }
+
+        #[test]
+        fn a_save_while_a_dialog_is_open_is_busy() {
+            let s = ready_image("holiday.jpg");
+            let mut open = None;
+            s.session
+                .choose_image(&mut s.window.emit(), |ticket| open = Some(ticket))
+                .unwrap();
+            refused_save(&s, Some(&args("beach", &s.key)), CommandError::Busy);
+            drop(open);
+            assert_eq!(save(&s, "beach"), Ok(()));
+        }
+
+        #[test]
+        fn a_save_while_an_image_is_loading_is_busy() {
+            let s = ready_image("holiday.jpg");
+            let other = s.dir.path().join("other.jpg");
+            fs::write(&other, ORIGINAL).unwrap();
+            let loading = Window::default();
+            let asked = Cell::new(false);
+            s.session
+                .choose_image(&mut loading.emit(), |ticket| {
+                    s.session.load_image(
+                        ticket,
+                        Some(other.clone()),
+                        |_| {
+                            // The probe runs while the load holds the guard.
+                            asked.set(true);
+                            refused_save(&s, Some(&args("beach", &s.key)), CommandError::Busy);
+                            ProbeAnswer::Size(Probe {
+                                width: Some(1),
+                                height: Some(1),
+                            })
+                        },
+                        &mut loading.emit(),
+                    );
+                })
+                .unwrap();
+            assert!(asked.get(), "the probe ran");
+            // Once the load is over the guard is free: the new image has no
+            // ready version yet, so the save is refused for that, not busy.
+            refused_save(&s, Some(&args("beach", &s.key)), CommandError::NotReady);
+        }
+
+        // The ticket is held for the whole save.
+
+        #[derive(Debug, Clone, Copy)]
+        enum Call {
+            Choice,
+            Drop,
+            SetView,
+            Preview,
+            StartRun,
+            ClearOutput,
+            ChooseOutput,
+        }
+
+        /// `call` while the save holds the ticket: it is refused as busy,
+        /// tells the window once and starts nothing.
+        fn compete(s: &Saving, call: Call) {
+            let other = Window::default();
+            let went_ahead = Cell::new(false);
+            let answer = match call {
+                Call::Choice => s
+                    .session
+                    .choose_image(&mut other.emit(), |_| went_ahead.set(true)),
+                Call::Drop => {
+                    s.session
+                        .drop_paths(vec![s.original.clone()], &mut other.emit(), |_, _| {
+                            went_ahead.set(true)
+                        });
+                    Err(CommandError::Busy)
+                }
+                Call::SetView => s
+                    .session
+                    .set_view(Some(&json!({ "view": "batch" })), &mut other.emit()),
+                Call::Preview => {
+                    s.session
+                        .preview_image(Some(&lossy(60)), &mut other.emit(), |_| {
+                            went_ahead.set(true)
+                        })
+                }
+                Call::StartRun => s
+                    .session
+                    .start_run(Some(&lossless()), &mut other.emit(), |_| {
+                        went_ahead.set(true)
+                    }),
+                Call::ClearOutput => s.session.clear_output_folder(&mut other.emit()),
+                Call::ChooseOutput => s
+                    .session
+                    .choose_output_folder(&mut other.emit(), |_| went_ahead.set(true)),
+            };
+            assert_eq!(answer, Err(CommandError::Busy), "{call:?}");
+            assert_eq!(other.take(), [Event::RunBusy], "{call:?}");
+            assert!(!went_ahead.get(), "{call:?}");
+        }
+
+        /// `holiday.jpg` with `exports` chosen, saved as `holiday` while
+        /// `call` lands at `at`: the call is busy, the save goes on.
+        fn ticket_race(call: Call, at: SaveSeam) {
+            let (s, out) = ready_with_exports();
+            pick(&s.session, &s.window, std::slice::from_ref(&s.original));
+            s.window.take();
+            let reached = Cell::new(false);
+            let answer = save_with(&s, "holiday", &mut |seam| {
+                if seam == at {
+                    reached.set(true);
+                    compete(&s, call);
+                }
+            });
+            assert!(reached.get(), "the seam was reached");
+            assert_eq!(answer, Ok(()));
+            assert_eq!(fs::read(out.join("holiday.jpg")).unwrap(), VERSION);
+            assert_eq!(only_saved(&s.window)["folder"], json!("exports"));
+            // Nothing the competing call would have changed did change.
+            assert_eq!(s.session.view(), View::Single);
+            assert_eq!(lock(&s.session.output).as_deref(), Some(out.as_path()));
+            assert_eq!(loaded(&s.session).key, 1);
+            assert_eq!(s.session.single().latest_ready(), Some((1, 1)));
+        }
+
+        macro_rules! ticket_races {
+            ($($name:ident: $call:ident, $seam:ident;)*) => {
+                $(
+                    #[test]
+                    fn $name() {
+                        ticket_race(Call::$call, SaveSeam::$seam);
+                    }
+                )*
+            };
+        }
+
+        ticket_races! {
+            race_choice_after_check_is_busy: Choice, AfterCheck;
+            race_choice_before_write_is_busy: Choice, BeforeWrite;
+            race_drop_after_check_is_busy: Drop, AfterCheck;
+            race_drop_before_write_is_busy: Drop, BeforeWrite;
+            race_set_view_after_check_is_busy: SetView, AfterCheck;
+            race_set_view_before_write_is_busy: SetView, BeforeWrite;
+            race_preview_after_check_is_busy: Preview, AfterCheck;
+            race_preview_before_write_is_busy: Preview, BeforeWrite;
+            race_start_run_after_check_is_busy: StartRun, AfterCheck;
+            race_start_run_before_write_is_busy: StartRun, BeforeWrite;
+            race_clear_output_folder_after_check_is_busy: ClearOutput, AfterCheck;
+            race_clear_output_folder_before_write_is_busy: ClearOutput, BeforeWrite;
+            race_choose_output_folder_after_check_is_busy: ChooseOutput, AfterCheck;
+            race_choose_output_folder_before_write_is_busy: ChooseOutput, BeforeWrite;
+        }
+
+        // A newer version or shutdown between the decision and the write.
+
+        /// Version 1 ready, version 2 asked for (its worker running) before
+        /// the save of `"1-1"` as `beach` starts; at `at` version 2 settles
+        /// ready, which deletes version 1's file. The save's answer.
+        fn newer_ready_at(s: &Saving, at: SaveSeam) -> Result<(), CommandError> {
+            let newer = request(&s.session);
+            let v1 = s.session.single().served_file(1, Some(1)).unwrap();
+            let answer = save_with(s, "beach", &mut |seam| {
+                if seam == at {
+                    assert_eq!(settle_ready(&s.session, &newer, b"newer"), "1-2");
+                    assert!(!v1.exists(), "the newer version removed version 1");
+                }
+            });
+            assert_eq!(s.session.single().latest_ready(), Some((1, 2)));
+            answer
+        }
+
+        #[test]
+        fn race_newer_ready_after_check_is_not_ready_and_writes_nothing() {
+            let s = ready_image("holiday.jpg");
+            assert_eq!(
+                newer_ready_at(&s, SaveSeam::AfterCheck),
+                Err(CommandError::NotReady)
+            );
+            assert_eq!(entries(s.dir.path()), ["holiday.jpg"]);
+            assert!(s.window.take().is_empty());
+            assert_eq!(last_output(&s.session), None);
+        }
+
+        #[test]
+        fn race_newer_ready_before_write_saves_the_named_versions_bytes() {
+            let s = ready_image("holiday.jpg");
+            assert_eq!(newer_ready_at(&s, SaveSeam::BeforeWrite), Ok(()));
+            let saved = fs::read(s.dir.path().join("beach.jpg")).unwrap();
+            assert_eq!(saved, VERSION);
+            assert_ne!(saved, b"newer");
+            assert_eq!(only_saved(&s.window)["name"], json!("beach.jpg"));
+        }
+
+        #[test]
+        fn race_shutdown_after_check_is_not_ready_and_writes_nothing() {
+            let s = ready_image("holiday.jpg");
+            let answer = save_with(&s, "beach", &mut |seam| {
+                if seam == SaveSeam::AfterCheck {
+                    s.session.shutdown();
+                }
+            });
+            assert_eq!(answer, Err(CommandError::NotReady));
+            assert_eq!(entries(s.dir.path()), ["holiday.jpg"]);
+            assert!(s.window.take().is_empty());
+        }
+
+        /// `Session::shutdown` (what the window closing calls) neither waits
+        /// for nor stops a save that has read its bytes: while the process
+        /// runs on, the write completes. This does not cover the process
+        /// exiting during the write; then the file may be missing and a
+        /// staging file may be left in the folder (see `save_image`).
+        #[test]
+        fn race_session_shutdown_before_write_does_not_stop_the_write() {
+            let s = ready_image("holiday.jpg");
+            let private = loaded(&s.session).copy.parent().unwrap().to_path_buf();
+            let answer = save_with(&s, "beach", &mut |seam| {
+                if seam == SaveSeam::BeforeWrite {
+                    s.session.shutdown();
+                }
+            });
+            assert!(!private.exists(), "shutdown removed the private folder");
+            assert_eq!(answer, Ok(()));
+            assert_eq!(fs::read(s.dir.path().join("beach.jpg")).unwrap(), VERSION);
+        }
+
+        #[test]
+        fn image_saved_names_a_chosen_folder_without_a_name_by_an_empty_string() {
+            // A folder path ending in `..` has no file name, as a drive root
+            // such as `D:\` has none; it is still a writable folder.
+            let s = ready_image("holiday.jpg");
+            let exports = s.dir.path().join("exports");
+            fs::create_dir(&exports).unwrap();
+            choose_output(&s.session, &s.window, &exports.join(".."));
+            s.window.take();
+            assert_eq!(save(&s, "beach"), Ok(()));
+            assert_eq!(
+                only_saved(&s.window),
+                json!({ "name": "beach.jpg", "folder": "", "suggested": "beach-1" })
+            );
+            assert_eq!(fs::read(s.dir.path().join("beach.jpg")).unwrap(), VERSION);
+        }
+
+        // After saving.
+
+        #[test]
+        fn image_saved_gives_the_next_free_name_after_the_suggested_one() {
+            let s = ready_image("holiday.jpg");
+            let suggested = loaded(&s.session).info(None).suggested;
+            assert_eq!(suggested, "optimized-holiday");
+            assert_eq!(save(&s, &suggested), Ok(()));
+            let saved = only_saved(&s.window);
+            assert_eq!(saved["suggested"], json!("optimized-holiday-1"));
+            assert_ne!(saved["suggested"], json!(suggested));
+        }
+
+        #[test]
+        fn image_saved_gives_the_next_free_name_after_a_typed_one() {
+            let s = ready_image("holiday.jpg");
+            assert_eq!(save(&s, "beach"), Ok(()));
+            let saved = only_saved(&s.window);
+            assert_eq!(saved["suggested"], json!("beach-1"));
+            assert_ne!(saved["suggested"], json!("beach"));
+        }
+
+        #[test]
+        fn image_saved_skips_a_taken_number() {
+            let s = ready_image("holiday.jpg");
+            fs::write(s.dir.path().join("beach-1.jpg"), b"theirs").unwrap();
+            assert_eq!(save(&s, "beach"), Ok(()));
+            assert_eq!(only_saved(&s.window)["suggested"], json!("beach-2"));
+            // Pressing Save again with it works; the next one numbers that
+            // name, as Batch numbers a taken output name.
+            assert_eq!(save(&s, "beach-2"), Ok(()));
+            assert_eq!(only_saved(&s.window)["suggested"], json!("beach-2-1"));
+        }
+
+        #[test]
+        fn open_output_folder_opens_the_folder_of_the_last_save() {
+            let s = ready_image("holiday.jpg");
+            assert_eq!(save(&s, "beach"), Ok(()));
+            assert_eq!(opened(&s.session), Ok(s.dir.path().to_path_buf()));
+            let out = s.dir.path().join("exports");
+            fs::create_dir(&out).unwrap();
+            choose_output(&s.session, &s.window, &out);
+            assert_eq!(save(&s, "beach"), Ok(()));
+            assert_eq!(opened(&s.session), Ok(out));
+        }
+
+        #[test]
+        fn a_refused_save_leaves_open_output_folder_as_it_was() {
+            let s = ready_image("holiday.jpg");
+            assert_eq!(opened(&s.session), Err(CommandError::NoOutput));
+            refused_save(&s, Some(&args("holiday", &s.key)), CommandError::NameTaken);
+            assert_eq!(opened(&s.session), Err(CommandError::NoOutput));
+            assert_eq!(save(&s, "beach"), Ok(()));
+            let out = s.dir.path().join("exports");
+            fs::create_dir(&out).unwrap();
+            choose_output(&s.session, &s.window, &out);
+            s.window.take();
+            refused_save(&s, Some(&args("a/b", &s.key)), CommandError::InvalidName);
+            assert_eq!(opened(&s.session), Ok(s.dir.path().to_path_buf()));
+        }
+
+        /// The list holds the original; a run into `runs` (chosen first).
+        fn run_into(s: &Saving, runs: &Path) {
+            fs::create_dir_all(runs).unwrap();
+            choose_output(&s.session, &s.window, runs);
+            pick(&s.session, &s.window, std::slice::from_ref(&s.original));
+            let prepared = started(&s.session, &s.window, &lossless());
+            run_fake(&s.session, &s.window, prepared);
+            s.window.take();
+        }
+
+        #[test]
+        fn a_run_after_a_save_wins() {
+            let (s, out) = ready_with_exports();
+            assert_eq!(save(&s, "holiday"), Ok(()));
+            assert_eq!(opened(&s.session), Ok(out));
+            let runs = s.dir.path().join("runs");
+            run_into(&s, &runs);
+            assert_eq!(opened(&s.session), Ok(runs));
+        }
+
+        #[test]
+        fn a_save_after_a_run_wins() {
+            let s = ready_image("holiday.jpg");
+            let runs = s.dir.path().join("runs");
+            run_into(&s, &runs);
+            assert_eq!(opened(&s.session), Ok(runs));
+            let out = s.dir.path().join("exports");
+            fs::create_dir(&out).unwrap();
+            choose_output(&s.session, &s.window, &out);
+            assert_eq!(save(&s, "holiday"), Ok(()));
+            assert_eq!(opened(&s.session), Ok(out));
+        }
+
+        // Names are saved exactly as typed.
+
+        #[test]
+        fn a_name_with_e_acute_saves_under_exactly_that_name() {
+            let s = ready_image("holiday.jpg");
+            assert_eq!(save(&s, "vakantie-caf\u{e9}"), Ok(()));
+            assert_eq!(
+                entries(s.dir.path()),
+                [
+                    OsString::from("holiday.jpg"),
+                    OsString::from("vakantie-caf\u{e9}.jpg")
+                ]
+            );
+            assert!(!entries(s.dir.path()).contains(&OsString::from("vakantie-cafe\u{301}.jpg")));
+            assert_eq!(
+                only_saved(&s.window)["name"],
+                json!("vakantie-caf\u{e9}.jpg")
+            );
+        }
+
+        #[test]
+        fn a_decomposed_e_acute_saves_under_exactly_those_bytes() {
+            let s = ready_image("holiday.jpg");
+            assert_eq!(save(&s, "vakantie-cafe\u{301}"), Ok(()));
+            assert_eq!(
+                entries(s.dir.path()),
+                [
+                    OsString::from("holiday.jpg"),
+                    OsString::from("vakantie-cafe\u{301}.jpg")
+                ]
+            );
+            assert!(!entries(s.dir.path()).contains(&OsString::from("vakantie-caf\u{e9}.jpg")));
+        }
     }
 }

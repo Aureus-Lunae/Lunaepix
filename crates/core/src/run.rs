@@ -6,7 +6,8 @@
 //! fails only its own file; the run carries on with the next one.
 //!
 //! A thumbnail is made the same way, by [`run_thumb`]: one worker process per
-//! file, with its own timeout and cap on the answer.
+//! file, with its own timeout and cap on the answer. So is a probe of a
+//! file's shown size, by [`run_probe`].
 
 use std::ffi::OsString;
 use std::fmt;
@@ -19,10 +20,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::worker::{
-    THUMB_FLAG, THUMB_HEADER_LEN, WORKER_FLAG, option_args, parse_record, parse_thumb_answer,
+    PROBE_FLAG, THUMB_FLAG, THUMB_HEADER_LEN, WORKER_FLAG, option_args, parse_probe_answer,
+    parse_record, parse_thumb_answer,
 };
 use crate::{
-    Job, MAX_WORKER_OUTPUT_BYTES, OptimizeError, Options, Outcome, Skip, Thumbnail, WORKER_TIMEOUT,
+    Job, MAX_WORKER_OUTPUT_BYTES, OptimizeError, Options, Outcome, Probe, Skip, Thumbnail,
+    WORKER_TIMEOUT,
 };
 
 /// Longest pause between two checks on a running worker. The pause starts at
@@ -353,18 +356,116 @@ pub(crate) fn run_thumb_command(
     timeout: Duration,
     cap: usize,
 ) -> ThumbAnswer {
+    match run_short(command, timeout, cap + THUMB_HEADER_LEN) {
+        Some(Short {
+            code: 0,
+            stdout: Some(answer),
+        }) => match parse_thumb_answer(&answer) {
+            Some(Thumbnail::Png(bytes)) => ThumbAnswer::Png(bytes),
+            Some(Thumbnail::Svg(bytes)) => ThumbAnswer::Svg(bytes),
+            None => ThumbAnswer::Failed,
+        },
+        Some(Short { code: 3, .. }) => ThumbAnswer::CannotShow,
+        _ => ThumbAnswer::Failed,
+    }
+}
+
+/// What a probe worker answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeAnswer {
+    /// The size the file is shown at (an SVG has none).
+    Size(Probe),
+    /// The worker said the file is refused, with Batch's reason (exit code 3).
+    Refused(String),
+    /// Anything else: the worker could not be started, timed out, crashed,
+    /// exited with another code, wrote too much, or gave no valid answer.
+    Failed,
+}
+
+/// How long one probe worker may take: a thumbnail's, since a probe reads a
+/// file's header the way a thumbnail does and is waited for by the window
+/// the same way. Not [`crate::WORKER_TIMEOUT`], which is for optimising.
+pub(crate) const PROBE_TIMEOUT: Duration = THUMB_TIMEOUT;
+
+/// The most bytes the runner reads from a probe worker's stdout (and, as for
+/// every worker, from its stderr): a record is at most a few KiB.
+pub(crate) const PROBE_OUTPUT_CAP: usize = MAX_WORKER_OUTPUT_BYTES;
+
+/// Probe `src` in a worker process: `program` started as
+/// `<program> --lunaepix-probe <src>` (see [`crate::worker`]).
+///
+/// Started and waited for on the calling thread, with no shell and no stdin,
+/// and with [`PROBE_TIMEOUT`] and [`PROBE_OUTPUT_CAP`]: a worker that
+/// runs past the limit or writes more is killed and reaped. Only exit code 0
+/// with a `size` record is [`ProbeAnswer::Size`] and only exit code 3 with a
+/// `refused` record is [`ProbeAnswer::Refused`]; every other way of not
+/// giving a valid answer is [`ProbeAnswer::Failed`].
+pub fn run_probe(program: &Path, src: &Path) -> ProbeAnswer {
+    run_probe_with(program, src, PROBE_TIMEOUT, PROBE_OUTPUT_CAP)
+}
+
+/// [`run_probe`], with the timeout and the cap on the answer given: the
+/// tests shorten them.
+pub(crate) fn run_probe_with(
+    program: &Path,
+    src: &Path,
+    timeout: Duration,
+    cap: usize,
+) -> ProbeAnswer {
+    let mut command = Command::new(program);
+    command.arg(PROBE_FLAG).arg(src);
+    run_probe_command(&mut command, timeout, cap)
+}
+
+/// [`run_probe_with`], with the whole command given: the tests put a shell
+/// script in the worker's place.
+pub(crate) fn run_probe_command(
+    command: &mut Command,
+    timeout: Duration,
+    cap: usize,
+) -> ProbeAnswer {
+    match run_short(command, timeout, cap) {
+        Some(Short {
+            code: 0,
+            stdout: Some(answer),
+        }) => match parse_probe_answer(&answer) {
+            Some(Ok(probe)) => ProbeAnswer::Size(probe),
+            _ => ProbeAnswer::Failed,
+        },
+        Some(Short {
+            code: 3,
+            stdout: Some(answer),
+        }) => match parse_probe_answer(&answer) {
+            Some(Err(message)) => ProbeAnswer::Refused(message),
+            _ => ProbeAnswer::Failed,
+        },
+        _ => ProbeAnswer::Failed,
+    }
+}
+
+/// How a short worker (a thumbnail or a probe) ended, when it ended on its
+/// own with an exit code.
+struct Short {
+    code: i32,
+    /// Everything it wrote to stdout, or `None` if the reader gave none.
+    stdout: Option<Vec<u8>>,
+}
+
+/// Run `command` to its end on the calling thread, with no stdin: stdout
+/// read up to `stdout_limit` bytes and stderr up to
+/// [`MAX_WORKER_OUTPUT_BYTES`], and a worker that runs past `timeout` or
+/// writes more is killed and reaped. `None` unless it ended on its own with
+/// an exit code and no output went past its limit: it could not be started,
+/// timed out, crashed on a signal, or overflowed.
+fn run_short(command: &mut Command, timeout: Duration, stdout_limit: usize) -> Option<Short> {
     // Nobody else holds this handle, so nothing stops the worker but its
     // own end, the timeout, or an overflow.
     let stop = StopHandle::new();
-    let started = start(command, cap + THUMB_HEADER_LEN, &mut stop.active());
-    let Ok(Started {
+    let Started {
         stdout,
         stderr,
         overflow,
-    }) = started
-    else {
-        return ThumbAnswer::Failed;
-    };
+    } = start(command, stdout_limit, &mut stop.active()).ok()?;
 
     let ended = wait(&stop, timeout, &overflow);
     // Reaped by now.
@@ -377,21 +478,16 @@ pub(crate) fn run_thumb_command(
     // A timeout, a failed wait and a stop (which cannot happen here) are all
     // "no answer", like a crash.
     let Ended::Exited(status) = ended else {
-        return ThumbAnswer::Failed;
+        return None;
     };
     if overflow.load(Ordering::SeqCst) {
-        return ThumbAnswer::Failed;
+        return None;
     }
     // A worker killed by a signal has no exit code.
-    match (status.code(), stdout) {
-        (Some(0), Some(answer)) => match parse_thumb_answer(&answer) {
-            Some(Thumbnail::Png(bytes)) => ThumbAnswer::Png(bytes),
-            Some(Thumbnail::Svg(bytes)) => ThumbAnswer::Svg(bytes),
-            None => ThumbAnswer::Failed,
-        },
-        (Some(3), _) => ThumbAnswer::CannotShow,
-        _ => ThumbAnswer::Failed,
-    }
+    Some(Short {
+        code: status.code()?,
+        stdout,
+    })
 }
 
 /// Windows' `CREATE_NO_WINDOW` process creation flag.
@@ -833,6 +929,23 @@ mod tests {
         assert!(MAX_THUMB_ANSWER_BYTES as u64 >= crate::MAX_SVG_THUMB_BYTES);
     }
 
+    #[test]
+    fn the_probe_limits_are_the_thumbnail_limits_and_not_a_batch_files() {
+        // A probe reads a header: it gets a thumbnail's ten seconds, not the
+        // ten minutes a file's optimising gets, and the cap a record needs.
+        assert_eq!(PROBE_TIMEOUT, THUMB_TIMEOUT);
+        assert_eq!(PROBE_TIMEOUT, Duration::from_secs(10));
+        assert_ne!(PROBE_TIMEOUT, crate::WORKER_TIMEOUT);
+        assert_eq!(PROBE_OUTPUT_CAP, MAX_WORKER_OUTPUT_BYTES);
+        assert_eq!(PROBE_OUTPUT_CAP, 64 * 1024);
+        // Not the thumbnail's 2 MiB: a record is at most a few KiB.
+        assert_ne!(PROBE_OUTPUT_CAP, MAX_THUMB_ANSWER_BYTES);
+        // A longest record (the message cut at its cap, every byte escaped
+        // to two) fits.
+        let longest = "lunaepix-probe 1 refused ".len() + 2 * crate::MAX_WORKER_MESSAGE_BYTES + 1;
+        assert!(longest <= PROBE_OUTPUT_CAP);
+    }
+
     /// The thumbnail runner against doubles: shell scripts that print what a
     /// worker would, or misbehave.
     #[cfg(unix)]
@@ -1119,5 +1232,212 @@ mod tests {
             timed_out.to_string(),
             "big.png: the optimiser timed out after 600s and was stopped"
         );
+    }
+
+    /// The probe runner against doubles: shell scripts that print what a
+    /// worker would, or misbehave.
+    #[cfg(unix)]
+    mod probe {
+        use std::fs;
+
+        use tempfile::TempDir;
+
+        use super::*;
+
+        const LONG: Duration = Duration::from_secs(30);
+        /// A small cap, so the boundary tests stay small.
+        const CAP: usize = 100;
+        /// `lunaepix-probe 1 refused `, the start of a refusal's record.
+        const REFUSED_PREFIX: &str = "lunaepix-probe 1 refused ";
+
+        fn answer_of(script: &str) -> ProbeAnswer {
+            answer_with(script, LONG, CAP)
+        }
+
+        fn answer_with(script: &str, timeout: Duration, cap: usize) -> ProbeAnswer {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", script]);
+            run_probe_command(&mut command, timeout, cap)
+        }
+
+        fn size(width: u32, height: u32) -> ProbeAnswer {
+            ProbeAnswer::Size(Probe {
+                width: Some(width),
+                height: Some(height),
+            })
+        }
+
+        /// A script that prints a refusal record whose message is `length`
+        /// bytes of `x`, then exits 3.
+        fn refusal_of(length: usize) -> String {
+            format!(
+                "printf '{REFUSED_PREFIX}'; head -c {length} /dev/zero | tr '\\0' x; echo; exit 3"
+            )
+        }
+
+        #[test]
+        fn a_valid_size_answer_with_exit_0_is_size() {
+            assert_eq!(
+                answer_of("printf 'lunaepix-probe 1 size 300 200\\n'"),
+                size(300, 200)
+            );
+            assert_eq!(
+                answer_of("printf 'lunaepix-probe 1 size - -\\n'"),
+                ProbeAnswer::Size(Probe {
+                    width: None,
+                    height: None
+                })
+            );
+        }
+
+        #[test]
+        fn a_valid_refused_answer_with_exit_3_is_refused_with_its_message_unescaped() {
+            let script = "printf 'lunaepix-probe 1 refused File is too large\\n'; exit 3";
+            assert_eq!(
+                answer_of(script),
+                ProbeAnswer::Refused("File is too large".to_owned())
+            );
+            // The escapes the worker wrote are undone.
+            let escaped = "printf '%s\\n' 'lunaepix-probe 1 refused a\\\\b\\nc'; exit 3";
+            assert_eq!(
+                answer_of(escaped),
+                ProbeAnswer::Refused("a\\b\nc".to_owned())
+            );
+        }
+
+        #[test]
+        fn a_record_with_the_wrong_exit_code_is_failed() {
+            // Each prints a valid record first, so only the way the worker
+            // ended can make it `Failed`.
+            let size_record = "printf 'lunaepix-probe 1 size 3 2\\n'";
+            let refused_record = "printf 'lunaepix-probe 1 refused File is too large\\n'";
+            for ending in ["exit 1", "exit 2", "exit 3", "exit 4", "exit 101"] {
+                let script = format!("{size_record}; {ending}");
+                // A size is only a size with exit 0; exit 3 reads the record as
+                // a refusal, and it is not one.
+                assert_eq!(answer_of(&script), ProbeAnswer::Failed, "size, {ending}");
+            }
+            for ending in ["exit 0", "exit 1", "exit 2", "exit 4", "exit 101"] {
+                let script = format!("{refused_record}; {ending}");
+                assert_eq!(answer_of(&script), ProbeAnswer::Failed, "refused, {ending}");
+            }
+            for ending in ["kill -SEGV $$", "kill -KILL $$"] {
+                for record in [size_record, refused_record] {
+                    let script = format!("{record}; {ending}");
+                    assert_eq!(answer_of(&script), ProbeAnswer::Failed, "{script}");
+                }
+            }
+            // And with nothing printed.
+            for ending in ["exit 0", "exit 1", "exit 2", "exit 3", "exit 101"] {
+                assert_eq!(answer_of(ending), ProbeAnswer::Failed, "{ending}");
+            }
+        }
+
+        #[test]
+        fn a_wrong_version_or_a_garbled_record_is_failed_even_with_the_right_exit_code() {
+            // Control: the same shape, valid, is an answer.
+            assert_eq!(
+                answer_of("printf 'lunaepix-probe 1 size 3 2\\n'"),
+                size(3, 2)
+            );
+            for record in [
+                "lunaepix-probe 2 size 3 2\\n",
+                "lunaepix-probe 1 size 3 2",
+                "lunaepix-probe 1 size 3\\n",
+                "lunaepix-probe 1 size 3 -\\n",
+                "lunaepix-probe 1 size x 2\\n",
+                "lunaepix-probe 1 size 4294967296 2\\n",
+                "lunaepix-probe 1 size 3 2\\nlunaepix-probe 1 size 3 2\\n",
+                "lunaepix-thumb 1 size 3 2\\n",
+            ] {
+                let script = format!("printf '{record}'");
+                assert_eq!(answer_of(&script), ProbeAnswer::Failed, "{record}");
+            }
+            for record in [
+                "lunaepix-probe 2 refused x\\n",
+                "lunaepix-probe 1 refused x",
+                "lunaepix-probe 1 refused\\n",
+                "lunaepix-probe 1 refused \\n",
+                "lunaepix-probe 1 refused a\\\\x\\n",
+            ] {
+                let script = format!("printf '{record}'; exit 3");
+                assert_eq!(answer_of(&script), ProbeAnswer::Failed, "{record}");
+            }
+        }
+
+        #[test]
+        fn an_answer_of_exactly_the_cap_is_read_and_one_byte_over_it_is_failed() {
+            // The cap counts the whole line: prefix, message and newline.
+            let message = CAP - REFUSED_PREFIX.len() - 1;
+            assert_eq!(
+                answer_with(&refusal_of(message), LONG, CAP),
+                ProbeAnswer::Refused("x".repeat(message))
+            );
+            assert_eq!(
+                answer_with(&refusal_of(message + 1), LONG, CAP),
+                ProbeAnswer::Failed
+            );
+        }
+
+        #[test]
+        fn a_worker_that_also_writes_to_stderr_still_answers() {
+            let script = "echo some noise >&2; printf 'lunaepix-probe 1 size 3 2\\n'";
+            assert_eq!(answer_of(script), size(3, 2));
+        }
+
+        #[test]
+        fn a_worker_whose_stderr_overflows_is_failed() {
+            let script = format!(
+                "head -c {} /dev/zero >&2; printf 'lunaepix-probe 1 size 3 2\\n'",
+                MAX_WORKER_OUTPUT_BYTES + 1
+            );
+            assert_eq!(answer_of(&script), ProbeAnswer::Failed);
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_worker_past_the_timeout_is_failed_and_reaped() {
+            let tmp = TempDir::new().unwrap();
+            let pid_file = tmp.path().join("worker.pid");
+            // `exec` keeps the PID: the process that sleeps is the one started.
+            let script = format!("echo $$ > '{}'; exec sleep 60", pid_file.display());
+            let limit = Duration::from_millis(500);
+            let started = Instant::now();
+
+            let answer = answer_with(&script, limit, CAP);
+
+            let elapsed = started.elapsed();
+            assert_eq!(answer, ProbeAnswer::Failed);
+            assert!(elapsed >= limit, "{elapsed:?}");
+            assert!(elapsed < Duration::from_secs(20), "{elapsed:?}");
+            let pid = fs::read_to_string(&pid_file).unwrap();
+            assert!(
+                !Path::new("/proc").join(pid.trim()).exists(),
+                "process {} still exists",
+                pid.trim()
+            );
+        }
+
+        #[test]
+        fn a_slow_worker_within_the_timeout_is_not_stopped() {
+            let script = "sleep 1; printf 'lunaepix-probe 1 size 3 2\\n'";
+            assert_eq!(answer_with(script, LONG, CAP), size(3, 2));
+        }
+
+        #[test]
+        fn a_worker_that_floods_stdout_is_stopped_and_failed() {
+            // `yes` writes without end; the cap stops it at once.
+            let started = Instant::now();
+            assert_eq!(answer_with("exec yes", LONG, CAP), ProbeAnswer::Failed);
+            assert!(started.elapsed() < Duration::from_secs(20));
+        }
+
+        #[test]
+        fn a_program_that_does_not_exist_is_failed() {
+            let missing = Path::new("/nonexistent/lunaepix-worker");
+            let src = Path::new("/photos/a.png");
+            assert_eq!(run_probe_with(missing, src, LONG, CAP), ProbeAnswer::Failed);
+            assert_eq!(run_probe(missing, src), ProbeAnswer::Failed);
+        }
     }
 }

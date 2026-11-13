@@ -77,11 +77,15 @@ jobs:
 
       # Includes the hostile-input tests: a corrupt JPEG, a decompression
       # bomb, and a CSS crash that the worker process must survive.
+      # --no-fail-fast: every test binary runs even after one fails, so one
+      # run reports every Windows failure.
       - name: Rust tests
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
-      # The glob is quoted so that node expands it, not the shell.
+      # The glob is quoted so that node expands it, not the shell. Runs even
+      # when the Rust tests failed, so one run reports the failures of both.
       - name: Window script tests
+        if: success() || failure()
         run: node --test "tests/ui/*.test.js"
 
   build:

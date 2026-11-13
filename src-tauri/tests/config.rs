@@ -1,7 +1,7 @@
 //! Guards on the window's security settings, so a later change cannot widen
-//! them silently: the capability grants the seven app commands and event
+//! them silently: the capability grants the twelve app commands and event
 //! listening only, and the content security policy stays strict (only
-//! `img-src` names the `thumb` scheme).
+//! `img-src` names the `thumb` and `preview` schemes).
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -14,6 +14,9 @@ use html5ever::tokenizer::{
 };
 use serde_json::Value;
 
+#[path = "common/contract_names.rs"]
+mod contract_names;
+
 /// Every permission the window may have.
 const ALLOWED: &[&str] = &[
     "allow-choose-files",
@@ -23,6 +26,11 @@ const ALLOWED: &[&str] = &[
     "allow-clear-output-folder",
     "allow-start-run",
     "allow-open-output-folder",
+    "allow-set-view",
+    "allow-choose-image",
+    "allow-preview-image",
+    "allow-save-image",
+    "allow-move-drop-to-batch",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
 ];
@@ -48,7 +56,7 @@ fn unexpected_permissions(capability: &Value) -> Vec<String> {
 /// What makes a content security policy weaker than we allow: inline code,
 /// `eval`, wildcards, `data:`/`blob:`, and any remote source. The only
 /// network origins allowed are Tauri's IPC endpoint on Windows, and the
-/// `thumb` scheme's origin on Windows in `img-src` only. Also missing
+/// `thumb` and `preview` schemes' origins on Windows in `img-src` only. Also missing
 /// `default-src 'self'` or `script-src 'self'`.
 fn csp_problems(csp: &str) -> Vec<String> {
     let mut problems = Vec::new();
@@ -61,8 +69,9 @@ fn csp_problems(csp: &str) -> Vec<String> {
         let img_src = tokens[0].eq_ignore_ascii_case("img-src");
         for source in &tokens[1..] {
             let lower = source.to_ascii_lowercase();
-            let allowed_origin =
-                lower == "http://ipc.localhost" || (img_src && lower == "http://thumb.localhost");
+            let allowed_origin = lower == "http://ipc.localhost"
+                || (img_src
+                    && (lower == "http://thumb.localhost" || lower == "http://preview.localhost"));
             let weak = lower.starts_with("'unsafe-")
                 || lower == "*"
                 || lower.contains("*.")
@@ -89,13 +98,23 @@ fn csp_problems(csp: &str) -> Vec<String> {
 }
 
 /// The policy as it must be, directive by directive. Only `img-src` differs
-/// from the policy before thumbnails: the `thumb` scheme, as Linux and macOS
-/// name it (`thumb:`) and as Windows serves it (`http://thumb.localhost`).
+/// from the policy before thumbnails: the `thumb` and `preview` schemes, as
+/// Linux and macOS name them (`thumb:`, `preview:`) and as Windows serves
+/// them (`http://thumb.localhost`, `http://preview.localhost`).
 const EXPECTED_CSP: &[(&str, &[&str])] = &[
     ("default-src", &["'self'"]),
     ("script-src", &["'self'"]),
     ("style-src", &["'self'"]),
-    ("img-src", &["'self'", "thumb:", "http://thumb.localhost"]),
+    (
+        "img-src",
+        &[
+            "'self'",
+            "thumb:",
+            "http://thumb.localhost",
+            "preview:",
+            "http://preview.localhost",
+        ],
+    ),
     ("font-src", &["'self'"]),
     ("connect-src", &["ipc:", "http://ipc.localhost"]),
     ("object-src", &["'none'"]),
@@ -153,9 +172,13 @@ fn all_csp_problems(csp: &str) -> Vec<String> {
 
 /// The policy the window must have, written out as a fixture.
 const GOOD_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
-    img-src 'self' thumb: http://thumb.localhost; font-src 'self'; \
-    connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; \
-    form-action 'none'; frame-src 'none'";
+    img-src 'self' thumb: http://thumb.localhost preview: http://preview.localhost; \
+    font-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; \
+    base-uri 'none'; form-action 'none'; frame-src 'none'";
+
+/// The `img-src` directive of [`GOOD_CSP`].
+const GOOD_IMG_SRC: &str =
+    "img-src 'self' thumb: http://thumb.localhost preview: http://preview.localhost";
 
 /// The permissions a capability grants that are plain names, in order.
 fn granted(capability: &Value) -> Vec<&str> {
@@ -169,7 +192,7 @@ fn granted(capability: &Value) -> Vec<&str> {
 
 /// What is wrong with a capability's permissions: one that is not in
 /// [`ALLOWED`], one of [`ALLOWED`] that is missing or given twice, and any
-/// count of `allow-` commands other than seven.
+/// count of `allow-` commands other than twelve.
 fn capability_problems(capability: &Value) -> Vec<String> {
     let mut problems: Vec<String> = unexpected_permissions(capability)
         .into_iter()
@@ -184,51 +207,54 @@ fn capability_problems(capability: &Value) -> Vec<String> {
         }
     }
     let commands = granted.iter().filter(|p| p.starts_with("allow-")).count();
-    if commands != 7 {
-        problems.push(format!("{commands} app commands, not seven"));
+    if commands != 12 {
+        problems.push(format!("{commands} app commands, not twelve"));
     }
     problems
 }
 
 #[test]
-fn a_capability_with_six_or_eight_commands_is_flagged_in_a_fixture() {
+fn a_capability_with_eleven_or_thirteen_commands_is_flagged_in_a_fixture() {
     let all: Vec<Value> = ALLOWED.iter().map(|p| Value::from(*p)).collect();
     // The control: the full list has nothing to report.
     assert_eq!(
         capability_problems(&serde_json::json!({ "permissions": all })),
         Vec::<String>::new()
     );
-    // Six: no `allow-readd-list`.
-    let six: Vec<Value> = all
+    // Eleven: no `allow-move-drop-to-batch`.
+    let eleven: Vec<Value> = all
         .iter()
-        .filter(|p| p.as_str() != Some("allow-readd-list"))
+        .filter(|p| p.as_str() != Some("allow-move-drop-to-batch"))
         .cloned()
         .collect();
     assert_eq!(
-        capability_problems(&serde_json::json!({ "permissions": six })),
-        ["missing allow-readd-list", "6 app commands, not seven"]
+        capability_problems(&serde_json::json!({ "permissions": eleven })),
+        [
+            "missing allow-move-drop-to-batch",
+            "11 app commands, not twelve"
+        ]
     );
-    // Eight: an extra command.
-    let mut eight = all.clone();
-    eight.push(Value::from("allow-delete-everything"));
+    // Thirteen: an extra command.
+    let mut thirteen = all.clone();
+    thirteen.push(Value::from("allow-delete-everything"));
     assert_eq!(
-        capability_problems(&serde_json::json!({ "permissions": eight })),
+        capability_problems(&serde_json::json!({ "permissions": thirteen })),
         [
             r#"unexpected "allow-delete-everything""#,
-            "8 app commands, not seven"
+            "13 app commands, not twelve"
         ]
     );
     // A permission given twice.
     let mut twice = all;
-    twice.push(Value::from("allow-readd-list"));
+    twice.push(Value::from("allow-set-view"));
     assert!(
         capability_problems(&serde_json::json!({ "permissions": twice }))
-            .contains(&"allow-readd-list given more than once".to_owned())
+            .contains(&"allow-set-view given more than once".to_owned())
     );
 }
 
 #[test]
-fn the_capability_grants_exactly_the_seven_commands_and_event_listening() {
+fn the_capability_grants_exactly_the_twelve_commands_and_event_listening() {
     let capability = read_json("capabilities/default.json");
     assert_eq!(capability_problems(&capability), Vec::<String>::new());
     assert_eq!(
@@ -283,12 +309,12 @@ fn an_img_src_with_anything_more_or_another_changed_directive_is_flagged() {
     // The control: the policy as it must be, also in another spelling.
     assert_eq!(all_csp_problems(GOOD_CSP), Vec::<String>::new());
     let respelled = GOOD_CSP.replace(
-        "img-src 'self' thumb: http://thumb.localhost",
-        "IMG-SRC http://THUMB.localhost 'SELF'  thumb:",
+        GOOD_IMG_SRC,
+        "IMG-SRC http://PREVIEW.localhost Preview: http://THUMB.localhost 'SELF'  thumb:",
     );
     assert_eq!(all_csp_problems(&respelled), Vec::<String>::new());
 
-    let img_src = "img-src 'self' thumb: http://thumb.localhost";
+    let img_src = GOOD_IMG_SRC;
     for extra in [
         "data:",
         "blob:",
@@ -298,7 +324,9 @@ fn an_img_src_with_anything_more_or_another_changed_directive_is_flagged() {
         "http://evil.localhost",
         "http://*.localhost",
         "https://thumb.localhost",
+        "https://preview.localhost",
         "thumbs:",
+        "previews:",
         "'unsafe-inline'",
     ] {
         let widened = GOOD_CSP.replace(img_src, &format!("{img_src} {extra}"));
@@ -317,7 +345,7 @@ fn an_img_src_with_anything_more_or_another_changed_directive_is_flagged() {
             "connect-src ipc: http://ipc.localhost thumb:",
         ),
         // `img-src` narrowed, given twice, or dropped.
-        GOOD_CSP.replace(img_src, "img-src 'self' thumb:"),
+        GOOD_CSP.replace(img_src, "img-src 'self' thumb: http://thumb.localhost"),
         GOOD_CSP.replace(img_src, &format!("{img_src}; img-src 'self'")),
         GOOD_CSP.replace(&format!("{img_src}; "), ""),
         // Another directive changed or added.
@@ -325,6 +353,38 @@ fn an_img_src_with_anything_more_or_another_changed_directive_is_flagged() {
         format!("{GOOD_CSP}; worker-src 'self'"),
     ];
     for csp in &changed {
+        assert_ne!(csp, GOOD_CSP);
+        assert!(!all_csp_problems(csp).is_empty(), "{csp}");
+    }
+}
+
+/// The policy after Single image mode, exactly (Global Constraints).
+const NEW_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' thumb: http://thumb.localhost preview: http://preview.localhost; font-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'";
+
+#[test]
+fn the_csp_is_exactly_the_new_string() {
+    let config = read_json("tauri.conf.json");
+    assert_eq!(config["app"]["security"]["csp"].as_str(), Some(NEW_CSP));
+    // The fixture the other checks use is the same policy.
+    assert_eq!(GOOD_CSP, NEW_CSP);
+    assert_eq!(all_csp_problems(NEW_CSP), Vec::<String>::new());
+}
+
+#[test]
+fn a_csp_without_the_preview_scheme_is_flagged_in_a_fixture() {
+    let without = [
+        // The policy before this work.
+        GOOD_CSP.replace(" preview: http://preview.localhost", ""),
+        GOOD_CSP.replace(" preview:", ""),
+        GOOD_CSP.replace(" http://preview.localhost", ""),
+        // The scheme moved out of `img-src` or spelled for another origin.
+        GOOD_CSP
+            .replace(" preview: http://preview.localhost", "")
+            .replace("connect-src ipc:", "connect-src preview: ipc:"),
+        GOOD_CSP.replace("http://preview.localhost", "https://preview.localhost"),
+        GOOD_CSP.replace("preview:", "previews:"),
+    ];
+    for csp in &without {
         assert_ne!(csp, GOOD_CSP);
         assert!(!all_csp_problems(csp).is_empty(), "{csp}");
     }
@@ -897,7 +957,7 @@ fn every_element_the_scripts_ask_for_is_in_the_page() {
             "in ui/{name}"
         );
     }
-    // Not vacuous: app.js does ask for elements.
+    // Not vacuous: window.js does ask for elements.
     assert!(asked >= 10, "only {asked} getElementById calls were found");
 }
 
@@ -1248,11 +1308,17 @@ fn only_a_real_html_lang_and_real_column_headers_satisfy_the_structure() {
 
 // --- the run settings (Task 11) ---------------------------------------------
 
+/// The id of Single image's compare divider: a range input of its own, which
+/// the Quality checks below leave out (it is checked by
+/// [`single_screen_problems`]).
+const DIVIDER_ID: &str = "divider";
+
 /// Problems with the settings controls the accessibility rules need, read as
 /// tokens: the "Compression" choice is a `<fieldset>` whose `<legend>` says
 /// "Compression" and that holds two radio inputs, and the quality range and
 /// number inputs each have a `<label for>` and the bounds min 0, max 100,
-/// step 1.
+/// step 1. The page has one range input besides the compare divider (id
+/// [`DIVIDER_ID`]), and that one is Quality's.
 fn settings_problems(html: &str) -> Vec<String> {
     let pieces = pieces(html);
     let mut problems = Vec::new();
@@ -1318,6 +1384,7 @@ fn settings_problems(html: &str) -> Vec<String> {
             .iter()
             .filter(|tag| {
                 tag.name == "input"
+                    && tag.attr("id") != Some(DIVIDER_ID)
                     && tag
                         .attr("type")
                         .is_some_and(|value| value.eq_ignore_ascii_case(kind))
@@ -1444,8 +1511,9 @@ fn a_settings_fixture_without_a_legend_a_label_or_a_bound_is_flagged() {
 /// `chooseOutput` says "Choose folder"; `clearOutput` says "Clear" and has the
 /// `aria-label` "Clear output folder" (the visible text is inside the
 /// accessible name); and an element with the id `qualityRow` holds the range
-/// input, the number input and the `qualityError` line, so one `hidden` on the
-/// row hides the whole Quality row.
+/// input (every one but the compare divider, id [`DIVIDER_ID`]), the number
+/// input and the `qualityError` line, so one `hidden` on the row hides the
+/// whole Quality row.
 fn output_and_quality_problems(html: &str) -> Vec<String> {
     const VOID: &[&str] = &["input", "br", "img", "hr", "meta", "link"];
     const ROW: &str = "qualityRow";
@@ -1468,7 +1536,10 @@ fn output_and_quality_problems(html: &str) -> Vec<String> {
                 row_seen |= id == Some(ROW);
                 let kind = tag.attr("type").map(str::to_ascii_lowercase);
                 if tag.name == "input" && kind.as_deref() == Some("range") {
-                    ranges.push(inside);
+                    // The compare divider is Single image's own range input.
+                    if id != Some(DIVIDER_ID) {
+                        ranges.push(inside);
+                    }
                 } else if tag.name == "input" && kind.as_deref() == Some("number") {
                     numbers.push(inside);
                 } else if id == Some("qualityError") {
@@ -1623,6 +1694,711 @@ fn an_output_and_quality_fixture_with_old_texts_no_label_or_a_misplaced_input_is
     for (html, problems) in cases {
         let expected: Vec<String> = problems.into_iter().map(str::to_owned).collect();
         assert_eq!(output_and_quality_problems(&html), expected, "{html}");
+    }
+}
+
+// --- the compare divider is the page's second range input (Task 9) ----------
+
+/// The Single image compare divider: a range input that is not Quality's.
+const DIVIDER: &str = "<input id=\"divider\" type=\"range\" min=\"0\" max=\"100\" step=\"1\">";
+
+#[test]
+fn a_settings_fixture_with_the_divider_still_passes() {
+    for html in [
+        format!("{SETTINGS_FIXTURE}{DIVIDER}"),
+        format!("{DIVIDER}{SETTINGS_FIXTURE}"),
+    ] {
+        assert_eq!(settings_problems(&html), Vec::<String>::new(), "{html}");
+    }
+}
+
+#[test]
+fn an_output_fixture_with_the_divider_outside_the_row_still_passes() {
+    assert_eq!(
+        output_and_quality_problems(&format!("{OUTPUT_FIXTURE}{DIVIDER}")),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_second_range_input_that_is_not_the_divider_is_still_flagged() {
+    let other = "<input id=\"other\" type=\"range\" min=\"0\" max=\"100\" step=\"1\">";
+    assert_eq!(
+        settings_problems(&format!("{SETTINGS_FIXTURE}{other}")),
+        vec!["one range input".to_owned()]
+    );
+    assert_eq!(
+        output_and_quality_problems(&format!("{OUTPUT_FIXTURE}{other}")),
+        vec!["the range input inside qualityRow".to_owned()]
+    );
+    // `data-id` or a comment is not the divider's id.
+    let spoofed = "<input data-id=\"divider\" type=\"range\">";
+    assert_eq!(
+        settings_problems(&format!("{SETTINGS_FIXTURE}{spoofed}")),
+        vec!["one range input".to_owned()]
+    );
+}
+
+// --- the Single image screen (Task 9) ----------------------------------------
+
+/// Each `<fieldset>` of `html`, as (its legend's text on one line, the
+/// `value`s of the radio inputs inside it, in order). Read as tokens, so a
+/// legend or an input in a comment does not count.
+fn fieldsets_with_radios(html: &str) -> Vec<(String, Vec<String>)> {
+    let mut done = Vec::new();
+    let mut open: Vec<(String, Vec<String>)> = Vec::new();
+    let mut in_legend = 0usize;
+    for piece in pieces(html) {
+        match piece {
+            Piece::Start(tag) if tag.name == "fieldset" => open.push((String::new(), Vec::new())),
+            Piece::End(name) if name == "fieldset" => {
+                if let Some(closed) = open.pop() {
+                    done.push(closed);
+                }
+            }
+            Piece::Start(tag) if tag.name == "legend" && !open.is_empty() => in_legend += 1,
+            Piece::End(name) if name == "legend" => in_legend = in_legend.saturating_sub(1),
+            Piece::Text(text) if in_legend > 0 => {
+                if let Some(current) = open.last_mut() {
+                    current.0.push_str(&text);
+                }
+            }
+            Piece::Start(tag)
+                if tag.name == "input"
+                    && tag
+                        .attr("type")
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("radio")) =>
+            {
+                if let Some(current) = open.last_mut() {
+                    current
+                        .1
+                        .push(tag.attr("value").unwrap_or_default().to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    done.extend(open);
+    done.into_iter()
+        .map(|(legend, radios)| (one_line(&legend), radios))
+        .collect()
+}
+
+/// The text of each `<label for>` of `html`, as (the `for` value, the text on
+/// one line).
+fn label_texts(html: &str) -> Vec<(String, String)> {
+    let mut labels: Vec<(String, String)> = Vec::new();
+    let mut in_label = false;
+    for piece in pieces(html) {
+        match piece {
+            Piece::Start(tag) if tag.name == "label" => {
+                in_label = true;
+                labels.push((
+                    tag.attr("for").unwrap_or_default().to_owned(),
+                    String::new(),
+                ));
+            }
+            Piece::End(name) if name == "label" => in_label = false,
+            Piece::Text(text) if in_label => {
+                if let Some(last) = labels.last_mut() {
+                    last.1.push_str(&text);
+                }
+            }
+            _ => {}
+        }
+    }
+    labels
+        .into_iter()
+        .map(|(target, text)| (target, one_line(&text)))
+        .collect()
+}
+
+/// What the Single image screen needs for the accessibility rules, read as
+/// tokens: the Single image / Batch switch is a `<fieldset>` with its legend
+/// ("Work on") and exactly its two radios; the picture area is
+/// `role="region"` with `aria-label="Picture"` and `tabindex="0"`; and the
+/// compare divider is a range input (id `divider`, 0 to 100, step 1) named by
+/// a `<label for>` and sitting inside that region. (Task 11 removed the
+/// layout switch; [`column_problems`] checks that it stays gone.)
+fn single_screen_problems(html: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let found = fieldsets_with_radios(html)
+        .iter()
+        .any(|(text, values)| text == "Work on" && values.as_slice() == ["single", "batch"]);
+    if !found {
+        problems
+            .push("a fieldset with the legend \"Work on\" and the radios single, batch".to_owned());
+    }
+
+    // The region, and whether the divider is inside it.
+    let mut region: Option<StartTag> = None;
+    let mut depth = 0usize;
+    let mut divider: Option<(StartTag, bool)> = None;
+    for piece in pieces(html) {
+        match piece {
+            Piece::Start(tag) => {
+                let void = VOID_ELEMENTS.contains(&tag.name.as_str());
+                let is_region = region.is_none()
+                    && tag.attr("role") == Some("region")
+                    && tag.attr("aria-label") == Some("Picture");
+                if tag.name == "input" && tag.attr("id") == Some("divider") {
+                    divider = Some((tag, depth > 0));
+                    continue;
+                }
+                if is_region && !void {
+                    region = Some(tag);
+                    depth = 1;
+                } else if depth > 0 && !void {
+                    depth += 1;
+                }
+            }
+            Piece::End(_) if depth > 0 => depth -= 1,
+            _ => {}
+        }
+    }
+    match &region {
+        None => {
+            problems.push("an element with role=\"region\" and aria-label=\"Picture\"".to_owned())
+        }
+        Some(tag) if tag.attr("tabindex") != Some("0") => {
+            problems.push("tabindex=\"0\" on the Picture region".to_owned());
+        }
+        Some(_) => {}
+    }
+    let labelled = label_texts(html)
+        .iter()
+        .any(|(target, text)| target == "divider" && text == "Compare original and compressed");
+    if !labelled {
+        problems.push(
+            "a <label for=\"divider\"> saying \"Compare original and compressed\"".to_owned(),
+        );
+    }
+    let range_ok = divider.as_ref().is_some_and(|(tag, _)| {
+        tag.attr("type")
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("range"))
+            && tag.attr("min") == Some("0")
+            && tag.attr("max") == Some("100")
+            && tag.attr("step") == Some("1")
+    });
+    if !range_ok {
+        problems.push("a range input with the id divider, min 0, max 100, step 1".to_owned());
+    }
+    if !divider.as_ref().is_some_and(|(_, inside)| *inside) {
+        problems.push("the divider inside the Picture region".to_owned());
+    }
+    problems
+}
+
+/// Markup with everything [`single_screen_problems`] asks for.
+const SINGLE_FIXTURE: &str = "<header><fieldset><legend>Work on</legend>\
+     <label><input type=\"radio\" name=\"view\" value=\"single\" checked> Single image</label>\
+     <label><input type=\"radio\" name=\"view\" value=\"batch\"> Batch</label></fieldset></header>\
+     <div id=\"picture\" role=\"region\" aria-label=\"Picture\" tabindex=\"0\">\
+     <div><img alt=\"Original\"></div>\
+     <label for=\"divider\">Compare original and compressed</label>\
+     <input id=\"divider\" type=\"range\" min=\"0\" max=\"100\" step=\"1\" value=\"50\"></div>";
+
+#[test]
+fn index_html_has_the_view_switch_as_a_fieldset_with_a_legend_the_region_and_the_labelled_divider()
+{
+    assert_eq!(single_screen_problems(&index_html()), Vec::<String>::new());
+}
+
+#[test]
+fn a_single_screen_fixture_with_everything_passes_in_any_spelling() {
+    assert_eq!(single_screen_problems(SINGLE_FIXTURE), Vec::<String>::new());
+    let spelled = SINGLE_FIXTURE
+        .replace(
+            "<legend>Work on</legend>",
+            "<LEGEND>\n  Work\n  on\n</LEGEND>",
+        )
+        .replace("type=\"radio\"", "TYPE='Radio'")
+        .replace(
+            "<label for=\"divider\">Compare original and compressed</label>",
+            "<LABEL FOR='divider'>\n Compare original\n and compressed </LABEL>",
+        )
+        .replace("role=\"region\"", "ROLE='region'");
+    assert_eq!(single_screen_problems(&spelled), Vec::<String>::new());
+}
+
+#[test]
+fn a_single_screen_fixture_without_a_divider_label_a_legend_or_the_region_is_flagged() {
+    const VIEWS: &str = "a fieldset with the legend \"Work on\" and the radios single, batch";
+    const REGION: &str = "an element with role=\"region\" and aria-label=\"Picture\"";
+    const TABINDEX: &str = "tabindex=\"0\" on the Picture region";
+    const LABEL: &str = "a <label for=\"divider\"> saying \"Compare original and compressed\"";
+    const RANGE: &str = "a range input with the id divider, min 0, max 100, step 1";
+    const INSIDE: &str = "the divider inside the Picture region";
+    let label = "<label for=\"divider\">Compare original and compressed</label>";
+    let divider =
+        "<input id=\"divider\" type=\"range\" min=\"0\" max=\"100\" step=\"1\" value=\"50\">";
+    let cases: Vec<(String, Vec<&str>)> = vec![
+        (SINGLE_FIXTURE.replace(label, ""), vec![LABEL]),
+        (
+            SINGLE_FIXTURE.replace(label, &format!("<!-- {label} -->")),
+            vec![LABEL],
+        ),
+        (
+            SINGLE_FIXTURE.replace(">Compare original and compressed<", ">Compare<"),
+            vec![LABEL],
+        ),
+        (
+            SINGLE_FIXTURE.replace("<label for=\"divider\">", "<label for=\"other\">"),
+            vec![LABEL],
+        ),
+        (
+            SINGLE_FIXTURE.replace("<legend>Work on</legend>", "<!-- <legend>Work on</legend> -->"),
+            vec![VIEWS],
+        ),
+        (
+            SINGLE_FIXTURE.replace(
+                "Batch</label></fieldset>",
+                "Batch</label><label><input type=\"radio\" name=\"view\" value=\"both\"></label></fieldset>",
+            ),
+            vec![VIEWS],
+        ),
+        (
+            SINGLE_FIXTURE.replace("value=\"batch\"", "value=\"Batch\""),
+            vec![VIEWS],
+        ),
+        (
+            SINGLE_FIXTURE.replace(" tabindex=\"0\"", ""),
+            vec![TABINDEX],
+        ),
+        (
+            SINGLE_FIXTURE.replace("tabindex=\"0\"", "tabindex=\"-1\""),
+            vec![TABINDEX],
+        ),
+        (
+            SINGLE_FIXTURE.replace("aria-label=\"Picture\"", "aria-label=\"Image\""),
+            vec![REGION, INSIDE],
+        ),
+        (
+            SINGLE_FIXTURE.replace(divider, "") + "</div>" + divider,
+            vec![INSIDE],
+        ),
+        (
+            SINGLE_FIXTURE.replace(" step=\"1\" value=\"50\"", " value=\"50\""),
+            vec![RANGE],
+        ),
+        (SINGLE_FIXTURE.replace(divider, ""), vec![RANGE, INSIDE]),
+    ];
+    for (html, problems) in cases {
+        let expected: Vec<String> = problems.into_iter().map(str::to_owned).collect();
+        assert_eq!(single_screen_problems(&html), expected, "{html}");
+    }
+}
+
+// --- the docked column and the floating zoom controls (Task 11) --------------
+
+/// One element of a page read as tokens: its start tag, the element it sits
+/// in, and its text (its own and that of everything inside it).
+struct Element {
+    tag: StartTag,
+    parent: Option<usize>,
+    text: String,
+}
+
+/// The elements of `html` in document order, each with the element it sits
+/// in. An end tag closes the nearest open element of its name (and whatever
+/// was left open inside it); a void element never stays open. Comments are
+/// neither elements nor text.
+fn elements(html: &str) -> Vec<Element> {
+    let mut all: Vec<Element> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    for piece in pieces(html) {
+        match piece {
+            Piece::Start(tag) => {
+                let void = VOID_ELEMENTS.contains(&tag.name.as_str());
+                all.push(Element {
+                    tag,
+                    parent: open.last().copied(),
+                    text: String::new(),
+                });
+                if !void {
+                    open.push(all.len() - 1);
+                }
+            }
+            Piece::End(name) => {
+                if let Some(at) = open.iter().rposition(|&index| all[index].tag.name == name) {
+                    open.truncate(at);
+                }
+            }
+            Piece::Text(text) => {
+                for &index in &open {
+                    all[index].text.push_str(&text);
+                }
+            }
+            Piece::Comment(_) => {}
+        }
+    }
+    all
+}
+
+/// Whether element `index` sits (at any depth) inside element `outer`.
+fn is_inside(all: &[Element], index: usize, outer: usize) -> bool {
+    let mut current = all[index].parent;
+    while let Some(at) = current {
+        if at == outer {
+            return true;
+        }
+        current = all[at].parent;
+    }
+    false
+}
+
+const COLUMN_ASIDE: &str = "an <aside> with aria-label=\"Settings\"";
+const COLUMN_SCROLL: &str =
+    "a part of the Settings aside with role=\"region\", an aria-label and tabindex=\"0\"";
+const COLUMN_TOGGLE: &str = "a \"Hide settings\" button in the Settings aside with \
+     aria-expanded=\"true\" and aria-controls naming elements of the page";
+const ZOOM_GROUP: &str = "a role=\"group\" with aria-label=\"Zoom\" inside the Picture region";
+const ZOOM_OUT: &str = "a button with aria-label=\"Zoom out\" in the zoom group";
+const ZOOM_IN: &str = "a button with aria-label=\"Zoom in\" in the zoom group";
+const ZOOM_QUIET: &str = "no aria-live in or on the zoom group";
+const FLOAT_SLOT: &str = "an element with id=\"floatStatusSlot\" beside the Picture region \
+     (the same parent) and before it";
+const NO_LAYOUT: &str = "no input with name=\"layout\" (the layout switch is gone)";
+
+/// What Task 11's layout needs in the page, read as tokens: the column is an
+/// `<aside aria-label="Settings">`; inside it a part that scrolls on its own
+/// (`role="region"`, a non-empty `aria-label`, `tabindex="0"`) and the "Hide
+/// settings" button, which starts expanded and controls elements that exist;
+/// inside the Picture region a `role="group"` named "Zoom" with the buttons
+/// named "Zoom out" and "Zoom in", and no `aria-live` in it (every wheel step
+/// would be read out); the slot the status line floats in while the column
+/// is folded, `#floatStatusSlot`, beside the Picture region and before it (so
+/// neither the hidden picture of the empty state nor the folded column hides
+/// it, and it comes first in focus order, as it is at the top); and no input
+/// named `layout` anywhere.
+fn column_problems(html: &str) -> Vec<String> {
+    let all = elements(html);
+    let ids: HashSet<&str> = all
+        .iter()
+        .filter_map(|element| element.tag.attr("id"))
+        .collect();
+    let find = |predicate: &dyn Fn(usize, &Element) -> bool| {
+        all.iter()
+            .enumerate()
+            .find(|(index, element)| predicate(*index, element))
+            .map(|(index, _)| index)
+    };
+    let inside =
+        |index: usize, outer: Option<usize>| outer.is_some_and(|at| is_inside(&all, index, at));
+    let mut problems = Vec::new();
+
+    let aside = find(&|_, element| {
+        element.tag.name == "aside" && element.tag.attr("aria-label") == Some("Settings")
+    });
+    if aside.is_none() {
+        problems.push(COLUMN_ASIDE.to_owned());
+    }
+    let scroll = find(&|index, element| {
+        inside(index, aside)
+            && element.tag.attr("role") == Some("region")
+            && element
+                .tag
+                .attr("aria-label")
+                .is_some_and(|label| !label.trim().is_empty())
+            && element.tag.attr("tabindex") == Some("0")
+    });
+    if scroll.is_none() {
+        problems.push(COLUMN_SCROLL.to_owned());
+    }
+    let toggle = find(&|index, element| {
+        let controls = element.tag.attr("aria-controls").unwrap_or_default();
+        inside(index, aside)
+            && element.tag.name == "button"
+            && one_line(&element.text) == "Hide settings"
+            && element.tag.attr("aria-expanded") == Some("true")
+            && controls.split_ascii_whitespace().next().is_some()
+            && controls.split_ascii_whitespace().all(|id| ids.contains(id))
+    });
+    if toggle.is_none() {
+        problems.push(COLUMN_TOGGLE.to_owned());
+    }
+
+    let picture = find(&|_, element| {
+        element.tag.attr("role") == Some("region")
+            && element.tag.attr("aria-label") == Some("Picture")
+    });
+    let group = find(&|index, element| {
+        inside(index, picture)
+            && element.tag.attr("role") == Some("group")
+            && element.tag.attr("aria-label") == Some("Zoom")
+    });
+    if group.is_none() {
+        problems.push(ZOOM_GROUP.to_owned());
+    }
+    for (name, what) in [("Zoom out", ZOOM_OUT), ("Zoom in", ZOOM_IN)] {
+        let named = find(&|index, element| {
+            inside(index, group)
+                && element.tag.name == "button"
+                && element.tag.attr("aria-label") == Some(name)
+        });
+        if named.is_none() {
+            problems.push(what.to_owned());
+        }
+    }
+    let live = find(&|index, element| {
+        (Some(index) == group || inside(index, group)) && element.tag.attr("aria-live").is_some()
+    });
+    if live.is_some() {
+        problems.push(ZOOM_QUIET.to_owned());
+    }
+
+    let float = find(&|_, element| element.tag.attr("id") == Some("floatStatusSlot"));
+    let float_placed = match (float, picture) {
+        (Some(slot), Some(region)) => slot < region && all[slot].parent == all[region].parent,
+        _ => false,
+    };
+    if !float_placed {
+        problems.push(FLOAT_SLOT.to_owned());
+    }
+
+    if find(&|_, element| element.tag.name == "input" && element.tag.attr("name") == Some("layout"))
+        .is_some()
+    {
+        problems.push(NO_LAYOUT.to_owned());
+    }
+    problems
+}
+
+const COLUMN_PICTURE: &str = "<div id=\"picture\" role=\"region\" aria-label=\"Picture\" tabindex=\"0\">\
+     <div role=\"group\" aria-label=\"Zoom\">\
+     <button type=\"button\" aria-label=\"Zoom out\">\u{2212}</button><span>28%</span>\
+     <button type=\"button\" aria-label=\"Zoom in\">+</button>\
+     <button type=\"button\">100%</button><button type=\"button\">Fit</button></div></div>";
+const COLUMN_TOP: &str = "<div><button type=\"button\" aria-expanded=\"true\" \
+     aria-controls=\"columnBody columnFoot\">Hide settings</button></div>";
+const COLUMN_BODY: &str = "<div id=\"columnBody\" role=\"region\" aria-label=\"Image settings\" \
+     tabindex=\"0\"><h2>holiday.jpg</h2><input type=\"text\" id=\"saveName\"></div>";
+const COLUMN_FOOT: &str = "<div id=\"columnFoot\"><button type=\"button\">Save</button></div>";
+const COLUMN_FLOAT: &str = "<div id=\"floatStatusSlot\"></div>";
+
+/// Markup with everything [`column_problems`] asks for, from its parts, in
+/// one work area: the float slot, the picture, the aside.
+fn column_fixture(picture: &str, top: &str, body: &str, foot: &str) -> String {
+    format!(
+        "<section>{COLUMN_FLOAT}{picture}<aside aria-label=\"Settings\">{top}{body}{foot}</aside></section>"
+    )
+}
+
+fn full_column_fixture() -> String {
+    column_fixture(COLUMN_PICTURE, COLUMN_TOP, COLUMN_BODY, COLUMN_FOOT)
+}
+
+#[test]
+fn index_html_has_the_column_the_zoom_controls_and_no_layout_switch() {
+    assert_eq!(column_problems(&index_html()), Vec::<String>::new());
+}
+
+#[test]
+fn a_column_fixture_with_everything_passes_in_any_spelling() {
+    assert_eq!(
+        column_problems(&full_column_fixture()),
+        Vec::<String>::new()
+    );
+    let spelled = full_column_fixture()
+        .replace("<aside aria-label", "<ASIDE ARIA-LABEL")
+        .replace("</aside>", "</ASIDE>")
+        .replace(">Hide settings<", ">\n  Hide\n  settings\n<")
+        .replace(
+            "aria-controls=\"columnBody columnFoot\"",
+            "ARIA-CONTROLS='  columnBody\n columnFoot '",
+        )
+        .replace("role=\"group\"", "ROLE='group'")
+        .replace(
+            "<button type=\"button\" aria-label=\"Zoom in\"",
+            "<BUTTON aria-label='Zoom in'",
+        )
+        .replace(
+            COLUMN_FLOAT,
+            "<DIV class=\"lunaepixSingle__statusFloat -empty\" ID='floatStatusSlot'></DIV>",
+        );
+    assert_eq!(column_problems(&spelled), Vec::<String>::new());
+    // A layout radio only in a comment is not an input.
+    let commented = format!(
+        "{}<!-- <input type=\"radio\" name=\"layout\" value=\"under\"> -->",
+        full_column_fixture()
+    );
+    assert_eq!(column_problems(&commented), Vec::<String>::new());
+}
+
+#[test]
+fn a_column_fixture_with_each_part_missing_or_misplaced_is_flagged() {
+    let full = full_column_fixture();
+    let layout = "<fieldset><legend>Settings</legend>\
+         <label><input type=\"radio\" name=\"layout\" value=\"under\" checked> Settings under</label>\
+         <label><input type=\"radio\" name=\"layout\" value=\"beside\"> Settings beside</label></fieldset>";
+    let cases: Vec<(String, Vec<&str>)> = vec![
+        // The aside: missing, misnamed, another element.
+        (
+            full.replace("aria-label=\"Settings\"", "aria-label=\"Options\""),
+            vec![COLUMN_ASIDE, COLUMN_SCROLL, COLUMN_TOGGLE],
+        ),
+        (
+            full.replace("<aside ", "<div ")
+                .replace("</aside>", "</div>"),
+            vec![COLUMN_ASIDE, COLUMN_SCROLL, COLUMN_TOGGLE],
+        ),
+        // The scrolling part: each attribute missing, an empty name, outside the aside.
+        (
+            full.replace(
+                " role=\"region\" aria-label=\"Image settings\"",
+                " aria-label=\"Image settings\"",
+            ),
+            vec![COLUMN_SCROLL],
+        ),
+        (
+            full.replace(" aria-label=\"Image settings\"", ""),
+            vec![COLUMN_SCROLL],
+        ),
+        (
+            full.replace("aria-label=\"Image settings\"", "aria-label=\" \""),
+            vec![COLUMN_SCROLL],
+        ),
+        (
+            full.replace(
+                "aria-label=\"Image settings\" tabindex=\"0\"",
+                "aria-label=\"Image settings\"",
+            ),
+            vec![COLUMN_SCROLL],
+        ),
+        (
+            full.replace(
+                "aria-label=\"Image settings\" tabindex=\"0\"",
+                "aria-label=\"Image settings\" tabindex=\"-1\"",
+            ),
+            vec![COLUMN_SCROLL],
+        ),
+        (
+            column_fixture(COLUMN_PICTURE, COLUMN_TOP, "", COLUMN_FOOT) + COLUMN_BODY,
+            vec![COLUMN_SCROLL],
+        ),
+        // The toggle: its attributes, its text, a control that is not in the page, in a comment, outside.
+        (
+            full.replace(" aria-expanded=\"true\"", ""),
+            vec![COLUMN_TOGGLE],
+        ),
+        (
+            full.replace("aria-expanded=\"true\"", "aria-expanded=\"false\""),
+            vec![COLUMN_TOGGLE],
+        ),
+        (
+            full.replace(" aria-controls=\"columnBody columnFoot\"", ""),
+            vec![COLUMN_TOGGLE],
+        ),
+        (
+            full.replace(
+                "aria-controls=\"columnBody columnFoot\"",
+                "aria-controls=\"\"",
+            ),
+            vec![COLUMN_TOGGLE],
+        ),
+        (
+            full.replace(
+                "aria-controls=\"columnBody columnFoot\"",
+                "aria-controls=\"columnBody columnGone\"",
+            ),
+            vec![COLUMN_TOGGLE],
+        ),
+        (
+            full.replace(">Hide settings<", ">Hide<"),
+            vec![COLUMN_TOGGLE],
+        ),
+        (
+            column_fixture(
+                COLUMN_PICTURE,
+                &format!("<!-- {COLUMN_TOP} -->"),
+                COLUMN_BODY,
+                COLUMN_FOOT,
+            ),
+            vec![COLUMN_TOGGLE],
+        ),
+        (
+            column_fixture(COLUMN_PICTURE, "", COLUMN_BODY, COLUMN_FOOT) + COLUMN_TOP,
+            vec![COLUMN_TOGGLE],
+        ),
+        // The zoom group: outside the Picture region, unnamed, no group; each button's name.
+        (
+            full.replace(
+                "tabindex=\"0\"><div role=\"group\"",
+                "tabindex=\"0\"></div><div role=\"group\"",
+            )
+            .replace("Fit</button></div></div>", "Fit</button></div>"),
+            vec![ZOOM_GROUP, ZOOM_OUT, ZOOM_IN],
+        ),
+        (
+            full.replace("role=\"group\" aria-label=\"Zoom\"", "role=\"group\""),
+            vec![ZOOM_GROUP, ZOOM_OUT, ZOOM_IN],
+        ),
+        (
+            full.replace("role=\"group\" ", ""),
+            vec![ZOOM_GROUP, ZOOM_OUT, ZOOM_IN],
+        ),
+        (full.replace(" aria-label=\"Zoom out\"", ""), vec![ZOOM_OUT]),
+        (
+            full.replace("aria-label=\"Zoom in\"", "aria-label=\"Zoom\""),
+            vec![ZOOM_IN],
+        ),
+        (
+            full.replace(
+                "<button type=\"button\" aria-label=\"Zoom in\">+</button>",
+                "",
+            ),
+            vec![ZOOM_IN],
+        ),
+        // A live region in the zoom group: on the percentage, on the group.
+        (
+            full.replace("<span>28%</span>", "<span aria-live=\"polite\">28%</span>"),
+            vec![ZOOM_QUIET],
+        ),
+        (
+            full.replace(
+                "role=\"group\" aria-label=\"Zoom\"",
+                "role=\"group\" aria-label=\"Zoom\" ARIA-LIVE='off'",
+            ),
+            vec![ZOOM_QUIET],
+        ),
+        // The float slot: missing, in a comment, inside the Picture region,
+        // inside the aside, after the picture, wrapped in another element.
+        (full.replace(COLUMN_FLOAT, ""), vec![FLOAT_SLOT]),
+        (
+            full.replace(COLUMN_FLOAT, &format!("<!-- {COLUMN_FLOAT} -->")),
+            vec![FLOAT_SLOT],
+        ),
+        (
+            full.replace(COLUMN_FLOAT, "").replace(
+                "tabindex=\"0\"><div role=\"group\"",
+                &format!("tabindex=\"0\">{COLUMN_FLOAT}<div role=\"group\""),
+            ),
+            vec![FLOAT_SLOT],
+        ),
+        (
+            full.replace(COLUMN_FLOAT, "")
+                .replace(COLUMN_FOOT, &format!("{COLUMN_FOOT}{COLUMN_FLOAT}")),
+            vec![FLOAT_SLOT],
+        ),
+        (
+            full.replace(COLUMN_FLOAT, "")
+                .replace("<aside ", &format!("{COLUMN_FLOAT}<aside ")),
+            vec![FLOAT_SLOT],
+        ),
+        (
+            full.replace(COLUMN_FLOAT, &format!("<div>{COLUMN_FLOAT}</div>")),
+            vec![FLOAT_SLOT],
+        ),
+        // The layout switch still there, inside or outside the column.
+        (format!("{layout}{full}"), vec![NO_LAYOUT]),
+        (
+            full.replace(COLUMN_FOOT, &format!("{COLUMN_FOOT}{layout}")),
+            vec![NO_LAYOUT],
+        ),
+    ];
+    for (html, problems) in cases {
+        let expected: Vec<String> = problems.into_iter().map(str::to_owned).collect();
+        assert_eq!(column_problems(&html), expected, "{html}");
     }
 }
 
@@ -2765,18 +3541,31 @@ fn a_page_without_webp_in_its_text_does_not_say_it_in_a_fixture() {
 // ---------------------------------------------------------------------
 // The moon logo in the window header: one decorative image, loaded from the
 // window folder (the CSP allows images from the window folder and the
-// `thumb` scheme only), made from the same SVG as the app icon.
+// `thumb` and `preview` schemes only), made from the same SVG as the app icon.
 // ---------------------------------------------------------------------
 
-/// Problems with the images in `html`. The page must hold exactly one `<img>`;
-/// it must be decorative (`alt` present and empty) and its `src` must be a
-/// relative path inside the window folder: no scheme, no leading slash, no
-/// `..` or backslash, and naming a file in `window_files`. Read as tokens.
+/// Problems with the images in `html`. Besides Single image's two compare
+/// pictures (class `lunaepixSingle__image`), which get their address from the
+/// `preview` scheme at run time and so carry no `src` in the page, the page
+/// must hold exactly one `<img>`, the logo; it must be decorative (`alt`
+/// present and empty) and its `src` must be a relative path inside the window
+/// folder: no scheme, no leading slash, no `..` or backslash, and naming a
+/// file in `window_files`. Read as tokens.
 fn logo_problems(html: &str, window_files: &[String]) -> Vec<String> {
-    let images: Vec<StartTag> = start_tags(html)
+    let is_compare = |tag: &StartTag| {
+        tag.attr("class").is_some_and(|class| {
+            class
+                .split_whitespace()
+                .any(|name| name == "lunaepixSingle__image")
+        })
+    };
+    let (compare, images): (Vec<StartTag>, Vec<StartTag>) = start_tags(html)
         .into_iter()
         .filter(|tag| tag.name == "img")
-        .collect();
+        .partition(is_compare);
+    if compare.iter().any(|tag| tag.attr("src").is_some()) {
+        return vec!["a compare picture has a src in the page".to_owned()];
+    }
     if images.len() != 1 {
         return vec![format!(
             "exactly one <img> expected, found {}",
@@ -2874,6 +3663,43 @@ fn a_logo_without_alt_or_from_outside_the_window_folder_is_caught_in_a_fixture()
         ),
     ] {
         assert!(!logo_problems(html, &files).is_empty(), "{bad}: {html}");
+    }
+}
+
+#[test]
+fn the_compare_pictures_without_a_src_do_not_count_as_logos() {
+    let files = vec!["lunaepix-logo.svg".to_owned()];
+    let logo = "<img class=\"lunaepixHeader__logo\" src=\"lunaepix-logo.svg\" alt=\"\">";
+    let compare = "<img class=\"lunaepixSingle__image -original\" alt=\"Original\" hidden>\
+                   <img class=\"lunaepixSingle__image -compressed\" alt=\"Compressed\" hidden>";
+    assert_eq!(
+        logo_problems(&format!("{logo}{compare}"), &files),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_compare_picture_with_a_src_or_a_second_logo_is_caught_in_a_fixture() {
+    let files = vec!["lunaepix-logo.svg".to_owned()];
+    let logo = "<img class=\"lunaepixHeader__logo\" src=\"lunaepix-logo.svg\" alt=\"\">";
+    for (bad, extra) in [
+        (
+            "a compare picture with a src",
+            "<img class=\"lunaepixSingle__image -original\" src=\"lunaepix-logo.svg\" alt=\"Original\">",
+        ),
+        (
+            "a compare picture from elsewhere",
+            "<img class=\"lunaepixSingle__image\" src=\"https://example.com/a.png\" alt=\"\">",
+        ),
+        (
+            "an image whose class only contains the name",
+            "<img class=\"lunaepixSingle__imageX\" alt=\"\">",
+        ),
+    ] {
+        assert!(
+            !logo_problems(&format!("{logo}{extra}"), &files).is_empty(),
+            "{bad}"
+        );
     }
 }
 
@@ -3087,4 +3913,531 @@ fn a_summary_without_readd_or_with_it_misplaced_is_flagged_in_a_fixture() {
     ] {
         assert!(!readd_button_problems(&html).is_empty(), "{what}: {html}");
     }
+}
+
+// --- which commands run on the main thread ------------------------------------
+
+/// The commands that run on the main thread (a plain `#[tauri::command]`).
+/// An event sent from the main thread is shown at once, while one sent from
+/// any other thread waits in the event loop's queue, so a main-thread event
+/// can overtake an earlier one. These commands send nothing but `run-busy`,
+/// whose place among other events the window does not depend on; their
+/// real answers come later from the dialog plugin's thread, or not at all.
+/// Every other command is `async`, so all its events go through the one
+/// queue in the order they were sent.
+const MAIN_THREAD_COMMANDS: &[&str] = &[
+    "choose_files",
+    "choose_output_folder",
+    "set_view",
+    "choose_image",
+    "open_output_folder",
+];
+
+/// Whether `path` is exactly `tauri::command`.
+fn is_tauri_command(path: &syn::Path) -> bool {
+    let segments: Vec<String> = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    segments == ["tauri", "command"]
+}
+
+/// The functions in the Rust `source` marked `#[tauri::command]` without
+/// `async` among the attribute's arguments: the commands Tauri runs on the
+/// main thread.
+fn main_thread_commands(source: &str) -> HashSet<String> {
+    let file = syn::parse_file(source).expect("valid Rust");
+    file.items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Fn(function) => Some(function),
+            _ => None,
+        })
+        .filter_map(|function| {
+            let attribute = function
+                .attrs
+                .iter()
+                .find(|attribute| is_tauri_command(attribute.path()))?;
+            let is_async = match &attribute.meta {
+                syn::Meta::List(list) => list
+                    .tokens
+                    .clone()
+                    .into_iter()
+                    .any(|token| token.to_string() == "async"),
+                _ => false,
+            };
+            (!is_async).then(|| function.sig.ident.to_string())
+        })
+        .collect()
+}
+
+fn name_set(list: &[&str]) -> HashSet<String> {
+    list.iter().map(|name| (*name).to_owned()).collect()
+}
+
+#[test]
+fn only_commands_that_send_nothing_but_run_busy_run_on_the_main_thread() {
+    let lib = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let source = fs::read_to_string(lib).unwrap();
+    assert_eq!(
+        main_thread_commands(&source),
+        name_set(MAIN_THREAD_COMMANDS)
+    );
+}
+
+#[test]
+fn a_command_without_async_is_found_in_a_fixture() {
+    let fixture = r#"
+        #[tauri::command]
+        fn preview_image() {}
+        #[tauri::command(async)]
+        fn start_run() {}
+        #[tauri::command(rename_all = "snake_case")]
+        fn clear_list() {}
+        #[tauri::command(async, rename_all = "snake_case")]
+        fn readd_list() {}
+        #[tauri::command(rename_all = "async")]
+        fn renamed() {}
+        #[other::command]
+        fn set_view() {}
+        fn not_a_command() {}
+        /// A doc comment that says #[tauri::command] is not an attribute.
+        fn documented() {}
+    "#;
+    assert_eq!(
+        main_thread_commands(fixture),
+        name_set(&["preview_image", "clear_list", "renamed"])
+    );
+}
+
+// --- tauri's `tracing` feature stays off --------------------------------------
+
+/// The dependency tables of a manifest that can name `tauri`: the plain
+/// ones and the target-specific ones, each with the place it sits.
+fn dependency_tables(manifest: &toml::Table) -> Vec<(String, &toml::Table)> {
+    const SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    let mut tables = Vec::new();
+    for section in SECTIONS {
+        if let Some(table) = manifest.get(section).and_then(toml::Value::as_table) {
+            tables.push((section.to_owned(), table));
+        }
+    }
+    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+        for (target, value) in targets {
+            for section in SECTIONS {
+                if let Some(table) = value.get(section).and_then(toml::Value::as_table) {
+                    tables.push((format!("target.{target}.{section}"), table));
+                }
+            }
+        }
+    }
+    tables
+}
+
+/// What would turn tauri's `tracing` feature on, which makes the emits
+/// `single.rs` sends while it holds its state lock block on the main thread
+/// (see `Single::begin_preview` and `Single::settle_preview_with`):
+/// - in `cargo_toml`, `tracing` among the features of a `tauri` dependency
+///   (also one renamed with `package = "tauri"`) in any dependency table;
+/// - in `cargo_lock`, a `tracing` dependency of the `tauri` or the
+///   `tauri-runtime-wry` package, which is where a feature turned on by
+///   another crate shows up.
+///
+/// A lock without either package is a problem too, so the check cannot pass
+/// by finding nothing.
+fn tracing_problems(cargo_toml: &str, cargo_lock: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let manifest: toml::Table = match cargo_toml.parse() {
+        Ok(table) => table,
+        Err(error) => return vec![format!("Cargo.toml: {error}")],
+    };
+    for (place, table) in dependency_tables(&manifest) {
+        for (key, dependency) in table {
+            let is_tauri = key == "tauri"
+                || dependency.get("package").and_then(toml::Value::as_str) == Some("tauri");
+            let traced = dependency
+                .get("features")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|features| {
+                    features
+                        .iter()
+                        .any(|feature| feature.as_str() == Some("tracing"))
+                });
+            if is_tauri && traced {
+                problems.push(format!("{place}: tauri has the tracing feature"));
+            }
+        }
+    }
+    let lock: toml::Table = match cargo_lock.parse() {
+        Ok(table) => table,
+        Err(error) => return vec![format!("Cargo.lock: {error}")],
+    };
+    let packages: Vec<&toml::Table> = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .map(|list| list.iter().filter_map(toml::Value::as_table).collect())
+        .unwrap_or_default();
+    for name in ["tauri", "tauri-runtime-wry"] {
+        let entries: Vec<&&toml::Table> = packages
+            .iter()
+            .filter(|package| package.get("name").and_then(toml::Value::as_str) == Some(name))
+            .collect();
+        if entries.is_empty() {
+            problems.push(format!("Cargo.lock has no {name}"));
+        }
+        for entry in entries {
+            // An entry is "name" or "name version" (with a source when two
+            // versions are locked).
+            let traced = entry
+                .get("dependencies")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|dependencies| {
+                    dependencies
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .any(|dependency| dependency.split(' ').next() == Some("tracing"))
+                });
+            if traced {
+                problems.push(format!("Cargo.lock: {name} depends on tracing"));
+            }
+        }
+    }
+    problems
+}
+
+#[test]
+fn tauri_never_gets_its_tracing_feature() {
+    assert_eq!(
+        tracing_problems(&read_text("Cargo.toml"), &repo_file("Cargo.lock")),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_tracing_feature_or_dependency_is_flagged_in_a_fixture() {
+    const LOCK: &str = r#"
+        [[package]]
+        name = "tauri"
+        version = "2.12.5"
+        dependencies = ["serde", "tauri-runtime-wry"]
+
+        [[package]]
+        name = "tauri-runtime-wry"
+        version = "2.12.3"
+        dependencies = ["wry"]
+    "#;
+    const MANIFEST: &str = "[dependencies]\ntauri = { version = \"2\", features = [] }\n";
+    // Controls: no feature, the version as a plain string, a crate whose
+    // name only starts with "tracing".
+    assert_eq!(tracing_problems(MANIFEST, LOCK), Vec::<String>::new());
+    assert_eq!(
+        tracing_problems("[dependencies]\ntauri = \"2\"\n", LOCK),
+        Vec::<String>::new()
+    );
+    let core_only = LOCK.replace(r#"["wry"]"#, r#"["tracing-core 0.1.33", "wry"]"#);
+    assert_eq!(tracing_problems(MANIFEST, &core_only), Vec::<String>::new());
+
+    // The feature in the manifest: plain, in a target table, renamed.
+    assert_eq!(
+        tracing_problems(
+            "[dependencies]\ntauri = { version = \"2\", features = [\"devtools\", \"tracing\"] }\n",
+            LOCK
+        ),
+        ["dependencies: tauri has the tracing feature"]
+    );
+    assert_eq!(
+        tracing_problems(
+            "[target.'cfg(windows)'.dependencies]\ntauri = { version = \"2\", features = [\"tracing\"] }\n",
+            LOCK
+        ),
+        ["target.cfg(windows).dependencies: tauri has the tracing feature"]
+    );
+    assert_eq!(
+        tracing_problems(
+            "[dependencies.webview]\npackage = \"tauri\"\nversion = \"2\"\nfeatures = [\"tracing\"]\n",
+            LOCK
+        ),
+        ["dependencies: tauri has the tracing feature"]
+    );
+
+    // The dependency in the lock, with and without a version.
+    let wry = LOCK.replace(r#"["wry"]"#, r#"["tracing 0.1.41", "wry"]"#);
+    assert_eq!(
+        tracing_problems(MANIFEST, &wry),
+        ["Cargo.lock: tauri-runtime-wry depends on tracing"]
+    );
+    let tauri = LOCK.replace(
+        r#"["serde", "tauri-runtime-wry"]"#,
+        r#"["serde", "tauri-runtime-wry", "tracing"]"#,
+    );
+    assert_eq!(
+        tracing_problems(MANIFEST, &tauri),
+        ["Cargo.lock: tauri depends on tracing"]
+    );
+
+    // A lock without tauri-runtime-wry checks nothing: flagged.
+    let no_wry = "[[package]]\nname = \"tauri\"\nversion = \"2.12.5\"\n";
+    assert_eq!(
+        tracing_problems(MANIFEST, no_wry),
+        ["Cargo.lock has no tauri-runtime-wry"]
+    );
+}
+
+// --- the command names the window may call ------------------------------------
+
+/// Calls `visit` with every expression in the functions of the Rust
+/// `source`, as deep as `let`s, method chains, calls, references, blocks and
+/// matches go: enough for a builder chain and a list literal. Comments and
+/// string contents are never expressions.
+fn each_expression(source: &str, visit: &mut dyn FnMut(&syn::Expr)) {
+    let file = syn::parse_file(source).expect("valid Rust");
+    for item in &file.items {
+        if let syn::Item::Fn(function) = item {
+            each_in_block(&function.block, visit);
+        }
+    }
+}
+
+fn each_in_block(block: &syn::Block, visit: &mut dyn FnMut(&syn::Expr)) {
+    for statement in &block.stmts {
+        match statement {
+            syn::Stmt::Local(local) => {
+                if let Some(init) = &local.init {
+                    each_in_expr(&init.expr, visit);
+                }
+            }
+            syn::Stmt::Expr(expr, _) => each_in_expr(expr, visit),
+            _ => {}
+        }
+    }
+}
+
+fn each_in_expr(expr: &syn::Expr, visit: &mut dyn FnMut(&syn::Expr)) {
+    visit(expr);
+    match expr {
+        syn::Expr::MethodCall(call) => {
+            each_in_expr(&call.receiver, visit);
+            for arg in &call.args {
+                each_in_expr(arg, visit);
+            }
+        }
+        syn::Expr::Call(call) => {
+            each_in_expr(&call.func, visit);
+            for arg in &call.args {
+                each_in_expr(arg, visit);
+            }
+        }
+        syn::Expr::Reference(reference) => each_in_expr(&reference.expr, visit),
+        syn::Expr::Paren(paren) => each_in_expr(&paren.expr, visit),
+        syn::Expr::Block(block) => each_in_block(&block.block, visit),
+        syn::Expr::Match(matched) => {
+            each_in_expr(&matched.expr, visit);
+            for arm in &matched.arms {
+                each_in_expr(&arm.body, visit);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The names in each `generate_handler![…]` call in the Rust `source` (the
+/// last segment of each path), one list per call.
+fn handler_lists(source: &str) -> Vec<Vec<String>> {
+    let mut lists = Vec::new();
+    each_expression(source, &mut |expr| {
+        if let syn::Expr::Macro(found) = expr
+            && found
+                .mac
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "generate_handler")
+        {
+            let paths = found
+                .mac
+                .parse_body_with(
+                    syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+                )
+                .expect("a list of command paths");
+            lists.push(
+                paths
+                    .iter()
+                    .map(|path| path.segments.last().unwrap().ident.to_string())
+                    .collect(),
+            );
+        }
+    });
+    lists
+}
+
+/// The string literals of each `commands(&[…])` call in the Rust `source`
+/// (the build script's app manifest), one list per call. An element that is
+/// not a string literal reads as `<not a literal>`, so it is flagged.
+fn manifest_lists(source: &str) -> Vec<Vec<String>> {
+    let mut lists = Vec::new();
+    each_expression(source, &mut |expr| {
+        if let syn::Expr::MethodCall(call) = expr
+            && call.method == "commands"
+            && let Some(syn::Expr::Reference(reference)) = call.args.first()
+            && let syn::Expr::Array(array) = &*reference.expr
+        {
+            lists.push(
+                array
+                    .elems
+                    .iter()
+                    .map(|element| match element {
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(text),
+                            ..
+                        }) => text.value(),
+                        _ => "<not a literal>".to_owned(),
+                    })
+                    .collect(),
+            );
+        }
+    });
+    lists
+}
+
+/// The commands a capability grants, as command names (`allow-set-view` is
+/// `set_view`); `core:` permissions are not commands.
+fn capability_commands(capability: &Value) -> Vec<String> {
+    granted(capability)
+        .into_iter()
+        .filter_map(|permission| permission.strip_prefix("allow-"))
+        .map(|command| command.replace('-', "_"))
+        .collect()
+}
+
+/// What is wrong with the command lists found in one place (`place`), next
+/// to the fixture's `expected`: not exactly one list, or a list with a
+/// missing, an extra or a repeated name.
+fn command_list_problems(place: &str, lists: &[Vec<String>], expected: &[String]) -> Vec<String> {
+    match lists {
+        [list] => contract_names::problems(expected, list)
+            .into_iter()
+            .map(|problem| format!("{place}: {problem}"))
+            .collect(),
+        _ => vec![format!("{place}: {} command lists, not one", lists.len())],
+    }
+}
+
+#[test]
+fn the_handler_build_script_and_capability_list_exactly_the_fixtures_commands() {
+    let fixture = contract_names::load();
+    let capability = read_json("capabilities/default.json");
+    let mut problems = command_list_problems(
+        "lib.rs",
+        &handler_lists(&read_text("src/lib.rs")),
+        &fixture.commands,
+    );
+    problems.extend(command_list_problems(
+        "build.rs",
+        &manifest_lists(&read_text("build.rs")),
+        &fixture.commands,
+    ));
+    problems.extend(command_list_problems(
+        "capability",
+        &[capability_commands(&capability)],
+        &fixture.commands,
+    ));
+    assert_eq!(problems, Vec::<String>::new());
+    assert_eq!(fixture.commands.len(), 12);
+}
+
+#[test]
+fn a_command_list_missing_or_adding_a_name_is_flagged_in_a_fixture() {
+    let expected: Vec<String> = vec!["set_view".to_owned(), "save_image".to_owned()];
+    let check =
+        |place: &str, lists: Vec<Vec<String>>| command_list_problems(place, &lists, &expected);
+
+    // The handler: one missing and one extra; none; two; one only in text.
+    let lib = r#"
+        pub fn run() {
+            let result = tauri::Builder::default()
+                .invoke_handler(tauri::generate_handler![set_view, commands::delete_all])
+                .run(tauri::generate_context!());
+        }
+    "#;
+    assert_eq!(
+        check("lib.rs", handler_lists(lib)),
+        ["lib.rs: missing save_image", "lib.rs: extra delete_all"]
+    );
+    let none = "fn run() { tauri::Builder::default().run(context()); }";
+    assert_eq!(
+        check("lib.rs", handler_lists(none)),
+        ["lib.rs: 0 command lists, not one"]
+    );
+    let two = "fn run() { let a = b.invoke_handler(generate_handler![set_view, save_image]); \
+               let c = d.invoke_handler(generate_handler![set_view, save_image]); }";
+    assert_eq!(
+        check("lib.rs", handler_lists(two)),
+        ["lib.rs: 2 command lists, not one"]
+    );
+    let in_text = r#"
+        /// generate_handler![set_view, save_image]
+        fn run() { let text = "generate_handler![set_view, save_image]"; }
+    "#;
+    assert_eq!(handler_lists(in_text), Vec::<Vec<String>>::new());
+
+    // The build script: a name twice, a name that is not a literal.
+    let build = r#"fn main() { let m = tauri_build::AppManifest::new().commands(&["set_view", "save_image", "save_image", NAME]); }"#;
+    assert_eq!(
+        check("build.rs", manifest_lists(build)),
+        [
+            "build.rs: save_image given twice",
+            "build.rs: extra <not a literal>"
+        ]
+    );
+
+    // The capability: one missing and one extra.
+    let capability = serde_json::json!({
+        "permissions": ["allow-set-view", "allow-delete-all", "core:event:allow-listen"]
+    });
+    assert_eq!(
+        check("capability", vec![capability_commands(&capability)]),
+        [
+            "capability: missing save_image",
+            "capability: extra delete_all"
+        ]
+    );
+
+    // Controls: the right lists, in another order, pass.
+    let good_lib = "fn run() { b.invoke_handler(tauri::generate_handler![save_image, set_view]); }";
+    assert_eq!(
+        check("lib.rs", handler_lists(good_lib)),
+        Vec::<String>::new()
+    );
+    let good_build =
+        r#"fn main() { tauri_build::AppManifest::new().commands(&["save_image", "set_view"]); }"#;
+    assert_eq!(
+        check("build.rs", manifest_lists(good_build)),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn the_contract_fixture_is_read_strictly() {
+    let real = contract_names::load();
+    assert_eq!((real.events.len(), real.commands.len()), (15, 12));
+    for bad in [
+        "not json",
+        "[]",
+        "null",
+        r#"{"events": [], "commands": [], "extra": []}"#,
+        r#"{"events": []}"#,
+        r#"{"events": ["a", 7], "commands": []}"#,
+        r#"{"events": ["a", ""], "commands": []}"#,
+        r#"{"events": ["a", "a"], "commands": []}"#,
+        r#"{"events": "a", "commands": []}"#,
+    ] {
+        assert!(contract_names::parse(bad).is_err(), "{bad}");
+    }
+    // Control: a well-formed text is read.
+    let read = contract_names::parse(r#"{"commands": ["x"], "events": ["y"]}"#).unwrap();
+    assert_eq!(
+        (read.commands, read.events),
+        (vec!["x".to_owned()], vec!["y".to_owned()])
+    );
 }
