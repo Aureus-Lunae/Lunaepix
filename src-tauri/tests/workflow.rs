@@ -7,8 +7,10 @@
 //! uploaded artifact named, filled and kept as agreed. The rules are the same
 //! for both; what differs per platform (the file, the runner, the cache and
 //! NASM policy, the artifact) is one `Platform` profile that every check
-//! reads. Each check has fixtures it must catch, so it is known to fail when
-//! it should.
+//! reads. The Mac file has one rule more: a check step between the build and
+//! the upload that verifies the app's signature and that the worker is sealed
+//! in, in `bundle/macos/` and inside the disk image. Each check has fixtures
+//! it must catch, so it is known to fail when it should.
 //!
 //! The workflow is parsed as YAML 1.2 (so the key `on` is a name, not
 //! boolean true) and every check reads the parsed tree, so quoting, spacing
@@ -22,11 +24,15 @@ use std::path::Path;
 
 use yaml_rust2::{Yaml, YamlLoader};
 
-/// Whether the Installer job may restore a build cache.
+/// Whether the Installer job restores a build cache.
 enum BuildCache {
     /// No cache: the test job's cache is a debug-profile cache, which a
     /// release build cannot use, and one of its own would only add upload time.
     Forbidden,
+    /// Its own `Swatinem/rust-cache`, before its first cargo step: Mac minutes
+    /// cost more than the cache upload, and the cache also keeps the installed
+    /// Tauri command line.
+    Required,
 }
 
 /// How a job gets NASM, which mozjpeg's SIMD code is assembled with.
@@ -34,10 +40,15 @@ enum NasmInstall {
     /// `choco install nasm --version=<x.y.z>`, with NASM's folder added to
     /// `GITHUB_PATH` (Chocolatey does not put it on the path).
     ChocolateyPinned,
+    /// `brew install nasm`, then `nasm -v` in the same step: Homebrew cannot
+    /// pin an older version without a tap of its own, so the version it
+    /// installed is printed to the log instead.
+    Homebrew,
 }
 
 /// What differs between the platforms' workflow files. Every check reads the
-/// profile it is given, so the same rules guard each file.
+/// profile it is given, so the same rules guard each file. The one rule only
+/// the Mac has, its check step, is added by `every_check` for `MACOS.file`.
 struct Platform {
     /// The file in `.github/workflows/`.
     file: &'static str,
@@ -61,6 +72,16 @@ const WINDOWS: Platform = Platform {
         "target/release/bundle/nsis/*.exe",
         "target/release/bundle/msi/*.msi",
     ],
+};
+
+/// Apple Silicon (`macos-latest`); the artifact is the disk image.
+const MACOS: Platform = Platform {
+    file: "macos.yml",
+    runner: "macos-latest",
+    build_cache: BuildCache::Required,
+    nasm: NasmInstall::Homebrew,
+    artifact: "lunaepix-macos-dmg",
+    artifact_paths: &["target/release/bundle/dmg/*.dmg"],
 };
 
 fn workflow(platform: &Platform) -> String {
@@ -335,8 +356,10 @@ fn injection_problems(text: &str) -> Vec<String> {
 }
 
 /// A script without its shell comments (whole-line, and a trailing ` # ...`).
-/// Only used to decide whether a command is present, where losing text can
-/// make a check fail but never pass.
+/// Used to decide whether a command is present, where losing text can make a
+/// check fail but never pass, and where a step's first cargo command is
+/// (`nasm_problems`, the `Required` cache rule): there a `cargo` after a ` #`
+/// inside quotes is lost, so that step does not count as a cargo step.
 fn without_comments(script: &str) -> String {
     let code = script
         .lines()
@@ -344,6 +367,18 @@ fn without_comments(script: &str) -> String {
     code.map(|line| line.split(" #").next().unwrap_or(line))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A step's `run` script without its shell comments; empty for a step that
+/// runs no script.
+fn step_code(step: &Yaml) -> String {
+    scalar(&step["run"]).map_or_else(String::new, |script| without_comments(&script))
+}
+
+/// Whether a script (comments already removed) runs cargo: it has the word
+/// `cargo`.
+fn runs_cargo(code: &str) -> bool {
+    code.split_whitespace().any(|word| word == "cargo")
 }
 
 /// No script found at all, or a command in `required` that no script contains
@@ -395,9 +430,10 @@ fn release_hits(text: &str) -> Vec<String> {
 /// Every job has a `runs-on` that is the platform's runner; the jobs `test`
 /// and `build` exist; `build` needs `test`, uploads with
 /// `actions/upload-artifact@` (what it uploads is `upload_problems`' business)
-/// and follows the platform's cache policy; runs are queued per workflow and
-/// ref; and no key or value anywhere (`uses` and `run` included) names a
-/// release.
+/// and follows the platform's `BuildCache` (`Forbidden`: no action with
+/// `cache` in its name; `Required`: a `Swatinem/rust-cache@` step before its
+/// first cargo step); runs are queued per workflow and ref; and no key or
+/// value anywhere (`uses` and `run` included) names a release.
 fn structure_problems(text: &str, platform: &Platform) -> Vec<String> {
     on_tree(text, |doc| {
         let jobs = jobs(doc);
@@ -444,6 +480,25 @@ fn structure_problems(text: &str, platform: &Platform) -> Vec<String> {
                     problems.extend(
                         caches.map(|uses| format!("the build job restores a cache: {uses}")),
                     );
+                }
+                BuildCache::Required => {
+                    let steps = steps_of(build);
+                    let cache = steps.iter().position(|step| {
+                        uses_of(step).is_some_and(|uses| {
+                            uses.to_ascii_lowercase()
+                                .starts_with("swatinem/rust-cache@")
+                        })
+                    });
+                    let cargo = steps.iter().position(|step| runs_cargo(&step_code(step)));
+                    match (cache, cargo) {
+                        (None, _) => problems
+                            .push("the build job does not restore Swatinem/rust-cache".to_owned()),
+                        (Some(cache), Some(cargo)) if cache > cargo => problems.push(
+                            "the build job restores its cache after its first cargo step"
+                                .to_owned(),
+                        ),
+                        (Some(_), _) => {}
+                    }
                 }
             }
         } else {
@@ -502,11 +557,14 @@ const RETENTION_DAYS: &str = "30";
 ///   lines, trailing spaces, tabs and Windows line endings do not matter, and a
 ///   `!` exclusion line or a folded single line does);
 /// - `if-no-files-found` is `error` (the action's default only warns);
-/// - `retention-days` is 30. The parser reads `30` as an integer and `"30"` as
-///   a string, and `scalar` turns both into the text `30`, so both are
-///   accepted; `30.0`, `"030"` and every other number are refused.
+/// - `retention-days` is 30. `scalar` turns the parsed value into text, so
+///   every spelling that YAML 1.2 reads as the integer 30 (`30`, `030`, `+30`,
+///   `0x1E`, `0o36`) and the string `"30"` are accepted; anything else
+///   (`30.0`, the string `"030"`, a list, null, any other number) is refused.
 ///
 /// Any other step that sets `if-no-files-found` must set it to `error` too.
+/// One that is set but is not a single value (a list, null, a mapping) is
+/// reported as such, apart from an upload that does not set it at all.
 fn upload_problems(text: &str, platform: &Platform) -> Vec<String> {
     on_tree(text, |doc| {
         let mut problems = Vec::new();
@@ -523,7 +581,12 @@ fn upload_problems(text: &str, platform: &Platform) -> Vec<String> {
                     Some(value) => {
                         problems.push(format!("if-no-files-found is {value}, not error"))
                     }
-                    None => problems.push("an upload does not set if-no-files-found".to_owned()),
+                    None if found.is_badvalue() => {
+                        problems.push("an upload does not set if-no-files-found".to_owned())
+                    }
+                    None => problems.push(format!(
+                        "if-no-files-found is not a single value: {found:?}"
+                    )),
                 }
             }
             if !upload {
@@ -633,8 +696,8 @@ fn bundle_build_problems(text: &str) -> Vec<String> {
 // ---- NASM ----
 
 /// Whether the line of a script that runs `choco install nasm` carries a
-/// `--version=<x.y.z>` pin (`NasmInstall::ChocolateyPinned`): the workflow pins every action by hash, so the
-/// build tool is pinned too.
+/// `--version=<x.y.z>` pin (`NasmInstall::ChocolateyPinned`): the workflow
+/// pins every action by hash, so the build tool is pinned too.
 fn nasm_install_is_pinned(script: &str) -> bool {
     script
         .lines()
@@ -647,48 +710,63 @@ fn nasm_install_is_pinned(script: &str) -> bool {
         })
 }
 
+/// Whether a script runs `nasm -v` (the words next to each other, on any
+/// line, so `brew install nasm && nasm -v` counts).
+fn prints_nasm_version(script: &str) -> bool {
+    script.lines().any(|line| {
+        let words = line.split_whitespace().collect::<Vec<_>>();
+        words.windows(2).any(|pair| pair == ["nasm", "-v"])
+    })
+}
+
 /// Every job with a cargo step installs NASM in an earlier step, the way the
 /// platform's `NasmInstall` says: mozjpeg's SIMD code is assembled with it
-/// when lunaepix-core builds. For `ChocolateyPinned` the install step is found
-/// by `choco install nasm` outside shell comments, it also puts NASM's folder
-/// on the path through `GITHUB_PATH`, and it carries a `--version=` pin. A
-/// cargo step is any step whose script has the word `cargo` outside shell
-/// comments.
+/// when lunaepix-core builds. The install step is found outside shell comments,
+/// by `choco install nasm` for `ChocolateyPinned` and `brew install nasm` for
+/// `Homebrew`. For `ChocolateyPinned` that step also puts NASM's folder on the
+/// path through `GITHUB_PATH`, and it carries a `--version=` pin; for
+/// `Homebrew` it also runs `nasm -v`. A cargo step is any step whose script
+/// has the word `cargo` outside shell comments.
 fn nasm_problems(text: &str, platform: &Platform) -> Vec<String> {
     on_tree(text, |doc| {
         let mut problems = Vec::new();
-        let NasmInstall::ChocolateyPinned = platform.nasm;
+        let install_command = match platform.nasm {
+            NasmInstall::ChocolateyPinned => "choco install nasm",
+            NasmInstall::Homebrew => "brew install nasm",
+        };
         for (name, job) in jobs(doc) {
-            let code = steps_of(job)
-                .into_iter()
-                .map(|step| scalar(&step["run"]).map_or_else(String::new, |s| without_comments(&s)))
-                .collect::<Vec<_>>();
-            let Some(cargo) = code
-                .iter()
-                .position(|script| script.split_whitespace().any(|word| word == "cargo"))
-            else {
+            let code = steps_of(job).into_iter().map(step_code).collect::<Vec<_>>();
+            let Some(cargo) = code.iter().position(|script| runs_cargo(script)) else {
                 continue;
             };
             let install = code
                 .iter()
-                .position(|script| script.contains("choco install nasm"));
+                .position(|script| script.contains(install_command));
             match install {
                 None => problems.push(format!("job {name}: does not install nasm")),
                 Some(at) if at > cargo => problems.push(format!(
                     "job {name}: installs nasm after its first cargo step"
                 )),
-                Some(at) => {
-                    if !code[at].contains("GITHUB_PATH") {
-                        problems.push(format!(
-                            "job {name}: the nasm step does not add NASM to GITHUB_PATH"
-                        ));
+                Some(at) => match platform.nasm {
+                    NasmInstall::ChocolateyPinned => {
+                        if !code[at].contains("GITHUB_PATH") {
+                            problems.push(format!(
+                                "job {name}: the nasm step does not add NASM to GITHUB_PATH"
+                            ));
+                        }
+                        if !nasm_install_is_pinned(&code[at]) {
+                            problems.push(format!(
+                                "job {name}: the nasm install is not pinned with --version="
+                            ));
+                        }
                     }
-                    if !nasm_install_is_pinned(&code[at]) {
-                        problems.push(format!(
-                            "job {name}: the nasm install is not pinned with --version="
-                        ));
+                    NasmInstall::Homebrew => {
+                        if !prints_nasm_version(&code[at]) {
+                            problems
+                                .push(format!("job {name}: the nasm step does not print nasm -v"));
+                        }
                     }
-                }
+                },
             }
         }
         problems
@@ -721,6 +799,59 @@ fn node_step_problems(text: &str) -> Vec<String> {
     })
 }
 
+// ---- the Mac check step ----
+
+/// The command that makes a step the check step.
+const CODESIGN_VERIFY: &str = "codesign --verify --deep --strict";
+
+/// Mac only: the build job has a check step between the bundle build and the
+/// upload, so a broken app or disk image fails the run before anyone downloads
+/// it. The check step is the first step of the build job whose script runs
+/// `codesign --verify --deep --strict` outside shell comments (the seal over
+/// the app and its worker). It must also run `plutil -extract` (the worker is
+/// listed in the seal) and `hdiutil attach` (the app inside the disk image is
+/// checked too), come after a step that runs `cargo tauri build`, and come
+/// before the first upload. Like the other script checks this is a lint on the
+/// `run:` text: it proves the commands are there and in order, not what the
+/// script does with their results.
+fn mac_check_step_problems(text: &str) -> Vec<String> {
+    on_tree(text, |doc| {
+        let Some((_, build)) = jobs(doc).into_iter().find(|(name, _)| name == "build") else {
+            return vec!["no build job".to_owned()];
+        };
+        let steps = steps_of(build);
+        let code = steps.iter().map(|step| step_code(step)).collect::<Vec<_>>();
+        let Some(check) = code
+            .iter()
+            .position(|script| script.contains(CODESIGN_VERIFY))
+        else {
+            return vec![format!(
+                "no check step: no step of the build job runs {CODESIGN_VERIFY}"
+            )];
+        };
+        let mut problems = Vec::new();
+        for command in ["plutil -extract", "hdiutil attach"] {
+            if !code[check].contains(command) {
+                problems.push(format!("the check step does not run {command}"));
+            }
+        }
+        let bundles = |script: &String| {
+            script.lines().any(|line| {
+                let words = line.split_whitespace().collect::<Vec<_>>();
+                words.windows(3).any(|w| w == ["cargo", "tauri", "build"])
+            })
+        };
+        if !code[..check].iter().any(bundles) {
+            problems.push("the check step does not come after a cargo tauri build".to_owned());
+        }
+        let upload = steps.iter().position(|step| uploads_artifact(step));
+        if !upload.is_some_and(|upload| upload > check) {
+            problems.push("the check step does not come before the upload".to_owned());
+        }
+        problems
+    })
+}
+
 const REQUIRED_COMMANDS: &[&str] = &[
     "cargo fmt --all --check",
     "cargo clippy --workspace --all-targets -- -D warnings",
@@ -733,7 +864,7 @@ const REQUIRED_COMMANDS: &[&str] = &[
 
 const PIN: &str = "11bd71901bbe5b1630ceea73d27597364c9af683";
 
-/// The build job's bundle step in `good()`.
+/// The build job's bundle step in `good()` and `good_mac()`.
 const BUILD_STEP: &str =
     "      - run: cargo tauri build --config src-tauri/tauri.bundle.conf.json\n";
 
@@ -753,9 +884,10 @@ const UPLOAD_STEP: &str = "      - uses: actions/upload-artifact@PIN # v7
           retention-days: 30
 ";
 
-/// A workflow every check accepts. It holds a `--release` build and a
-/// `target/release` path, which are not release steps, and a cache in the
-/// `test` job, which is allowed there. The variants below change one thing.
+/// A Windows workflow every check accepts under `WINDOWS` (the Mac one is
+/// `good_mac()`). It holds a `--release` build and a `target/release` path,
+/// which are not release steps, and a cache in the `test` job, which is
+/// allowed there. The variants below change one thing.
 fn good() -> String {
     let base = "name: x
 on:
@@ -815,8 +947,121 @@ fn steps_doc(steps: &str) -> String {
     format!("{head}{}\n", steps.replace("PIN", PIN))
 }
 
+// ---- Mac fixtures ----
+
+/// The NASM install step, in both jobs of `good_mac()` before their cargo steps.
+const MAC_NASM_STEP: &str = "      - run: |\n          brew install nasm\n          nasm -v\n";
+
+/// The Installer job's own cache in `good_mac()`; the test job's carries
+/// another release comment, so this line is only in the Installer job.
+const MAC_BUILD_CACHE: &str = "      - uses: Swatinem/rust-cache@PIN # v2.9.3\n";
+
+/// The Tauri command line install, the Installer job's first cargo step.
+const MAC_TAURI_INSTALL: &str = "      - run: cargo install tauri-cli --locked --version 2.12.4\n";
+
+/// The check step of `good_mac()`, with the script `macos.yml` runs.
+const MAC_CHECK_STEP: &str = r#"      - run: |
+          check_app() {
+            test -x "$1/Contents/MacOS/lunaepix-worker"
+            codesign --verify --deep --strict --verbose=2 "$1"
+            details=$(codesign -dv "$1" 2>&1)
+            echo "$details"
+            grep -qx 'Signature=adhoc' <<<"$details"
+            grep -q '^Sealed Resources version=2' <<<"$details"
+            plutil -extract 'files2.MacOS/lunaepix-worker' xml1 -o - \
+              "$1/Contents/_CodeSignature/CodeResources" >/dev/null
+          }
+          check_app target/release/bundle/macos/Lunaepix.app
+          dmg=$(ls target/release/bundle/dmg/*.dmg)
+          mount=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg"
+          trap 'hdiutil detach "$mount"' EXIT
+          check_app "$mount/Lunaepix.app"
+"#;
+
+const MAC_UPLOAD_STEP: &str = "      - uses: actions/upload-artifact@PIN # v7
+        with:
+          name: lunaepix-macos-dmg
+          path: target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 30
+";
+
+/// A Mac workflow every check accepts under `MACOS`: a cache in both jobs,
+/// Homebrew's NASM, and the check step between the build and the upload.
+fn good_mac() -> String {
+    let base = "name: x
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@PIN # v7.0.1
+      - uses: actions/setup-node@PIN # v7.1.0
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@PIN # v2
+NASM      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --no-fail-fast
+      - run: node --test \"tests/ui/*.test.js\"
+        if: success() || failure()
+  build:
+    needs: test
+    runs-on: macos-latest
+    steps:
+CACHENASMINSTALLBUILDCHECKUPLOAD";
+    base.replace("CACHE", MAC_BUILD_CACHE)
+        .replace("NASM", MAC_NASM_STEP)
+        .replace("INSTALL", MAC_TAURI_INSTALL)
+        .replace("BUILD", BUILD_STEP)
+        .replace("CHECK", MAC_CHECK_STEP)
+        .replace("UPLOAD", MAC_UPLOAD_STEP)
+        .replace("PIN", PIN)
+}
+
+/// `good_mac()` with the first `from` replaced by `to`. Fails when `from` is
+/// not there, so a fixture cannot silently be a no-op.
+fn with_mac(from: &str, to: &str) -> String {
+    let from = from.replace("PIN", PIN);
+    assert!(good_mac().contains(&from), "the Mac fixture lacks {from:?}");
+    good_mac().replacen(&from, &to.replace("PIN", PIN), 1)
+}
+
+/// `good_mac()` with its last `from` (the Installer job's copy of a step both
+/// jobs have) replaced by `to`.
+fn with_mac_last(from: &str, to: &str) -> String {
+    let at = good_mac().rfind(from).expect("the Mac fixture lacks it");
+    let mut text = good_mac();
+    text.replace_range(at..at + from.len(), to);
+    text
+}
+
+/// The problems the check named `check` reports when `every_check` runs on
+/// `text` with the Mac profile.
+fn mac_check(text: &str, check: &str) -> Vec<String> {
+    every_check(text, &MACOS)
+        .into_iter()
+        .find(|(name, _)| *name == check)
+        .map(|(_, problems)| problems)
+        .unwrap_or_else(|| panic!("every_check has no {check} for the Mac"))
+}
+
+/// Every check, named, on `text` with `platform`'s profile; the Mac's file
+/// also gets `mac_check_step_problems`.
 fn every_check(text: &str, platform: &Platform) -> Vec<(&'static str, Vec<String>)> {
-    vec![
+    let mut checks = vec![
         ("unpinned_actions", unpinned_actions(text)),
         ("permission_problems", permission_problems(text)),
         ("secret_references", secret_references(text)),
@@ -832,7 +1077,11 @@ fn every_check(text: &str, platform: &Platform) -> Vec<(&'static str, Vec<String
         ("bundle_build_problems", bundle_build_problems(text)),
         ("nasm_problems", nasm_problems(text, platform)),
         ("node_step_problems", node_step_problems(text)),
-    ]
+    ];
+    if platform.file == MACOS.file {
+        checks.push(("mac_check_step_problems", mac_check_step_problems(text)));
+    }
+    checks
 }
 
 fn assert_clean(problems: Vec<String>) {
@@ -907,8 +1156,10 @@ fn a_workflow_that_does_not_parse_is_reported_by_every_check_in_a_fixture() {
         "- a\n- b\n",
         "a: 1\na: 2\n",
     ] {
-        for (name, problems) in every_check(bad, &WINDOWS) {
-            assert_problem(&problems, "the workflow", &format!("{name} on {bad:?}"));
+        for platform in [&WINDOWS, &MACOS] {
+            for (name, problems) in every_check(bad, platform) {
+                assert_problem(&problems, "the workflow", &format!("{name} on {bad:?}"));
+            }
         }
     }
 }
@@ -1243,8 +1494,8 @@ fn commands_in_one_line_and_block_scripts_are_found_in_a_fixture() {
     assert_clean(missing_commands(&steps_doc(steps), &["cargo test --workspace", "node --test \"tests/ui/*.test.js\""]));
 }
 
-// The window script tests run even when the Rust tests failed, so one
-// Windows run reports the failures of both.
+// The window script tests run even when the Rust tests failed, so one run
+// (Windows or Mac) reports the failures of both.
 #[test]
 #[rustfmt::skip]
 fn a_node_step_that_runs_after_a_failed_step_passes_in_a_fixture() {
@@ -1269,7 +1520,7 @@ fn a_node_step_skipped_after_a_failed_step_is_caught_in_a_fixture() {
 }
 
 // The Rust tests run every test binary even after one fails, so a single
-// Windows run reports every Windows failure, not only the first binary's.
+// run reports every failure on its platform, not only the first binary's.
 #[test]
 #[rustfmt::skip]
 fn the_rust_tests_run_without_stopping_at_the_first_failing_binary() {
@@ -1511,6 +1762,24 @@ fn a_step_that_is_not_an_upload_but_ignores_missing_files_is_caught_in_a_fixture
     assert_clean(upload_problems(&add_step(fine), &WINDOWS));
 }
 
+#[test]
+#[rustfmt::skip]
+fn an_if_no_files_found_that_is_not_a_single_value_has_its_own_message_in_a_fixture() {
+    // Set, but to a list, a null or a mapping: not "does not set".
+    for value in ["[error]", "null", "{a: error}"] {
+        let text = with("if-no-files-found: error", &format!("if-no-files-found: {value}"));
+        let problems = upload_problems(&text, &WINDOWS);
+        assert_eq!(problems.len(), 1, "{value}: {problems:?}");
+        assert_problem(&problems, "if-no-files-found is not a single value", value);
+    }
+    // The same on a step that is not an upload.
+    let other = "      - uses: other/action@PIN # v1\n        with:\n          if-no-files-found: [warn]\n";
+    assert_problem(&upload_problems(&add_step(other), &WINDOWS), "if-no-files-found is not a single value", "other action");
+    // An upload that leaves it out keeps its own message.
+    let missing = upload_problems(&with("          if-no-files-found: error\n", ""), &WINDOWS);
+    assert_eq!(missing, ["an upload does not set if-no-files-found"]);
+}
+
 // ---- the upload ----
 
 /// The two path lines of the upload step in `good()`.
@@ -1535,13 +1804,13 @@ fn the_upload_names_the_platform_artifact_its_paths_and_thirty_days_in_a_fixture
     assert_clean(upload_problems(&flat, &WINDOWS));
     assert_clean(upload_problems(&good().replace('\n', "\r\n"), &WINDOWS));
     // The name may be quoted; the retention is the number 30 however it is
-    // written: the parser reads `30`, `030` and `+30` as integers and `"30"` as
-    // a string, and `scalar` turns each into the text 30. A quoted `'030'` is
-    // the text 030, which is refused below.
+    // written: the parser reads `30`, `030`, `+30`, `0x1E` and `0o36` as the
+    // integer 30 and `"30"` as a string, and `scalar` turns each into the text
+    // 30. A quoted `'030'` is the text 030, which is refused below.
     for name in ["'lunaepix-windows-installer'", "\"lunaepix-windows-installer\""] {
         assert_clean(upload_problems(&with("name: lunaepix-windows-installer", &format!("name: {name}")), &WINDOWS));
     }
-    for days in ["'30'", "\"30\"", "30", "030", "+30"] {
+    for days in ["'30'", "\"30\"", "30", "030", "+30", "0x1E", "0o36"] {
         assert_clean(upload_problems(&with("retention-days: 30", &format!("retention-days: {days}")), &WINDOWS));
     }
 }
@@ -1570,7 +1839,7 @@ fn an_upload_with_another_name_path_or_retention_is_caught_in_a_fixture() {
 #[rustfmt::skip]
 fn an_upload_with_a_shape_the_rule_does_not_expect_is_caught_in_a_fixture() {
     // Other spellings of the same three inputs.
-    for days in ["'90'", "29", "31", "3", "300", "30.0", "'30 '", "'30d'", "[30]", "{a: 30}", "'030'", "0", "''", "null"] {
+    for days in ["'90'", "29", "31", "3", "300", "30.0", "'30 '", "'30d'", "[30]", "{a: 30}", "'030'", "\"030\"", "0", "''", "null"] {
         let text = with("retention-days: 30", &format!("retention-days: {days}"));
         assert_eq!(upload_problems(&text, &WINDOWS).len(), 1, "retention-days: {days}");
     }
@@ -1622,7 +1891,9 @@ fn a_workflow_without_an_upload_is_reported_by_the_upload_check_in_a_fixture() {
 
 // ---- the platform profile ----
 
-/// A profile that differs from `WINDOWS` in everything a check reads.
+/// A profile that differs from `WINDOWS` in its file, runner and artifact. Its
+/// cache and NASM policy are Windows's; those are crossed with `MACOS` in the
+/// Mac tests instead.
 const OTHER: Platform = Platform {
     file: "other.yml",
     runner: "other-runner",
@@ -1823,4 +2094,254 @@ fn a_nasm_install_without_a_version_pin_is_caught_in_a_fixture() {
         NASM_STEP,
         &step("choco install nasm --no-progress -y --version=2.16.3"),
     ), &WINDOWS));
+}
+
+// ---- the Mac workflow: the real file ----
+
+#[test]
+fn the_mac_workflow_parses_and_passes_every_check() {
+    let text = workflow(&MACOS);
+    let doc = parse(&text).unwrap_or_else(|e| panic!("{e}"));
+    // YAML 1.2: `on` is the name `on`, not boolean true.
+    assert!(doc["on"].as_hash().is_some());
+    for (name, problems) in every_check(&text, &MACOS) {
+        assert_eq!(problems, Vec::<String>::new(), "{name}");
+    }
+}
+
+#[test]
+fn the_checks_of_the_real_mac_file_are_not_vacuous() {
+    // Checkout, toolchain and cache in both jobs, node and upload; NASM in
+    // both jobs, fmt, clippy, test, node, the Tauri install, build and check;
+    // the bundle folder; and the check-step guard is among the checks.
+    let text = workflow(&MACOS);
+    let (refs, scripts) = (action_references(&text).len(), run_scripts(&text).len());
+    assert!(
+        refs >= 8 && scripts >= 9,
+        "{refs} action references, {scripts} run scripts"
+    );
+    assert!(text.contains("target/release/bundle/"));
+    let names: Vec<&str> = every_check(&text, &MACOS)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert!(names.contains(&"mac_check_step_problems"), "{names:?}");
+}
+
+// ---- the Mac workflow: fixtures ----
+
+#[test]
+fn a_well_formed_mac_workflow_passes_every_check_in_a_fixture() {
+    for (name, problems) in every_check(&good_mac(), &MACOS) {
+        assert_eq!(problems, Vec::<String>::new(), "{name}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "the Mac fixture lacks")]
+fn a_mac_fixture_change_that_finds_nothing_fails() {
+    with_mac("choco install nasm", "");
+}
+
+#[test]
+fn the_check_step_guard_runs_in_every_check_for_the_mac_only_in_a_fixture() {
+    let none = with_mac(MAC_CHECK_STEP, "");
+    assert_problem(
+        &mac_check(&none, "mac_check_step_problems"),
+        "no check step",
+        "Mac",
+    );
+    // Not for Windows, whose file has no check step.
+    let windows: Vec<&str> = every_check(&good(), &WINDOWS)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert!(!windows.contains(&"mac_check_step_problems"), "{windows:?}");
+}
+
+// The rules both files share, each broken once in the Mac fixture and caught
+// by its check through `every_check(.., &MACOS)`.
+#[test]
+#[rustfmt::skip]
+fn the_shared_guards_catch_their_problem_in_the_mac_fixture() {
+    let fmt = "      - run: cargo fmt --all --check\n";
+    let cases = [
+        (with_mac("contents: read", "contents: write"), "permission_problems", "write permission"),
+        (with_mac("  workflow_dispatch:\n", "  workflow_dispatch:\n  pull_request:\n"), "trigger_problems", "triggers are"),
+        (with_mac("actions/checkout@PIN # v7.0.1", "actions/checkout@v7"), "unpinned_actions", "not pinned"),
+        (with_mac(fmt, &format!("{fmt}        env:\n          T: ${{{{ secrets.X }}}}\n")), "secret_references", "${{ secrets.X }}"),
+        (with_mac("          nasm -v\n", "          nasm -v\n          echo \"${{ github.ref_name }}\"\n"), "injection_problems", "expression in a run script"),
+        (with_mac("cargo test --workspace --no-fail-fast", "cargo test --workspace"), "missing_commands", "missing: cargo test --workspace --no-fail-fast"),
+        (with_mac("        if: success() || failure()\n", ""), "node_step_problems", "a node test step without"),
+        (with_mac(BUILD_STEP, "      - run: cargo tauri build\n"), "bundle_build_problems", "a bundle build without"),
+        (format!("{}      - run: gh release create v1\n", good_mac()), "structure_problems", "release step"),
+        (with_mac("if-no-files-found: error", "if-no-files-found: warn"), "upload_problems", "if-no-files-found is warn"),
+    ];
+    for (text, check, start) in &cases {
+        assert_problem(&mac_check(text, check), start, check);
+    }
+}
+
+#[test]
+fn a_mac_runner_that_is_not_macos_latest_is_caught_in_a_fixture() {
+    for runner in ["windows-latest", "macos-13"] {
+        let text = with_mac("runs-on: macos-latest", &format!("runs-on: {runner}"));
+        assert_eq!(
+            structure_problems(&text, &MACOS),
+            [format!("job test: runner is not macos-latest: {runner}")]
+        );
+    }
+}
+
+#[test]
+fn the_mac_build_job_restores_its_own_cache_in_a_fixture() {
+    assert_clean(structure_problems(&good_mac(), &MACOS));
+    // A build job with its cache and no cargo step: nothing for it to be late for.
+    let no_cargo = with_mac(MAC_TAURI_INSTALL, "").replace(BUILD_STEP, "");
+    assert_clean(structure_problems(&no_cargo, &MACOS));
+}
+
+#[test]
+#[rustfmt::skip]
+fn a_mac_build_job_without_its_cache_or_with_it_after_cargo_is_caught_in_a_fixture() {
+    let missing = ["the build job does not restore Swatinem/rust-cache"];
+    // Only the test job keeps its cache.
+    assert_eq!(structure_problems(&with_mac(MAC_BUILD_CACHE, ""), &MACOS), missing);
+    // Another cache action is not the one the job relies on.
+    let other = with_mac(MAC_BUILD_CACHE, "      - uses: actions/cache@PIN # v4\n");
+    assert_eq!(structure_problems(&other, &MACOS), missing);
+    // After the first cargo step (the Tauri install), so that install is never cached.
+    let late = with_mac(
+        &format!("{MAC_BUILD_CACHE}{MAC_NASM_STEP}{MAC_TAURI_INSTALL}"),
+        &format!("{MAC_NASM_STEP}{MAC_TAURI_INSTALL}{MAC_BUILD_CACHE}"),
+    );
+    assert_eq!(structure_problems(&late, &MACOS), ["the build job restores its cache after its first cargo step"]);
+    // The policy comes from the profile: the Windows shape (no Installer cache)
+    // is wrong for the Mac, and the Mac shape is wrong for Windows.
+    let windows_shape = good().replace("windows-latest", "macos-latest");
+    assert_eq!(structure_problems(&windows_shape, &MACOS), missing);
+    let mac_shape = good_mac().replace("macos-latest", "windows-latest");
+    let forbidden = structure_problems(&mac_shape, &WINDOWS);
+    assert_eq!(forbidden.len(), 1, "{forbidden:?}");
+    assert_problem(&forbidden, "the build job restores a cache: Swatinem/rust-cache@", "Mac shape");
+}
+
+#[test]
+fn a_homebrew_nasm_before_cargo_with_its_version_printed_passes_a_fixture() {
+    assert_clean(nasm_problems(&good_mac(), &MACOS));
+    let one_line = "      - run: brew install nasm && nasm -v\n";
+    assert_clean(nasm_problems(&with_mac(MAC_NASM_STEP, one_line), &MACOS));
+    // A job without a cargo step needs no NASM.
+    assert_clean(nasm_problems(
+        &steps_doc("      - run: node --version"),
+        &MACOS,
+    ));
+}
+
+#[test]
+#[rustfmt::skip]
+fn a_mac_job_without_homebrew_nasm_or_with_it_late_or_unprinted_is_caught_in_a_fixture() {
+    let none = ["job test: does not install nasm"];
+    // Left out of the test job (the first one), or of the build job.
+    assert_eq!(nasm_problems(&with_mac(MAC_NASM_STEP, ""), &MACOS), none);
+    assert_eq!(nasm_problems(&with_mac_last(MAC_NASM_STEP, ""), &MACOS), ["job build: does not install nasm"]);
+    // Only in a shell comment, or Chocolatey's install instead.
+    let commented = "      - run: |\n          # brew install nasm\n          nasm -v\n";
+    assert_eq!(nasm_problems(&with_mac(MAC_NASM_STEP, commented), &MACOS), none);
+    assert_eq!(nasm_problems(&with_mac(MAC_NASM_STEP, NASM_STEP), &MACOS), none);
+    // After the first cargo step.
+    let late = with_mac(MAC_NASM_STEP, "").replacen("      - run: cargo clippy", &format!("{MAC_NASM_STEP}      - run: cargo clippy"), 1);
+    assert_eq!(nasm_problems(&late, &MACOS), ["job test: installs nasm after its first cargo step"]);
+    // Installed, but the version never reaches the log from the install step.
+    for step in [
+        "      - run: brew install nasm\n",
+        "      - run: |\n          brew install nasm\n          # nasm -v\n",
+        "      - run: |\n          brew install nasm # nasm -v\n",
+        "      - run: brew install nasm\n      - run: nasm -v\n",
+    ] {
+        assert_eq!(nasm_problems(&with_mac(MAC_NASM_STEP, step), &MACOS), ["job test: the nasm step does not print nasm -v"], "{step}");
+    }
+}
+
+#[test]
+fn the_nasm_rule_comes_from_the_profile_in_a_fixture() {
+    let both = [
+        "job test: does not install nasm",
+        "job build: does not install nasm",
+    ];
+    assert_eq!(nasm_problems(&good_mac(), &WINDOWS), both);
+    assert_eq!(nasm_problems(&good(), &MACOS), both);
+}
+
+#[test]
+fn a_mac_upload_with_the_windows_name_or_the_app_path_is_caught_in_a_fixture() {
+    assert_clean(upload_problems(&good_mac(), &MACOS));
+    let name = with_mac(
+        "name: lunaepix-macos-dmg",
+        "name: lunaepix-windows-installer",
+    );
+    assert_eq!(
+        upload_problems(&name, &MACOS),
+        ["an upload is named lunaepix-windows-installer, not lunaepix-macos-dmg"]
+    );
+    let app = with_mac(
+        "path: target/release/bundle/dmg/*.dmg",
+        "path: target/release/bundle/macos/*.app",
+    );
+    let app = upload_problems(&app, &MACOS);
+    assert_eq!(app.len(), 1, "{app:?}");
+    assert_problem(&app, "an upload's paths are", "the .app");
+}
+
+// ---- the Mac check step ----
+
+#[test]
+fn a_check_step_between_the_build_and_the_upload_passes_a_fixture() {
+    assert_clean(mac_check_step_problems(&good_mac()));
+}
+
+#[test]
+#[rustfmt::skip]
+fn a_missing_or_commented_check_step_is_caught_in_a_fixture() {
+    let verify = "            codesign --verify --deep --strict --verbose=2 \"$1\"\n";
+    let texts = [
+        with_mac(MAC_CHECK_STEP, ""),
+        with_mac(verify, "            # codesign --verify --deep --strict --verbose=2 \"$1\"\n"),
+        with_mac(verify, "            true # codesign --verify --deep --strict --verbose=2 \"$1\"\n"),
+    ];
+    for text in &texts {
+        assert_eq!(mac_check_step_problems(text), ["no check step: no step of the build job runs codesign --verify --deep --strict"]);
+    }
+    let no_build = good_mac().replacen("  build:\n", "  installer:\n", 1);
+    assert_eq!(mac_check_step_problems(&no_build), ["no build job"]);
+}
+
+#[test]
+#[rustfmt::skip]
+fn a_check_step_without_plutil_or_hdiutil_is_caught_in_a_fixture() {
+    let plutil = "            plutil -extract 'files2.MacOS/lunaepix-worker' xml1 -o - \\\n              \"$1/Contents/_CodeSignature/CodeResources\" >/dev/null\n";
+    let commented = format!("            # {}", plutil.trim_start());
+    for text in [with_mac(plutil, ""), with_mac(plutil, &commented)] {
+        assert_eq!(mac_check_step_problems(&text), ["the check step does not run plutil -extract"]);
+    }
+    let attach = "          hdiutil attach -nobrowse -readonly -mountpoint \"$mount\" \"$dmg\"\n";
+    let commented = format!("          # {}", attach.trim_start());
+    for text in [with_mac(attach, ""), with_mac(attach, &commented)] {
+        assert_eq!(mac_check_step_problems(&text), ["the check step does not run hdiutil attach"]);
+    }
+}
+
+#[test]
+#[rustfmt::skip]
+fn a_check_step_out_of_order_is_caught_in_a_fixture() {
+    let after = ["the check step does not come after a cargo tauri build"];
+    // Before the build, and with no build at all.
+    let early = with_mac(&format!("{BUILD_STEP}{MAC_CHECK_STEP}"), &format!("{MAC_CHECK_STEP}{BUILD_STEP}"));
+    assert_eq!(mac_check_step_problems(&early), after);
+    assert_eq!(mac_check_step_problems(&with_mac(BUILD_STEP, "")), after);
+    // After the upload, and with no upload at all.
+    let before = ["the check step does not come before the upload"];
+    let late = format!("{}{MAC_CHECK_STEP}", with_mac(MAC_CHECK_STEP, ""));
+    assert_eq!(mac_check_step_problems(&late), before);
+    assert_eq!(mac_check_step_problems(&with_mac(MAC_UPLOAD_STEP, "")), before);
 }
