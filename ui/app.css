@@ -561,7 +561,7 @@ body {
 }
 
 /* Single image mode. The mock-up
-   (docs/in-progress/specs/2026-11-12-lunaepix-single-image-layout-mockup.html,
+   (docs/finished/specs/2026-11-12-lunaepix-single-image-layout-mockup.html,
    Option 1, "docked column") sets the arrangement: the work area fills the
    window under the header and the page does not scroll; the picture (or the
    drop area) takes the remaining width and the full height, and the column

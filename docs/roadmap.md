@@ -44,8 +44,8 @@ divider with zoom, exact sizes, and Save under a chosen name. One layout:
 the picture fills the window, with the settings in a column on its right
 that "Hide settings" folds away (the status line then floats over the top of
 the picture).
-Spec: `docs/in-progress/specs/2026-11-11-lunaepix-single-image-design.md`.
-Plan: `docs/in-progress/plans/2026-11-11-lunaepix-single-image.md`.
+Spec: `docs/finished/specs/2026-11-11-lunaepix-single-image-design.md`.
+Plan: `docs/finished/plans/2026-11-11-lunaepix-single-image.md`.
 Built as version 0.1.3; being tested by hand on Linux and Windows.
 
 A before/after slider on one image, so the result can be judged before the
