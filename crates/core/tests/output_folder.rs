@@ -392,6 +392,54 @@ fn a_non_utf8_name_without_a_clash_keeps_its_exact_bytes() {
     assert_eq!(names[0].as_bytes(), b"caf\xE9.png");
 }
 
+// --- two sources that differ only in letter case (Review Focus 3) -------------
+
+/// `x/a.png` and `y/A.png` planned and run into one output folder, then
+/// checked: both outputs are there, each with the bytes of its own source's
+/// optimised version, so neither replaced the other. The planner numbers the
+/// second name (`A-1.png`) because it compares names case-insensitively on
+/// every platform, whatever the folder's file system does.
+fn two_case_variants_are_both_kept() {
+    let tmp = TempDir::new().unwrap();
+    let x = folder(tmp.path(), "x");
+    let y = folder(tmp.path(), "y");
+    let out = folder(tmp.path(), "exports");
+    let lower = write(&x, "a.png", &png(1));
+    let upper = write(&y, "A.png", &png(2));
+
+    let jobs = plan_files_to(&[lower, upper], Some(&out));
+    assert_eq!(dests(&jobs), [out.join("a.png"), out.join("A-1.png")]);
+    run_all(&jobs, &NO_REPLACE);
+
+    // Two entries: on a folder that ignores case, a replaced file would leave one.
+    assert_eq!(listing(&out), ["A-1.png", "a.png"]);
+    assert_eq!(
+        fs::read(out.join("a.png")).unwrap(),
+        lossless("a.png", &png(1))
+    );
+    assert_eq!(
+        fs::read(out.join("A-1.png")).unwrap(),
+        lossless("A.png", &png(2))
+    );
+}
+
+/// The file systems of Windows and the Mac ignore case: `a.png` and `A.png`
+/// would be one file there.
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn two_sources_whose_names_differ_only_in_case_both_reach_one_output_folder() {
+    two_case_variants_are_both_kept();
+}
+
+/// The same planner on Linux, where the folder could hold `a.png` and
+/// `A.png` side by side: the second is numbered all the same, so the plan is
+/// the one the Windows and Mac test checks.
+#[cfg(target_os = "linux")]
+#[test]
+fn on_linux_names_that_differ_only_in_case_are_numbered_all_the_same() {
+    two_case_variants_are_both_kept();
+}
+
 // --- a file that appears while the run goes ----------------------------------
 
 #[test]
