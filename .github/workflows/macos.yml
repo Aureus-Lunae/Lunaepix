@@ -133,18 +133,26 @@ jobs:
       # holds (an ad-hoc one, made by the bundler, with sealed resources), and
       # the seal lists the worker; otherwise macOS can refuse the worker after
       # "Open Anyway". Checked in bundle/macos/ and again inside the mounted
-      # .dmg, which is what people download.
+      # .dmg, which is what people download. Each app's Contents/MacOS is
+      # listed first, and a seal that lacks the worker prints the seal's
+      # entries before the step fails, so one run shows what went wrong (the
+      # listing and the printout are not checks).
       - name: Check the signature and the sealed worker
         run: |
           check_app() {
+            ls -l "$1/Contents/MacOS"
             test -x "$1/Contents/MacOS/lunaepix-worker"
             codesign --verify --deep --strict --verbose=2 "$1"
             details=$(codesign -dv "$1" 2>&1)
             echo "$details"
             grep -qx 'Signature=adhoc' <<<"$details"
             grep -q '^Sealed Resources version=2' <<<"$details"
-            plutil -extract 'files2.MacOS/lunaepix-worker' xml1 -o - \
-              "$1/Contents/_CodeSignature/CodeResources" >/dev/null
+            if ! plutil -extract 'files2.MacOS/lunaepix-worker' xml1 -o - \
+              "$1/Contents/_CodeSignature/CodeResources" >/dev/null; then
+              echo "The seal of $1 does not list MacOS/lunaepix-worker. Its entries:"
+              plutil -p "$1/Contents/_CodeSignature/CodeResources" || true
+              return 1
+            fi
           }
           check_app target/release/bundle/macos/Lunaepix.app
           dmg=$(ls target/release/bundle/dmg/*.dmg)
