@@ -702,9 +702,14 @@ fn images_in_folder_fails_for_a_missing_folder() {
 
 // --- save_new: exactly this name, never a number -----------------------------
 
-/// Some permissions to hand to `save_new`.
-fn some_permissions(dir: &Path) -> fs::Permissions {
-    fs::metadata(dir).unwrap().permissions()
+/// Some permissions to hand to `save_new`: a file's, as the real Save hands
+/// in (the original image's). A folder's would carry the directory attribute
+/// on Windows, which a new file refuses ("The parameter is incorrect"). The
+/// file sits in a folder of its own, so no listing in a test sees it.
+fn some_permissions() -> fs::Permissions {
+    let donor_folder = TempDir::new().unwrap();
+    let donor = write(donor_folder.path(), "donor.png", b"");
+    fs::metadata(donor).unwrap().permissions()
 }
 
 #[test]
@@ -712,7 +717,7 @@ fn save_new_writes_exactly_the_bytes_under_exactly_the_name() {
     let tmp = TempDir::new().unwrap();
     let dest = tmp.path().join("vakantie-café.png");
 
-    save_new(&dest, b"new bytes", some_permissions(tmp.path())).unwrap();
+    save_new(&dest, b"new bytes", some_permissions()).unwrap();
 
     assert_eq!(fs::read(&dest).unwrap(), b"new bytes");
     assert_eq!(listing(tmp.path()), ["vakantie-café.png"]);
@@ -723,7 +728,7 @@ fn save_new_refuses_a_taken_name_and_leaves_that_file_byte_for_byte() {
     let tmp = TempDir::new().unwrap();
     let dest = write(tmp.path(), "logo.png", b"existing");
 
-    let error = save_new(&dest, b"new", some_permissions(tmp.path())).unwrap_err();
+    let error = save_new(&dest, b"new", some_permissions()).unwrap_err();
 
     assert_eq!(error.kind(), ErrorKind::AlreadyExists, "{error}");
     assert_eq!(fs::read(&dest).unwrap(), b"existing");
@@ -736,7 +741,7 @@ fn save_new_refuses_a_taken_name_that_is_a_folder_and_leaves_it_alone() {
     let dest = folder(tmp.path(), "logo.png");
     write(&dest, "inside", b"kept");
 
-    let error = save_new(&dest, b"new", some_permissions(tmp.path())).unwrap_err();
+    let error = save_new(&dest, b"new", some_permissions()).unwrap_err();
 
     assert_eq!(error.kind(), ErrorKind::AlreadyExists, "{error}");
     assert!(dest.is_dir());
@@ -750,8 +755,9 @@ fn save_new_never_numbers() {
     let tmp = TempDir::new().unwrap();
     let dest = write(tmp.path(), "logo.png", b"existing");
 
-    save_new(&dest, b"new", some_permissions(tmp.path())).unwrap_err();
+    let error = save_new(&dest, b"new", some_permissions()).unwrap_err();
 
+    assert_eq!(error.kind(), ErrorKind::AlreadyExists, "{error}");
     assert_eq!(listing(tmp.path()), ["logo.png"]);
 }
 
@@ -760,7 +766,7 @@ fn save_new_refuses_a_missing_folder_and_creates_nothing() {
     let tmp = TempDir::new().unwrap();
     let dest = tmp.path().join("exports").join("logo.png");
 
-    let error = save_new(&dest, b"new", some_permissions(tmp.path())).unwrap_err();
+    let error = save_new(&dest, b"new", some_permissions()).unwrap_err();
 
     assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
     assert_eq!(listing(tmp.path()), Vec::<OsString>::new());
@@ -772,8 +778,9 @@ fn save_new_leaves_no_temporary_file_after_a_refusal() {
     let dest = write(tmp.path(), "logo.png", b"existing");
     let before = listing(tmp.path());
 
-    save_new(&dest, b"new", some_permissions(tmp.path())).unwrap_err();
+    let error = save_new(&dest, b"new", some_permissions()).unwrap_err();
 
+    assert_eq!(error.kind(), ErrorKind::AlreadyExists, "{error}");
     assert_eq!(listing(tmp.path()), before);
 }
 
