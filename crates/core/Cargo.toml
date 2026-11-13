@@ -72,6 +72,13 @@ windows-sys = { version = "0.61.2", features = ["Win32_System_Diagnostics_Debug"
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
 
+# The tests that a worker was killed and reaped ask `kill(pid, 0)` whether the
+# process still exists (no `/proc` on macOS), and wait with `waitid` for a
+# killed child to become a zombie. Tests only. The version already in
+# Cargo.lock (the Linux dependency above uses it), so no new package.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2.191"
+
 [dev-dependencies]
 # Chunk CRCs: the tests make valid ones for hand-made hostile PNGs. Already in
 # the tree via `png`.

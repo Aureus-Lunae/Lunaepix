@@ -392,6 +392,41 @@ fn a_non_utf8_name_without_a_clash_keeps_its_exact_bytes() {
     assert_eq!(names[0].as_bytes(), b"caf\xE9.png");
 }
 
+// --- two sources that differ only in letter case (Review Focus 3) -------------
+
+/// `x/a.png` and `y/A.png` planned and run into one output folder: both
+/// outputs are there, each with the bytes of its own source's optimised
+/// version, so neither replaced the other. The planner numbers the second name
+/// (`A-1.png`) because it compares names case-insensitively on every
+/// platform, whatever the folder's file system does. Windows and the Mac, whose
+/// file systems ignore case, would otherwise write one name over the other.
+/// The test runs everywhere; `different_names_get_no_number` is its negative
+/// pair (names that differ in more than case stay as they are).
+#[test]
+fn two_sources_whose_names_differ_only_in_case_both_reach_one_output_folder() {
+    let tmp = TempDir::new().unwrap();
+    let x = folder(tmp.path(), "x");
+    let y = folder(tmp.path(), "y");
+    let out = folder(tmp.path(), "exports");
+    let lower = write(&x, "a.png", &png(1));
+    let upper = write(&y, "A.png", &png(2));
+
+    let jobs = plan_files_to(&[lower, upper], Some(&out));
+    assert_eq!(dests(&jobs), [out.join("a.png"), out.join("A-1.png")]);
+    run_all(&jobs, &NO_REPLACE);
+
+    // Two entries: on a folder that ignores case, a replaced file would leave one.
+    assert_eq!(listing(&out), ["A-1.png", "a.png"]);
+    assert_eq!(
+        fs::read(out.join("a.png")).unwrap(),
+        lossless("a.png", &png(1))
+    );
+    assert_eq!(
+        fs::read(out.join("A-1.png")).unwrap(),
+        lossless("A.png", &png(2))
+    );
+}
+
 // --- a file that appears while the run goes ----------------------------------
 
 #[test]

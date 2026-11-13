@@ -749,6 +749,82 @@ fn signal_of(_status: ExitStatus) -> Option<i32> {
 mod tests {
     use super::*;
 
+    /// Whether process `pid` is gone from the process table: killed and reaped,
+    /// not even a zombie left. `kill(pid, 0)` sends nothing and only asks whether
+    /// the pid exists, which a zombie still does. It works on every Unix; macOS
+    /// has no `/proc` to look in.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn process_is_gone(pid: u32) -> bool {
+        let pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+        // SAFETY: signal 0 sends nothing; it only asks whether the pid exists.
+        let answer = unsafe { libc::kill(pid, 0) };
+        // `EPERM` would mean the process exists, so only `ESRCH` is "gone".
+        answer == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    /// Block until child `pid` has exited, and leave it unreaped (a zombie).
+    /// `waitid` with `WNOWAIT` does that on Linux and on macOS alike.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn wait_until_exited_without_reaping(pid: u32) {
+        // SAFETY: `info` is a zeroed `siginfo_t` that the call fills in.
+        let waited = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    #[cfg(unix)]
+    fn sleeper() -> Child {
+        Command::new("sleep").arg("60").spawn().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reaped_child_is_gone() {
+        let mut child = sleeper();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(process_is_gone(child.id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_child_is_not_gone() {
+        let mut child = sleeper();
+        let gone = process_is_gone(child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!gone);
+    }
+
+    /// Pid 1 exists and is not ours: `kill(1, 0)` answers `EPERM` to a user and
+    /// 0 to root. Either way the process is there, so it is not gone.
+    #[cfg(unix)]
+    #[test]
+    fn pid_1_is_not_gone() {
+        assert!(!process_is_gone(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_child_that_was_not_waited_for_is_not_gone() {
+        let mut child = sleeper();
+        child.kill().unwrap();
+        wait_until_exited_without_reaping(child.id());
+        let zombie_is_gone = process_is_gone(child.id());
+        child.wait().unwrap();
+        assert!(!zombie_is_gone, "a zombie is not reaped");
+        assert!(process_is_gone(child.id()), "now it is reaped");
+    }
+
     /// The worker's start and its wait, driven directly: the stop paths that
     /// a whole run can reach only through a timing race.
     #[cfg(unix)]
@@ -1085,7 +1161,6 @@ mod tests {
             assert_eq!(answer_of(&script), ThumbAnswer::Failed);
         }
 
-        #[cfg(target_os = "linux")]
         #[test]
         fn a_worker_past_the_timeout_is_failed_and_reaped() {
             let tmp = TempDir::new().unwrap();
@@ -1104,7 +1179,7 @@ mod tests {
             let pid = fs::read_to_string(&pid_file).unwrap();
             // Gone from the process table: killed and reaped, no zombie.
             assert!(
-                !Path::new("/proc").join(pid.trim()).exists(),
+                process_is_gone(pid.trim().parse().unwrap()),
                 "process {} still exists",
                 pid.trim()
             );
@@ -1394,7 +1469,6 @@ mod tests {
             assert_eq!(answer_of(&script), ProbeAnswer::Failed);
         }
 
-        #[cfg(target_os = "linux")]
         #[test]
         fn a_worker_past_the_timeout_is_failed_and_reaped() {
             let tmp = TempDir::new().unwrap();
@@ -1412,7 +1486,7 @@ mod tests {
             assert!(elapsed < Duration::from_secs(20), "{elapsed:?}");
             let pid = fs::read_to_string(&pid_file).unwrap();
             assert!(
-                !Path::new("/proc").join(pid.trim()).exists(),
+                process_is_gone(pid.trim().parse().unwrap()),
                 "process {} still exists",
                 pid.trim()
             );

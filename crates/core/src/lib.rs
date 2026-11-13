@@ -12,7 +12,8 @@
 //!
 //! `unsafe` code is denied everywhere but in `jpg`, the libjpeg FFI, in
 //! `platform`, the worker's two start-up system calls, and in `webp::codec`,
-//! the libwebp FFI.
+//! the libwebp FFI. The one other exception is two test helpers in `run`'s
+//! unit tests, which ask `kill(pid, 0)` and `waitid` about a worker's process.
 
 #![deny(unsafe_code)]
 

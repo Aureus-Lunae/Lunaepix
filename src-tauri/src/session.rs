@@ -1927,9 +1927,88 @@ mod tests {
         })
     }
 
+    // --- whether a process is gone ----------------------------------------
+
+    /// Whether process `pid` is gone from the process table: killed and reaped,
+    /// not even a zombie left. `kill(pid, 0)` sends nothing and only asks whether
+    /// the pid exists, which a zombie still does. It works on every Unix; macOS
+    /// has no `/proc` to look in.
+    #[cfg(unix)]
+    fn process_is_gone(pid: u32) -> bool {
+        let pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+        // SAFETY: signal 0 sends nothing; it only asks whether the pid exists.
+        let answer = unsafe { libc::kill(pid, 0) };
+        // `EPERM` would mean the process exists, so only `ESRCH` is "gone".
+        answer == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    /// Block until child `pid` has exited, and leave it unreaped (a zombie).
+    /// `waitid` with `WNOWAIT` does that on Linux and on macOS alike.
+    #[cfg(unix)]
+    fn wait_until_exited_without_reaping(pid: u32) {
+        // SAFETY: `info` is a zeroed `siginfo_t` that the call fills in.
+        let waited = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    #[cfg(unix)]
+    fn sleeper() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reaped_child_is_gone() {
+        let mut child = sleeper();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(process_is_gone(child.id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_child_is_not_gone() {
+        let mut child = sleeper();
+        let gone = process_is_gone(child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!gone);
+    }
+
+    /// Pid 1 exists and is not ours: `kill(1, 0)` answers `EPERM` to a user and
+    /// 0 to root. Either way the process is there, so it is not gone.
+    #[cfg(unix)]
+    #[test]
+    fn pid_1_is_not_gone() {
+        assert!(!process_is_gone(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_child_that_was_not_waited_for_is_not_gone() {
+        let mut child = sleeper();
+        child.kill().unwrap();
+        wait_until_exited_without_reaping(child.id());
+        let zombie_is_gone = process_is_gone(child.id());
+        child.wait().unwrap();
+        assert!(!zombie_is_gone, "a zombie is not reaped");
+        assert!(process_is_gone(child.id()), "now it is reaped");
+    }
+
     // --- the window closes during a run -------------------------------------
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn stopping_a_session_as_the_window_closes_kills_its_worker_and_finishes_once() {
         use std::time::{Duration, Instant};
@@ -1980,7 +2059,7 @@ mod tests {
         assert_eq!(started.lines().count(), 1, "b.png must not start");
         let pid = started.trim();
         assert!(
-            !Path::new("/proc").join(pid).exists(),
+            process_is_gone(pid.parse().unwrap()),
             "worker {pid} runs on"
         );
         let events = events.into_inner().unwrap();
