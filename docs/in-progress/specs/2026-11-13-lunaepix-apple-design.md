@@ -19,6 +19,9 @@ Decided in conversation (2026-11-13). The user's words are quoted as they were s
 - **Actions minutes:** asked whether minutes are a constraint (Mac minutes count about ten times on a private repository). The user chose "Limited: keep runs few". The full Mac tests stay. The plan caps the number of rc runs, caches the build in the Installer job too, and the builder fixes as much as possible before each tag.
 - **Budget (2026-11-13, after approval):** "I already used 3.90 from 12$ this month". Asked what the rc-tag cap should be, given that each tag costs about $3–5 (Mac plus Windows). The user chose "1 now, then ask": one rc tag, then a report with what it showed and its real cost before any further tag. This replaces the cap of three.
 - **Starting point:** `main` = origin/main at 97a1e15 (0.1.3). This work goes on `feature/lunaepix-apple`, from `main` at 97a1e15.
+- **Installer after a red test (2026-11-13, final review before the rc tag):** asked whether the Installer job should still run when a Mac test fails. The user chose "Keep needs: test strict".
+- **NASM on the Mac (2026-11-13, final review):** the review found mozjpeg needs NASM only for x86; on Apple Silicon it assembles NEON with clang. The user chose "Drop it before the tag (Recommended)": no NASM step in `macos.yml`, and the guard refuses one there.
+- **Build cache on rc tags (2026-11-13, final review):** rc tags cannot restore each other's cache, only `main`'s. The user chose "Save only from main (Recommended)": the Mac cache steps save only on `refs/heads/main`; Windows unchanged.
 
 ## Problem
 
