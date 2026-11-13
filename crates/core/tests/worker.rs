@@ -111,18 +111,86 @@ fn io_dest(record: &str) -> (i32, String) {
     (code, message.to_owned())
 }
 
-/// `record` names no part of `path` and no temporary file: the reason a file
-/// failed reaches the window, which never receives a path.
+// The check that a record names no part of a path the test made, shared with
+// the core's unit tests and the app's tests. Its own tests are here.
+#[path = "common/no_path.rs"]
+mod no_path;
 #[cfg(unix)]
-fn assert_no_path(record: &str, path: &Path) {
-    assert!(!record.contains("at path"), "{record:?}");
-    assert!(!record.contains(".tmp"), "{record:?}");
-    for part in path.components() {
-        if let std::path::Component::Normal(name) = part {
-            let name = name.to_string_lossy();
-            assert!(!record.contains(&*name), "{name:?} in {record:?}");
-        }
+use no_path::assert_no_path;
+
+/// Where macOS puts its temp folder (`/var/folders/<2 characters>/<hash>/T`):
+/// `er` and `on` are parts of "Permission denied (os error 13)".
+const MAC_TEMP_ROOT: &str = "/var/folders/er/on/T";
+const OS_REASON: &str = "Permission denied (os error 13)";
+
+#[test]
+fn a_reason_that_names_nothing_the_test_made_passes_the_path_check() {
+    let path = Path::new(MAC_TEMP_ROOT).join(".tmpAbCdEf/locked-folder/optimized-a.png");
+
+    // The reason does hold the 2-character names of the temp folder: a check
+    // over them would be flagging the root, not a leak.
+    assert!(OS_REASON.contains("er") && OS_REASON.contains("on"));
+    assert_eq!(
+        no_path::leaked_name(OS_REASON, &path, Path::new(MAC_TEMP_ROOT)),
+        None
+    );
+    assert_eq!(
+        no_path::leaked_name(
+            "T var folders: Permission denied (os error 13)",
+            &path,
+            Path::new(MAC_TEMP_ROOT)
+        ),
+        None
+    );
+}
+
+#[test]
+fn a_reason_that_names_a_folder_or_file_the_test_made_fails_the_path_check() {
+    let path = Path::new(MAC_TEMP_ROOT).join(".tmpAbCdEf/locked-folder/optimized-a.png");
+    let root = Path::new(MAC_TEMP_ROOT);
+
+    for (reason, leaked) in [
+        ("cannot write into locked-folder", "locked-folder"),
+        ("cannot write optimized-a.png", "optimized-a.png"),
+        ("cannot write in /var/x/.tmpAbCdEf", ".tmp"),
+        ("too many temporary files exist at path \"/x\"", "at path"),
+    ] {
+        assert_eq!(
+            no_path::leaked_name(reason, &path, root).as_deref(),
+            Some(leaked),
+            "{reason}"
+        );
     }
+}
+
+#[test]
+fn a_path_outside_the_temp_folder_is_checked_in_full() {
+    let path = Path::new("/home/someone/private-folder");
+    let root = Path::new(MAC_TEMP_ROOT);
+
+    assert_eq!(
+        no_path::leaked_name("failed in private-folder", path, root).as_deref(),
+        Some("private-folder")
+    );
+    assert_eq!(
+        no_path::leaked_name("failed for someone", path, root).as_deref(),
+        Some("someone")
+    );
+    assert_eq!(no_path::leaked_name(OS_REASON, path, root), None);
+}
+
+#[test]
+fn the_names_checked_are_those_below_the_temp_folder() {
+    let root = Path::new(MAC_TEMP_ROOT);
+
+    assert_eq!(
+        no_path::names_below(&root.join(".tmpX/a/b.png"), root),
+        [".tmpX", "a", "b.png"]
+    );
+    assert_eq!(
+        no_path::names_below(Path::new("/elsewhere/a"), root),
+        ["elsewhere", "a"]
+    );
 }
 
 /// Make `folder` read-only. `false` when running as root, where it stays
@@ -711,7 +779,8 @@ fn thumb_flag_works_for_a_name_with_spaces_and_accents() {
     assert_eq!(decoded_size(&bytes), (64, 32));
 }
 
-#[cfg(unix)]
+// Linux only: APFS and NTFS store only valid Unicode names, so such a name cannot exist there.
+#[cfg(target_os = "linux")]
 #[test]
 fn thumb_flag_works_for_a_name_that_is_not_utf8() {
     use std::os::unix::ffi::OsStrExt;

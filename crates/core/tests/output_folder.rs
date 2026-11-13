@@ -350,7 +350,8 @@ fn non_ascii_names_that_differ_beyond_case_do_not_clash() {
     assert_eq!(listing(&out).len(), 3);
 }
 
-#[cfg(unix)]
+// Linux only: APFS and NTFS store only valid Unicode names, so such a name cannot exist there.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_non_utf8_name_gets_its_number_with_its_bytes_intact() {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -374,7 +375,8 @@ fn a_non_utf8_name_gets_its_number_with_its_bytes_intact() {
     assert_eq!(listing(&out).len(), 2);
 }
 
-#[cfg(unix)]
+// Linux only: APFS and NTFS store only valid Unicode names, so such a name cannot exist there.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_non_utf8_name_without_a_clash_keeps_its_exact_bytes() {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -904,7 +906,8 @@ fn first_free_name_in_a_missing_folder_gives_the_name() {
     );
 }
 
-#[cfg(unix)]
+// Linux only: APFS and NTFS store only valid Unicode names, so such a name cannot exist there.
+#[cfg(target_os = "linux")]
 #[test]
 fn first_free_name_keeps_the_bytes_of_a_name_that_is_not_utf8() {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};

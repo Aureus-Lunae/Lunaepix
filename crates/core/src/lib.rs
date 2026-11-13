@@ -45,6 +45,12 @@ pub mod worker;
 #[path = "../tests/common/jpeg_fixtures.rs"]
 mod jpeg_fixtures;
 
+/// The check that a failure reason carries no path, shared with the
+/// integration tests (`atomic`'s tests).
+#[cfg(test)]
+#[path = "../tests/common/no_path.rs"]
+mod no_path;
+
 pub use atomic::{is_staging_name, save_new};
 use lossy::Lossy;
 pub use lossy::{DEFAULT_QUALITY, Note, Quality};
