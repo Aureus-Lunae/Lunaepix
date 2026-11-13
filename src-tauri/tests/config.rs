@@ -3041,6 +3041,221 @@ fn an_unknown_key_or_table_in_about_toml_is_refused() {
     assert_eq!(about_problems(known), Vec::<String>::new());
 }
 
+/// The platforms the licence page covers: Linux, Windows and Apple Silicon
+/// macOS. No Intel Mac and no mobile; a crate only another platform uses
+/// would be missing from the page, or an unwanted one listed on it.
+const ABOUT_TARGETS: &[&str] = &[
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+];
+
+/// What is wrong with the `targets` of an `about.toml`: a file that does not
+/// parse, no `targets`, one that is not an array, an entry that is not a
+/// string, a platform of [`ABOUT_TARGETS`] that is missing, a target that is
+/// not wanted, or one listed twice.
+fn about_target_problems(about_toml: &str) -> Vec<String> {
+    let table = match about_toml.parse::<toml::Table>() {
+        Ok(table) => table,
+        Err(error) => return vec![format!("about.toml does not parse: {error}")],
+    };
+    let Some(targets) = table.get("targets") else {
+        return vec!["targets: missing".to_owned()];
+    };
+    let Some(targets) = targets.as_array() else {
+        return vec!["targets: not an array".to_owned()];
+    };
+    let mut problems = Vec::new();
+    let mut listed: Vec<&str> = Vec::new();
+    for entry in targets {
+        match entry.as_str() {
+            Some(target) => listed.push(target),
+            None => problems.push(format!("targets: {entry} is not a string")),
+        }
+    }
+    for wanted in ABOUT_TARGETS {
+        if !listed.contains(wanted) {
+            problems.push(format!("targets: {wanted} is missing"));
+        }
+    }
+    for (index, target) in listed.iter().enumerate() {
+        if !ABOUT_TARGETS.contains(target) {
+            problems.push(format!("targets: {target} is not wanted"));
+        } else if listed[..index].contains(target) {
+            problems.push(format!("targets: {target} is listed twice"));
+        }
+    }
+    problems
+}
+
+#[test]
+fn the_real_about_toml_lists_the_linux_windows_and_mac_targets() {
+    assert_eq!(
+        about_target_problems(&repo_file("about.toml")),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn about_toml_targets_without_one_platform_or_with_another_are_caught_in_a_fixture() {
+    let with = |targets: &str| about_target_problems(&format!("targets = {targets}\n"));
+    // The right list, in any order, is not flagged (so each case below fails on its own).
+    let right = r#"["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]"#;
+    assert_eq!(with(right), Vec::<String>::new());
+    let reordered =
+        r#"["aarch64-apple-darwin", "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]"#;
+    assert_eq!(with(reordered), Vec::<String>::new());
+    // Mac missing: the state of the file before the Mac build.
+    assert_eq!(
+        with(r#"["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]"#),
+        vec!["targets: aarch64-apple-darwin is missing".to_owned()]
+    );
+    // Linux missing.
+    assert_eq!(
+        with(r#"["x86_64-pc-windows-msvc", "aarch64-apple-darwin"]"#),
+        vec!["targets: x86_64-unknown-linux-gnu is missing".to_owned()]
+    );
+    // An Intel Mac next to the right three is not wanted.
+    assert_eq!(
+        with(
+            r#"["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin", "x86_64-apple-darwin"]"#
+        ),
+        vec!["targets: x86_64-apple-darwin is not wanted".to_owned()]
+    );
+    // The Intel Mac instead of the Apple Silicon one: one missing, one unwanted.
+    let intel =
+        with(r#"["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-apple-darwin"]"#);
+    assert!(
+        names(&intel, "aarch64-apple-darwin is missing"),
+        "{intel:?}"
+    );
+    assert!(
+        names(&intel, "x86_64-apple-darwin is not wanted"),
+        "{intel:?}"
+    );
+    // One platform listed twice.
+    let twice = with(
+        r#"["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin", "aarch64-apple-darwin"]"#,
+    );
+    assert_eq!(
+        twice,
+        vec!["targets: aarch64-apple-darwin is listed twice".to_owned()]
+    );
+    // A string where a list belongs: cargo-about would not read it as one.
+    assert_eq!(
+        with(r#""aarch64-apple-darwin""#),
+        vec!["targets: not an array".to_owned()]
+    );
+    // An entry that is not a string.
+    let not_string = with(
+        r#"["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin", 7]"#,
+    );
+    assert_eq!(not_string, vec!["targets: 7 is not a string".to_owned()]);
+    // No targets at all, and a file that does not parse.
+    assert_eq!(
+        about_target_problems("accepted = [\"MIT\"]\n"),
+        vec!["targets: missing".to_owned()]
+    );
+    assert!(names(
+        &about_target_problems("targets = ["),
+        "does not parse"
+    ));
+}
+
+/// The names of the crates the licence page lists as users of a licence: the
+/// first word of the text of every `<li>` (`libwebp-sys 0.14.4 (<a ...>...)`).
+/// Text in a comment, a script or a style is not on the page, and an `<li>`
+/// of the licence index (`MIT License (350)`) gives a word that is no crate.
+fn listed_crates(html: &str) -> Vec<String> {
+    let mut depth = 0usize;
+    let mut inside_li = false;
+    let mut current = String::new();
+    let mut crates = Vec::new();
+    for piece in pieces(html) {
+        match piece {
+            Piece::Start(tag) if ["script", "style"].contains(&tag.name.as_str()) => depth += 1,
+            Piece::End(name) if ["script", "style"].contains(&name.as_str()) => {
+                depth = depth.saturating_sub(1);
+            }
+            Piece::Start(tag) if tag.name == "li" && depth == 0 => {
+                inside_li = true;
+                current.clear();
+            }
+            Piece::End(name) if name == "li" && inside_li => {
+                inside_li = false;
+                if let Some(word) = current.split_whitespace().next() {
+                    crates.push(word.to_owned());
+                }
+            }
+            Piece::Text(chunk) if inside_li && depth == 0 => current.push_str(&chunk),
+            _ => {}
+        }
+    }
+    crates
+}
+
+/// A crate that only the Mac build ships (the `objc2` family: Objective-C
+/// bindings that tao, wry and rfd use on macOS). `cargo tree --target
+/// aarch64-apple-darwin -i objc2 -e normal` shows it under tauri; the same
+/// command for the Linux and Windows targets finds nothing.
+const MAC_ONLY_CRATE: &str = "objc2";
+
+/// What is missing from the licence page for the Mac build.
+fn mac_licence_page_problems(html: &str) -> Vec<String> {
+    if listed_crates(html)
+        .iter()
+        .any(|name| name == MAC_ONLY_CRATE)
+    {
+        Vec::new()
+    } else {
+        vec![format!("the page does not list {MAC_ONLY_CRATE}")]
+    }
+}
+
+#[test]
+fn the_licence_page_names_a_crate_only_the_mac_build_uses() {
+    assert_eq!(
+        mac_licence_page_problems(&repo_file(LICENCE_FILE)),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_licence_page_without_a_crate_only_the_mac_build_uses_is_caught_in_a_fixture() {
+    let page = |items: &str| format!("<main><ul>{items}</ul></main>");
+    let objc2 = "<li>objc2 0.6.5 (<a href=\"https://github.com/madsmtm/objc2\">repo</a>)</li>";
+    // The page with the crate is right (so each case below fails on its own).
+    assert_eq!(
+        mac_licence_page_problems(&page(&format!("<li>libwebp-sys 0.14.4</li>{objc2}"))),
+        Vec::<String>::new()
+    );
+    let missing = vec![format!("the page does not list {MAC_ONLY_CRATE}")];
+    // The Linux and Windows crates alone: the page before the Mac build.
+    assert_eq!(
+        mac_licence_page_problems(&page("<li>libwebp-sys 0.14.4</li><li>quantizr 1.4.3</li>")),
+        missing
+    );
+    // A neighbour of the family is not the crate itself.
+    assert_eq!(
+        mac_licence_page_problems(&page("<li>objc2-app-kit 0.3.2</li><li>xobjc2 1.0.0</li>")),
+        missing
+    );
+    // The name in a comment, a script, a style or outside a list item is not listed.
+    assert_eq!(
+        mac_licence_page_problems(&page(&format!("<!-- {objc2} -->"))),
+        missing
+    );
+    assert_eq!(
+        mac_licence_page_problems(&page(&format!("<script>'{objc2}'</script>"))),
+        missing
+    );
+    assert_eq!(
+        mac_licence_page_problems(&page(&format!("<style>/* {objc2} */</style>"))),
+        missing
+    );
+    assert_eq!(mac_licence_page_problems("<p>objc2 0.6.5</p>"), missing);
+}
+
 #[test]
 fn the_installer_bundles_the_licence_file_at_its_own_name_and_the_file_exists() {
     let config = read_json("tauri.conf.json");
