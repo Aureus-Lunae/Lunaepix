@@ -961,6 +961,33 @@ mod tests {
     }
 
     /// The private folder of `single`, found from its current image's copy.
+    /// Whether `text` holds `path`, plainly or in its `{:?}` form, the form
+    /// `tempfile` writes into its error text. On Windows that form doubles
+    /// every backslash, so a search for the plain path alone misses it.
+    fn carries_path(text: &str, path: &Path) -> bool {
+        let plain = path.to_string_lossy();
+        let debug = format!("{path:?}");
+        let escaped = debug.trim_matches('"');
+        text.contains(plain.as_ref()) || text.contains(escaped)
+    }
+
+    #[test]
+    fn carries_path_finds_the_plain_and_the_escaped_form() {
+        // A backslash in a name gives the Windows shape on every system:
+        // `{:?}` doubles it, as `tempfile` does in its error text.
+        let path = Path::new("/tmp/one\\two");
+        assert!(carries_path("at /tmp/one\\two here", path));
+        assert!(carries_path("at path \"/tmp/one\\\\two\"", path));
+    }
+
+    #[test]
+    fn carries_path_rejects_a_text_without_the_path() {
+        let path = Path::new("/tmp/one\\two");
+        assert!(!carries_path("Permission denied (os error 13)", path));
+        assert!(!carries_path("at /tmp/one", path));
+        assert!(!carries_path("", path));
+    }
+
     fn private_folder(single: &Single) -> PathBuf {
         let image = single.current().expect("an image is loaded");
         image.copy.parent().unwrap().parent().unwrap().to_path_buf()
@@ -1052,7 +1079,7 @@ mod tests {
         let dest = dir.path().join("gone").join("copy.png");
         let reason = copy_capped(&src, &dest, 5).unwrap_err();
         assert!(!reason.is_empty());
-        assert!(!reason.contains(dir.path().to_str().unwrap()), "{reason}");
+        assert!(!carries_path(&reason, dir.path()), "{reason}");
         assert!(!dest.exists());
     }
 
@@ -1090,11 +1117,11 @@ mod tests {
             .tempdir_in(&missing)
             .expect_err("no such folder");
         assert!(
-            wrapped.to_string().contains(missing.to_str().unwrap()),
+            carries_path(&wrapped.to_string(), &missing),
             "the fixture carries the path: {wrapped}"
         );
         let reason = io_reason(&wrapped);
-        assert!(!reason.contains(missing.to_str().unwrap()), "{reason}");
+        assert!(!carries_path(&reason, &missing), "{reason}");
         assert_eq!(reason, wrapped.kind().to_string());
     }
 
@@ -1197,7 +1224,7 @@ mod tests {
         let single = Single::with_root(root.clone());
         let reason = single.load(&png, one_pixel).unwrap_err();
         assert!(!reason.is_empty());
-        assert!(!reason.contains(dir.path().to_str().unwrap()), "{reason}");
+        assert!(!carries_path(&reason, dir.path()), "{reason}");
         assert_eq!(single.current(), None);
 
         // With a root that is a folder, the same file loads.
@@ -2063,10 +2090,7 @@ mod tests {
         fs::write(&not_a_folder, b"x").unwrap();
         let lines = recorded(|log| clean_version_folder(&not_a_folder.join("v2.png"), 2, log));
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(
-            !lines[0].contains(dir.path().to_str().unwrap()),
-            "{lines:?}"
-        );
+        assert!(!carries_path(&lines[0], dir.path()), "{lines:?}");
     }
 
     // A path that is not a regular file when it is opened.
