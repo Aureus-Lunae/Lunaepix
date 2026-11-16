@@ -7,6 +7,8 @@
 Decided in conversation (2026-11-16). The user's words are quoted as they were said.
 
 - **Spec approved by the user (2026-11-16):** "Approved", including the "Calls I made" list.
+- **Plan approved by the user (2026-11-16):** "approved", including the calls made while planning. Execute in a fresh session, subagent-driven, on `feature/lunaepix-brew`.
+- **Download users and the link (2026-11-16, at plan approval):** a coworker who installed the 0.1.4 `.dmg` has a real `Lunaepix.app` folder in Applications, so `ln -sfn` would put the link inside it. Asked whether to add "If Lunaepix from the download is in Applications, move it to the Bin first." to the after-install note, with a guard. The user chose "Add the sentence (Recommended)".
 - **Start:** "Brew formula can already be started". This is the roadmap item "Apple support: a brew formula", split off from the Mac download earlier the same day ("Later, own roadmap item").
 - **No separate repository:** "If we can't do the brew part, we won't make it. I do not want a separate repo just to allow that". Homebrew can tap this repository itself when the address is given once, so the formula lives here.
 - **What it installs:** "Formula in this repo, both app and command line".
@@ -81,7 +83,8 @@ A tap given by address reads formulas from the `Formula/` folder at the reposito
   Lunaepix.app is installed in:
     #{opt_prefix}/Lunaepix.app
 
-  To open it from the Applications folder, link it there once:
+  To open it from the Applications folder, link it there once. If Lunaepix
+  from the download is in Applications, move it to the Bin first.
     ln -sfn "#{opt_prefix}/Lunaepix.app" /Applications/Lunaepix.app
 
   The link keeps working after `brew upgrade`. Spotlight and Launchpad
@@ -167,7 +170,7 @@ No CMS changes.
 2. **No `--HEAD`, no bottles, no automatic bump** (see Non-goals).
 3. **The Formula job runs on every tag, with `needs: test` and no cache.** Runs are free now; a user's Mac has no cache either.
 4. **Version 0.1.5,** so the first formula ships with the 0.1.5 release, not 0.1.4.
-5. **The caveat text above,** including `ln -sfn` and the Spotlight sentence.
+5. **The caveat text above,** including `ln -sfn` and the Spotlight sentence (the download sentence is the user's, see Handoff).
 6. **The release step is by hand for now,** written down as a checklist.
 7. **The placeholder checksum is 64 zeros** until the release commit fills it in.
 8. **`skip_clean "Lunaepix.app"`** from the start, so Homebrew's clean-up cannot break the app's seal. Re-signing after install stays a stop-and-ask.
