@@ -17,8 +17,9 @@
 #   - the cache steps save only from main (see the comment at the first one);
 #   - the Rust tests run even after a failed formatting or lint step;
 #   - the app is checked (signature, worker sealed in) before it is uploaded;
-#   - the Formula job needs the tests, has 60 minutes, uses no cache and
-#     installs nothing the formula does not declare, and runs brew audit and
+#   - the Formula job needs the tests, has 60 minutes, uses no action but
+#     the checkout (no cache, no toolchain), installs nothing else the
+#     formula does not declare, and runs brew audit and
 #     brew style on the committed formula, then git archive of HEAD,
 #     brew install --build-from-source of a copy, and brew test, in that order.
 
@@ -180,9 +181,10 @@ jobs:
   # formula that points at an archive of this commit. Homebrew installs only
   # formulas that sit in a tap, so both live in a local tap of their own.
   #
-  # No cache, and no step installs a toolchain or a package: a user's Mac has
-  # neither, so only what the formula declares (Rust, from Homebrew) is there
-  # when it builds, and a dependency it forgot fails here first.
+  # No action but the checkout, so no cache, and no step installs a toolchain
+  # or a package: a user's Mac has neither, so only what the formula declares
+  # (Rust, from Homebrew) is there when it builds, and a dependency it forgot
+  # fails here first.
   formula:
     name: Formula
     needs: test

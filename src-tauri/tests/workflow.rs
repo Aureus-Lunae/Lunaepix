@@ -13,8 +13,9 @@
 //! Mac file has two rules more. A check step between the build and the upload
 //! verifies the app's signature and that the worker is sealed in, in
 //! `bundle/macos/` and inside the disk image. A Formula job builds this commit
-//! with the Homebrew formula: it needs the tests, has 60 minutes, uses no cache
-//! and installs nothing the formula does not declare, and runs `brew audit`,
+//! with the Homebrew formula: it needs the tests, has 60 minutes, uses no
+//! action but the checkout (so no cache and no toolchain) and installs nothing
+//! else the formula does not declare, and runs `brew audit`,
 //! `brew style`, `git archive` of `HEAD`, `brew install --build-from-source`
 //! and `brew test`, in that order; the Windows file must have no such job. The
 //! shared rules (pinned actions, runner, read-only token, no expression in a
@@ -1063,13 +1064,13 @@ fn formula_line_problem(line: &str) -> Option<String> {
         ));
     }
     let commands = line.split([';', '&', '|', '(', ')', '`']);
-    let refused = commands.map(|command| {
+    let commands_words = commands.map(|command| {
         command
             .split_whitespace()
             .map(|word| word.trim_matches(|c| c == '\'' || c == '"'))
             .collect::<Vec<_>>()
     });
-    let refused = refused
+    let refused = commands_words
         .filter(|words| {
             words
                 .iter()
@@ -1087,12 +1088,14 @@ fn formula_line_problem(line: &str) -> Option<String> {
 /// When the platform has `formula_job`, the job `formula` exists and:
 /// - has `needs: test` (a name or a list that holds it), so it builds only
 ///   what the tests passed;
-/// - uses no action with `cache` in its name (a user's Mac has no cache);
-/// - installs nothing the formula does not declare (Review Focus 3): no
-///   action with `toolchain` or `setup-` in its name (`dtolnay/rust-toolchain`,
-///   `setup-node`), no `rustup`, and no command with the word `install` or
-///   `reinstall` but `brew install --build-from-source` of the tap's formula
-///   (`formula_line_problem`). This part reads the scripts without their
+/// - installs nothing the formula does not declare (Review Focus 3): the only
+///   action its steps use is `actions/checkout@` (compared without case, as
+///   `is_rust_cache` does), so no cache (a user's Mac has none), no toolchain
+///   (`dtolnay/rust-toolchain`, `setup-node`) and no other installer
+///   (`jdx/mise-action`) gets in, whatever its name; and its scripts run no
+///   `rustup`, and no command with the word `install` or `reinstall` but
+///   `brew install --build-from-source` of the tap's formula
+///   (`formula_line_problem`). The script part reads them without their
 ///   whole-line comments only, as `nasm_absent_problems` does: a trailing
 ///   `# brew install x` is a false hit it accepts, and a ` #` inside quotes
 ///   cannot hide what follows it;
@@ -1123,14 +1126,13 @@ fn formula_job_problems(text: &str, platform: &Platform) -> Vec<String> {
             problems.push("the formula job does not have needs: test".to_owned());
         }
         let steps = steps_of(job);
-        for uses in steps.iter().filter_map(|step| uses_of(step)) {
-            let lower = uses.to_ascii_lowercase();
-            if lower.contains("cache") {
-                problems.push(format!("the formula job restores a cache: {uses}"));
-            } else if lower.contains("toolchain") || lower.contains("setup-") {
-                problems.push(format!("the formula job installs a toolchain: {uses}"));
-            }
-        }
+        let others = steps
+            .iter()
+            .filter_map(|step| uses_of(step))
+            .filter(|uses| !uses.to_ascii_lowercase().starts_with("actions/checkout@"));
+        problems.extend(others.map(|uses| {
+            format!("the formula job uses an action other than actions/checkout: {uses}")
+        }));
         let lines = steps
             .iter()
             .filter_map(|step| scalar(&step["run"]))
@@ -3156,7 +3158,7 @@ fn a_formula_job_with_a_cache_is_caught_in_a_fixture() {
             &formula_with_step(step),
             &MACOS,
             "formula_job_problems",
-            "the formula job restores a cache",
+            OTHER_ACTION,
         );
     }
 }
@@ -3164,13 +3166,55 @@ fn a_formula_job_with_a_cache_is_caught_in_a_fixture() {
 #[test]
 #[rustfmt::skip]
 fn a_formula_job_that_installs_a_toolchain_is_caught_in_a_fixture() {
+    // An action is refused because it is not the checkout.
     for step in [
         "      - uses: dtolnay/rust-toolchain@PIN # stable\n",
         "      - uses: actions/setup-node@PIN # v7.1.0\n",
+    ] {
+        assert_only_problem(&formula_with_step(step), &MACOS, "formula_job_problems", OTHER_ACTION);
+    }
+    // A script line is refused for `rustup`.
+    for step in [
         "      - run: rustup toolchain install stable\n",
         "      - run: curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y\n",
     ] {
         assert_only_problem(&formula_with_step(step), &MACOS, "formula_job_problems", "the formula job installs a toolchain");
+    }
+}
+
+/// The start of the problem for a Formula job step that uses another action
+/// than the checkout.
+const OTHER_ACTION: &str = "the formula job uses an action other than actions/checkout";
+
+#[test]
+#[rustfmt::skip]
+fn a_formula_job_that_uses_only_the_checkout_action_passes_a_fixture() {
+    let texts = [
+        good_mac(),
+        // Action names are compared without case.
+        with_formula("actions/checkout@PIN # v7.0.1", "Actions/Checkout@PIN # v7.0.1"),
+        // A second checkout step.
+        formula_with_step("      - uses: actions/checkout@PIN # v7.0.1\n"),
+    ];
+    for text in &texts {
+        for (name, problems) in every_check(text, &MACOS) {
+            assert_eq!(problems, Vec::<String>::new(), "{name} in\n{text}");
+        }
+    }
+}
+
+#[test]
+#[rustfmt::skip]
+fn a_formula_job_that_uses_another_action_is_caught_in_a_fixture() {
+    for step in [
+        // An action that installs tools, with neither `cache`, `toolchain`
+        // nor `setup-` in its name.
+        "      - uses: jdx/mise-action@PIN # v2\n",
+        "      - uses: actions/setup-python@PIN # v5\n",
+        // A name that only starts like the checkout.
+        "      - uses: actions/checkout-extra@PIN # v1\n",
+    ] {
+        assert_only_problem(&formula_with_step(step), &MACOS, "formula_job_problems", OTHER_ACTION);
     }
 }
 
