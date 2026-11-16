@@ -26,6 +26,7 @@ These lines are copied verbatim from the spec's Handoff. The standing process ru
 - **rc tags after going public (2026-11-16):** the cap of one tag was set for cost; public runs cost no Actions minutes. The user chose "Tag as needed (Recommended)": the builder fixes, pushes and tags rc2, rc3 and so on itself until the Mac build is green, and reports then. A real behaviour difference still stops and asks. This replaces "1 now, then ask".
 - **Brew formula (2026-11-16):** the user chose "Later, own roadmap item (Recommended)": this plan finishes with the Mac download; the brew formula becomes a separate roadmap item, brainstormed and planned on its own.
 - **Branches (2026-11-16):** the user: "Now, we use main for releases, and development as the branch we work on till we are ready for release that is stable enough." `development` was created from `main` at 97a1e15. This branch merges into `development` when finished, not into `main`; `main` gets a release only when the user asks.
+- **Finalize (2026-11-16):** asked whether the coworker's hand check of the rc2 `.dmg` succeeded. The user: "It built, it can be marked complete. Testing on mac will happen later." Plan marked Completed; the coworker's check (spec "Hand check" items 1–6, plan Task 6 items 7–8) is still to come. Audits: None.
 
 **Standing process rules** (the user's, from earlier Lunaepix plans; they apply to every task here):
 
@@ -94,6 +95,7 @@ These lines are copied verbatim from the spec's Handoff. The standing process ru
 ---
 
 ### Task 1: The kill-and-reap tests run on the Mac too
+Status: Completed
 
 **Files:**
 - Modify: `crates/core/Cargo.toml` (`[target.'cfg(unix)'.dev-dependencies] libc = "0.2.191"`).
@@ -107,14 +109,14 @@ These lines are copied verbatim from the spec's Handoff. The standing process ru
 **Interfaces:**
 - Produces: `fn process_is_gone(pid: u32) -> bool`, once per test crate (core unit tests, core `tests/`, src-tauri unit tests, src-tauri `tests/`). Where a crate's `tests/` already has a shared module, it goes there.
 
-- [ ] **Step 1: Write the tables, then the failing tests.**
+- [x] **Step 1: Write the tables, then the failing tests.**
   - `process_is_gone`, in each crate that gets one:
     - `a_reaped_child_is_gone` (spawn `sleep 60`, kill, `wait()` → `true`);
     - `a_running_child_is_not_gone` (→ `false`);
     - `a_killed_child_that_was_not_waited_for_is_not_gone` (kill, wait until it is a zombie, then `false`; reap afterwards). This one proves "gone" means reaped.
   - The case test (Review Focus 3), `cfg(any(windows, target_os = "macos"))`: `two_sources_whose_names_differ_only_in_case_both_reach_one_output_folder`. Sources `x/a.png` and `y/A.png` go to one output folder. Assert two output files whose bytes match their own source's optimised output, and that neither was replaced. Its negative pair is `cfg(target_os = "linux")`: `on_linux_names_that_differ_only_in_case_are_both_kept_as_they_are`, which gives `a.png` and `A.png`, neither numbered.
-- [ ] **Step 2:** Run `cargo test --workspace`. The new helper tests fail (no helper yet). Record the output.
-- [ ] **Step 3:** Write `process_is_gone`. This is the exact shape, because `EPERM` means "exists":
+- [x] **Step 2:** Run `cargo test --workspace`. The new helper tests fail (no helper yet). Record the output.
+- [x] **Step 3:** Write `process_is_gone`. This is the exact shape, because `EPERM` means "exists":
 
   ```rust
   fn process_is_gone(pid: u32) -> bool {
@@ -126,15 +128,16 @@ These lines are copied verbatim from the spec's Handoff. The standing process ru
   ```
 
   Then change the listed tests from `cfg(target_os = "linux")` to `cfg(unix)`, and replace each `/proc/<pid>` existence check with `process_is_gone`. If a listed test also relies on something Linux-only (`PR_SET_PDEATHSIG`, the OOM score), keep that part Linux-only and give the reason in a comment and in the report. The tests of the OOM score, `die_with_parent`, `/proc/self/status` and the case-sensitive folder stay `cfg(target_os = "linux")`.
-- [ ] **Step 4:** Run these; all must pass on Linux:
+- [x] **Step 4:** Run these; all must pass on Linux:
   - `cargo test --workspace`
   - `cargo clippy --workspace --all-targets -- -D warnings`
   - `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings`
 
   The case test runs first on the Windows and Mac runs. If it fails there, that is a behaviour difference: stop and ask.
-- [ ] **Step 5:** Commit "Run the kill-and-reap tests on every Unix, through kill(pid, 0)".
+- [x] **Step 5:** Commit "Run the kill-and-reap tests on every Unix, through kill(pid, 0)".
 
 ### Task 2: The Mac bundle settings
+Status: Completed
 
 **Files:**
 - Create: `src-tauri/tauri.macos.conf.json`.
@@ -143,15 +146,15 @@ These lines are copied verbatim from the spec's Handoff. The standing process ru
 **Interfaces:**
 - Produces: `const MACOS_BUNDLE_TARGETS: &[&str] = &["app", "dmg"];` and `fn macos_config_problems(config: &Value) -> Vec<String>`.
 
-- [ ] **Step 1: Write the tables, then the failing tests.**
+- [x] **Step 1: Write the tables, then the failing tests.**
   - `the_macos_config_targets_app_and_dmg_signs_ad_hoc_and_needs_macos_11`: the real file reads as JSON, `macos_config_problems` is empty, and the three values are exactly as in the Global Constraints.
   - `a_macos_config_with_other_targets_is_caught_in_a_fixture`: targets missing, `"all"`, `["app"]`, `["app", "dmg", "deb"]`, `["dmg", 1]`.
   - `a_macos_config_without_an_ad_hoc_signature_is_caught_in_a_fixture`: identity missing, `""`, `"Developer ID Application: X"`, `null`.
   - `a_macos_config_with_another_minimum_version_is_caught_in_a_fixture`: missing, `"10.13"`, `11`.
   - `a_macos_config_that_sets_anything_else_is_caught_in_a_fixture`: top-level `app`, `bundle.resources`, `bundle.macOS.entitlements`, `bundle.macOS.providerShortName`.
   - `a_macos_config_with_or_without_a_schema_passes_a_fixture`: the positive pair of the line above.
-- [ ] **Step 2:** Run `cargo test -p lunaepix --test config`. The tests fail (no file, no function). Record the output.
-- [ ] **Step 3:** Create the file. This is the exact content:
+- [x] **Step 2:** Run `cargo test -p lunaepix --test config`. The tests fail (no file, no function). Record the output.
+- [x] **Step 3:** Create the file. This is the exact content:
 
   ```json
   {
@@ -167,17 +170,18 @@ These lines are copied verbatim from the spec's Handoff. The standing process ru
   ```
 
   Then write `macos_config_problems`.
-- [ ] **Step 4:** `cargo test --workspace` and clippy (Linux and windows-gnu) pass.
-- [ ] **Step 5:** Commit "Mac bundle settings: app and dmg, ad-hoc signature, macOS 11".
+- [x] **Step 4:** `cargo test --workspace` and clippy (Linux and windows-gnu) pass.
+- [x] **Step 5:** Commit "Mac bundle settings: app and dmg, ad-hoc signature, macOS 11".
 
 ### Task 3: Licences for the Mac build
+Status: Completed
 
 **Files:**
 - Modify: `about.toml` (`targets`, and the comment above it).
 - Modify: `THIRD-PARTY-LICENSES.html` (regenerated, never edited by hand).
 - Modify: `src-tauri/tests/config.rs` (`about_problems`, or a new `about_target_problems(about_toml: &str) -> Vec<String>` beside it).
 
-- [ ] **Step 1: Write the tables, then the failing tests.**
+- [x] **Step 1: Write the tables, then the failing tests.**
   - `the_real_about_toml_lists_the_linux_windows_and_mac_targets`.
   - `about_toml_targets_without_one_platform_or_with_another_are_caught_in_a_fixture`: Mac missing, Linux missing, an extra `x86_64-apple-darwin`, `targets = "aarch64-apple-darwin"` (not a list), and a non-string entry.
   - If `config.rs` already parses `THIRD-PARTY-LICENSES.html`, extend that parse:
@@ -185,13 +189,14 @@ These lines are copied verbatim from the spec's Handoff. The standing process ru
     - its fixture negative, a page without it, which is reported.
 
     If no such parse exists, say so in the report and do not add text matching.
-- [ ] **Step 2:** Run the config tests and record the RED output.
-- [ ] **Step 3:** Change `targets` and its comment ("Linux, Windows and Apple Silicon macOS; no Intel Mac, no mobile"). Then run `cargo about generate -c about.toml about.hbs -o THIRD-PARTY-LICENSES.html`.
+- [x] **Step 2:** Run the config tests and record the RED output.
+- [x] **Step 3:** Change `targets` and its comment ("Linux, Windows and Apple Silicon macOS; no Intel Mac, no mobile"). Then run `cargo about generate -c about.toml about.hbs -o THIRD-PARTY-LICENSES.html`.
   - **If cargo-about refuses a licence:** stop and report the crate and the licence to the user. Never touch `accepted`.
-- [ ] **Step 4:** `cargo test --workspace` passes. `git diff --stat THIRD-PARTY-LICENSES.html` shows the page grew.
-- [ ] **Step 5:** Commit "List the licences of the crates the Mac build ships".
+- [x] **Step 4:** `cargo test --workspace` passes. `git diff --stat THIRD-PARTY-LICENSES.html` shows the page grew.
+- [x] **Step 5:** Commit "List the licences of the crates the Mac build ships".
 
 ### Task 4: Workflow guards per platform (Windows unchanged)
+Status: Completed
 
 **Files:**
 - Modify: `src-tauri/tests/workflow.rs` (module doc, `workflow()`, `structure_problems`, `nasm_problems`, `every_check`, and the real-file tests).
@@ -218,17 +223,18 @@ These lines are copied verbatim from the spec's Handoff. The standing process ru
   fn every_check(text: &str, platform: &Platform) -> Vec<(&'static str, Vec<String>)>;
   ```
 
-- [ ] **Step 1: Write the tables, then the failing tests.** Every existing test keeps its assertions and passes `&WINDOWS` where a signature now asks for it. The new behaviour is `upload_problems`, tested on Windows:
+- [x] **Step 1: Write the tables, then the failing tests.** Every existing test keeps its assertions and passes `&WINDOWS` where a signature now asks for it. The new behaviour is `upload_problems`, tested on Windows:
   - `the_upload_names_the_platform_artifact_its_paths_and_thirty_days_in_a_fixture` (positive);
   - `an_upload_with_another_name_path_or_retention_is_caught_in_a_fixture`: name `lunaepix`, a missing `.msi` path, an extra path, `retention-days: 90`, and no `retention-days`.
 
   `the_workflow_passes_every_check` still passes on the real `windows.yml`.
-- [ ] **Step 2:** Run `cargo test -p lunaepix --test workflow`. It fails to compile, or the new tests fail. Record the output.
-- [ ] **Step 3:** Implement. `ChocolateyPinned` keeps today's rule exactly (`choco install nasm`, `--version=`, `GITHUB_PATH`). `Forbidden` keeps today's no-cache rule. `Homebrew` and `Required` are written in Task 5. The module doc says it guards both workflows.
-- [ ] **Step 4:** `cargo test --workspace` and clippy pass. `git diff .github/workflows/windows.yml` is empty.
-- [ ] **Step 5:** Commit "Workflow guards take a platform profile; the upload guard checks name, paths and retention".
+- [x] **Step 2:** Run `cargo test -p lunaepix --test workflow`. It fails to compile, or the new tests fail. Record the output.
+- [x] **Step 3:** Implement. `ChocolateyPinned` keeps today's rule exactly (`choco install nasm`, `--version=`, `GITHUB_PATH`). `Forbidden` keeps today's no-cache rule. `Homebrew` and `Required` are written in Task 5. The module doc says it guards both workflows.
+- [x] **Step 4:** `cargo test --workspace` and clippy pass. `git diff .github/workflows/windows.yml` is empty.
+- [x] **Step 5:** Commit "Workflow guards take a platform profile; the upload guard checks name, paths and retention".
 
 ### Task 5: The Mac workflow
+Status: Completed
 
 **Files:**
 - Create: `.github/workflows/macos.yml`.
@@ -238,7 +244,7 @@ These lines are copied verbatim from the spec's Handoff. The standing process ru
 - Consumes: Task 4's `Platform`, `every_check`, `structure_problems`, `nasm_problems` and `upload_problems`.
 - Produces: `const MACOS: Platform` (`"macos.yml"`, `"macos-latest"`, `Required`, `Homebrew`, `"lunaepix-macos-dmg"`, `&["target/release/bundle/dmg/*.dmg"]`), and `fn mac_check_step_problems(text: &str) -> Vec<String>`. `every_check(text, &MACOS)` includes it.
 
-- [ ] **Step 1: Write the tables, then the failing tests.**
+- [x] **Step 1: Write the tables, then the failing tests.**
   - **The real file:** `the_mac_workflow_parses_and_passes_every_check`, and `the_checks_of_the_real_mac_file_are_not_vacuous` (as the Windows one: it counts references and scripts and contains `target/release/bundle/`).
   - **A good Mac fixture** (`good_mac()`, with a `with_mac(from, to)` that fails when `from` is absent) passes every check.
   - **The shared guards are wired to the Mac,** one negative each on the Mac fixture:
@@ -264,8 +270,8 @@ These lines are copied verbatim from the spec's Handoff. The standing process ru
     - `codesign --verify --deep --strict` only in a shell comment;
     - no `plutil -extract`;
     - no `hdiutil attach`.
-- [ ] **Step 2:** Run `cargo test -p lunaepix --test workflow` and record the RED output.
-- [ ] **Step 3:** Write `macos.yml` from `windows.yml`, with the changes the spec lists and comments in the same voice. The check step's script must keep this shape (it is the gate, so it is given here). Bash on Actions runs with `-e -o pipefail`, so every failing line fails the step.
+- [x] **Step 2:** Run `cargo test -p lunaepix --test workflow` and record the RED output.
+- [x] **Step 3:** Write `macos.yml` from `windows.yml`, with the changes the spec lists and comments in the same voice. The check step's script must keep this shape (it is the gate, so it is given here). Bash on Actions runs with `-e -o pipefail`, so every failing line fails the step.
 
   ```bash
   app=target/release/bundle/macos/Lunaepix.app
@@ -290,17 +296,18 @@ These lines are copied verbatim from the spec's Handoff. The standing process ru
   The step's own failure arms (worker missing, verification failing, not ad hoc, not in the seal) can only fire on a broken Mac build. They are not staged, because producing a broken build on purpose is breaking production code to prove a test. The branch table lists them as "untested: needs a broken bundle; guarded by `mac_check_step_problems` for presence and order".
 
 The worker's name inside the bundle (`lunaepix-worker`) is what Tauri gives an `externalBin` there. If the first run shows another name, the name changes in the script and the guard together; that is a fixture fix. `grep` reads `codesign`'s free-text output, which is not a structured file. `CodeResources` is a property list and is read with `plutil`.
-- [ ] **Step 4:** `cargo test --workspace` and clippy pass. `git diff .github/workflows/windows.yml` is empty.
-- [ ] **Step 5:** Commit "macOS build workflow: tests on Apple Silicon, then an ad-hoc signed dmg with the worker sealed in".
+- [x] **Step 4:** `cargo test --workspace` and clippy pass. `git diff .github/workflows/windows.yml` is empty.
+- [x] **Step 5:** Commit "macOS build workflow: tests on Apple Silicon, then an ad-hoc signed dmg with the worker sealed in".
 
 ### Task 6: README, version 0.1.4 and the coworker's check
+Status: Completed
 
 **Files:**
 - Modify: `README.md` (new section "Getting the Mac app" after "Getting the Windows installer", worded as in the spec, with the artifact name and the Open Anyway steps). Also change any sentence that says the app is built for Linux and Windows only.
 - Modify: `Cargo.toml` (`version = "0.1.4"`) and `Cargo.lock`, which `cargo build` brings along.
 
-- [ ] **Step 1:** Write the README section and bump the version.
-- [ ] **Step 2:** Run the full checks:
+- [x] **Step 1:** Write the README section and bump the version.
+- [x] **Step 2:** Run the full checks:
   - `cargo fmt --all --check`
   - `cargo clippy --workspace --all-targets -- -D warnings`
   - `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings`
@@ -309,26 +316,27 @@ The worker's name inside the bundle (`lunaepix-worker`) is what Tauri gives an `
   - the `debug(` grep from `~/.claude/CLAUDE.md`
 
   All pass.
-- [ ] **Step 3:** Write the coworker's check into the report, not the repository. It is the spec's six items plus:
+- [x] **Step 3:** Write the coworker's check into the report, not the repository. It is the spec's six items plus:
   - 7: drop an iPhone `.heic` photo; it is listed as skipped with a reason, and nothing crashes.
   - 8: in Single image at 100 % zoom on the Mac's own screen, the picture is sharp.
-- [ ] **Step 4:** Commit "Document the Mac download; version 0.1.4".
+- [x] **Step 4:** Commit "Document the Mac download; version 0.1.4".
 
 ### Task 7: The Mac run (controller, not an implementer)
+Status: Completed
 
 **One tag only. Then report and ask** ("1 now, then ask").
 
-- [ ] **Step 1: Everything off the Mac first.**
+- [x] **Step 1: Everything off the Mac first.**
   - Run the Task 6 Step 2 checks on the merged branch.
   - Read every `cfg(unix)`, `cfg(target_os = …)`, `/proc`, `/dev/`, `sleep`, `head -c` and `chmod` use in the tests. List the ones the Mac meets for the first time, each with why it should hold on macOS (BSD tools, APFS, no `/proc`). If one cannot hold, it becomes a fixture fix through an implementer, with tables, before the tag.
-- [ ] **Step 2:**
+- [x] **Step 2:**
   - `git push -u origin feature/lunaepix-apple`
   - `git tag -a v0.1.4-rc1 -m "Lunaepix 0.1.4 rc1: first Mac build"`
   - `git push origin v0.1.4-rc1`
-- [ ] **Step 3:** Follow the runs with `gh run list --limit 4` and `gh run watch <id>`, for both the "macOS build" and the "Windows build" runs.
+- [x] **Step 3:** Follow the runs with `gh run list --limit 4` and `gh run watch <id>`, for both the "macOS build" and the "Windows build" runs.
   - **Green:** note the artifact `lunaepix-macos-dmg` and its expiry.
   - **Red:** `gh run view <id> --log-failed`. Sort each failure into fixture or behaviour difference (the spec's "Stop and ask").
-- [ ] **Step 4: Report to the user and stop.** The report covers:
+- [x] **Step 4: Report to the user and stop.** The report covers:
   - each run's result and duration;
   - the real cost (Mac minutes × price, or the billing page);
   - every failure, sorted;

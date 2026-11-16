@@ -2,6 +2,13 @@
 
 **Owner:** Aureus-Lunae · **Started:** 2026-11-13
 
+Plan filename: 2026-11-13-lunaepix-apple.md
+Plan Status: Completed
+Date plan executed: 2026-11-16
+
+Audits performed:
+- None
+
 ## Handoff
 
 Decided in conversation (2026-11-13). The user's words are quoted as they were said.
@@ -26,6 +33,7 @@ Decided in conversation (2026-11-13). The user's words are quoted as they were s
 - **rc tags after going public (2026-11-16):** the cap of one tag was set for cost; public runs cost no Actions minutes. The user chose "Tag as needed (Recommended)": the builder fixes, pushes and tags rc2, rc3 and so on itself until the Mac build is green, and reports then. A real behaviour difference still stops and asks. This replaces "1 now, then ask".
 - **Brew formula (2026-11-16):** the user chose "Later, own roadmap item (Recommended)": this plan finishes with the Mac download; the brew formula becomes a separate roadmap item, brainstormed and planned on its own.
 - **Branches (2026-11-16):** the user: "Now, we use main for releases, and development as the branch we work on till we are ready for release that is stable enough." `development` was created from `main` at 97a1e15. This branch merges into `development` when finished, not into `main`; `main` gets a release only when the user asks.
+- **Finalize (2026-11-16):** asked whether the coworker's hand check of the rc2 `.dmg` succeeded. The user: "It built, it can be marked complete. Testing on mac will happen later." Plan marked Completed; the coworker's check (spec "Hand check" items 1–6, plan Task 6 items 7–8) is still to come. Audits: None.
 
 ## Problem
 
