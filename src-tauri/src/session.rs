@@ -6177,13 +6177,17 @@ mod tests {
             }
         }
 
+        /// Each name gets a folder of its own: two accepted names can be one
+        /// name on a Mac (`vakantie-café` composed and decomposed), and the
+        /// Mac then refuses the second as taken (see
+        /// `on_a_mac_the_other_spelling_of_an_existing_name_is_name_taken_and_the_file_is_untouched`).
         #[test]
         fn every_accepted_fixture_name_saves() {
             let names = save_names::load();
             assert_eq!(names.extension, ".jpg");
-            let s = ready_image("holiday.jpg");
             assert!(!names.accepted.is_empty());
             for stem in &names.accepted {
+                let s = ready_image("holiday.jpg");
                 assert_eq!(save(&s, stem), Ok(()), "{stem:?}");
                 let file = format!("{stem}.jpg");
                 assert_eq!(fs::read(s.dir.path().join(&file)).unwrap(), VERSION);
@@ -6880,6 +6884,84 @@ mod tests {
                 ]
             );
             assert!(!entries(s.dir.path()).contains(&OsString::from("vakantie-caf\u{e9}.jpg")));
+        }
+
+        // One name, two spellings: "vakantie-café" as one character, and as
+        // `e` plus a combining accent. APFS treats them as one name (and keeps
+        // the spelling the file was made with); ext4 and NTFS keep them apart.
+
+        const COMPOSED: &str = "vakantie-caf\u{e9}";
+        const DECOMPOSED: &str = "vakantie-cafe\u{301}";
+
+        /// Save `first`, then try `second` in the same folder. `first` is saved
+        /// with [`VERSION`] and then rewritten as `EDITED`, so a save that
+        /// replaced it could not go unseen: it would be [`VERSION`] again.
+        #[cfg(target_os = "macos")]
+        fn second_spelling_is_refused(first: &str, second: &str) {
+            const EDITED: &[u8] = b"the first save, edited afterwards";
+            let s = ready_image("holiday.jpg");
+            assert_eq!(save(&s, first), Ok(()));
+            assert_eq!(only_saved(&s.window)["name"], json!(format!("{first}.jpg")));
+            let path = s.dir.path().join(format!("{first}.jpg"));
+            fs::write(&path, EDITED).unwrap();
+            refused_save(&s, Some(&args(second, &s.key)), CommandError::NameTaken);
+            assert_eq!(fs::read(&path).unwrap(), EDITED);
+            // Only the first spelling's file is in the folder, once.
+            assert_eq!(
+                entries(s.dir.path()),
+                [
+                    OsString::from("holiday.jpg"),
+                    OsString::from(format!("{first}.jpg"))
+                ]
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn on_a_mac_the_other_spelling_of_an_existing_name_is_name_taken_and_the_file_is_untouched()
+        {
+            second_spelling_is_refused(COMPOSED, DECOMPOSED);
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn on_a_mac_the_composed_spelling_of_an_existing_decomposed_name_is_name_taken_and_the_file_is_untouched()
+         {
+            second_spelling_is_refused(DECOMPOSED, COMPOSED);
+        }
+
+        /// Save `first`, then `second`, in one folder, both `Ok`; the folder
+        /// then holds both, each under its own bytes.
+        #[cfg(not(target_os = "macos"))]
+        fn both_spellings_are_saved(first: &str, second: &str) {
+            let s = ready_image("holiday.jpg");
+            for stem in [first, second] {
+                assert_eq!(save(&s, stem), Ok(()), "{stem:?}");
+                assert_eq!(only_saved(&s.window)["name"], json!(format!("{stem}.jpg")));
+            }
+            let mut expected = vec![
+                OsString::from("holiday.jpg"),
+                OsString::from(format!("{first}.jpg")),
+                OsString::from(format!("{second}.jpg")),
+            ];
+            expected.sort();
+            assert_eq!(entries(s.dir.path()), expected);
+            for stem in [first, second] {
+                let saved = fs::read(s.dir.path().join(format!("{stem}.jpg"))).unwrap();
+                assert_eq!(saved, VERSION, "{stem:?}");
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        #[test]
+        fn off_a_mac_both_spellings_of_a_name_save_side_by_side_composed_first() {
+            both_spellings_are_saved(COMPOSED, DECOMPOSED);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        #[test]
+        fn off_a_mac_both_spellings_of_a_name_save_side_by_side_decomposed_first() {
+            both_spellings_are_saved(DECOMPOSED, COMPOSED);
         }
     }
 }
