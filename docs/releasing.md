@@ -15,10 +15,19 @@ match). The formula's `sha256` is still 64 zeros.
 
 ## Checklist
 
-1. Merge `development` into `main`, keeping a merge commit:
+Do not bump the version on `development` until step 6 is pushed. Otherwise
+`git merge main` in step 6 conflicts on the formula's `url` and `sha256`
+lines.
+
+1. Fetch, bring local `development` and `main` up to date, then merge
+   `development` into `main`, keeping a merge commit:
 
    ```
+   git fetch origin
+   git switch development
+   git pull --ff-only
    git switch main
+   git pull --ff-only
    git merge --no-ff development
    ```
 
@@ -35,14 +44,15 @@ match). The formula's `sha256` is still 64 zeros.
    check the file:
 
    ```
-   curl -L -o vX.Y.Z.tar.gz https://github.com/Aureus-Lunae/Lunaepix/archive/refs/tags/vX.Y.Z.tar.gz
+   curl -fL -o vX.Y.Z.tar.gz https://github.com/Aureus-Lunae/Lunaepix/archive/refs/tags/vX.Y.Z.tar.gz
    shasum -a 256 vX.Y.Z.tar.gz
    ```
 
-   or check it as it comes in:
+   or check it as it comes in. The `-f` makes curl fail on a 404 (archive not
+   ready, mistyped tag) instead of hashing an error page:
 
    ```
-   curl -L https://github.com/Aureus-Lunae/Lunaepix/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
+   curl -fL https://github.com/Aureus-Lunae/Lunaepix/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
    ```
 
 4. Put the value into `Formula/lunaepix.rb`, on the `sha256` line (the 64
