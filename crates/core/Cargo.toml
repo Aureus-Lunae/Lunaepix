@@ -27,8 +27,11 @@ tempfile = "3.27.0"
 # A jpegtran-style coefficient transcode (the lossless path, as in the Step 2
 # evaluation) and a pixel re-encode (the lossy path). `nasm_simd` builds
 # mozjpeg's SIMD code (DCT, colour conversion, sampling), which speeds up the
-# lossy decode and encode; it needs `nasm` on the PATH at build time
-# (.github/workflows/windows.yml installs it). The lossless transcode runs no
+# lossy decode and encode; on x86 and x86_64 it needs `nasm` on the PATH at
+# build time (.github/workflows/windows.yml installs it; Linux installs it
+# by hand, see the README). On Apple Silicon (aarch64) mozjpeg-sys assembles
+# its Arm SIMD code with clang instead and never runs `nasm`, so
+# .github/workflows/macos.yml installs none. The lossless transcode runs no
 # DCT, so its output is the same with or without it. `unwinding` lets libjpeg
 # errors unwind as Rust panics (`extern "C-unwind"`); `jpegtran` builds
 # transupp.c, which copies the markers.
@@ -71,6 +74,13 @@ windows-sys = { version = "0.61.2", features = ["Win32_System_Diagnostics_Debug"
 # Tests only, so the shipped worker gains no feature.
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
+
+# The tests that a worker was killed and reaped ask `kill(pid, 0)` whether the
+# process still exists (no `/proc` on macOS), and wait with `waitid` for a
+# killed child to become a zombie. Tests only. The version already in
+# Cargo.lock (the Linux dependency above uses it), so no new package.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2.191"
 
 [dev-dependencies]
 # Chunk CRCs: the tests make valid ones for hand-made hostile PNGs. Already in

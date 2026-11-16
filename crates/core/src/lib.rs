@@ -12,7 +12,8 @@
 //!
 //! `unsafe` code is denied everywhere but in `jpg`, the libjpeg FFI, in
 //! `platform`, the worker's two start-up system calls, and in `webp::codec`,
-//! the libwebp FFI.
+//! the libwebp FFI. The one other exception is two test helpers in `run`'s
+//! unit tests, which ask `kill(pid, 0)` and `waitid` about a worker's process.
 
 #![deny(unsafe_code)]
 
@@ -43,6 +44,13 @@ pub mod worker;
 #[cfg(test)]
 #[path = "../tests/common/jpeg_fixtures.rs"]
 mod jpeg_fixtures;
+
+/// The check that a failure reason carries no path. `atomic`'s unit tests use
+/// it through this module (`crate::no_path`); `tests/worker.rs` in the core and
+/// `session_run.rs` in the app include the same file by `#[path]`.
+#[cfg(test)]
+#[path = "../tests/common/no_path.rs"]
+mod no_path;
 
 pub use atomic::{is_staging_name, save_new};
 use lossy::Lossy;

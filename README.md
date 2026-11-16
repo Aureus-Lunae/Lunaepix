@@ -255,7 +255,7 @@ node --test "tests/ui/*.test.js"                              # the window scrip
 ```
 
 The window script tests need Node 21 or later (one of them reads numbers
-with `JSON.parse`'s source text); the Windows check runs them on Node 22.
+with `JSON.parse`'s source text); the Windows and Mac checks run them on Node 22.
 
 The `--config` file adds the small worker program that optimises each file,
 makes each thumbnail and reads the header of each image Single image mode
@@ -277,6 +277,30 @@ The workflow installs NASM itself.
 
 The installers are **not signed**, so Windows SmartScreen warns when you start
 one: choose "More info", then "Run anyway".
+
+## Getting the Mac app
+
+The Mac app is built on GitHub Actions too; nothing here builds it locally.
+The workflow needs no NASM: on Apple Silicon mozjpeg assembles its SIMD code
+with the compiler that comes with the runner. It is for Macs with Apple
+Silicon (M1 or later) and macOS 11 or later. There is no build for Intel Macs.
+
+1. In the repository on GitHub, open Actions, choose the "macOS build"
+   workflow (`.github/workflows/macos.yml`) and press "Run workflow". Pushing
+   a tag that starts with `v` (for example `v0.1.0`) starts it too.
+2. When the run is green, download the `lunaepix-macos-dmg` artifact from the
+   run's page. GitHub delivers it as a zip; the zip holds the `.dmg`.
+3. Open the `.dmg` and drag Lunaepix into Applications.
+
+The app is **not signed with an Apple developer certificate**, so macOS blocks
+the first launch. To get past it, once:
+
+1. Open Lunaepix from Applications, then close the warning that appears.
+2. Open System Settings › Privacy & Security and scroll down to Security.
+3. Next to the message about Lunaepix, choose "Open Anyway" and confirm.
+
+After that it opens normally. Since macOS Sequoia, Right-click › Open no longer
+gets past the block; use "Open Anyway" in System Settings.
 
 ## Licence
 

@@ -1927,9 +1927,88 @@ mod tests {
         })
     }
 
+    // --- whether a process is gone ----------------------------------------
+
+    /// Whether process `pid` is gone from the process table: killed and reaped,
+    /// not even a zombie left. `kill(pid, 0)` sends nothing and only asks whether
+    /// the pid exists, which a zombie still does. It works on every Unix; macOS
+    /// has no `/proc` to look in.
+    #[cfg(unix)]
+    fn process_is_gone(pid: u32) -> bool {
+        let pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+        // SAFETY: signal 0 sends nothing; it only asks whether the pid exists.
+        let answer = unsafe { libc::kill(pid, 0) };
+        // `EPERM` would mean the process exists, so only `ESRCH` is "gone".
+        answer == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    /// Block until child `pid` has exited, and leave it unreaped (a zombie).
+    /// `waitid` with `WNOWAIT` does that on Linux and on macOS alike.
+    #[cfg(unix)]
+    fn wait_until_exited_without_reaping(pid: u32) {
+        // SAFETY: `info` is a zeroed `siginfo_t` that the call fills in.
+        let waited = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    #[cfg(unix)]
+    fn sleeper() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reaped_child_is_gone() {
+        let mut child = sleeper();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(process_is_gone(child.id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_child_is_not_gone() {
+        let mut child = sleeper();
+        let gone = process_is_gone(child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!gone);
+    }
+
+    /// Pid 1 exists and is not ours: `kill(1, 0)` answers `EPERM` to a user and
+    /// 0 to root. Either way the process is there, so it is not gone.
+    #[cfg(unix)]
+    #[test]
+    fn pid_1_is_not_gone() {
+        assert!(!process_is_gone(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_child_that_was_not_waited_for_is_not_gone() {
+        let mut child = sleeper();
+        child.kill().unwrap();
+        wait_until_exited_without_reaping(child.id());
+        let zombie_is_gone = process_is_gone(child.id());
+        child.wait().unwrap();
+        assert!(!zombie_is_gone, "a zombie is not reaped");
+        assert!(process_is_gone(child.id()), "now it is reaped");
+    }
+
     // --- the window closes during a run -------------------------------------
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn stopping_a_session_as_the_window_closes_kills_its_worker_and_finishes_once() {
         use std::time::{Duration, Instant};
@@ -1967,8 +2046,12 @@ mod tests {
                     &mut |event| events.lock().unwrap().push(event),
                 );
             });
+            // The shell creates the file before `echo` writes into it, so wait
+            // for the finished line, not for the file.
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !pids.exists() && Instant::now() < deadline {
+            while fs::read_to_string(&pids).map_or(0, |text| text.lines().count()) < 1
+                && Instant::now() < deadline
+            {
                 std::thread::sleep(Duration::from_millis(10));
             }
             // What the close handler does.
@@ -1980,7 +2063,7 @@ mod tests {
         assert_eq!(started.lines().count(), 1, "b.png must not start");
         let pid = started.trim();
         assert!(
-            !Path::new("/proc").join(pid).exists(),
+            process_is_gone(pid.parse().unwrap()),
             "worker {pid} runs on"
         );
         let events = events.into_inner().unwrap();
@@ -6094,13 +6177,17 @@ mod tests {
             }
         }
 
+        /// Each name gets a folder of its own: two accepted names can be one
+        /// name on a Mac (`vakantie-café` composed and decomposed), and the
+        /// Mac then refuses the second as taken (see
+        /// `on_a_mac_the_other_spelling_of_an_existing_name_is_name_taken_and_the_file_is_untouched`).
         #[test]
         fn every_accepted_fixture_name_saves() {
             let names = save_names::load();
             assert_eq!(names.extension, ".jpg");
-            let s = ready_image("holiday.jpg");
             assert!(!names.accepted.is_empty());
             for stem in &names.accepted {
+                let s = ready_image("holiday.jpg");
                 assert_eq!(save(&s, stem), Ok(()), "{stem:?}");
                 let file = format!("{stem}.jpg");
                 assert_eq!(fs::read(s.dir.path().join(&file)).unwrap(), VERSION);
@@ -6797,6 +6884,84 @@ mod tests {
                 ]
             );
             assert!(!entries(s.dir.path()).contains(&OsString::from("vakantie-caf\u{e9}.jpg")));
+        }
+
+        // One name, two spellings: "vakantie-café" as one character, and as
+        // `e` plus a combining accent. APFS treats them as one name (and keeps
+        // the spelling the file was made with); ext4 and NTFS keep them apart.
+
+        const COMPOSED: &str = "vakantie-caf\u{e9}";
+        const DECOMPOSED: &str = "vakantie-cafe\u{301}";
+
+        /// Save `first`, then try `second` in the same folder. `first` is saved
+        /// with [`VERSION`] and then rewritten as `EDITED`, so a save that
+        /// replaced it could not go unseen: it would be [`VERSION`] again.
+        #[cfg(target_os = "macos")]
+        fn second_spelling_is_refused(first: &str, second: &str) {
+            const EDITED: &[u8] = b"the first save, edited afterwards";
+            let s = ready_image("holiday.jpg");
+            assert_eq!(save(&s, first), Ok(()));
+            assert_eq!(only_saved(&s.window)["name"], json!(format!("{first}.jpg")));
+            let path = s.dir.path().join(format!("{first}.jpg"));
+            fs::write(&path, EDITED).unwrap();
+            refused_save(&s, Some(&args(second, &s.key)), CommandError::NameTaken);
+            assert_eq!(fs::read(&path).unwrap(), EDITED);
+            // Only the first spelling's file is in the folder, once.
+            assert_eq!(
+                entries(s.dir.path()),
+                [
+                    OsString::from("holiday.jpg"),
+                    OsString::from(format!("{first}.jpg"))
+                ]
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn on_a_mac_the_other_spelling_of_an_existing_name_is_name_taken_and_the_file_is_untouched()
+        {
+            second_spelling_is_refused(COMPOSED, DECOMPOSED);
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn on_a_mac_the_composed_spelling_of_an_existing_decomposed_name_is_name_taken_and_the_file_is_untouched()
+         {
+            second_spelling_is_refused(DECOMPOSED, COMPOSED);
+        }
+
+        /// Save `first`, then `second`, in one folder, both `Ok`; the folder
+        /// then holds both, each under its own bytes.
+        #[cfg(not(target_os = "macos"))]
+        fn both_spellings_are_saved(first: &str, second: &str) {
+            let s = ready_image("holiday.jpg");
+            for stem in [first, second] {
+                assert_eq!(save(&s, stem), Ok(()), "{stem:?}");
+                assert_eq!(only_saved(&s.window)["name"], json!(format!("{stem}.jpg")));
+            }
+            let mut expected = vec![
+                OsString::from("holiday.jpg"),
+                OsString::from(format!("{first}.jpg")),
+                OsString::from(format!("{second}.jpg")),
+            ];
+            expected.sort();
+            assert_eq!(entries(s.dir.path()), expected);
+            for stem in [first, second] {
+                let saved = fs::read(s.dir.path().join(format!("{stem}.jpg"))).unwrap();
+                assert_eq!(saved, VERSION, "{stem:?}");
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        #[test]
+        fn off_a_mac_both_spellings_of_a_name_save_side_by_side_composed_first() {
+            both_spellings_are_saved(COMPOSED, DECOMPOSED);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        #[test]
+        fn off_a_mac_both_spellings_of_a_name_save_side_by_side_decomposed_first() {
+            both_spellings_are_saved(DECOMPOSED, COMPOSED);
         }
     }
 }

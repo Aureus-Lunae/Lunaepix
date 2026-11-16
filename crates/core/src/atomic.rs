@@ -273,6 +273,10 @@ fn output_permissions(permissions: fs::Permissions) -> fs::Permissions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // A reason names no part of the path below the temp folder and no
+    // temporary file: the reason a file failed reaches the window, which
+    // never receives a path.
+    use crate::no_path::assert_no_path;
     use std::ffi::OsString;
     use std::fs;
     use tempfile::TempDir;
@@ -770,19 +774,6 @@ mod tests {
             return None;
         }
         Some(folder)
-    }
-
-    /// `message` names no part of `path` and no temporary file: the reason a
-    /// file failed reaches the window, which never receives a path.
-    fn assert_no_path(message: &str, path: &Path) {
-        assert!(!message.contains("at path"), "{message}");
-        assert!(!message.contains(".tmp"), "{message}");
-        for part in path.components() {
-            if let std::path::Component::Normal(name) = part {
-                let name = name.to_string_lossy();
-                assert!(!message.contains(&*name), "{name:?} in {message:?}");
-            }
-        }
     }
 
     #[test]

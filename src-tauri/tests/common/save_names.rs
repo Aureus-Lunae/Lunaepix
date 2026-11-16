@@ -21,7 +21,9 @@ use serde_json::Value;
 pub struct SaveNames {
     /// The extension the stems are saved with (`".jpg"`).
     pub extension: String,
-    /// Stems that must be accepted.
+    /// Stems that must be accepted. A test that saves them gives each its own
+    /// folder: two of them can be one name on a Mac (`vakantie-café`, composed
+    /// and decomposed), whose file system refuses the second as taken.
     pub accepted: Vec<String>,
     /// `(NameProblem variant name, stems that must give that problem)`, by
     /// variant name in alphabetical order.

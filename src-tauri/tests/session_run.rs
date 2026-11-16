@@ -245,19 +245,13 @@ fn lock(folder: &Path) -> bool {
     true
 }
 
-/// `reason` names no part of `path` and no temporary file: the window never
-/// receives a path. Used on every platform: the probe test that is not
-/// Unix-only calls it too.
-fn assert_no_path(reason: &str, path: &Path) {
-    assert!(!reason.contains("at path"), "{reason:?}");
-    assert!(!reason.contains(".tmp"), "{reason:?}");
-    for part in path.components() {
-        if let std::path::Component::Normal(name) = part {
-            let name = name.to_string_lossy();
-            assert!(!reason.contains(&*name), "{name:?} in {reason:?}");
-        }
-    }
-}
+// `reason` names no part of `path` below the temp folder and no temporary
+// file: the window never receives a path. The check is the core's, shared
+// with its tests (and tested there). Used on every platform: the probe test
+// that is not Unix-only calls it too.
+#[path = "../../crates/core/tests/common/no_path.rs"]
+mod no_path;
+use no_path::assert_no_path;
 
 /// What the system calls a refused write: `EACCES` is 13 on Linux and macOS.
 #[cfg(unix)]
@@ -377,7 +371,7 @@ fn a_choice_loads_through_the_real_probe_worker_and_a_damaged_png_is_refused() {
 // --- Single image mode: the preview through the real worker -----------------
 
 use std::sync::Mutex;
-// Only `shell` and its tests (Unix) and `mod running` (Linux) use it, so on
+// Only `shell` and its tests and `mod running` (all Unix) use it, so on
 // Windows it would be an unused import.
 #[cfg(unix)]
 use std::time::Duration;
@@ -919,11 +913,90 @@ fn the_orientation_reader_finds_none_in_a_jpg_without_exif() {
     assert_eq!(exif_orientation(&with_exif(&plain, 8, true)), Some(8));
 }
 
-// A running preview, stopped or not (Linux: the worker's PID is checked in
-// /proc). The worker is the real one behind a gate: a shell that records its
-// PID, waits until the gate opens, then becomes the real worker.
+// --- Whether a process is gone -------------------------------------------------
 
-#[cfg(target_os = "linux")]
+/// Whether process `pid` is gone from the process table: killed and reaped,
+/// not even a zombie left. `kill(pid, 0)` sends nothing and only asks whether
+/// the pid exists, which a zombie still does. It works on every Unix; macOS
+/// has no `/proc` to look in.
+#[cfg(unix)]
+fn process_is_gone(pid: u32) -> bool {
+    let pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+    // SAFETY: signal 0 sends nothing; it only asks whether the pid exists.
+    let answer = unsafe { libc::kill(pid, 0) };
+    // `EPERM` would mean the process exists, so only `ESRCH` is "gone".
+    answer == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Block until child `pid` has exited, and leave it unreaped (a zombie).
+/// `waitid` with `WNOWAIT` does that on Linux and on macOS alike.
+#[cfg(unix)]
+fn wait_until_exited_without_reaping(pid: u32) {
+    // SAFETY: `info` is a zeroed `siginfo_t` that the call fills in.
+    let waited = unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    assert_eq!(waited, 0, "{}", std::io::Error::last_os_error());
+}
+
+#[cfg(unix)]
+fn sleeper() -> std::process::Child {
+    std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_reaped_child_is_gone() {
+    let mut child = sleeper();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(process_is_gone(child.id()));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_running_child_is_not_gone() {
+    let mut child = sleeper();
+    let gone = process_is_gone(child.id());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(!gone);
+}
+
+/// Pid 1 exists and is not ours: `kill(1, 0)` answers `EPERM` to a user and
+/// 0 to root. Either way the process is there, so it is not gone.
+#[cfg(unix)]
+#[test]
+fn pid_1_is_not_gone() {
+    assert!(!process_is_gone(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_killed_child_that_was_not_waited_for_is_not_gone() {
+    let mut child = sleeper();
+    child.kill().unwrap();
+    wait_until_exited_without_reaping(child.id());
+    let zombie_is_gone = process_is_gone(child.id());
+    child.wait().unwrap();
+    assert!(!zombie_is_gone, "a zombie is not reaped");
+    assert!(process_is_gone(child.id()), "now it is reaped");
+}
+
+// A running preview, stopped or not (the worker's PID is checked with
+// `process_is_gone`). The worker is the real one behind a gate: a shell that
+// records its PID, waits until the gate opens, then becomes the real worker.
+
+#[cfg(unix)]
 mod running {
     use std::time::Instant;
 
@@ -978,8 +1051,10 @@ mod running {
         }
     }
 
+    /// The process is still in the process table (a zombie counts, so
+    /// "not alive" means killed and reaped).
     fn alive(pid: &str) -> bool {
-        Path::new("/proc").join(pid).exists()
+        !process_is_gone(pid.parse().unwrap())
     }
 
     /// Start a lossy 40 preview of the current image through a gated worker

@@ -419,9 +419,10 @@ fn the_window_is_lunaepix_with_the_global_api_and_native_drag_and_drop() {
     assert!(window["minWidth"].as_u64().unwrap() >= 360);
 }
 
-/// The bundle formats we ship: deb and rpm for Linux, NSIS and MSI for
-/// Windows. Never `all` and never an AppImage, which would carry about 190
-/// LGPL/GPL system libraries without notices or a source offer.
+/// The bundle formats `tauri.conf.json` ships: deb and rpm for Linux, NSIS and
+/// MSI for Windows. The Mac has its own list in `tauri.macos.conf.json`, see
+/// [`MACOS_BUNDLE_TARGETS`]. Never `all` and never an AppImage, which would
+/// carry about 190 LGPL/GPL system libraries without notices or a source offer.
 const BUNDLE_TARGETS: &[&str] = &["deb", "rpm", "nsis", "msi"];
 
 /// What is wrong with `bundle.targets`: it must be a non-empty list, and
@@ -491,6 +492,252 @@ fn a_bundle_target_list_outside_the_four_is_caught_in_a_fixture() {
     ] {
         assert_eq!(bundle_target_problems(&with(ok)), Vec::<String>::new());
     }
+}
+
+/// The bundle formats the Mac build ships: the `.app` and the `.dmg` that
+/// holds it. Tauri merges `tauri.macos.conf.json` over `tauri.conf.json` on
+/// macOS only, so this list replaces [`BUNDLE_TARGETS`] there.
+const MACOS_BUNDLE_TARGETS: &[&str] = &["app", "dmg"];
+
+/// The keys one object may hold, as problems for any other key. `path` names
+/// the object in the messages.
+fn unexpected_keys(
+    object: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+    path: &str,
+) -> Vec<String> {
+    object
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .map(|key| format!("{path}: {key} is not allowed"))
+        .collect()
+}
+
+/// What is wrong with `tauri.macos.conf.json`. It may hold only `$schema` and
+/// `bundle`; `bundle` only `targets` and `macOS`; `bundle.macOS` only
+/// `signingIdentity` and `minimumSystemVersion`. The targets are exactly
+/// [`MACOS_BUNDLE_TARGETS`], each once. The identity is the string `-` (an
+/// ad-hoc signature: no certificate, no secret) and the minimum version the
+/// string `11.0`, the first macOS that runs Apple Silicon. Values are judged
+/// by JSON type: the number `11` and `null` are wrong values.
+fn macos_config_problems(config: &Value) -> Vec<String> {
+    let mut problems = Vec::new();
+    if let Some(top) = config.as_object() {
+        problems.extend(unexpected_keys(top, &["$schema", "bundle"], "top level"));
+    }
+    let Some(bundle) = config.get("bundle").and_then(Value::as_object) else {
+        problems.push("bundle: missing or not an object".to_owned());
+        return problems;
+    };
+    problems.extend(unexpected_keys(bundle, &["targets", "macOS"], "bundle"));
+
+    match bundle.get("targets") {
+        None => problems.push("bundle.targets: no list (Tauri then builds all)".to_owned()),
+        Some(targets) => match targets.as_array() {
+            None => problems.push(format!("bundle.targets: {targets} is not a list")),
+            Some(list) => {
+                for target in list {
+                    match target.as_str() {
+                        Some(name) if MACOS_BUNDLE_TARGETS.contains(&name) => {}
+                        Some(name) => problems.push(format!(
+                            "bundle.targets: {name} is not one of {MACOS_BUNDLE_TARGETS:?}"
+                        )),
+                        None => {
+                            problems.push(format!("bundle.targets: {target} is not a string"));
+                        }
+                    }
+                }
+                for wanted in MACOS_BUNDLE_TARGETS {
+                    let times = list.iter().filter(|t| t.as_str() == Some(wanted)).count();
+                    if times != 1 {
+                        problems.push(format!(
+                            "bundle.targets: {wanted} must be listed once, found {times} times"
+                        ));
+                    }
+                }
+            }
+        },
+    }
+
+    let Some(macos) = bundle.get("macOS").and_then(Value::as_object) else {
+        problems.push("bundle.macOS: missing or not an object".to_owned());
+        return problems;
+    };
+    problems.extend(unexpected_keys(
+        macos,
+        &["signingIdentity", "minimumSystemVersion"],
+        "bundle.macOS",
+    ));
+    for (key, wanted) in [("signingIdentity", "-"), ("minimumSystemVersion", "11.0")] {
+        if macos.get(key) != Some(&Value::String(wanted.to_owned())) {
+            problems.push(format!(
+                "bundle.macOS.{key}: must be the string {wanted:?}, found {}",
+                macos
+                    .get(key)
+                    .map_or("nothing".to_owned(), Value::to_string)
+            ));
+        }
+    }
+    problems
+}
+
+/// A Mac config that passes [`macos_config_problems`], for the fixtures below
+/// to change one thing in.
+fn good_macos_config() -> Value {
+    serde_json::json!({
+        "$schema": "https://schema.tauri.app/config/2",
+        "bundle": {
+            "targets": ["app", "dmg"],
+            "macOS": { "signingIdentity": "-", "minimumSystemVersion": "11.0" }
+        }
+    })
+}
+
+#[test]
+fn the_macos_config_targets_app_and_dmg_signs_ad_hoc_and_needs_macos_11() {
+    let config = read_json("tauri.macos.conf.json");
+    assert_eq!(macos_config_problems(&config), Vec::<String>::new());
+    assert_eq!(
+        config["bundle"]["targets"],
+        serde_json::json!(MACOS_BUNDLE_TARGETS)
+    );
+    assert_eq!(config["bundle"]["macOS"]["signingIdentity"], "-");
+    assert_eq!(config["bundle"]["macOS"]["minimumSystemVersion"], "11.0");
+}
+
+#[test]
+fn a_macos_config_with_other_targets_is_caught_in_a_fixture() {
+    let with = |targets: Option<Value>| {
+        let mut config = good_macos_config();
+        match targets {
+            Some(targets) => config["bundle"]["targets"] = targets,
+            None => {
+                config["bundle"].as_object_mut().unwrap().remove("targets");
+            }
+        }
+        config
+    };
+    for (fixture, needle) in [
+        (with(None), "no list"),
+        (with(Some(serde_json::json!("all"))), "not a list"),
+        (with(Some(serde_json::json!(["app"]))), "dmg"),
+        (with(Some(serde_json::json!(["dmg"]))), "app"),
+        (with(Some(serde_json::json!(["app", "dmg", "deb"]))), "deb"),
+        (with(Some(serde_json::json!(["dmg", 1]))), "not a string"),
+        (with(Some(serde_json::json!(["app", "app", "dmg"]))), "app"),
+        (with(Some(serde_json::json!([]))), "app"),
+    ] {
+        let problems = macos_config_problems(&fixture);
+        assert!(names(&problems, needle), "{fixture}: {problems:?}");
+    }
+    // Either order of the two is fine.
+    for ok in [
+        serde_json::json!(["app", "dmg"]),
+        serde_json::json!(["dmg", "app"]),
+    ] {
+        assert_eq!(macos_config_problems(&with(Some(ok))), Vec::<String>::new());
+    }
+}
+
+#[test]
+fn a_macos_config_without_an_ad_hoc_signature_is_caught_in_a_fixture() {
+    let with = |identity: Option<Value>| {
+        let mut config = good_macos_config();
+        let macos = config["bundle"]["macOS"].as_object_mut().unwrap();
+        match identity {
+            Some(identity) => macos.insert("signingIdentity".to_owned(), identity),
+            None => macos.remove("signingIdentity"),
+        };
+        config
+    };
+    for fixture in [
+        with(None),
+        with(Some(serde_json::json!(""))),
+        with(Some(serde_json::json!("Developer ID Application: X"))),
+        with(Some(Value::Null)),
+        with(Some(serde_json::json!(["-"]))),
+    ] {
+        let problems = macos_config_problems(&fixture);
+        assert!(
+            names(&problems, "signingIdentity"),
+            "{fixture}: {problems:?}"
+        );
+    }
+    assert_eq!(
+        macos_config_problems(&with(Some(serde_json::json!("-")))),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_macos_config_with_another_minimum_version_is_caught_in_a_fixture() {
+    let with = |version: Option<Value>| {
+        let mut config = good_macos_config();
+        let macos = config["bundle"]["macOS"].as_object_mut().unwrap();
+        match version {
+            Some(version) => macos.insert("minimumSystemVersion".to_owned(), version),
+            None => macos.remove("minimumSystemVersion"),
+        };
+        config
+    };
+    for fixture in [
+        with(None),
+        with(Some(serde_json::json!("10.13"))),
+        with(Some(serde_json::json!("11"))),
+        with(Some(serde_json::json!(11))),
+        with(Some(serde_json::json!(11.0))),
+    ] {
+        let problems = macos_config_problems(&fixture);
+        assert!(
+            names(&problems, "minimumSystemVersion"),
+            "{fixture}: {problems:?}"
+        );
+    }
+    assert_eq!(
+        macos_config_problems(&with(Some(serde_json::json!("11.0")))),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_macos_config_that_sets_anything_else_is_caught_in_a_fixture() {
+    let mut top = good_macos_config();
+    top["app"] = serde_json::json!({ "windows": [] });
+    let mut resources = good_macos_config();
+    resources["bundle"]["resources"] = serde_json::json!({ "a": "b" });
+    let mut entitlements = good_macos_config();
+    entitlements["bundle"]["macOS"]["entitlements"] = serde_json::json!("e.plist");
+    let mut provider = good_macos_config();
+    provider["bundle"]["macOS"]["providerShortName"] = serde_json::json!("X");
+    let mut bundle_not_object = good_macos_config();
+    bundle_not_object["bundle"] = serde_json::json!(["app", "dmg"]);
+    let mut macos_not_object = good_macos_config();
+    macos_not_object["bundle"]["macOS"] = serde_json::json!("-");
+    let mut no_macos = good_macos_config();
+    no_macos["bundle"].as_object_mut().unwrap().remove("macOS");
+    for (fixture, needle) in [
+        (top, "app"),
+        (resources, "resources"),
+        (entitlements, "entitlements"),
+        (provider, "providerShortName"),
+        (bundle_not_object, "bundle"),
+        (macos_not_object, "bundle.macOS"),
+        (no_macos, "bundle.macOS"),
+        (serde_json::json!({}), "bundle"),
+    ] {
+        let problems = macos_config_problems(&fixture);
+        assert!(names(&problems, needle), "{fixture}: {problems:?}");
+    }
+}
+
+#[test]
+fn a_macos_config_with_or_without_a_schema_passes_a_fixture() {
+    let with_schema = good_macos_config();
+    assert!(with_schema.get("$schema").is_some());
+    assert_eq!(macos_config_problems(&with_schema), Vec::<String>::new());
+    let mut without_schema = good_macos_config();
+    without_schema.as_object_mut().unwrap().remove("$schema");
+    assert_eq!(macos_config_problems(&without_schema), Vec::<String>::new());
 }
 
 // ---------------------------------------------------------------------
@@ -2794,6 +3041,222 @@ fn an_unknown_key_or_table_in_about_toml_is_refused() {
     assert_eq!(about_problems(known), Vec::<String>::new());
 }
 
+/// The platforms the licence page covers: Linux, Windows and Apple Silicon
+/// macOS. No Intel Mac and no mobile; a crate only another platform uses
+/// would be missing from the page, or an unwanted one listed on it.
+const ABOUT_TARGETS: &[&str] = &[
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+];
+
+/// What is wrong with the `targets` of an `about.toml`: a file that does not
+/// parse, no `targets`, one that is not an array, an entry that is not a
+/// string, a platform of [`ABOUT_TARGETS`] that is missing, a target that is
+/// not wanted, or one listed twice.
+fn about_target_problems(about_toml: &str) -> Vec<String> {
+    let table = match about_toml.parse::<toml::Table>() {
+        Ok(table) => table,
+        Err(error) => return vec![format!("about.toml does not parse: {error}")],
+    };
+    let Some(targets) = table.get("targets") else {
+        return vec!["targets: missing".to_owned()];
+    };
+    let Some(targets) = targets.as_array() else {
+        return vec!["targets: not an array".to_owned()];
+    };
+    let mut problems = Vec::new();
+    let mut listed: Vec<&str> = Vec::new();
+    for entry in targets {
+        match entry.as_str() {
+            Some(target) => listed.push(target),
+            None => problems.push(format!("targets: {entry} is not a string")),
+        }
+    }
+    for wanted in ABOUT_TARGETS {
+        if !listed.contains(wanted) {
+            problems.push(format!("targets: {wanted} is missing"));
+        }
+    }
+    for (index, target) in listed.iter().enumerate() {
+        if !ABOUT_TARGETS.contains(target) {
+            problems.push(format!("targets: {target} is not wanted"));
+        } else if listed[..index].contains(target) {
+            problems.push(format!("targets: {target} is listed twice"));
+        }
+    }
+    problems
+}
+
+#[test]
+fn the_real_about_toml_lists_the_linux_windows_and_mac_targets() {
+    assert_eq!(
+        about_target_problems(&repo_file("about.toml")),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn about_toml_targets_without_one_platform_or_with_another_are_caught_in_a_fixture() {
+    let with = |targets: &str| about_target_problems(&format!("targets = {targets}\n"));
+    // The right list, in any order, is not flagged (so each case below fails on its own).
+    let right = r#"["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]"#;
+    assert_eq!(with(right), Vec::<String>::new());
+    let reordered =
+        r#"["aarch64-apple-darwin", "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]"#;
+    assert_eq!(with(reordered), Vec::<String>::new());
+    // Mac missing: the state of the file before the Mac build.
+    assert_eq!(
+        with(r#"["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]"#),
+        vec!["targets: aarch64-apple-darwin is missing".to_owned()]
+    );
+    // Linux missing.
+    assert_eq!(
+        with(r#"["x86_64-pc-windows-msvc", "aarch64-apple-darwin"]"#),
+        vec!["targets: x86_64-unknown-linux-gnu is missing".to_owned()]
+    );
+    // An Intel Mac next to the right three is not wanted.
+    assert_eq!(
+        with(
+            r#"["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin", "x86_64-apple-darwin"]"#
+        ),
+        vec!["targets: x86_64-apple-darwin is not wanted".to_owned()]
+    );
+    // The Intel Mac instead of the Apple Silicon one: one missing, one unwanted.
+    let intel =
+        with(r#"["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-apple-darwin"]"#);
+    assert!(
+        names(&intel, "aarch64-apple-darwin is missing"),
+        "{intel:?}"
+    );
+    assert!(
+        names(&intel, "x86_64-apple-darwin is not wanted"),
+        "{intel:?}"
+    );
+    // One platform listed twice.
+    let twice = with(
+        r#"["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin", "aarch64-apple-darwin"]"#,
+    );
+    assert_eq!(
+        twice,
+        vec!["targets: aarch64-apple-darwin is listed twice".to_owned()]
+    );
+    // A string where a list belongs: cargo-about would not read it as one.
+    assert_eq!(
+        with(r#""aarch64-apple-darwin""#),
+        vec!["targets: not an array".to_owned()]
+    );
+    // An entry that is not a string.
+    let not_string = with(
+        r#"["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin", 7]"#,
+    );
+    assert_eq!(not_string, vec!["targets: 7 is not a string".to_owned()]);
+    // No targets at all, and a file that does not parse.
+    assert_eq!(
+        about_target_problems("accepted = [\"MIT\"]\n"),
+        vec!["targets: missing".to_owned()]
+    );
+    assert!(names(
+        &about_target_problems("targets = ["),
+        "does not parse"
+    ));
+}
+
+/// The names of the crates the licence page lists as users of a licence: the
+/// first word of the text of every `<li>` (`libwebp-sys 0.14.4 (<a ...>...)`).
+/// Text in a comment, a script or a style is not on the page, and an `<li>`
+/// of the licence index (`MIT License (N)`, N the number of crates that use
+/// it) gives a word that is no crate.
+fn listed_crates(html: &str) -> Vec<String> {
+    let mut depth = 0usize;
+    let mut inside_li = false;
+    let mut current = String::new();
+    let mut crates = Vec::new();
+    for piece in pieces(html) {
+        match piece {
+            Piece::Start(tag) if ["script", "style"].contains(&tag.name.as_str()) => depth += 1,
+            Piece::End(name) if ["script", "style"].contains(&name.as_str()) => {
+                depth = depth.saturating_sub(1);
+            }
+            Piece::Start(tag) if tag.name == "li" && depth == 0 => {
+                inside_li = true;
+                current.clear();
+            }
+            Piece::End(name) if name == "li" && inside_li => {
+                inside_li = false;
+                if let Some(word) = current.split_whitespace().next() {
+                    crates.push(word.to_owned());
+                }
+            }
+            Piece::Text(chunk) if inside_li && depth == 0 => current.push_str(&chunk),
+            _ => {}
+        }
+    }
+    crates
+}
+
+/// A crate that only the Mac build ships (the `objc2` family: Objective-C
+/// bindings that tao, wry and rfd use on macOS). `cargo tree --target
+/// aarch64-apple-darwin -i objc2 -e normal` shows it under tauri; the same
+/// command for the Linux and Windows targets finds nothing.
+const MAC_ONLY_CRATE: &str = "objc2";
+
+/// What is missing from the licence page for the Mac build.
+fn mac_licence_page_problems(html: &str) -> Vec<String> {
+    if listed_crates(html)
+        .iter()
+        .any(|name| name == MAC_ONLY_CRATE)
+    {
+        Vec::new()
+    } else {
+        vec![format!("the page does not list {MAC_ONLY_CRATE}")]
+    }
+}
+
+#[test]
+fn the_licence_page_names_a_crate_only_the_mac_build_uses() {
+    assert_eq!(
+        mac_licence_page_problems(&repo_file(LICENCE_FILE)),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_licence_page_without_a_crate_only_the_mac_build_uses_is_caught_in_a_fixture() {
+    let page = |items: &str| format!("<main><ul>{items}</ul></main>");
+    let objc2 = "<li>objc2 0.6.5 (<a href=\"https://github.com/madsmtm/objc2\">repo</a>)</li>";
+    // The page with the crate is right (so each case below fails on its own).
+    assert_eq!(
+        mac_licence_page_problems(&page(&format!("<li>libwebp-sys 0.14.4</li>{objc2}"))),
+        Vec::<String>::new()
+    );
+    let missing = vec![format!("the page does not list {MAC_ONLY_CRATE}")];
+    // The Linux and Windows crates alone: the page before the Mac build.
+    assert_eq!(
+        mac_licence_page_problems(&page("<li>libwebp-sys 0.14.4</li><li>quantizr 1.4.3</li>")),
+        missing
+    );
+    // A neighbour of the family is not the crate itself.
+    assert_eq!(
+        mac_licence_page_problems(&page("<li>objc2-app-kit 0.3.2</li><li>xobjc2 1.0.0</li>")),
+        missing
+    );
+    // The name in a comment, a script, a style or outside a list item is not listed.
+    assert_eq!(
+        mac_licence_page_problems(&page(&format!("<!-- {objc2} -->"))),
+        missing
+    );
+    assert_eq!(
+        mac_licence_page_problems(&page(&format!("<script>'{objc2}'</script>"))),
+        missing
+    );
+    assert_eq!(
+        mac_licence_page_problems(&page(&format!("<style>/* {objc2} */</style>"))),
+        missing
+    );
+    assert_eq!(mac_licence_page_problems("<p>objc2 0.6.5</p>"), missing);
+}
+
 #[test]
 fn the_installer_bundles_the_licence_file_at_its_own_name_and_the_file_exists() {
     let config = read_json("tauri.conf.json");
@@ -3265,7 +3728,8 @@ fn main_config_problems(config: &Value) -> Vec<String> {
 }
 
 /// The platform configs Tauri merges into every build on that platform
-/// (`tauri.<platform>.conf.json`, `.json5`, `Tauri.<platform>.toml`).
+/// (`tauri.<platform>.conf.json`, `.json5`, `Tauri.<platform>.toml`). Only
+/// `tauri.macos.conf.json` is allowed to exist.
 fn platform_configs(dir: &Path) -> Vec<String> {
     let platforms = ["linux", "windows", "macos", "android", "ios"];
     let names = platforms.iter().flat_map(|platform| {
@@ -3328,11 +3792,13 @@ fn a_bundle_config_without_the_sidecar_or_its_build_is_caught_in_a_fixture() {
 }
 
 #[test]
-fn the_main_config_has_no_external_bin_and_there_are_no_platform_configs() {
+fn the_main_config_has_no_external_bin_and_the_only_platform_config_is_the_macos_one() {
     let config = read_json("tauri.conf.json");
     assert_eq!(main_config_problems(&config), Vec::<String>::new());
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    assert_eq!(platform_configs(dir), Vec::<String>::new());
+    // The Mac's own bundle settings; `macos_config_problems` guards what it
+    // may hold (no `externalBin`, so `cargo test` on a Mac needs no sidecar).
+    assert_eq!(platform_configs(dir), ["tauri.macos.conf.json"]);
 }
 
 #[test]
