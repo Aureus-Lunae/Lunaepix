@@ -938,8 +938,10 @@ fn a_tauri_version_only_in_a_ruby_comment_is_caught_in_a_fixture() {
         "\"--version\", \"2.12.4\", ",
         "# \"--version\", \"2.12.4\"\n           ",
     );
-    // The line before ends in a comma only inside the comment, so the call is
-    // cut there: the install has no version in code.
+    // The fixture's first line is `... "--locked", # "--version", "2.12.4"`:
+    // its code part ends in a comma, so the next line (`"--root", tauri`) is
+    // joined to it, and the version, being only in the comment, is not read:
+    // the install has no version in code.
     let problems = tauri_version_problems(&formula, GOOD_MACOS_YML, GOOD_WINDOWS_YML);
     assert_problem(
         &problems,
