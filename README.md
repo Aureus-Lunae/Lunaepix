@@ -280,10 +280,45 @@ one: choose "More info", then "Run anyway".
 
 ## Getting the Mac app
 
-The Mac app is built on GitHub Actions too; nothing here builds it locally.
+It is for Macs with Apple Silicon (M1 or later) and macOS 11 or later. There
+is no build for Intel Macs. There are two ways to get it: with Homebrew, which
+builds it on your Mac, or as a download built on GitHub Actions.
+
+### With Homebrew
+
+Homebrew installs both the app and the command line, `lunaepix`. Tap this
+repository once, then install:
+
+```
+brew tap aureus-lunae/lunaepix https://github.com/Aureus-Lunae/Lunaepix
+brew install aureus-lunae/lunaepix/lunaepix
+```
+
+The first install builds Lunaepix from source on your Mac. Homebrew installs
+Rust for the build, and the build takes about TODO-MINUTES minutes on an
+Apple Silicon Mac. It reaches users from the 0.1.5 release on.
+
+The app is installed in `/opt/homebrew/opt/lunaepix/Lunaepix.app`. To open it
+from the Applications folder, link it there once:
+
+```
+ln -sfn "/opt/homebrew/opt/lunaepix/Lunaepix.app" /Applications/Lunaepix.app
+```
+
+- If you installed Lunaepix from the download below, it is already in
+  Applications. Move it to the Bin first, or the link will not work.
+- The link keeps working after `brew upgrade`.
+- Spotlight and Launchpad do not list a linked app. Open Lunaepix from the
+  Applications folder.
+
+After a release, `brew upgrade lunaepix` brings the new version. The app is
+built on your own Mac, so it never asks for "Open Anyway".
+
+### Download
+
+The download is built on GitHub Actions; nothing here builds it locally.
 The workflow needs no NASM: on Apple Silicon mozjpeg assembles its SIMD code
-with the compiler that comes with the runner. It is for Macs with Apple
-Silicon (M1 or later) and macOS 11 or later. There is no build for Intel Macs.
+with the compiler that comes with the runner.
 
 1. In the repository on GitHub, open Actions, choose the "macOS build"
    workflow (`.github/workflows/macos.yml`) and press "Run workflow". Pushing
@@ -301,6 +336,11 @@ the first launch. To get past it, once:
 
 After that it opens normally. Since macOS Sequoia, Right-click › Open no longer
 gets past the block; use "Open Anyway" in System Settings.
+
+## Releasing
+
+The steps for a release, including the Homebrew formula's checksum, are in
+[docs/releasing.md](docs/releasing.md).
 
 ## Licence
 
