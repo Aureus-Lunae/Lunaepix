@@ -3,11 +3,14 @@
 //! and they build the installers people download, so the rules that keep them
 //! safe are checked in a test: every action pinned to a commit, read-only
 //! permissions, no secrets, no way to start one from a pull request, the test
-//! and build commands present, NASM installed before cargo runs, and the
-//! uploaded artifact named, filled and kept as agreed. The rules are the same
-//! for both; what differs per platform (the file, the runner, the cache and
-//! NASM policy, the artifact) is one `Platform` profile that every check
-//! reads. The Mac file has one rule more: a check step between the build and
+//! and build commands present, NASM installed before cargo runs on Windows
+//! and absent from the Mac file (Apple Silicon needs none), and the uploaded
+//! artifact named, filled and kept as agreed. The rules are the same for
+//! both; what differs per platform (the file, the runner, the cache, NASM and
+//! Rust-test policies, the artifact) is one `Platform` profile that every
+//! check reads. The Mac cache steps save only from `main`, and its Rust tests
+//! run after a failed lint; Windows has neither rule. The Mac file has one
+//! rule more: a check step between the build and
 //! the upload that verifies the app's signature and that the worker is sealed
 //! in, in `bundle/macos/` and inside the disk image. Each check has fixtures
 //! it must catch, so it is known to fail when it should.
@@ -15,8 +18,14 @@
 //! The workflow is parsed as YAML 1.2 (so the key `on` is a name, not
 //! boolean true) and every check reads the parsed tree, so quoting, spacing
 //! and flow or block style cannot hide anything. Only a `run:` string is
-//! scanned as text, and then all of it, shell comments included: a false hit
-//! from a comment is accepted, a missed release is not.
+//! scanned as text (and a `uses` for the word `nasm`), and then, for the
+//! checks that look for a command, all of it, shell comments included: a
+//! false hit from a comment is accepted, a missed release is not. The checks
+//! that decide whether a command is present read the script without its shell
+//! comments instead: they can lose text, which makes them fail, never pass.
+//! The Mac rule that no NASM is installed is the other way round (losing text
+//! could make it pass), so it drops only whole-line comments and a trailing
+//! `# nasm` is a false hit it accepts. It is a lint, not a proof.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -40,10 +49,13 @@ enum NasmInstall {
     /// `choco install nasm --version=<x.y.z>`, with NASM's folder added to
     /// `GITHUB_PATH` (Chocolatey does not put it on the path).
     ChocolateyPinned,
-    /// `brew install nasm`, then `nasm -v` in the same step: Homebrew cannot
-    /// pin an older version without a tap of its own, so the version it
-    /// installed is printed to the log instead.
-    Homebrew,
+    /// No NASM anywhere in the workflow. On Apple Silicon mozjpeg-sys
+    /// assembles its Arm SIMD code with clang (`gas_supported`, `build_gas`
+    /// in its `build.rs`); only x86 and x86_64 need NASM
+    /// (`nasm_needed_for_arch`). A step that installs NASM (`brew install
+    /// nasm`, `choco install nasm`, `apt-get install nasm`, an action such as
+    /// `setup-nasm`) or runs it (`nasm -v`) is refused.
+    NotNeeded,
 }
 
 /// What differs between the platforms' workflow files. Every check reads the
@@ -56,17 +68,30 @@ struct Platform {
     runner: &'static str,
     build_cache: BuildCache,
     nasm: NasmInstall,
+    /// The `save-if` every `Swatinem/rust-cache` step must carry, as the
+    /// expression text; `None`: no requirement.
+    cache_save_if: Option<&'static str>,
+    /// Whether the step that runs `cargo test` must carry
+    /// `if: success() || failure()`, so it still runs after a failed
+    /// formatting or lint step and one run reports every failure.
+    rust_tests_after_failure: bool,
     /// The `name` of the uploaded artifact.
     artifact: &'static str,
     /// The `path` lines of the upload, in any order.
     artifact_paths: &'static [&'static str],
 }
 
+/// The only `save-if` the Mac cache steps may have: rc tags cannot restore
+/// each other's cache, only `main`'s, so only `main` saves one.
+const SAVE_ONLY_FROM_MAIN: &str = "${{ github.ref == 'refs/heads/main' }}";
+
 const WINDOWS: Platform = Platform {
     file: "windows.yml",
     runner: "windows-latest",
     build_cache: BuildCache::Forbidden,
     nasm: NasmInstall::ChocolateyPinned,
+    cache_save_if: None,
+    rust_tests_after_failure: false,
     artifact: "lunaepix-windows-installer",
     artifact_paths: &[
         "target/release/bundle/nsis/*.exe",
@@ -79,7 +104,9 @@ const MACOS: Platform = Platform {
     file: "macos.yml",
     runner: "macos-latest",
     build_cache: BuildCache::Required,
-    nasm: NasmInstall::Homebrew,
+    nasm: NasmInstall::NotNeeded,
+    cache_save_if: Some(SAVE_ONLY_FROM_MAIN),
+    rust_tests_after_failure: true,
     artifact: "lunaepix-macos-dmg",
     artifact_paths: &["target/release/bundle/dmg/*.dmg"],
 };
@@ -381,6 +408,23 @@ fn runs_cargo(code: &str) -> bool {
     code.split_whitespace().any(|word| word == "cargo")
 }
 
+/// Whether a script (comments already removed) runs `cargo test`: the words
+/// `cargo` and `test` next to each other, on any line.
+fn runs_cargo_test(code: &str) -> bool {
+    code.lines().any(|line| {
+        let words = line.split_whitespace().collect::<Vec<_>>();
+        words.windows(2).any(|pair| pair == ["cargo", "test"])
+    })
+}
+
+/// Whether a step is the `Swatinem/rust-cache` action, however its name is cased.
+fn is_rust_cache(step: &Yaml) -> bool {
+    uses_of(step).is_some_and(|uses| {
+        uses.to_ascii_lowercase()
+            .starts_with("swatinem/rust-cache@")
+    })
+}
+
 /// No script found at all, or a command in `required` that no script contains
 /// outside a shell comment.
 fn missing_commands(text: &str, required: &[&str]) -> Vec<String> {
@@ -483,12 +527,7 @@ fn structure_problems(text: &str, platform: &Platform) -> Vec<String> {
                 }
                 BuildCache::Required => {
                     let steps = steps_of(build);
-                    let cache = steps.iter().position(|step| {
-                        uses_of(step).is_some_and(|uses| {
-                            uses.to_ascii_lowercase()
-                                .starts_with("swatinem/rust-cache@")
-                        })
-                    });
+                    let cache = steps.iter().position(|step| is_rust_cache(step));
                     let cargo = steps.iter().position(|step| runs_cargo(&step_code(step)));
                     match (cache, cargo) {
                         (None, _) => problems
@@ -710,30 +749,70 @@ fn nasm_install_is_pinned(script: &str) -> bool {
         })
 }
 
-/// Whether a script runs `nasm -v` (the words next to each other, on any
-/// line, so `brew install nasm && nasm -v` counts).
-fn prints_nasm_version(script: &str) -> bool {
-    script.lines().any(|line| {
-        let words = line.split_whitespace().collect::<Vec<_>>();
-        words.windows(2).any(|pair| pair == ["nasm", "-v"])
+/// Whether a line of a script (whole-line comments removed) names NASM: a word
+/// `nasm` in any case, where a word is a run of letters and digits and
+/// underscores, so `brew install nasm`, `nasm -v`, `/opt/homebrew/bin/nasm`,
+/// `nasm@2` and `NASM` all name it, and `nasmfoo`, `unasm` and `nasm_x` do not.
+fn names_nasm(line: &str) -> bool {
+    line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|word| word.eq_ignore_ascii_case("nasm"))
+}
+
+/// A script without its whole-line shell comments. A trailing ` # ...` is
+/// kept: a ` #` inside quotes would otherwise hide what follows it, and for a
+/// rule that wants something absent, losing text is the unsafe direction.
+fn without_comment_lines(script: &str) -> String {
+    let code = script
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'));
+    code.collect::<Vec<_>>().join("\n")
+}
+
+/// `NasmInstall::NotNeeded`: no step of any job installs or runs NASM. This
+/// is a lint over the `run:` text without its whole-line shell comments (a
+/// line that names the word `nasm`: `brew install nasm`, `choco install nasm`,
+/// `apt-get install nasm`, `nasm -v`, a path ending in `/nasm`; a trailing
+/// `# nasm` is read as code, a false hit this rule accepts) and over the
+/// `uses:` of every step (an action whose name has `nasm` in it, such as
+/// `setup-nasm`). It proves no such spelling is there, not that no other
+/// route to NASM exists. One problem per step.
+fn nasm_absent_problems(text: &str) -> Vec<String> {
+    on_tree(text, |doc| {
+        let mut problems = Vec::new();
+        for (name, job) in jobs(doc) {
+            for step in steps_of(job) {
+                let uses = uses_of(step).filter(|uses| uses.to_ascii_lowercase().contains("nasm"));
+                if let Some(uses) = uses {
+                    problems.push(format!("job {name}: a step uses a nasm action: {uses}"));
+                    continue;
+                }
+                let code = scalar(&step["run"])
+                    .map_or_else(String::new, |script| without_comment_lines(&script));
+                if let Some(line) = code.lines().find(|line| names_nasm(line)) {
+                    problems.push(format!(
+                        "job {name}: a step installs or runs nasm: {}",
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        problems
     })
 }
 
-/// Every job with a cargo step installs NASM in an earlier step, the way the
-/// platform's `NasmInstall` says: mozjpeg's SIMD code is assembled with it
-/// when lunaepix-core builds. The install step is found outside shell comments,
-/// by `choco install nasm` for `ChocolateyPinned` and `brew install nasm` for
-/// `Homebrew`. For `ChocolateyPinned` that step also puts NASM's folder on the
-/// path through `GITHUB_PATH`, and it carries a `--version=` pin; for
-/// `Homebrew` it also runs `nasm -v`. A cargo step is any step whose script
-/// has the word `cargo` outside shell comments.
+/// `NasmInstall::ChocolateyPinned`: every job with a cargo step installs NASM
+/// in an earlier step, with `choco install nasm`: mozjpeg's x86 SIMD code is
+/// assembled with it when lunaepix-core builds. The install step is found
+/// outside shell comments. It also puts NASM's folder on the path through
+/// `GITHUB_PATH`, and it carries a `--version=` pin. A cargo step is any step
+/// whose script has the word `cargo` outside shell comments.
+/// `NasmInstall::NotNeeded` is `nasm_absent_problems`' rule.
 fn nasm_problems(text: &str, platform: &Platform) -> Vec<String> {
+    if matches!(platform.nasm, NasmInstall::NotNeeded) {
+        return nasm_absent_problems(text);
+    }
     on_tree(text, |doc| {
         let mut problems = Vec::new();
-        let install_command = match platform.nasm {
-            NasmInstall::ChocolateyPinned => "choco install nasm",
-            NasmInstall::Homebrew => "brew install nasm",
-        };
         for (name, job) in jobs(doc) {
             let code = steps_of(job).into_iter().map(step_code).collect::<Vec<_>>();
             let Some(cargo) = code.iter().position(|script| runs_cargo(script)) else {
@@ -741,34 +820,104 @@ fn nasm_problems(text: &str, platform: &Platform) -> Vec<String> {
             };
             let install = code
                 .iter()
-                .position(|script| script.contains(install_command));
+                .position(|script| script.contains("choco install nasm"));
             match install {
                 None => problems.push(format!("job {name}: does not install nasm")),
                 Some(at) if at > cargo => problems.push(format!(
                     "job {name}: installs nasm after its first cargo step"
                 )),
-                Some(at) => match platform.nasm {
-                    NasmInstall::ChocolateyPinned => {
-                        if !code[at].contains("GITHUB_PATH") {
-                            problems.push(format!(
-                                "job {name}: the nasm step does not add NASM to GITHUB_PATH"
-                            ));
-                        }
-                        if !nasm_install_is_pinned(&code[at]) {
-                            problems.push(format!(
-                                "job {name}: the nasm install is not pinned with --version="
-                            ));
-                        }
+                Some(at) => {
+                    if !code[at].contains("GITHUB_PATH") {
+                        problems.push(format!(
+                            "job {name}: the nasm step does not add NASM to GITHUB_PATH"
+                        ));
                     }
-                    NasmInstall::Homebrew => {
-                        if !prints_nasm_version(&code[at]) {
-                            problems
-                                .push(format!("job {name}: the nasm step does not print nasm -v"));
-                        }
+                    if !nasm_install_is_pinned(&code[at]) {
+                        problems.push(format!(
+                            "job {name}: the nasm install is not pinned with --version="
+                        ));
                     }
-                },
+                }
             }
         }
+        problems
+    })
+}
+
+/// When the platform has a `cache_save_if`: there is a `Swatinem/rust-cache`
+/// step, and every one (in any job) has `with.save-if` equal to it, compared
+/// as parsed text with the outer whitespace trimmed. `scalar` turns the parsed
+/// value into text, so quoting (`'...'`, `"..."`) and a block scalar (which
+/// ends in a newline) read the same. The inside of the expression is compared
+/// as written: another spacing of the same expression, another ref, a
+/// boolean, a list or a missing `with` are all refused, so a change to the
+/// condition is a change to this rule, never a silent one.
+fn cache_save_problems(text: &str, platform: &Platform) -> Vec<String> {
+    on_tree(text, |doc| {
+        // No requirement: the file is still parsed, so one that does not parse
+        // is reported by every check.
+        let Some(wanted) = platform.cache_save_if else {
+            return Vec::new();
+        };
+        let mut problems = Vec::new();
+        let mut caches = 0;
+        for step in all_steps(doc)
+            .into_iter()
+            .filter(|step| is_rust_cache(step))
+        {
+            caches += 1;
+            let save_if = &step["with"]["save-if"];
+            match scalar(save_if) {
+                Some(value) if value.trim() == wanted => {}
+                Some(value) => problems.push(format!(
+                    "a rust-cache step's save-if is {value:?}, not {wanted:?}"
+                )),
+                None if save_if.is_badvalue() => {
+                    problems.push("a rust-cache step has no save-if".to_owned());
+                }
+                None => problems.push(format!(
+                    "a rust-cache step's save-if is not a single value: {save_if:?}"
+                )),
+            }
+        }
+        problems.extend((caches == 0).then(|| "no rust-cache step to check".to_owned()));
+        problems
+    })
+}
+
+/// Whether a step has `if: success() || failure()`, exactly: the condition
+/// that lets it run after an earlier step failed, but not after a cancel.
+fn runs_after_failure(step: &Yaml) -> bool {
+    scalar(&step["if"]).as_deref() == Some(AFTER_FAILURE)
+}
+
+/// When the platform has `rust_tests_after_failure`: there is a step that runs
+/// `cargo test` (outside shell comments), and every such step has
+/// `if: success() || failure()`, so it still runs after a failed formatting or
+/// lint step and one run reports every failure (`node_step_problems` is the
+/// same rule for the window script tests).
+fn rust_test_problems(text: &str, platform: &Platform) -> Vec<String> {
+    on_tree(text, |doc| {
+        // No requirement: the file is still parsed, so one that does not parse
+        // is reported by every check.
+        if !platform.rust_tests_after_failure {
+            return Vec::new();
+        }
+        let steps = all_steps(doc)
+            .into_iter()
+            .filter(|step| runs_cargo_test(&step_code(step)))
+            .collect::<Vec<_>>();
+        let mut problems = steps
+            .iter()
+            .filter(|step| !runs_after_failure(step))
+            .map(|step| {
+                format!(
+                    "a cargo test step without `if: {AFTER_FAILURE}`: {:?}",
+                    step["if"]
+                )
+            })
+            .collect::<Vec<_>>();
+        problems.extend(steps.is_empty().then(|| "no cargo test step".to_owned()));
         problems
     })
 }
@@ -788,7 +937,7 @@ fn node_step_problems(text: &str) -> Vec<String> {
                 scalar(&step["run"])
                     .is_some_and(|run| without_comments(&run).contains("node --test"))
             })
-            .filter(|step| scalar(&step["if"]).as_deref() != Some(AFTER_FAILURE))
+            .filter(|step| !runs_after_failure(step))
             .map(|step| {
                 format!(
                     "a node test step without `if: {AFTER_FAILURE}`: {:?}",
@@ -949,12 +1098,17 @@ fn steps_doc(steps: &str) -> String {
 
 // ---- Mac fixtures ----
 
-/// The NASM install step, in both jobs of `good_mac()` before their cargo steps.
-const MAC_NASM_STEP: &str = "      - run: |\n          brew install nasm\n          nasm -v\n";
+/// The `with:` block of the test job's cache in `good_mac()`.
+const MAC_SAVE_IF: &str =
+    "        with:\n          save-if: ${{ github.ref == 'refs/heads/main' }}\n";
 
 /// The Installer job's own cache in `good_mac()`; the test job's carries
-/// another release comment, so this line is only in the Installer job.
-const MAC_BUILD_CACHE: &str = "      - uses: Swatinem/rust-cache@PIN # v2.9.3\n";
+/// another release comment, so the first line is only in the Installer job.
+const MAC_BUILD_CACHE: &str = "      - uses: Swatinem/rust-cache@PIN # v2.9.3\n        with:\n          save-if: ${{ github.ref == 'refs/heads/main' }}\n";
+
+/// The Rust tests step of `good_mac()`.
+const MAC_RUST_TESTS: &str =
+    "      - run: cargo test --workspace --no-fail-fast\n        if: success() || failure()\n";
 
 /// The Tauri command line install, the Installer job's first cargo step.
 const MAC_TAURI_INSTALL: &str = "      - run: cargo install tauri-cli --locked --version 2.12.4\n";
@@ -987,8 +1141,9 @@ const MAC_UPLOAD_STEP: &str = "      - uses: actions/upload-artifact@PIN # v7
           retention-days: 30
 ";
 
-/// A Mac workflow every check accepts under `MACOS`: a cache in both jobs,
-/// Homebrew's NASM, and the check step between the build and the upload.
+/// A Mac workflow every check accepts under `MACOS`: a cache in both jobs that
+/// saves only from `main`, no NASM, the Rust tests after a failed lint, and the
+/// check step between the build and the upload.
 fn good_mac() -> String {
     let base = "name: x
 on:
@@ -1012,18 +1167,18 @@ jobs:
         with:
           node-version: 22
       - uses: Swatinem/rust-cache@PIN # v2
-NASM      - run: cargo fmt --all --check
+SAVEIF      - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace --no-fail-fast
-      - run: node --test \"tests/ui/*.test.js\"
+RUSTTESTS      - run: node --test \"tests/ui/*.test.js\"
         if: success() || failure()
   build:
     needs: test
     runs-on: macos-latest
     steps:
-CACHENASMINSTALLBUILDCHECKUPLOAD";
-    base.replace("CACHE", MAC_BUILD_CACHE)
-        .replace("NASM", MAC_NASM_STEP)
+CACHEINSTALLBUILDCHECKUPLOAD";
+    base.replace("SAVEIF", MAC_SAVE_IF)
+        .replace("RUSTTESTS", MAC_RUST_TESTS)
+        .replace("CACHE", MAC_BUILD_CACHE)
         .replace("INSTALL", MAC_TAURI_INSTALL)
         .replace("BUILD", BUILD_STEP)
         .replace("CHECK", MAC_CHECK_STEP)
@@ -1037,15 +1192,6 @@ fn with_mac(from: &str, to: &str) -> String {
     let from = from.replace("PIN", PIN);
     assert!(good_mac().contains(&from), "the Mac fixture lacks {from:?}");
     good_mac().replacen(&from, &to.replace("PIN", PIN), 1)
-}
-
-/// `good_mac()` with its last `from` (the Installer job's copy of a step both
-/// jobs have) replaced by `to`.
-fn with_mac_last(from: &str, to: &str) -> String {
-    let at = good_mac().rfind(from).expect("the Mac fixture lacks it");
-    let mut text = good_mac();
-    text.replace_range(at..at + from.len(), to);
-    text
 }
 
 /// The problems the check named `check` reports when `every_check` runs on
@@ -1077,6 +1223,8 @@ fn every_check(text: &str, platform: &Platform) -> Vec<(&'static str, Vec<String
         ("bundle_build_problems", bundle_build_problems(text)),
         ("nasm_problems", nasm_problems(text, platform)),
         ("node_step_problems", node_step_problems(text)),
+        ("cache_save_problems", cache_save_problems(text, platform)),
+        ("rust_test_problems", rust_test_problems(text, platform)),
     ];
     if platform.file == MACOS.file {
         checks.push(("mac_check_step_problems", mac_check_step_problems(text)));
@@ -1892,8 +2040,8 @@ fn a_workflow_without_an_upload_is_reported_by_the_upload_check_in_a_fixture() {
 // ---- the platform profile ----
 
 /// A profile that differs from `WINDOWS` in its file, runner and artifact. Its
-/// cache and NASM policy are Windows's; those are crossed with `MACOS` in the
-/// Mac tests instead.
+/// cache, NASM, `save-if` and Rust-test policies are Windows's; those are
+/// crossed with `MACOS` in the Mac tests instead.
 const OTHER: Platform = Platform {
     file: "other.yml",
     runner: "other-runner",
@@ -2111,13 +2259,14 @@ fn the_mac_workflow_parses_and_passes_every_check() {
 
 #[test]
 fn the_checks_of_the_real_mac_file_are_not_vacuous() {
-    // Checkout, toolchain and cache in both jobs, node and upload; NASM in
-    // both jobs, fmt, clippy, test, node, the Tauri install, build and check;
-    // the bundle folder; and the check-step guard is among the checks.
+    // Checkout, toolchain and cache in both jobs, node and upload; fmt,
+    // clippy, test, node, the Tauri install, build and check; the bundle
+    // folder; and the check-step, cache and Rust-tests guards are among the
+    // checks, with a cache step and a cargo test step for them to read.
     let text = workflow(&MACOS);
     let (refs, scripts) = (action_references(&text).len(), run_scripts(&text).len());
     assert!(
-        refs >= 8 && scripts >= 9,
+        refs >= 8 && scripts >= 7,
         "{refs} action references, {scripts} run scripts"
     );
     assert!(text.contains("target/release/bundle/"));
@@ -2125,7 +2274,24 @@ fn the_checks_of_the_real_mac_file_are_not_vacuous() {
         .into_iter()
         .map(|(name, _)| name)
         .collect();
-    assert!(names.contains(&"mac_check_step_problems"), "{names:?}");
+    for name in [
+        "mac_check_step_problems",
+        "cache_save_problems",
+        "rust_test_problems",
+    ] {
+        assert!(names.contains(&name), "{names:?}");
+    }
+    let doc = parse(&text).unwrap_or_else(|e| panic!("{e}"));
+    let caches = all_steps(&doc)
+        .into_iter()
+        .filter(|step| is_rust_cache(step))
+        .count();
+    assert_eq!(caches, 2, "a rust-cache step in each job");
+    let tests = all_steps(&doc)
+        .into_iter()
+        .filter(|step| runs_cargo_test(&step_code(step)))
+        .count();
+    assert_eq!(tests, 1, "one cargo test step");
 }
 
 // ---- the Mac workflow: fixtures ----
@@ -2140,7 +2306,7 @@ fn a_well_formed_mac_workflow_passes_every_check_in_a_fixture() {
 #[test]
 #[should_panic(expected = "the Mac fixture lacks")]
 fn a_mac_fixture_change_that_finds_nothing_fails() {
-    with_mac("choco install nasm", "");
+    with_mac("brew install nasm", "");
 }
 
 #[test]
@@ -2165,14 +2331,15 @@ fn the_check_step_guard_runs_in_every_check_for_the_mac_only_in_a_fixture() {
 #[rustfmt::skip]
 fn the_shared_guards_catch_their_problem_in_the_mac_fixture() {
     let fmt = "      - run: cargo fmt --all --check\n";
+    let node = "      - run: node --test \"tests/ui/*.test.js\"\n        if: success() || failure()\n";
     let cases = [
         (with_mac("contents: read", "contents: write"), "permission_problems", "write permission"),
         (with_mac("  workflow_dispatch:\n", "  workflow_dispatch:\n  pull_request:\n"), "trigger_problems", "triggers are"),
         (with_mac("actions/checkout@PIN # v7.0.1", "actions/checkout@v7"), "unpinned_actions", "not pinned"),
         (with_mac(fmt, &format!("{fmt}        env:\n          T: ${{{{ secrets.X }}}}\n")), "secret_references", "${{ secrets.X }}"),
-        (with_mac("          nasm -v\n", "          nasm -v\n          echo \"${{ github.ref_name }}\"\n"), "injection_problems", "expression in a run script"),
+        (with_mac(fmt, &format!("{fmt}      - run: echo \"${{{{ github.ref_name }}}}\"\n")), "injection_problems", "expression in a run script"),
         (with_mac("cargo test --workspace --no-fail-fast", "cargo test --workspace"), "missing_commands", "missing: cargo test --workspace --no-fail-fast"),
-        (with_mac("        if: success() || failure()\n", ""), "node_step_problems", "a node test step without"),
+        (with_mac(node, "      - run: node --test \"tests/ui/*.test.js\"\n"), "node_step_problems", "a node test step without"),
         (with_mac(BUILD_STEP, "      - run: cargo tauri build\n"), "bundle_build_problems", "a bundle build without"),
         (format!("{}      - run: gh release create v1\n", good_mac()), "structure_problems", "release step"),
         (with_mac("if-no-files-found: error", "if-no-files-found: warn"), "upload_problems", "if-no-files-found is warn"),
@@ -2212,8 +2379,8 @@ fn a_mac_build_job_without_its_cache_or_with_it_after_cargo_is_caught_in_a_fixtu
     assert_eq!(structure_problems(&other, &MACOS), missing);
     // After the first cargo step (the Tauri install), so that install is never cached.
     let late = with_mac(
-        &format!("{MAC_BUILD_CACHE}{MAC_NASM_STEP}{MAC_TAURI_INSTALL}"),
-        &format!("{MAC_NASM_STEP}{MAC_TAURI_INSTALL}{MAC_BUILD_CACHE}"),
+        &format!("{MAC_BUILD_CACHE}{MAC_TAURI_INSTALL}"),
+        &format!("{MAC_TAURI_INSTALL}{MAC_BUILD_CACHE}"),
     );
     assert_eq!(structure_problems(&late, &MACOS), ["the build job restores its cache after its first cargo step"]);
     // The policy comes from the profile: the Windows shape (no Installer cache)
@@ -2226,12 +2393,24 @@ fn a_mac_build_job_without_its_cache_or_with_it_after_cargo_is_caught_in_a_fixtu
     assert_problem(&forbidden, "the build job restores a cache: Swatinem/rust-cache@", "Mac shape");
 }
 
+// ---- the Mac workflow: no NASM ----
+
+/// `good_mac()` with `step` (six-space indent, newline-ended) added as the
+/// first step before the test job's first cargo step.
+fn mac_with_step_in_test_job(step: &str) -> String {
+    let fmt = "      - run: cargo fmt --all --check\n";
+    with_mac(fmt, &format!("{step}{fmt}"))
+}
+
+/// `good_mac()` with `step` added before the Installer job's Tauri install.
+fn mac_with_step_in_build_job(step: &str) -> String {
+    with_mac(MAC_TAURI_INSTALL, &format!("{step}{MAC_TAURI_INSTALL}"))
+}
+
 #[test]
-fn a_homebrew_nasm_before_cargo_with_its_version_printed_passes_a_fixture() {
+fn a_mac_workflow_without_nasm_passes_a_fixture() {
     assert_clean(nasm_problems(&good_mac(), &MACOS));
-    let one_line = "      - run: brew install nasm && nasm -v\n";
-    assert_clean(nasm_problems(&with_mac(MAC_NASM_STEP, one_line), &MACOS));
-    // A job without a cargo step needs no NASM.
+    // A job without a cargo step is read too, and passes without NASM.
     assert_clean(nasm_problems(
         &steps_doc("      - run: node --version"),
         &MACOS,
@@ -2240,37 +2419,298 @@ fn a_homebrew_nasm_before_cargo_with_its_version_printed_passes_a_fixture() {
 
 #[test]
 #[rustfmt::skip]
-fn a_mac_job_without_homebrew_nasm_or_with_it_late_or_unprinted_is_caught_in_a_fixture() {
-    let none = ["job test: does not install nasm"];
-    // Left out of the test job (the first one), or of the build job.
-    assert_eq!(nasm_problems(&with_mac(MAC_NASM_STEP, ""), &MACOS), none);
-    assert_eq!(nasm_problems(&with_mac_last(MAC_NASM_STEP, ""), &MACOS), ["job build: does not install nasm"]);
-    // Only in a shell comment, or Chocolatey's install instead.
-    let commented = "      - run: |\n          # brew install nasm\n          nasm -v\n";
-    assert_eq!(nasm_problems(&with_mac(MAC_NASM_STEP, commented), &MACOS), none);
-    assert_eq!(nasm_problems(&with_mac(MAC_NASM_STEP, NASM_STEP), &MACOS), none);
-    // After the first cargo step.
-    let late = with_mac(MAC_NASM_STEP, "").replacen("      - run: cargo clippy", &format!("{MAC_NASM_STEP}      - run: cargo clippy"), 1);
-    assert_eq!(nasm_problems(&late, &MACOS), ["job test: installs nasm after its first cargo step"]);
-    // Installed, but the version never reaches the log from the install step.
+fn nasm_only_in_a_comment_a_step_name_or_another_word_passes_a_mac_fixture() {
     for step in [
-        "      - run: brew install nasm\n",
-        "      - run: |\n          brew install nasm\n          # nasm -v\n",
-        "      - run: |\n          brew install nasm # nasm -v\n",
-        "      - run: brew install nasm\n      - run: nasm -v\n",
+        "      - run: |\n          # brew install nasm\n          echo done\n",
+        // In a plain value YAML itself ends the text at ` #`.
+        "      - run: echo done # nasm -v\n",
+        "      - name: brew install nasm\n        run: echo done\n",
+        "      - name: nasm -v\n        run: echo done\n",
+        "      - run: echo nasmfoo unasm nasm_x\n",
+        "      - uses: actions/setup-node@PIN # nasm is not needed\n",
     ] {
-        assert_eq!(nasm_problems(&with_mac(MAC_NASM_STEP, step), &MACOS), ["job test: the nasm step does not print nasm -v"], "{step}");
+        assert_clean(nasm_problems(&mac_with_step_in_test_job(step), &MACOS));
+    }
+}
+
+// Each spelling of a NASM install or run, once, in the test job. The rule is a
+// lint over the `run:` text and the `uses:` name, so these are the spellings it
+// is known to catch.
+#[test]
+#[rustfmt::skip]
+fn a_mac_step_that_installs_or_runs_nasm_is_caught_in_a_fixture() {
+    let steps = [
+        "      - run: brew install nasm\n",
+        "      - run: |\n          brew install nasm\n          nasm -v\n",
+        "      - run: brew install nasm && nasm -v\n",
+        "      - run: brew install --formula nasm\n",
+        "      - run: brew install nasm@2\n",
+        "      - run: choco install nasm --version=2.16.3 --no-progress -y\n",
+        "      - run: sudo apt-get install -y nasm\n",
+        "      - run: sudo apt install nasm\n",
+        "      - run: nasm -v\n",
+        "      - run: 'nasm -v'\n",
+        "      - run: /opt/homebrew/bin/nasm -v\n",
+        "      - run: echo \"$(brew --prefix)/bin/nasm\" >> \"$GITHUB_PATH\"\n",
+        "      - run: NASM -v\n",
+        // A trailing comment is read as code: a false hit the rule accepts.
+        "      - run: |\n          echo done # nasm -v\n",
+        // A ` #` inside quotes must not hide what follows it.
+        "      - run: 'echo \"a #b\"; brew install nasm'\n",
+    ];
+    for step in steps {
+        let problems = nasm_problems(&mac_with_step_in_test_job(step), &MACOS);
+        assert_eq!(problems.len(), 1, "{step}: {problems:?}");
+        assert_problem(&problems, "job test: a step installs or runs nasm", step);
     }
 }
 
 #[test]
+#[rustfmt::skip]
+fn a_mac_step_that_uses_a_nasm_action_is_caught_in_a_fixture() {
+    for step in [
+        "      - uses: ilammy/setup-nasm@PIN # v1.5.2\n",
+        "      - uses: Some/Install-NASM@v1\n",
+    ] {
+        let problems = nasm_problems(&mac_with_step_in_test_job(step), &MACOS);
+        assert_eq!(problems.len(), 1, "{step}: {problems:?}");
+        assert_problem(&problems, "job test: a step uses a nasm action", step);
+    }
+}
+
+#[test]
+fn nasm_in_the_installer_job_or_in_a_job_without_cargo_is_caught_in_a_fixture() {
+    let in_build = nasm_problems(
+        &mac_with_step_in_build_job("      - run: brew install nasm\n"),
+        &MACOS,
+    );
+    assert_eq!(in_build.len(), 1, "{in_build:?}");
+    assert_problem(
+        &in_build,
+        "job build: a step installs or runs nasm",
+        "build job",
+    );
+    // A third job that never runs cargo is read like the others.
+    let docs = format!(
+        "{}  docs:\n    runs-on: macos-latest\n    steps:\n      - run: nasm -v\n",
+        good_mac()
+    );
+    let problems = nasm_problems(&docs, &MACOS);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert_problem(
+        &problems,
+        "job docs: a step installs or runs nasm",
+        "job without cargo",
+    );
+}
+
+#[test]
 fn the_nasm_rule_comes_from_the_profile_in_a_fixture() {
-    let both = [
-        "job test: does not install nasm",
-        "job build: does not install nasm",
+    // The Windows file has Chocolatey's install: wrong for the Mac, in both jobs.
+    let windows_under_mac = nasm_problems(&good(), &MACOS);
+    assert_eq!(windows_under_mac.len(), 2, "{windows_under_mac:?}");
+    assert_problem(
+        &windows_under_mac,
+        "job test: a step installs or runs nasm",
+        "test",
+    );
+    assert_problem(
+        &windows_under_mac,
+        "job build: a step installs or runs nasm",
+        "build",
+    );
+    // The Mac file has no NASM: wrong for Windows, in both jobs.
+    assert_eq!(
+        nasm_problems(&good_mac(), &WINDOWS),
+        [
+            "job test: does not install nasm",
+            "job build: does not install nasm"
+        ]
+    );
+}
+
+// ---- the Mac workflow: the cache saves only from main ----
+
+/// The two `save-if` lines of `good_mac()` become `with:` blocks that carry
+/// `save_if` (the Installer job's block is replaced too).
+fn mac_with_save_if(save_if: &str) -> String {
+    let line = "          save-if: ${{ github.ref == 'refs/heads/main' }}\n";
+    good_mac().replace(line, &format!("          save-if: {save_if}\n"))
+}
+
+#[test]
+fn a_mac_cache_that_saves_only_from_main_passes_a_fixture() {
+    assert_clean(cache_save_problems(&good_mac(), &MACOS));
+    // The accepted spellings: the expression as parsed, outer whitespace
+    // trimmed. Quoting, a trailing space inside quotes, and a block scalar
+    // (which ends in a newline) are the same text.
+    let expression = "${{ github.ref == 'refs/heads/main' }}";
+    for spelling in [
+        expression.to_owned(),
+        "'${{ github.ref == ''refs/heads/main'' }}'".to_owned(),
+        format!("\"{expression}\""),
+        format!("\"{expression} \""),
+        format!("\" {expression}\""),
+        format!("|\n            {expression}"),
+        format!(">-\n            {expression}"),
+    ] {
+        let text = mac_with_save_if(&spelling);
+        assert_clean(cache_save_problems(&text, &MACOS));
+    }
+}
+
+#[test]
+#[rustfmt::skip]
+fn a_mac_cache_with_another_save_if_is_caught_in_a_fixture() {
+    // Refused spellings: another ref, a negation, a boolean, no expression
+    // wrapper, another expression with the same meaning, a different inner
+    // spacing (the rule compares the text, and fails closed), a list, null.
+    for save_if in [
+        "${{ github.ref == 'refs/heads/develop' }}",
+        "${{ github.ref != 'refs/heads/main' }}",
+        "${{ github.ref_name == 'main' }}",
+        "${{ github.ref == 'refs/heads/main' || true }}",
+        "${{github.ref == 'refs/heads/main'}}",
+        "${{ github.ref=='refs/heads/main' }}",
+        "github.ref == 'refs/heads/main'",
+        "true", "'true'", "false", "always", "''", "[a]", "null", "{a: b}",
+    ] {
+        let text = mac_with_save_if(save_if);
+        let problems = cache_save_problems(&text, &MACOS);
+        assert_eq!(problems.len(), 2, "save-if: {save_if}: {problems:?}");
+        assert_problem(&problems, "a rust-cache step's save-if", save_if);
+    }
+}
+
+#[test]
+fn a_mac_cache_without_save_if_is_caught_in_each_job_in_a_fixture() {
+    // Neither cache has a `with:` block of its own saying so.
+    let none = good_mac().replace(
+        "        with:\n          save-if: ${{ github.ref == 'refs/heads/main' }}\n",
+        "",
+    );
+    let problems = cache_save_problems(&none, &MACOS);
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    assert_problem(&problems, "a rust-cache step has no save-if", "no with");
+    // A `with:` block that sets something else.
+    let other = good_mac().replace("save-if:", "key:");
+    let problems = cache_save_problems(&other, &MACOS);
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    assert_problem(&problems, "a rust-cache step has no save-if", "other input");
+    // Only the test job's cache, or only the Installer job's.
+    let test_only = with_mac(
+        MAC_BUILD_CACHE,
+        "      - uses: Swatinem/rust-cache@PIN # v2.9.3\n",
+    );
+    assert_eq!(cache_save_problems(&test_only, &MACOS).len(), 1);
+    let build_only = with_mac(MAC_SAVE_IF, "");
+    assert_eq!(cache_save_problems(&build_only, &MACOS).len(), 1);
+}
+
+#[test]
+fn a_mac_workflow_without_any_rust_cache_step_is_caught_in_a_fixture() {
+    let problems = cache_save_problems(&steps_doc("      - run: cargo test"), &MACOS);
+    assert_eq!(problems, ["no rust-cache step to check"]);
+}
+
+#[test]
+fn the_save_if_rule_comes_from_the_profile_in_a_fixture() {
+    // Windows has no rule: its caches may carry any save-if, or none.
+    assert_clean(cache_save_problems(&good(), &WINDOWS));
+    let cache = format!("      - uses: Swatinem/rust-cache@{PIN} # v2\n");
+    let any = good().replace(
+        &cache,
+        &format!("{cache}        with:\n          save-if: true\n"),
+    );
+    assert_ne!(any, good(), "the fixture changed nothing");
+    assert_clean(cache_save_problems(&any, &WINDOWS));
+    // The same Windows file under the Mac profile is wrong.
+    assert_problem(
+        &cache_save_problems(&good(), &MACOS),
+        "a rust-cache step has no save-if",
+        "windows file",
+    );
+}
+
+// ---- the Mac workflow: the Rust tests run after a failed lint ----
+
+#[test]
+fn mac_rust_tests_that_run_after_a_failed_step_pass_a_fixture() {
+    assert_clean(rust_test_problems(&good_mac(), &MACOS));
+    let block = with_mac(
+        MAC_RUST_TESTS,
+        "      - name: x\n        if: success() || failure()\n        run: |\n          cargo test --workspace --no-fail-fast\n",
+    );
+    assert_clean(rust_test_problems(&block, &MACOS));
+}
+
+#[test]
+#[rustfmt::skip]
+fn mac_rust_tests_skipped_after_a_failed_step_are_caught_in_a_fixture() {
+    let test = "cargo test --workspace --no-fail-fast";
+    for step in [
+        // No condition: skipped once clippy failed.
+        format!("      - run: {test}\n"),
+        // Only after success.
+        format!("      - run: {test}\n        if: success()\n"),
+        // Runs after a cancel too.
+        format!("      - run: {test}\n        if: always()\n"),
+        // The condition only in a comment.
+        format!("      - run: {test}\n        # if: success() || failure()\n"),
+        // In a block with other commands.
+        format!("      - run: |\n          echo start\n          {test}\n"),
+    ] {
+        let text = with_mac(MAC_RUST_TESTS, &step);
+        let problems = rust_test_problems(&text, &MACOS);
+        assert_eq!(problems.len(), 1, "{step}: {problems:?}");
+        assert_problem(&problems, "a cargo test step without `if: success() || failure()`", &step);
+    }
+    // A second cargo test step is checked too.
+    let second = format!("{}      - run: cargo test -p x\n", good_mac());
+    assert_problem(&rust_test_problems(&second, &MACOS), "a cargo test step without", "second step");
+    // No cargo test step at all.
+    assert_eq!(rust_test_problems(&with_mac(MAC_RUST_TESTS, ""), &MACOS), ["no cargo test step"]);
+}
+
+#[test]
+fn the_rust_tests_rule_comes_from_the_profile_in_a_fixture() {
+    // Windows's test step has no condition, and the Windows file must not change.
+    assert!(good().contains("      - run: cargo test --workspace --no-fail-fast\n      - run:"));
+    assert_clean(rust_test_problems(&good(), &WINDOWS));
+    // The same file under the Mac profile is wrong.
+    assert_problem(
+        &rust_test_problems(&good(), &MACOS),
+        "a cargo test step without",
+        "windows file",
+    );
+}
+
+#[test]
+fn the_new_guards_are_checks_of_both_platforms_in_a_fixture() {
+    for platform in [&WINDOWS, &MACOS] {
+        let names: Vec<&str> = every_check(&good_mac(), platform)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for name in ["cache_save_problems", "rust_test_problems"] {
+            assert!(names.contains(&name), "{name} in {names:?}");
+        }
+    }
+}
+
+// The new Mac rules, each broken once in the Mac fixture and caught by its
+// check through `every_check(.., &MACOS)`.
+#[test]
+#[rustfmt::skip]
+fn the_new_mac_guards_catch_their_problem_in_the_mac_fixture() {
+    let cases = [
+        (mac_with_step_in_test_job("      - run: brew install nasm\n"), "nasm_problems", "job test: a step installs or runs nasm"),
+        (mac_with_save_if("true"), "cache_save_problems", "a rust-cache step's save-if"),
+        (with_mac(MAC_RUST_TESTS, "      - run: cargo test --workspace --no-fail-fast\n"), "rust_test_problems", "a cargo test step without"),
     ];
-    assert_eq!(nasm_problems(&good_mac(), &WINDOWS), both);
-    assert_eq!(nasm_problems(&good(), &MACOS), both);
+    for (text, check, start) in &cases {
+        assert_problem(&mac_check(text, check), start, check);
+    }
 }
 
 #[test]

@@ -255,7 +255,7 @@ node --test "tests/ui/*.test.js"                              # the window scrip
 ```
 
 The window script tests need Node 21 or later (one of them reads numbers
-with `JSON.parse`'s source text); the Windows check runs them on Node 22.
+with `JSON.parse`'s source text); the Windows and Mac checks run them on Node 22.
 
 The `--config` file adds the small worker program that optimises each file,
 makes each thumbnail and reads the header of each image Single image mode
@@ -280,9 +280,10 @@ one: choose "More info", then "Run anyway".
 
 ## Getting the Mac app
 
-The Mac app is built on GitHub Actions too; nothing here builds it locally. The
-workflow installs NASM itself. It is for Macs with Apple Silicon (M1 or later)
-and macOS 11 or later. There is no build for Intel Macs.
+The Mac app is built on GitHub Actions too; nothing here builds it locally.
+The workflow needs no NASM: on Apple Silicon mozjpeg assembles its SIMD code
+with the compiler that comes with the runner. It is for Macs with Apple
+Silicon (M1 or later) and macOS 11 or later. There is no build for Intel Macs.
 
 1. In the repository on GitHub, open Actions, choose the "macOS build"
    workflow (`.github/workflows/macos.yml`) and press "Run workflow". Pushing

@@ -66,7 +66,7 @@ These lines are copied verbatim from the spec's Handoff. The standing process ru
 
 - **Mac workflow:** `.github/workflows/macos.yml`, name "macOS build", triggers `workflow_dispatch` and `push` of tags `v*` only. `permissions: contents: read`, concurrency group `${{ github.workflow }}-${{ github.ref }}`, `defaults.run.shell: bash`, runner `macos-latest`.
 - **Actions:** the same pinned hashes and release comments as `windows.yml`: checkout `3d3c42e5…` (`persist-credentials: false`), rust-toolchain `b725eda5…`, rust-cache `d1527c8f…`, setup-node `949feb24…` (Node 22), upload-artifact `cf430e03…`.
-- **NASM on the Mac:** `brew install nasm`, then `nasm -v`, before the first cargo step of every job.
+- **NASM on the Mac:** none. No NASM on the Mac: mozjpeg assembles its Arm SIMD with clang; NASM is only for x86 (decided 2026-11-13, see Handoff).
 - **Installer:**
   - `cargo install tauri-cli --locked --version 2.12.4`, then `cargo tauri build --config src-tauri/tauri.bundle.conf.json`.
   - The Installer job has its own rust-cache.
