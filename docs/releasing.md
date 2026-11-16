@@ -40,20 +40,17 @@ lines.
 
    The tag starts the Windows and Mac workflows.
 
-3. Get the checksum of the tag's source archive. Either download it and
-   check the file:
+3. Download the tag's source archive and take its checksum:
 
    ```
    curl -fL -o vX.Y.Z.tar.gz https://github.com/Aureus-Lunae/Lunaepix/archive/refs/tags/vX.Y.Z.tar.gz
    shasum -a 256 vX.Y.Z.tar.gz
    ```
 
-   or check it as it comes in. The `-f` makes curl fail on a 404 (archive not
-   ready, mistyped tag) instead of hashing an error page:
-
-   ```
-   curl -fL https://github.com/Aureus-Lunae/Lunaepix/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
-   ```
+   The `-f` makes curl fail on a 404 (archive not ready, mistyped tag) and
+   write no file, so `shasum` then reports the file missing instead of
+   hashing an error page. Delete a `vX.Y.Z.tar.gz` left from an earlier
+   try first, or `shasum` hashes that one.
 
 4. Put the value into `Formula/lunaepix.rb`, on the `sha256` line (the 64
    hex digits, nothing else). Leave the `url` as it is.
