@@ -1,6 +1,7 @@
 # macOS build: checks the whole workspace on an Apple Silicon Mac, then builds
 # the app and its disk image and keeps the disk image as a downloadable
-# artifact of the run.
+# artifact of the run. Beside that build, the Formula job builds this commit
+# with the Homebrew formula and tests what it installed.
 #
 # Starts by hand (Actions tab, "Run workflow") or when a tag like v0.1.0 is
 # pushed. Nothing here makes a release or uses a credential: the app is only
@@ -15,7 +16,11 @@
 #     clang on Apple Silicon, and only x86 builds need NASM (unlike Windows);
 #   - the cache steps save only from main (see the comment at the first one);
 #   - the Rust tests run even after a failed formatting or lint step;
-#   - the app is checked (signature, worker sealed in) before it is uploaded.
+#   - the app is checked (signature, worker sealed in) before it is uploaded;
+#   - the Formula job needs the tests, has 60 minutes, uses no cache and
+#     installs nothing the formula does not declare, and runs brew audit and
+#     brew style on the committed formula, then git archive of HEAD,
+#     brew install --build-from-source of a copy, and brew test, in that order.
 
 name: macOS build
 
@@ -166,3 +171,98 @@ jobs:
           path: target/release/bundle/dmg/*.dmg
           if-no-files-found: error
           retention-days: 30
+
+  # Builds this commit with the Homebrew formula (Formula/lunaepix.rb), as
+  # `brew install` does on a user's Mac, and runs the formula's test on what
+  # it installed. The formula's url names the tag archive of the version: on
+  # an rc tag that archive does not exist, and its checksum is only filled in
+  # after the tag (docs/releasing.md). So the build goes through a copy of the
+  # formula that points at an archive of this commit. Homebrew installs only
+  # formulas that sit in a tap, so both live in a local tap of their own.
+  #
+  # No cache, and no step installs a toolchain or a package: a user's Mac has
+  # neither, so only what the formula declares (Rust, from Homebrew) is there
+  # when it builds, and a dependency it forgot fails here first.
+  formula:
+    name: Formula
+    needs: test
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      # Homebrew does not update itself before a command: the run then uses
+      # the Homebrew of the runner image, and starts sooner.
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_ANALYTICS: 1
+      # The two local taps: one holds the committed formula unchanged, the
+      # other the copy that builds this commit.
+      CHECK_TAP: lunaepix-ci/check
+      BUILD_TAP: lunaepix-ci/build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Checked unchanged, so the url and checksum lines people install from
+      # are what Homebrew's audit and style checks read. The audit runs
+      # offline (no --online), so the archive the url names need not exist
+      # yet.
+      - name: Check the committed formula
+        run: |
+          brew tap-new --no-git "$CHECK_TAP"
+          tap=$(brew --repository "$CHECK_TAP")
+          mkdir -p "$tap/Formula"
+          cp Formula/lunaepix.rb "$tap/Formula/lunaepix.rb"
+          brew audit --formula "$CHECK_TAP/lunaepix"
+          brew style "$CHECK_TAP/lunaepix"
+
+      # GitHub's tag archive is `git archive` of the tag: it holds only
+      # tracked files. So the formula builds `git archive` of this commit, not
+      # the working tree, and a build that needs an untracked file fails here.
+      # The archive keeps the file name of the formula's url
+      # (v<version>.tar.gz, read from the formula, not typed again), from
+      # which Homebrew reads the version, and GitHub's top folder
+      # (Lunaepix-<version>/). The copy of the formula differs only in its url
+      # and sha256 lines: each is replaced as a whole line, and the step fails
+      # unless each was replaced exactly once, so a reshaped formula cannot
+      # quietly build the published archive instead. The diff is printed for
+      # the log; it is not a check.
+      - name: Build this commit with the formula
+        run: |
+          urls=$(grep -c '^  url "' Formula/lunaepix.rb || true)
+          if [ "$urls" != 1 ]; then
+            echo "Formula/lunaepix.rb has $urls url lines, not 1."
+            exit 1
+          fi
+          url=$(sed -n 's/^  url "\(.*\)"$/\1/p' Formula/lunaepix.rb)
+          name=${url##*/}
+          case $name in
+            v*.tar.gz) ;;
+            *) echo "The formula's url does not end in v<version>.tar.gz: $url"; exit 1 ;;
+          esac
+          version=${name#v}
+          version=${version%.tar.gz}
+          archive="$RUNNER_TEMP/$name"
+          git archive --format=tar.gz --prefix="Lunaepix-$version/" -o "$archive" HEAD
+          sum=$(shasum -a 256 "$archive" | cut -d ' ' -f 1)
+          brew tap-new --no-git "$BUILD_TAP"
+          tap=$(brew --repository "$BUILD_TAP")
+          mkdir -p "$tap/Formula"
+          copy="$tap/Formula/lunaepix.rb"
+          sed -e "s|^  url \".*\"\$|  url \"file://$archive\"|" \
+            -e "s|^  sha256 \".*\"\$|  sha256 \"$sum\"|" \
+            Formula/lunaepix.rb > "$copy"
+          diff Formula/lunaepix.rb "$copy" || true
+          urls=$(grep -c "^  url \"file://$archive\"\$" "$copy" || true)
+          sums=$(grep -c "^  sha256 \"$sum\"\$" "$copy" || true)
+          if [ "$urls" != 1 ] || [ "$sums" != 1 ]; then
+            echo "The copy has $urls url lines and $sums sha256 lines of this archive, not 1 each."
+            exit 1
+          fi
+          brew install --build-from-source --verbose "$BUILD_TAP/lunaepix"
+
+      # The formula's own test, on the installed copy in Homebrew's folder:
+      # the command line compresses a PNG, the worker sits in the app, and
+      # the app's seal holds, so nothing Homebrew does after the install
+      # changed a file inside the app.
+      - name: Test the installed formula
+        run: brew test --verbose "$BUILD_TAP/lunaepix"
