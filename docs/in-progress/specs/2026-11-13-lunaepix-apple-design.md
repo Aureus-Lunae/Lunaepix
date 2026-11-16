@@ -69,15 +69,14 @@ This is a new file kept separate from `windows.yml` (my call). Its shape and com
 - **Settings shared with Windows:** `permissions: contents: read`, the same `concurrency` group pattern, `CARGO_TERM_COLOR: always` and `shell: bash`.
 - **Runner:** `macos-latest`, which is an Apple Silicon runner (my call, mirroring `windows-latest`).
 - **Actions:** the same as Windows, at the same pinned commit hashes with their release comments: checkout (`persist-credentials: false`), rust-toolchain, rust-cache (Test job only), setup-node (Node 22) and upload-artifact.
-- **NASM:** mozjpeg's SIMD code needs it. Every job that runs cargo installs it with `brew install nasm` before the first cargo step, then prints `nasm -v` to the log. Homebrew is already on GitHub's Mac runners. Homebrew cannot pin an older version without a tap of its own, so this NASM is not pinned, unlike the Chocolatey install on Windows (my call; see "Calls I made").
+- **NASM:** none. No NASM on the Mac: mozjpeg assembles its Arm SIMD with clang; NASM is only for x86 (decided 2026-11-13, see Handoff). The Windows build still installs it.
 - **Test job:** formatting (`cargo fmt --all --check`), lints (`cargo clippy --workspace --all-targets -- -D warnings`), then `cargo test --workspace --no-fail-fast`. After that come the window script tests (`node --test "tests/ui/*.test.js"`) with `if: success() || failure()`, the same as Windows.
 - **Installer job,** which `needs: test`:
-  - Install NASM.
   - Install `tauri-cli` at `--locked --version 2.12.4`.
   - Run `cargo tauri build --config src-tauri/tauri.bundle.conf.json`.
   - Then a check step (below). It fails the job if the app, the worker or the signature is wrong.
   - Then upload the `.dmg`: artifact name `lunaepix-macos-dmg`, path `target/release/bundle/dmg/*.dmg`, `if-no-files-found: error`, `retention-days: 30`.
-- **Build cache:** both jobs use `Swatinem/rust-cache`, at the same pinned hash as Windows. The Installer job's cache is its own (release profile), and it also keeps the installed `tauri-cli` in `~/.cargo/bin`, so later runs skip that install. This differs from Windows, which has no Installer cache. Here Mac minutes cost more than the cache upload does.
+- **Build cache:** both jobs use `Swatinem/rust-cache`, at the same pinned hash as Windows. The Installer job's cache is its own (release profile), and it also keeps the installed `tauri-cli` in `~/.cargo/bin`, so later runs skip that install. This differs from Windows, which has no Installer cache. Here Mac minutes cost more than the cache upload does. Both cache steps save only from `main` (`save-if: ${{ github.ref == 'refs/heads/main' }}`), because rc tags cannot restore each other's cache, only `main`'s (decided 2026-11-13, see Handoff). The "Rust tests" step also carries `if: success() || failure()`, so one rc run reports a failed formatting or lint step and the test failures together.
 - **Timeouts:** the same as Windows (45 and 60 minutes). The builder may raise them if a first run shows they are too short.
 
 ### Getting Mac runs while building
@@ -119,10 +118,10 @@ The worker is built for the host triple by `crates/xtask`, which refuses cross b
 - no pull-request trigger, and no `${{ }}` inside a run script;
 - the triggers are `workflow_dispatch` plus `v*` tags;
 - no release is made;
-- NASM is installed in every job that runs cargo, before the first cargo step;
+- NASM is installed in every job that runs cargo, before the first cargo step (Windows; on the Mac no step may install or run NASM);
 - `--no-fail-fast`, and the node step running after a failed Rust step.
 
-The NASM guard keeps its Windows rule (a pinned Chocolatey version). On the Mac it requires a `brew install nasm` step before cargo.
+The NASM guard keeps its Windows rule (a pinned Chocolatey version). On the Mac it refuses any step that installs or runs NASM. The Mac profile also requires every `rust-cache` step to have exactly the `save-if` above and the `cargo test` step to carry `if: success() || failure()`; Windows has neither rule.
 
 New guards for `macos.yml` only:
 
@@ -228,7 +227,7 @@ None of these was decided by the user. Check them while reading:
    - If an Intel user asks for a download, a second job can be added then.
 2. **A separate `macos.yml`** next to `windows.yml`, not one workflow with two platforms. Each file stays short, and a Mac failure does not mark the Windows run red.
 3. **`macos-latest`** as the runner, as Windows uses `windows-latest`.
-4. **NASM from Homebrew, unpinned**, with its version printed in the log. Pinning would need our own Homebrew tap or a source build of NASM. That is more moving parts for a build-time assembler whose output the tests check anyway.
+4. **No NASM on the Mac.** (Changed 2026-11-13 after the final review; the user chose "Drop it before the tag": see Handoff.) mozjpeg assembles its Arm SIMD with clang; NASM is only for x86.
 5. **`tauri.macos.conf.json`** for the Mac settings, guarded so it can only touch `bundle.targets` and `bundle.macOS`.
 6. **macOS 11 as the minimum.**
 7. **A check step after the build** that proves the worker is inside the app and that both are signed ad hoc. Without it, a missing worker or signature only shows up on the coworker's Mac.

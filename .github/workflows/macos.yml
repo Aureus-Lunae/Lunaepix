@@ -11,7 +11,10 @@
 #   - every action is pinned to a full commit hash, with its release in a comment;
 #   - the token can only read the repository;
 #   - no pull request trigger, and no ${{ }} expression inside a run script;
-#   - every job that runs cargo installs NASM first (mozjpeg's SIMD code);
+#   - no step installs or runs NASM: mozjpeg assembles its Arm SIMD code with
+#     clang on Apple Silicon, and only x86 builds need NASM (unlike Windows);
+#   - the cache steps save only from main (see the comment at the first one);
+#   - the Rust tests run even after a failed formatting or lint step;
 #   - the app is checked (signature, worker sealed in) before it is uploaded.
 
 name: macOS build
@@ -55,19 +58,16 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
+      # Saves its cache only from main: a tag run can restore the cache of the
+      # default branch but not the cache of another tag, so a cache saved by a
+      # tag run is never read and only costs upload time.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
-
-      # mozjpeg's SIMD code (lunaepix-core) is assembled with NASM when it
-      # builds. Homebrew cannot pin an older version without a tap of its own,
-      # so the version it installed is printed to the log instead.
-      - name: Install NASM
-        run: |
-          brew install nasm
-          nasm -v
 
       - name: Formatting
         run: cargo fmt --all --check
@@ -78,8 +78,10 @@ jobs:
       # Includes the hostile-input tests: a corrupt JPEG, a decompression
       # bomb, and a CSS crash that the worker process must survive.
       # --no-fail-fast: every test binary runs even after one fails, so one
-      # run reports every macOS failure.
+      # run reports every macOS failure. Runs even when the formatting or the
+      # lints failed, for the same reason.
       - name: Rust tests
+        if: success() || failure()
         run: cargo test --workspace --no-fail-fast
 
       # The glob is quoted so that node expands it, not the shell. Runs even
@@ -104,17 +106,14 @@ jobs:
 
       # A cache of its own, unlike Windows: Mac minutes cost more than the
       # cache upload does. rust-cache keys it by job, so it stays apart from
-      # the test job's debug-profile cache. It also keeps ~/.cargo/bin, so a
-      # later run that restores it finds the Tauri command line installed.
+      # the test job's debug-profile cache. It also keeps ~/.cargo/bin. Like
+      # the test job's cache it is saved only from main (a tag run cannot
+      # restore another tag's cache, only main's), so a tag run finds the Tauri
+      # command line installed only when a run from main saved it; otherwise
+      # the install below builds it from source.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-
-      # mozjpeg's SIMD code (lunaepix-core) is assembled with NASM when it
-      # builds. Homebrew cannot pin an older version without a tap of its own,
-      # so the version it installed is printed to the log instead.
-      - name: Install NASM
-        run: |
-          brew install nasm
-          nasm -v
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # The repository has no package.json, so the Tauri command line comes
       # from crates.io at a fixed version, built against the lock file of the

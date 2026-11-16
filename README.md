@@ -280,9 +280,10 @@ one: choose "More info", then "Run anyway".
 
 ## Getting the Mac app
 
-The Mac app is built on GitHub Actions too; nothing here builds it locally. The
-workflow installs NASM itself. It is for Macs with Apple Silicon (M1 or later)
-and macOS 11 or later. There is no build for Intel Macs.
+The Mac app is built on GitHub Actions too; nothing here builds it locally.
+The workflow needs no NASM: on Apple Silicon mozjpeg assembles its SIMD code
+with the compiler that comes with the runner. It is for Macs with Apple
+Silicon (M1 or later) and macOS 11 or later. There is no build for Intel Macs.
 
 1. In the repository on GitHub, open Actions, choose the "macOS build"
    workflow (`.github/workflows/macos.yml`) and press "Run workflow". Pushing
