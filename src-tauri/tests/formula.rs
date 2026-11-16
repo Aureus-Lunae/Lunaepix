@@ -652,7 +652,7 @@ jobs:
           cargo install tauri-cli --locked --version 2.12.4
 ";
 
-/// The formula as it is meant to be, except for the PNG's bytes. Every
+/// The formula as it is meant to be, without its `test do` block. Every
 /// formula fixture is this text with one change.
 const GOOD_FORMULA: &str = r##"class Lunaepix < Formula
   desc "Make PNG, JPG and WebP images smaller, lossless or lossy"

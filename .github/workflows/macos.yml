@@ -22,6 +22,8 @@
 #     formula does not declare, and runs brew audit and
 #     brew style on the committed formula, then git archive of HEAD,
 #     brew install --build-from-source of a copy, and brew test, in that order.
+#     It trusts the formula in each local tap (brew trust --formula) before
+#     Homebrew loads it, and prints the Homebrew version first.
 
 name: macOS build
 
@@ -180,6 +182,8 @@ jobs:
   # after the tag (docs/releasing.md). So the build goes through a copy of the
   # formula that points at an archive of this commit. Homebrew installs only
   # formulas that sit in a tap, so both live in a local tap of their own.
+  # Homebrew 6 refuses to load a formula from a tap it does not trust, so each
+  # copy is trusted by name before anything loads it (see the first step).
   #
   # No action but the checkout, so no cache, and no step installs a toolchain
   # or a package: a user's Mac has neither, so only what the formula declares
@@ -208,12 +212,22 @@ jobs:
       # are what Homebrew's audit and style checks read. The audit runs
       # offline (no --online), so the archive the url names need not exist
       # yet.
+      #
+      # Homebrew 6 refuses to load a formula from a tap it does not trust, and
+      # a tap made here is not trusted. `brew trust --formula` trusts this one
+      # formula and not the whole tap, which is what Homebrew recommends. A
+      # user needs no such line: installing by the full name
+      # (aureus-lunae/lunaepix/lunaepix) trusts that formula by itself. The
+      # version line is for the log, so a later failure shows which Homebrew
+      # ran; it is not a check.
       - name: Check the committed formula
         run: |
+          brew --version
           brew tap-new --no-git "$CHECK_TAP"
           tap=$(brew --repository "$CHECK_TAP")
           mkdir -p "$tap/Formula"
           cp Formula/lunaepix.rb "$tap/Formula/lunaepix.rb"
+          brew trust --formula "$CHECK_TAP/lunaepix"
           brew audit --formula "$CHECK_TAP/lunaepix"
           brew style "$CHECK_TAP/lunaepix"
 
@@ -227,7 +241,8 @@ jobs:
       # and sha256 lines: each is replaced as a whole line, and the step fails
       # unless each was replaced exactly once, so a reshaped formula cannot
       # quietly build the published archive instead. The diff is printed for
-      # the log; it is not a check.
+      # the log; it is not a check. The copy is trusted by name once it is
+      # written and checked, as the committed formula is in the step above.
       - name: Build this commit with the formula
         run: |
           urls=$(grep -c '^  url "' Formula/lunaepix.rb || true)
@@ -260,6 +275,7 @@ jobs:
             echo "The copy has $urls url lines and $sums sha256 lines of this archive, not 1 each."
             exit 1
           fi
+          brew trust --formula "$BUILD_TAP/lunaepix"
           brew install --build-from-source --verbose "$BUILD_TAP/lunaepix"
 
       # The formula's own test, on the installed copy in Homebrew's folder:
