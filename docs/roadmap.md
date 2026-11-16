@@ -9,7 +9,8 @@ plan (in `docs/pending-approval/` until approved) when it starts.
 | Image lossless compression | Done |
 | Lossy image compression | Done |
 | Preview single image compression before compressing (before/after slider) | Done |
-| Apple support: a brew formula, and a plain download with one awkward step | Not started |
+| Apple support: a plain download with one awkward step (Mac, Apple Silicon) | Done; hand test on a Mac later |
+| Apple support: a brew formula | Not started |
 | Choose how much it can get compressed (quality, like JPEG 70%) on lossy | Part of lossy compression |
 | Export rename (single file only) | Part of single image mode; done |
 | Re-add after a run, and thumbnails | Done |
@@ -54,23 +55,37 @@ difference; most useful together with the quality setting.
 
 ## Apple support
 
-Two routes, both free of the $99-a-year Apple developer fee:
+Two routes, both free of the $99-a-year Apple developer fee. They are two
+roadmap items: the plain download is done; the brew formula is its own item
+("Later, own roadmap item").
 
-- **Brew formula** that builds from source on the user's Mac. Programs built
-  locally are not quarantined, so Gatekeeper does not block them. Costs the
-  user a Rust toolchain and a long first build.
-- **Plain download** (`.dmg` from the GitHub release), unsigned. The one
-  awkward step: on first launch, System Settings › Privacy & Security ›
-  "Open Anyway" (right-click › Open no longer works since macOS Sequoia).
-  The README explains it.
-
-Known before starting:
+Known for both:
 
 - Homebrew's own cask repository no longer accepts unsigned apps (disabled
   since 2026-09-01) and dropped `--no-quarantine`, so a cask is not a route.
 - Apple Silicon needs an ad-hoc signature; the Rust/Tauri build adds one.
-- GitHub Actions has macOS runners, so the download can be built in CI next
-  to Linux and Windows. Hand testing needs a Mac.
+
+### Plain download (Mac, Apple Silicon) — Done
+
+An unsigned `.dmg` for Apple Silicon Macs, built on GitHub Actions
+(`.github/workflows/macos.yml`) next to the Windows build: the full tests on
+the Mac, then an ad-hoc signed app with the worker inside its seal, checked
+in the `.dmg` too. The one awkward step: on first launch, System Settings ›
+Privacy & Security › "Open Anyway" (right-click › Open no longer works since
+macOS Sequoia). The README explains it. No Intel Mac build.
+Built as version 0.1.4 (tag `v0.1.4-rc2`); for now the `.dmg` is a run
+artifact, until "Automated draft release" attaches it to a release.
+Marked complete when it built: "Testing on mac will happen later." A
+coworker checks it on an Apple Silicon Mac.
+Spec: `docs/finished/specs/2026-11-13-lunaepix-apple-design.md`.
+Plan: `docs/finished/plans/2026-11-13-lunaepix-apple.md`.
+
+### Brew formula — Not started
+
+A brew formula that builds from source on the user's Mac. Programs built
+locally are not quarantined, so Gatekeeper does not block them. Costs the
+user a Rust toolchain and a long first build. It waited for a public
+download link; the repository is public since 2026-11-16.
 
 ## Choose the quality on lossy
 
@@ -117,6 +132,5 @@ Known before starting:
   that.
 - Linux packages are built locally today. Either a Linux build job is added,
   or the `.deb` and `.rpm` are attached to the draft by hand.
-- The repository is private, so release files only download for people with
-  access. A public download (and the brew formula, which needs a public URL)
-  needs the repository made public or a separate public release repository.
+- The repository is public since 2026-11-16, so release files download for
+  anyone (and the brew formula has a public URL to build from).
