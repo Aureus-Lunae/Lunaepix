@@ -294,9 +294,14 @@ brew tap aureus-lunae/lunaepix https://github.com/Aureus-Lunae/Lunaepix
 brew install aureus-lunae/lunaepix/lunaepix
 ```
 
-The first install builds Lunaepix from source on your Mac. Homebrew installs
-Rust for the build, and the build takes about TODO-MINUTES minutes on an
-Apple Silicon Mac. It reaches users from the 0.1.5 release on.
+Every install, and every `brew upgrade lunaepix`, builds Lunaepix from source
+on your Mac, including the Tauri command line it needs. Only the first install
+also installs Rust. A build takes about TODO-MINUTES minutes on an Apple
+Silicon Mac. It reaches users from the 0.1.5 release on.
+
+Homebrew 6 asks you to trust a third-party tap. Installing by the full name
+`aureus-lunae/lunaepix/lunaepix`, as above, trusts only this formula, so no
+extra step is needed.
 
 The app is installed in `/opt/homebrew/opt/lunaepix/Lunaepix.app`. To open it
 from the Applications folder, link it there once:
@@ -311,8 +316,12 @@ ln -sfn "/opt/homebrew/opt/lunaepix/Lunaepix.app" /Applications/Lunaepix.app
 - Spotlight and Launchpad do not list a linked app. Open Lunaepix from the
   Applications folder.
 
-After a release, `brew upgrade lunaepix` brings the new version. The app is
-built on your own Mac, so it never asks for "Open Anyway".
+After a release, `brew upgrade lunaepix` brings the new version, built from
+source again. The app is built on your own Mac, so it never asks for "Open
+Anyway".
+
+To remove it, run `brew uninstall lunaepix`, then delete the link
+`/Applications/Lunaepix.app`, which would point at nothing.
 
 ### Download
 

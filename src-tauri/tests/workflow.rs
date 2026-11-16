@@ -1353,10 +1353,13 @@ const MAC_FORMULA_JOB: &str = r#"  formula:
     steps:
       - uses: actions/checkout@PIN # v7.0.1
       - run: |
+          brew --version
+          brew trust --formula "$CHECK_TAP/lunaepix"
           brew audit --formula "$CHECK_TAP/lunaepix"
           brew style "$CHECK_TAP/lunaepix"
       - run: |
           git archive --format=tar.gz -o "$RUNNER_TEMP/v0.1.5.tar.gz" HEAD
+          brew trust --formula "$BUILD_TAP/lunaepix"
           brew install --build-from-source "$BUILD_TAP/lunaepix"
       - run: brew test "$BUILD_TAP/lunaepix"
 "#;
@@ -3079,6 +3082,9 @@ fn a_check_step_out_of_order_is_caught_in_a_fixture() {
 // ---- the Formula job ----
 
 /// The lines of `MAC_FORMULA_JOB` the fixtures below change.
+const FORMULA_CHECK_PRELUDE: &str =
+    "          brew --version\n          brew trust --formula \"$CHECK_TAP/lunaepix\"\n";
+const FORMULA_BUILD_TRUST: &str = "          brew trust --formula \"$BUILD_TAP/lunaepix\"\n";
 const FORMULA_AUDIT: &str = "          brew audit --formula \"$CHECK_TAP/lunaepix\"\n";
 const FORMULA_STYLE: &str = "          brew style \"$CHECK_TAP/lunaepix\"\n";
 const FORMULA_ARCHIVE: &str =
@@ -3097,7 +3103,7 @@ fn a_formula_fixture_change_that_finds_nothing_fails() {
 fn a_formula_job_that_needs_the_tests_passes_a_fixture() {
     assert_clean(formula_job_problems(&good_mac(), &MACOS));
     let one_script = format!(
-        "      - run: |\n{FORMULA_AUDIT}{FORMULA_STYLE}{FORMULA_ARCHIVE}{FORMULA_INSTALL}          brew test \"$BUILD_TAP/lunaepix\"\n"
+        "      - run: |\n{FORMULA_CHECK_PRELUDE}{FORMULA_AUDIT}{FORMULA_STYLE}{FORMULA_ARCHIVE}{FORMULA_BUILD_TRUST}{FORMULA_INSTALL}          brew test \"$BUILD_TAP/lunaepix\"\n"
     );
     let texts = [
         // `needs` as a list that holds the test job.
@@ -3292,7 +3298,7 @@ fn a_formula_job_with_its_commands_out_of_order_is_caught_in_a_fixture() {
         ),
         // `git archive` after `brew install`.
         (
-            with_formula(&format!("{FORMULA_ARCHIVE}{FORMULA_INSTALL}"), &format!("{FORMULA_INSTALL}{FORMULA_ARCHIVE}")),
+            with_formula(&format!("{FORMULA_ARCHIVE}{FORMULA_BUILD_TRUST}{FORMULA_INSTALL}"), &format!("{FORMULA_BUILD_TRUST}{FORMULA_INSTALL}{FORMULA_ARCHIVE}")),
             "the formula job runs brew install --build-from-source before git archive",
         ),
         // `brew style` before `brew audit`.
