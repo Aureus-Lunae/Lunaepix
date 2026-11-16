@@ -1,6 +1,7 @@
 //! The check that a failure reason carries no path, shared by the tests of the
-//! core (`atomic.rs`, `worker.rs`) and of the app (`session_run.rs`). Each
-//! includes this file with `#[path]`; the helper's own tests are in
+//! core (`atomic.rs`, through `lib.rs`'s `mod no_path`; `worker.rs`) and of the
+//! app (`session_run.rs`). `lib.rs`, `worker.rs` and `session_run.rs` each
+//! include this file with `#[path]`; the helper's own tests are in
 //! `worker.rs`, so they run once.
 //!
 //! A path made by a test starts with the system's temp folder, and that part
@@ -8,6 +9,13 @@
 //! <hash>/T`, and a 2-character folder name such as `er` is a part of
 //! "Permission denied (os error 13)". Only the names below the temp folder
 //! are checked.
+//!
+//! Callers must pass paths built from the raw `std::env::temp_dir()`, as
+//! `tempfile` builds them, and not canonicalised ones: `assert_no_path` strips
+//! that raw folder from the front of the path, and on macOS `/var` is a link to
+//! `/private/var`, so a canonicalised path no longer starts with it. Nothing is
+//! stripped then, and `var`, `folders` and the hash count as names the message
+//! must not hold.
 #![allow(dead_code)]
 
 use std::path::{Component, Path};

@@ -68,7 +68,7 @@ This is a new file kept separate from `windows.yml` (my call). Its shape and com
 - **Triggers:** `workflow_dispatch`, and `push` of tags matching `v*`. A `v*` tag therefore starts both workflows.
 - **Settings shared with Windows:** `permissions: contents: read`, the same `concurrency` group pattern, `CARGO_TERM_COLOR: always` and `shell: bash`.
 - **Runner:** `macos-latest`, which is an Apple Silicon runner (my call, mirroring `windows-latest`).
-- **Actions:** the same as Windows, at the same pinned commit hashes with their release comments: checkout (`persist-credentials: false`), rust-toolchain, rust-cache (Test job only), setup-node (Node 22) and upload-artifact.
+- **Actions:** the same as Windows, at the same pinned commit hashes with their release comments: checkout (`persist-credentials: false`), rust-toolchain, rust-cache (both jobs, see "Build cache"), setup-node (Node 22) and upload-artifact.
 - **NASM:** none. No NASM on the Mac: mozjpeg assembles its Arm SIMD with clang; NASM is only for x86 (decided 2026-11-13, see Handoff). The Windows build still installs it.
 - **Test job:** formatting (`cargo fmt --all --check`), lints (`cargo clippy --workspace --all-targets -- -D warnings`), then `cargo test --workspace --no-fail-fast`. After that come the window script tests (`node --test "tests/ui/*.test.js"`) with `if: success() || failure()`, the same as Windows.
 - **Installer job,** which `needs: test`:

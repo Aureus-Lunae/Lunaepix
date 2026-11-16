@@ -45,8 +45,9 @@ pub mod worker;
 #[path = "../tests/common/jpeg_fixtures.rs"]
 mod jpeg_fixtures;
 
-/// The check that a failure reason carries no path, shared with the
-/// integration tests (`atomic`'s tests).
+/// The check that a failure reason carries no path. `atomic`'s unit tests use
+/// it through this module (`crate::no_path`); `tests/worker.rs` in the core and
+/// `session_run.rs` in the app include the same file by `#[path]`.
 #[cfg(test)]
 #[path = "../tests/common/no_path.rs"]
 mod no_path;

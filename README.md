@@ -255,7 +255,7 @@ node --test "tests/ui/*.test.js"                              # the window scrip
 ```
 
 The window script tests need Node 21 or later (one of them reads numbers
-with `JSON.parse`'s source text); the Windows check runs them on Node 22.
+with `JSON.parse`'s source text); the Windows and Mac checks run them on Node 22.
 
 The `--config` file adds the small worker program that optimises each file,
 makes each thumbnail and reads the header of each image Single image mode

@@ -3165,7 +3165,8 @@ fn about_toml_targets_without_one_platform_or_with_another_are_caught_in_a_fixtu
 /// The names of the crates the licence page lists as users of a licence: the
 /// first word of the text of every `<li>` (`libwebp-sys 0.14.4 (<a ...>...)`).
 /// Text in a comment, a script or a style is not on the page, and an `<li>`
-/// of the licence index (`MIT License (350)`) gives a word that is no crate.
+/// of the licence index (`MIT License (N)`, N the number of crates that use
+/// it) gives a word that is no crate.
 fn listed_crates(html: &str) -> Vec<String> {
     let mut depth = 0usize;
     let mut inside_li = false;
