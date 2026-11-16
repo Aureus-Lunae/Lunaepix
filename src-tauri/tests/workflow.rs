@@ -7,13 +7,21 @@
 //! and absent from the Mac file (Apple Silicon needs none), and the uploaded
 //! artifact named, filled and kept as agreed. The rules are the same for
 //! both; what differs per platform (the file, the runner, the cache, NASM and
-//! Rust-test policies, the artifact) is one `Platform` profile that every
-//! check reads. The Mac cache steps save only from `main`, and its Rust tests
-//! run after a failed lint; Windows has neither rule. The Mac file has one
-//! rule more: a check step between the build and
-//! the upload that verifies the app's signature and that the worker is sealed
-//! in, in `bundle/macos/` and inside the disk image. Each check has fixtures
-//! it must catch, so it is known to fail when it should.
+//! Rust-test policies, the artifact, the Formula job) is one `Platform`
+//! profile that every check reads. The Mac cache steps save only from `main`,
+//! and its Rust tests run after a failed lint; Windows has neither rule. The
+//! Mac file has two rules more. A check step between the build and the upload
+//! verifies the app's signature and that the worker is sealed in, in
+//! `bundle/macos/` and inside the disk image. A Formula job builds this commit
+//! with the Homebrew formula: it needs the tests, has 60 minutes, uses no
+//! action but the checkout (so no cache and no toolchain) and installs nothing
+//! else the formula does not declare, and runs `brew audit`,
+//! `brew style`, `git archive` of `HEAD`, `brew install --build-from-source`
+//! and `brew test`, in that order; the Windows file must have no such job. The
+//! shared rules (pinned actions, runner, read-only token, no expression in a
+//! script, no release, no NASM on the Mac) read every job, the Formula job
+//! included. Each check has fixtures it must catch, so it is known to fail
+//! when it should.
 //!
 //! The workflow is parsed as YAML 1.2 (so the key `on` is a name, not
 //! boolean true) and every check reads the parsed tree, so quoting, spacing
@@ -23,9 +31,11 @@
 //! false hit from a comment is accepted, a missed release is not. The checks
 //! that decide whether a command is present read the script without its shell
 //! comments instead: they can lose text, which makes them fail, never pass.
-//! The Mac rule that no NASM is installed is the other way round (losing text
-//! could make it pass), so it drops only whole-line comments and a trailing
-//! `# nasm` is a false hit it accepts. It is a lint, not a proof.
+//! The Mac rule that no NASM is installed, and the Formula job's rule that
+//! nothing but the formula is installed, are the other way round (losing text
+//! could make them pass), so they drop only whole-line comments, and a
+//! trailing `# nasm` or `# brew install x` is a false hit they accept. They
+//! are lints, not proofs.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -79,6 +89,11 @@ struct Platform {
     artifact: &'static str,
     /// The `path` lines of the upload, in any order.
     artifact_paths: &'static [&'static str],
+    /// Whether the workflow has the job `formula`, which builds this commit
+    /// with the Homebrew formula and tests what it installed
+    /// (`formula_job_problems` lists what it must hold). `false`: no job may
+    /// be named `formula`.
+    formula_job: bool,
 }
 
 /// The only `save-if` the Mac cache steps may have: rc tags cannot restore
@@ -97,6 +112,7 @@ const WINDOWS: Platform = Platform {
         "target/release/bundle/nsis/*.exe",
         "target/release/bundle/msi/*.msi",
     ],
+    formula_job: false,
 };
 
 /// Apple Silicon (`macos-latest`); the artifact is the disk image.
@@ -109,6 +125,7 @@ const MACOS: Platform = Platform {
     rust_tests_after_failure: true,
     artifact: "lunaepix-macos-dmg",
     artifact_paths: &["target/release/bundle/dmg/*.dmg"],
+    formula_job: true,
 };
 
 fn workflow(platform: &Platform) -> String {
@@ -1001,6 +1018,187 @@ fn mac_check_step_problems(text: &str) -> Vec<String> {
     })
 }
 
+// ---- the Formula job ----
+
+/// The commands the Formula job runs, in this order: the committed formula is
+/// audited and style-checked as it is, then this commit is archived the way
+/// GitHub archives a tag, built through a copy of the formula, and tested.
+const FORMULA_COMMANDS: &[&str] = &[
+    "brew audit",
+    "brew style",
+    "git archive",
+    "brew install --build-from-source",
+    "brew test",
+];
+
+/// The `timeout-minutes` of the Formula job.
+const FORMULA_TIMEOUT: &str = "60";
+
+/// Whether the words of one shell command (quotes trimmed) are the one install
+/// the Formula job may run: `brew install` with `--build-from-source`, any
+/// other flags, and exactly one name, the tap's formula (`…/lunaepix`).
+fn is_formula_install(words: &[&str]) -> bool {
+    let Some(rest) = words.strip_prefix(&["brew", "install"][..]) else {
+        return false;
+    };
+    let names = rest
+        .iter()
+        .filter(|word| !word.starts_with('-'))
+        .collect::<Vec<_>>();
+    rest.contains(&"--build-from-source")
+        && matches!(names.as_slice(), [name] if name.ends_with("/lunaepix"))
+}
+
+/// The first problem of one script line (whole-line comments already removed)
+/// of the Formula job: a toolchain (`rustup` anywhere in it) or an install that
+/// is not the formula's. The line is cut into commands at `;`, `&`, `|`, `(`,
+/// `)` and backquotes, and a command that has the word `install` or
+/// `reinstall` must be `is_formula_install`. A command it cannot read that way
+/// (`sudo brew install …`, a line continued with `\`) is refused: it fails
+/// closed.
+fn formula_line_problem(line: &str) -> Option<String> {
+    if line.to_ascii_lowercase().contains("rustup") {
+        return Some(format!(
+            "the formula job installs a toolchain: {}",
+            line.trim()
+        ));
+    }
+    let commands = line.split([';', '&', '|', '(', ')', '`']);
+    let commands_words = commands.map(|command| {
+        command
+            .split_whitespace()
+            .map(|word| word.trim_matches(|c| c == '\'' || c == '"'))
+            .collect::<Vec<_>>()
+    });
+    let refused = commands_words
+        .filter(|words| {
+            words
+                .iter()
+                .any(|word| matches!(*word, "install" | "reinstall"))
+        })
+        .any(|words| !is_formula_install(&words));
+    refused.then(|| {
+        format!(
+            "the formula job installs what the formula does not declare: {}",
+            line.trim()
+        )
+    })
+}
+
+/// When the platform has `formula_job`, the job `formula` exists and:
+/// - has `needs: test` (a name or a list that holds it), so it builds only
+///   what the tests passed;
+/// - installs nothing the formula does not declare (Review Focus 3): the only
+///   action its steps use is `actions/checkout@` (compared without case, as
+///   `is_rust_cache` does), so no cache (a user's Mac has none), no toolchain
+///   (`dtolnay/rust-toolchain`, `setup-node`) and no other installer
+///   (`jdx/mise-action`) gets in, whatever its name; and its scripts run no
+///   `rustup`, and no command with the word `install` or `reinstall` but
+///   `brew install --build-from-source` of the tap's formula
+///   (`formula_line_problem`). The script part reads them without their
+///   whole-line comments only, as `nasm_absent_problems` does: a trailing
+///   `# brew install x` is a false hit it accepts, and a ` #` inside quotes
+///   cannot hide what follows it;
+/// - runs `FORMULA_COMMANDS`, in that order, in its scripts without their
+///   shell comments (`without_comments`, where lost text makes the check fail),
+///   compared by where each first appears; the first `git archive` line names
+///   `HEAD`;
+/// - has `timeout-minutes: 60`, compared as parsed text like `retention-days`.
+///
+/// Without `formula_job`, no job may be named `formula`. The scripts are read
+/// as text, so this is a lint: it proves the commands are there and in order,
+/// not what they do.
+fn formula_job_problems(text: &str, platform: &Platform) -> Vec<String> {
+    on_tree(text, |doc| {
+        let job = jobs(doc)
+            .into_iter()
+            .find(|(name, _)| name == "formula")
+            .map(|(_, job)| job);
+        let Some(job) = job.filter(|_| platform.formula_job) else {
+            return match (job, platform.formula_job) {
+                (Some(_), _) => vec![format!("{} must have no formula job", platform.file)],
+                (None, true) => vec!["no formula job".to_owned()],
+                (None, false) => Vec::new(),
+            };
+        };
+        let mut problems = Vec::new();
+        if !all_texts(&job["needs"]).iter().any(|name| name == "test") {
+            problems.push("the formula job does not have needs: test".to_owned());
+        }
+        let steps = steps_of(job);
+        let others = steps
+            .iter()
+            .filter_map(|step| uses_of(step))
+            .filter(|uses| !uses.to_ascii_lowercase().starts_with("actions/checkout@"));
+        problems.extend(others.map(|uses| {
+            format!("the formula job uses an action other than actions/checkout: {uses}")
+        }));
+        let lines = steps
+            .iter()
+            .filter_map(|step| scalar(&step["run"]))
+            .map(|script| without_comment_lines(&script))
+            .collect::<Vec<_>>();
+        problems.extend(
+            lines
+                .iter()
+                .flat_map(|script| script.lines())
+                .filter_map(formula_line_problem),
+        );
+        let code = steps
+            .iter()
+            .map(|step| step_code(step))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at: Vec<Option<usize>> = FORMULA_COMMANDS
+            .iter()
+            .map(|command| code.find(command))
+            .collect();
+        for (command, found) in FORMULA_COMMANDS.iter().zip(&at) {
+            if found.is_none() {
+                problems.push(format!("the formula job does not run {command}"));
+            }
+        }
+        for pair in FORMULA_COMMANDS
+            .iter()
+            .zip(&at)
+            .collect::<Vec<_>>()
+            .windows(2)
+        {
+            if let [(earlier, Some(first)), (later, Some(second))] = pair
+                && second < first
+            {
+                problems.push(format!("the formula job runs {later} before {earlier}"));
+            }
+        }
+        let archive = code.lines().find(|line| line.contains("git archive"));
+        if let Some(line) = archive {
+            let mut words = line
+                .split_whitespace()
+                .map(|word| word.trim_matches(|c| c == '\'' || c == '"'));
+            if !words.any(|word| word == "HEAD") {
+                problems.push(format!(
+                    "the formula job's git archive is not of HEAD: {}",
+                    line.trim()
+                ));
+            }
+        }
+        let timeout = &job["timeout-minutes"];
+        match scalar(timeout) {
+            Some(minutes) if minutes == FORMULA_TIMEOUT => {}
+            Some(minutes) => problems.push(format!(
+                "the formula job's timeout-minutes is {minutes}, not {FORMULA_TIMEOUT}"
+            )),
+            None if timeout.is_badvalue() => {
+                problems.push("the formula job has no timeout-minutes".to_owned());
+            }
+            None => problems.push(format!(
+                "the formula job's timeout-minutes is not a single value: {timeout:?}"
+            )),
+        }
+        problems
+    })
+}
+
 const REQUIRED_COMMANDS: &[&str] = &[
     "cargo fmt --all --check",
     "cargo clippy --workspace --all-targets -- -D warnings",
@@ -1141,9 +1339,36 @@ const MAC_UPLOAD_STEP: &str = "      - uses: actions/upload-artifact@PIN # v7
           retention-days: 30
 ";
 
-/// A Mac workflow every check accepts under `MACOS`: a cache in both jobs that
-/// saves only from `main`, no NASM, the Rust tests after a failed lint, and the
-/// check step between the build and the upload.
+/// The Formula job of `good_mac()`: the five commands in their order, in the
+/// three steps `macos.yml` runs them in, and nothing installed but the
+/// formula. Its scripts name the taps through `$CHECK_TAP` and `$BUILD_TAP`,
+/// as the real job does.
+const MAC_FORMULA_JOB: &str = r#"  formula:
+    needs: test
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      CHECK_TAP: ci/check
+      BUILD_TAP: ci/build
+    steps:
+      - uses: actions/checkout@PIN # v7.0.1
+      - run: |
+          brew audit --formula "$CHECK_TAP/lunaepix"
+          brew style "$CHECK_TAP/lunaepix"
+      - run: |
+          git archive --format=tar.gz -o "$RUNNER_TEMP/v0.1.5.tar.gz" HEAD
+          brew install --build-from-source "$BUILD_TAP/lunaepix"
+      - run: brew test "$BUILD_TAP/lunaepix"
+"#;
+
+/// The last step of `MAC_FORMULA_JOB`.
+const FORMULA_TEST_STEP: &str = "      - run: brew test \"$BUILD_TAP/lunaepix\"\n";
+
+/// A Mac workflow every check accepts under `MACOS`: a cache in the test and
+/// Installer jobs that saves only from `main`, no NASM, the Rust tests after a
+/// failed lint, the check step between the build and the upload, and the
+/// Formula job. The Formula job sits between the other two, so a step added
+/// at the end of the fixture lands in the Installer job, as in `good()`.
 fn good_mac() -> String {
     let base = "name: x
 on:
@@ -1171,7 +1396,7 @@ SAVEIF      - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 RUSTTESTS      - run: node --test \"tests/ui/*.test.js\"
         if: success() || failure()
-  build:
+FORMULA  build:
     needs: test
     runs-on: macos-latest
     steps:
@@ -1183,6 +1408,9 @@ CACHEINSTALLBUILDCHECKUPLOAD";
         .replace("BUILD", BUILD_STEP)
         .replace("CHECK", MAC_CHECK_STEP)
         .replace("UPLOAD", MAC_UPLOAD_STEP)
+        // After the tokens above: the job's `$BUILD_TAP` and `$CHECK_TAP`
+        // hold two of them.
+        .replace("FORMULA", MAC_FORMULA_JOB)
         .replace("PIN", PIN)
 }
 
@@ -1192,6 +1420,52 @@ fn with_mac(from: &str, to: &str) -> String {
     let from = from.replace("PIN", PIN);
     assert!(good_mac().contains(&from), "the Mac fixture lacks {from:?}");
     good_mac().replacen(&from, &to.replace("PIN", PIN), 1)
+}
+
+/// `good_mac()` with each `(from, to)` applied in turn inside its Formula job
+/// only, the first `from` each time. Fails when a `from` is not there, so a
+/// fixture cannot silently be a no-op.
+fn with_formula_all(edits: &[(&str, &str)]) -> String {
+    let original = MAC_FORMULA_JOB.replace("PIN", PIN);
+    assert_eq!(
+        good_mac().matches(&original).count(),
+        1,
+        "the job is in good_mac() once"
+    );
+    let mut job = original.clone();
+    for (from, to) in edits {
+        let from = from.replace("PIN", PIN);
+        assert!(job.contains(&from), "the formula job lacks {from:?}");
+        job = job.replacen(&from, &to.replace("PIN", PIN), 1);
+    }
+    good_mac().replacen(&original, &job, 1)
+}
+
+/// `good_mac()` with the first `from` of its Formula job replaced by `to`.
+fn with_formula(from: &str, to: &str) -> String {
+    with_formula_all(&[(from, to)])
+}
+
+/// `good_mac()` with `step` (six-space indent, newline-ended) added as the
+/// last step of its Formula job.
+fn formula_with_step(step: &str) -> String {
+    with_formula(FORMULA_TEST_STEP, &format!("{FORMULA_TEST_STEP}{step}"))
+}
+
+/// `every_check` on `text` with `platform`'s profile finds exactly one
+/// problem: from the check `check`, starting with `start`.
+fn assert_only_problem(text: &str, platform: &Platform, check: &str, start: &str) {
+    let found: Vec<(&str, String)> = every_check(text, platform)
+        .into_iter()
+        .flat_map(|(name, problems)| problems.into_iter().map(move |p| (name, p)))
+        .collect();
+    assert_eq!(found.len(), 1, "{check} {start:?}: {found:?} in\n{text}");
+    let (name, problem) = &found[0];
+    assert_eq!(*name, check, "{problem}");
+    assert!(
+        problem.starts_with(start),
+        "{problem:?} does not start with {start:?}"
+    );
 }
 
 /// The problems the check named `check` reports when `every_check` runs on
@@ -1225,6 +1499,7 @@ fn every_check(text: &str, platform: &Platform) -> Vec<(&'static str, Vec<String
         ("node_step_problems", node_step_problems(text)),
         ("cache_save_problems", cache_save_problems(text, platform)),
         ("rust_test_problems", rust_test_problems(text, platform)),
+        ("formula_job_problems", formula_job_problems(text, platform)),
     ];
     if platform.file == MACOS.file {
         checks.push(("mac_check_step_problems", mac_check_step_problems(text)));
@@ -2040,8 +2315,8 @@ fn a_workflow_without_an_upload_is_reported_by_the_upload_check_in_a_fixture() {
 // ---- the platform profile ----
 
 /// A profile that differs from `WINDOWS` in its file, runner and artifact. Its
-/// cache, NASM, `save-if` and Rust-test policies are Windows's; those are
-/// crossed with `MACOS` in the Mac tests instead.
+/// cache, NASM, `save-if`, Rust-test and Formula-job policies are Windows's;
+/// those are crossed with `MACOS` in the Mac tests instead.
 const OTHER: Platform = Platform {
     file: "other.yml",
     runner: "other-runner",
@@ -2259,14 +2534,16 @@ fn the_mac_workflow_parses_and_passes_every_check() {
 
 #[test]
 fn the_checks_of_the_real_mac_file_are_not_vacuous() {
-    // Checkout, toolchain and cache in both jobs, node and upload; fmt,
-    // clippy, test, node, the Tauri install, build and check; the bundle
-    // folder; and the check-step, cache and Rust-tests guards are among the
-    // checks, with a cache step and a cargo test step for them to read.
+    // Checkout, toolchain and cache in the test and Installer jobs, node,
+    // upload, and the Formula job's checkout; fmt, clippy, test, node, the
+    // Tauri install, build and check, and the Formula job's three scripts;
+    // the bundle folder; the check-step, cache, Rust-tests and Formula-job
+    // guards are among the checks, with a cache step, a cargo test step and
+    // the Formula job for them to read.
     let text = workflow(&MACOS);
     let (refs, scripts) = (action_references(&text).len(), run_scripts(&text).len());
     assert!(
-        refs >= 8 && scripts >= 7,
+        refs >= 9 && scripts >= 10,
         "{refs} action references, {scripts} run scripts"
     );
     assert!(text.contains("target/release/bundle/"));
@@ -2278,10 +2555,19 @@ fn the_checks_of_the_real_mac_file_are_not_vacuous() {
         "mac_check_step_problems",
         "cache_save_problems",
         "rust_test_problems",
+        "formula_job_problems",
     ] {
         assert!(names.contains(&name), "{names:?}");
     }
     let doc = parse(&text).unwrap_or_else(|e| panic!("{e}"));
+    let formula = jobs(&doc)
+        .into_iter()
+        .find(|(name, _)| name == "formula")
+        .map(|(_, job)| steps_of(job).len());
+    assert!(
+        formula.is_some_and(|steps| steps >= 4),
+        "the formula job and its steps: {formula:?}"
+    );
     let caches = all_steps(&doc)
         .into_iter()
         .filter(|step| is_rust_cache(step))
@@ -2692,7 +2978,11 @@ fn the_new_guards_are_checks_of_both_platforms_in_a_fixture() {
             .into_iter()
             .map(|(name, _)| name)
             .collect();
-        for name in ["cache_save_problems", "rust_test_problems"] {
+        for name in [
+            "cache_save_problems",
+            "rust_test_problems",
+            "formula_job_problems",
+        ] {
             assert!(names.contains(&name), "{name} in {names:?}");
         }
     }
@@ -2784,4 +3074,315 @@ fn a_check_step_out_of_order_is_caught_in_a_fixture() {
     let late = format!("{}{MAC_CHECK_STEP}", with_mac(MAC_CHECK_STEP, ""));
     assert_eq!(mac_check_step_problems(&late), before);
     assert_eq!(mac_check_step_problems(&with_mac(MAC_UPLOAD_STEP, "")), before);
+}
+
+// ---- the Formula job ----
+
+/// The lines of `MAC_FORMULA_JOB` the fixtures below change.
+const FORMULA_AUDIT: &str = "          brew audit --formula \"$CHECK_TAP/lunaepix\"\n";
+const FORMULA_STYLE: &str = "          brew style \"$CHECK_TAP/lunaepix\"\n";
+const FORMULA_ARCHIVE: &str =
+    "          git archive --format=tar.gz -o \"$RUNNER_TEMP/v0.1.5.tar.gz\" HEAD\n";
+const FORMULA_INSTALL: &str =
+    "          brew install --build-from-source \"$BUILD_TAP/lunaepix\"\n";
+
+#[test]
+#[should_panic(expected = "the formula job lacks")]
+fn a_formula_fixture_change_that_finds_nothing_fails() {
+    with_formula("brew install node", "");
+}
+
+#[test]
+#[rustfmt::skip]
+fn a_formula_job_that_needs_the_tests_passes_a_fixture() {
+    assert_clean(formula_job_problems(&good_mac(), &MACOS));
+    let one_script = format!(
+        "      - run: |\n{FORMULA_AUDIT}{FORMULA_STYLE}{FORMULA_ARCHIVE}{FORMULA_INSTALL}          brew test \"$BUILD_TAP/lunaepix\"\n"
+    );
+    let texts = [
+        // `needs` as a list that holds the test job.
+        with_formula("needs: test", "needs: [test]"),
+        with_formula("needs: test", "needs: [test, build]"),
+        // The timeout quoted.
+        with_formula("timeout-minutes: 60", "timeout-minutes: '60'"),
+        // Another flag after --build-from-source (the presence check looks for
+        // `brew install --build-from-source` as written, so the flag comes first).
+        with_formula("--build-from-source \"$BUILD_TAP", "--build-from-source --verbose \"$BUILD_TAP"),
+        // An install only in a whole-line comment.
+        formula_with_step("      - run: |\n          # brew install node\n          echo done\n"),
+        // The five commands in one script.
+        with_formula_all(&[
+            ("      - run: |\n          git archive", "          git archive"),
+            (FORMULA_TEST_STEP, "          brew test \"$BUILD_TAP/lunaepix\"\n"),
+        ]),
+    ];
+    assert!(texts[5].contains(&one_script), "{}", texts[5]);
+    for text in &texts {
+        for (name, problems) in every_check(text, &MACOS) {
+            assert_eq!(problems, Vec::<String>::new(), "{name} in\n{text}");
+        }
+    }
+}
+
+#[test]
+fn a_mac_workflow_without_the_formula_job_is_caught_in_a_fixture() {
+    let job = MAC_FORMULA_JOB.replace("PIN", PIN);
+    let none = good_mac().replacen(&job, "", 1);
+    assert_only_problem(&none, &MACOS, "formula_job_problems", "no formula job");
+    let renamed = good_mac().replacen("  formula:\n", "  brew:\n", 1);
+    assert_only_problem(&renamed, &MACOS, "formula_job_problems", "no formula job");
+    // The Windows fixture has none.
+    assert_eq!(formula_job_problems(&good(), &MACOS), ["no formula job"]);
+}
+
+#[test]
+fn a_formula_job_without_needs_test_is_caught_in_a_fixture() {
+    for text in [
+        with_formula("    needs: test\n", ""),
+        with_formula("needs: test", "needs: build"),
+        with_formula("needs: test", "needs: [build]"),
+    ] {
+        assert_only_problem(
+            &text,
+            &MACOS,
+            "formula_job_problems",
+            "the formula job does not have needs: test",
+        );
+    }
+}
+
+#[test]
+fn a_formula_job_with_a_cache_is_caught_in_a_fixture() {
+    for step in [MAC_BUILD_CACHE, "      - uses: actions/cache@PIN # v4\n"] {
+        assert_only_problem(
+            &formula_with_step(step),
+            &MACOS,
+            "formula_job_problems",
+            OTHER_ACTION,
+        );
+    }
+}
+
+#[test]
+#[rustfmt::skip]
+fn a_formula_job_that_installs_a_toolchain_is_caught_in_a_fixture() {
+    // An action is refused because it is not the checkout.
+    for step in [
+        "      - uses: dtolnay/rust-toolchain@PIN # stable\n",
+        "      - uses: actions/setup-node@PIN # v7.1.0\n",
+    ] {
+        assert_only_problem(&formula_with_step(step), &MACOS, "formula_job_problems", OTHER_ACTION);
+    }
+    // A script line is refused for `rustup`.
+    for step in [
+        "      - run: rustup toolchain install stable\n",
+        "      - run: curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y\n",
+    ] {
+        assert_only_problem(&formula_with_step(step), &MACOS, "formula_job_problems", "the formula job installs a toolchain");
+    }
+}
+
+/// The start of the problem for a Formula job step that uses another action
+/// than the checkout.
+const OTHER_ACTION: &str = "the formula job uses an action other than actions/checkout";
+
+#[test]
+#[rustfmt::skip]
+fn a_formula_job_that_uses_only_the_checkout_action_passes_a_fixture() {
+    let texts = [
+        good_mac(),
+        // Action names are compared without case.
+        with_formula("actions/checkout@PIN # v7.0.1", "Actions/Checkout@PIN # v7.0.1"),
+        // A second checkout step.
+        formula_with_step("      - uses: actions/checkout@PIN # v7.0.1\n"),
+    ];
+    for text in &texts {
+        for (name, problems) in every_check(text, &MACOS) {
+            assert_eq!(problems, Vec::<String>::new(), "{name} in\n{text}");
+        }
+    }
+}
+
+#[test]
+#[rustfmt::skip]
+fn a_formula_job_that_uses_another_action_is_caught_in_a_fixture() {
+    for step in [
+        // An action that installs tools, with neither `cache`, `toolchain`
+        // nor `setup-` in its name.
+        "      - uses: jdx/mise-action@PIN # v2\n",
+        "      - uses: actions/setup-python@PIN # v5\n",
+        // A name that only starts like the checkout.
+        "      - uses: actions/checkout-extra@PIN # v1\n",
+    ] {
+        assert_only_problem(&formula_with_step(step), &MACOS, "formula_job_problems", OTHER_ACTION);
+    }
+}
+
+// Each spelling once, as a step added after a valid job. The rule is a lint
+// over the `run:` text without its whole-line comments, so these are the
+// spellings it is known to catch.
+#[test]
+#[rustfmt::skip]
+fn a_formula_job_that_installs_another_package_is_caught_in_a_fixture() {
+    let other = "the formula job installs what the formula does not declare";
+    let steps = [
+        "      - run: brew install node\n",
+        "      - run: brew install --build-from-source node\n",
+        "      - run: brew install --formula node\n",
+        // The tap's formula, but not built from source.
+        "      - run: brew install \"$BUILD_TAP/lunaepix\"\n",
+        // The tap's formula and one more.
+        "      - run: brew install --build-from-source \"$BUILD_TAP/lunaepix\" node\n",
+        "      - run: echo \"$(brew install node)\"\n",
+        "      - run: cargo install tauri-cli --locked --version 2.12.4\n",
+        "      - run: npm install\n",
+        "      - run: brew reinstall node\n",
+        // Another command in front fails closed.
+        "      - run: sudo brew install --build-from-source \"$BUILD_TAP/lunaepix\"\n",
+        // So does a line continued with `\`.
+        "      - run: |\n          brew install --build-from-source \\\n            \"$BUILD_TAP/lunaepix\"\n",
+        // A trailing comment is read as code: a false hit the rule accepts.
+        "      - run: |\n          echo x # brew install node\n",
+        // A ` #` inside quotes must not hide what follows it.
+        "      - run: 'echo \"a #b\"; brew install node'\n",
+    ];
+    for step in steps {
+        assert_only_problem(&formula_with_step(step), &MACOS, "formula_job_problems", other);
+    }
+    // A second command on the line of the allowed install.
+    let chained = with_formula(FORMULA_INSTALL, &format!("{} && brew install node\n", FORMULA_INSTALL.trim_end()));
+    assert_only_problem(&chained, &MACOS, "formula_job_problems", other);
+}
+
+#[test]
+#[rustfmt::skip]
+fn a_formula_job_missing_a_required_command_is_caught_in_a_fixture() {
+    let commented_test = "      - run: |\n          # brew test \"$BUILD_TAP/lunaepix\"\n";
+    let cases = [
+        ("brew audit", FORMULA_AUDIT, String::new()),
+        ("brew style", FORMULA_STYLE, String::new()),
+        ("git archive", FORMULA_ARCHIVE, String::new()),
+        ("brew install --build-from-source", FORMULA_INSTALL, String::new()),
+        ("brew test", FORMULA_TEST_STEP, String::new()),
+        // Only in a whole-line shell comment.
+        ("brew audit", FORMULA_AUDIT, FORMULA_AUDIT.replacen("brew", "# brew", 1)),
+        ("brew style", FORMULA_STYLE, FORMULA_STYLE.replacen("brew", "# brew", 1)),
+        ("git archive", FORMULA_ARCHIVE, FORMULA_ARCHIVE.replacen("git", "# git", 1)),
+        ("brew install --build-from-source", FORMULA_INSTALL, FORMULA_INSTALL.replacen("brew", "# brew", 1)),
+        ("brew test", FORMULA_TEST_STEP, commented_test.to_owned()),
+    ];
+    for (command, from, to) in &cases {
+        let text = with_formula(from, to);
+        assert_only_problem(&text, &MACOS, "formula_job_problems", &format!("the formula job does not run {command}"));
+    }
+    // `brew test` only in the Installer job (the last job of the fixture).
+    let elsewhere = format!("{}{FORMULA_TEST_STEP}", with_formula(FORMULA_TEST_STEP, ""));
+    assert_only_problem(&elsewhere, &MACOS, "formula_job_problems", "the formula job does not run brew test");
+}
+
+#[test]
+#[rustfmt::skip]
+fn a_formula_job_with_its_commands_out_of_order_is_caught_in_a_fixture() {
+    let test_line = "          brew test \"$BUILD_TAP/lunaepix\"\n";
+    let cases = [
+        // `brew test` before `brew install`.
+        (
+            with_formula_all(&[(FORMULA_TEST_STEP, ""), (FORMULA_INSTALL, &format!("{test_line}{FORMULA_INSTALL}"))]),
+            "the formula job runs brew test before brew install --build-from-source",
+        ),
+        // `git archive` after `brew install`.
+        (
+            with_formula(&format!("{FORMULA_ARCHIVE}{FORMULA_INSTALL}"), &format!("{FORMULA_INSTALL}{FORMULA_ARCHIVE}")),
+            "the formula job runs brew install --build-from-source before git archive",
+        ),
+        // `brew style` before `brew audit`.
+        (
+            with_formula(&format!("{FORMULA_AUDIT}{FORMULA_STYLE}"), &format!("{FORMULA_STYLE}{FORMULA_AUDIT}")),
+            "the formula job runs brew style before brew audit",
+        ),
+    ];
+    for (text, start) in &cases {
+        assert_only_problem(text, &MACOS, "formula_job_problems", start);
+    }
+}
+
+#[test]
+fn a_formula_job_whose_archive_is_not_of_head_is_caught_in_a_fixture() {
+    for rev in ["v0.1.5", "HEAD~1", "main"] {
+        let text = with_formula("\" HEAD\n", &format!("\" {rev}\n"));
+        assert_only_problem(
+            &text,
+            &MACOS,
+            "formula_job_problems",
+            "the formula job's git archive is not of HEAD",
+        );
+    }
+}
+
+#[test]
+fn a_formula_job_with_another_timeout_is_caught_in_a_fixture() {
+    let cases = [
+        (
+            with_formula("timeout-minutes: 60", "timeout-minutes: 45"),
+            "the formula job's timeout-minutes is 45, not 60",
+        ),
+        (
+            with_formula("timeout-minutes: 60", "timeout-minutes: 60.0"),
+            "the formula job's timeout-minutes is 60.0, not 60",
+        ),
+        (
+            with_formula("    timeout-minutes: 60\n", ""),
+            "the formula job has no timeout-minutes",
+        ),
+        (
+            with_formula("timeout-minutes: 60", "timeout-minutes: [60]"),
+            "the formula job's timeout-minutes is not a single value",
+        ),
+    ];
+    for (text, start) in &cases {
+        assert_only_problem(text, &MACOS, "formula_job_problems", start);
+    }
+}
+
+#[test]
+fn the_formula_job_rule_comes_from_the_profile_in_a_fixture() {
+    // Windows has none, and must have none.
+    assert_clean(formula_job_problems(&good(), &WINDOWS));
+    let job = MAC_FORMULA_JOB
+        .replace("PIN", PIN)
+        .replace("macos-latest", "windows-latest");
+    let windows = good().replacen("  build:\n", &format!("{job}  build:\n"), 1);
+    assert_ne!(windows, good(), "the fixture changed nothing");
+    assert_only_problem(
+        &windows,
+        &WINDOWS,
+        "formula_job_problems",
+        "windows.yml must have no formula job",
+    );
+    // The Mac fixture is wrong for Windows, and the Windows one for the Mac.
+    assert_eq!(
+        formula_job_problems(&good_mac(), &WINDOWS),
+        ["windows.yml must have no formula job"]
+    );
+    assert_eq!(formula_job_problems(&good(), &MACOS), ["no formula job"]);
+}
+
+// The rules every job keeps, each broken once inside the Formula job only and
+// caught by its own check, with nothing else reported.
+#[test]
+#[rustfmt::skip]
+fn the_shared_guards_reach_the_formula_job_in_a_fixture() {
+    let tap = "      BUILD_TAP: ci/build\n";
+    let cases = [
+        (with_formula("actions/checkout@PIN # v7.0.1", "actions/checkout@v7"), "unpinned_actions", "not pinned to a commit: actions/checkout@v7"),
+        (with_formula("runs-on: macos-latest", "runs-on: macos-13"), "structure_problems", "job formula: runner is not macos-latest"),
+        (with_formula(FORMULA_TEST_STEP, "      - run: brew test \"${{ env.BUILD_TAP }}/lunaepix\"\n"), "injection_problems", "expression in a run script"),
+        (with_formula(tap, &format!("{tap}      RELEASE_TAP: ci/x\n")), "structure_problems", "release step: RELEASE_TAP"),
+        (formula_with_step("      - run: nasm -v\n"), "nasm_problems", "job formula: a step installs or runs nasm"),
+        (with_formula("    timeout-minutes: 60\n", "    timeout-minutes: 60\n    permissions:\n      contents: write\n"), "permission_problems", "write permission in job formula"),
+        (with_formula(tap, &format!("{tap}      T: ${{{{ secrets.X }}}}\n")), "secret_references", "${{ secrets.X }}"),
+    ];
+    for (text, check, start) in &cases {
+        assert_only_problem(text, &MACOS, check, start);
+    }
 }
