@@ -9,10 +9,18 @@
 //!   workspace version, with a checksum that is the placeholder (64 zeros,
 //!   until the release commit) or 64 lower-case hex characters;
 //! - the macOS floor, which must be `minimumSystemVersion` of
-//!   `tauri.macos.conf.json`;
+//!   `tauri.macos.conf.json`, in the spelling `brew style` allows: a bare
+//!   `depends_on :macos` while that floor is not newer than Homebrew's oldest
+//!   macOS (a named one is then redundant), a named one above it;
 //! - the requirements (Apple Silicon, Rust at build time, no NASM, no Node),
-//!   the app build line and `skip_clean` of the app, and the note printed
-//!   after the install (the link command and its two sentences).
+//!   the app build line (the pinned `cargo-tauri` binary, called directly from
+//!   the install root of the pinned install, never through PATH) and
+//!   `skip_clean` of the app, and the note printed after the install (the link
+//!   command and its two sentences).
+//!
+//! Some checks mirror a rule of Homebrew's own `brew style`, which only runs
+//! on the Mac (in the Formula job): they are here so a mistake fails the
+//! tests on any machine, not only after the push.
 //!
 //! Each check is a function from text to a list of problems, so a fixture can
 //! feed it, and each has fixtures it must catch.
@@ -34,10 +42,13 @@
 //! - A call is read as its quoted words: `system "cargo", "install",
 //!   "tauri-cli", "--version", "2.12.4"` is the words `cargo`, `install`,
 //!   `tauri-cli`, `--version`, `2.12.4`. Words that are not quoted (a splat,
-//!   `buildpath/"x"`) are not read. A flag that takes a value is accepted as
+//!   `buildpath/"x"`) are not read, with two exceptions that are read from
+//!   the statement's text: the variable after `"--root",` in the tauri-cli
+//!   install, and the start of the build call (`system tauri/"bin/cargo-tauri",`),
+//!   which must name that variable. A flag that takes a value is accepted as
 //!   two words (`"--version", "2.12.4"`) or one (`"--version=2.12.4"`):
 //!   `--version` of `cargo install`, and `--bundles` and `--config` of
-//!   `cargo tauri build`. `--locked` is one word.
+//!   `cargo-tauri build`. `--locked` is one word.
 //! - A stanza (`url`, `sha256`, `depends_on`, `skip_clean`) is read as the
 //!   statement with its white space collapsed, in its one exact spelling, in
 //!   double quotes. A form with parentheses or single quotes is not accepted
@@ -442,6 +453,11 @@ const MACOS_NAMES: &[(&str, (u32, u32))] = &[
     ("tahoe", (26, 0)),
 ];
 
+/// Homebrew's oldest macOS: the first entry of `MacOSVersion::SYMBOLS` in
+/// Homebrew's `Library/Homebrew/macos_version.rb`. It is a copy of Homebrew's
+/// own table and must follow it: when Homebrew drops big_sur, change this.
+const HOMEBREW_OLDEST_MACOS: (&str, (u32, u32)) = ("big_sur", (11, 0));
+
 /// `"11.0"` or `"11"` as major and minor.
 fn parse_version(text: &str) -> Option<(u32, u32)> {
     let mut parts = text.split('.');
@@ -450,27 +466,21 @@ fn parse_version(text: &str) -> Option<(u32, u32)> {
     parts.next().is_none().then_some((major, minor))
 }
 
-/// `depends_on macos: :<name>` names the same version as `minimumSystemVersion`
-/// in `tauri.macos.conf.json`, so the formula refuses what the app refuses.
+/// The floor the formula declares is the one `minimumSystemVersion` in
+/// `tauri.macos.conf.json` sets, so the formula refuses what the app refuses.
+/// It has two spellings, and Homebrew's `brew style` decides which one is
+/// allowed (`Library/Homebrew/rubocops/os_depends_on.rb`):
+///
+/// - `minimumSystemVersion` is not newer than Homebrew's oldest macOS
+///   (`HOMEBREW_OLDEST_MACOS`): the floor is redundant, so the formula has
+///   exactly one bare `depends_on :macos` (it only limits the formula to
+///   macOS) and no `depends_on macos:` line. brew style refuses a named floor
+///   that old, and a bare line next to a named one.
+/// - It is newer: exactly one `depends_on macos: :<name>` that names that
+///   version, and no bare line.
+///
+/// The config is read first, so a config problem is reported alone.
 fn macos_floor_problems(formula: &str, tauri_macos_json: &str) -> Vec<String> {
-    let floors = stanzas(formula, "depends_on")
-        .into_iter()
-        .filter_map(|s| s.strip_prefix("depends_on macos: :").map(str::to_owned))
-        .collect::<Vec<_>>();
-    let [name] = floors.as_slice() else {
-        return vec![format!(
-            "the formula has {} depends_on macos: lines, not 1",
-            floors.len()
-        )];
-    };
-    let Some(&(_, formula_floor)) = MACOS_NAMES
-        .iter()
-        .find(|(known, _)| *known == name.as_str())
-    else {
-        return vec![format!(
-            "depends_on macos: :{name} is not a macOS name this check knows"
-        )];
-    };
     let config: Value = match serde_json::from_str(tauri_macos_json) {
         Ok(value) => value,
         Err(e) => return vec![format!("tauri.macos.conf.json does not parse: {e}")],
@@ -485,14 +495,62 @@ fn macos_floor_problems(formula: &str, tauri_macos_json: &str) -> Vec<String> {
             "minimumSystemVersion {text:?} is not a version number"
         )];
     };
-    if config_floor == formula_floor {
-        Vec::new()
+
+    let (oldest_name, oldest) = HOMEBREW_OLDEST_MACOS;
+    let depends = stanzas(formula, "depends_on");
+    let bare = depends.iter().filter(|s| *s == "depends_on :macos").count();
+    let named: Vec<&String> = depends
+        .iter()
+        .filter(|s| s.starts_with("depends_on macos:"))
+        .collect();
+
+    let mut problems = Vec::new();
+    if config_floor <= oldest {
+        for line in &named {
+            problems.push(format!(
+                "the formula names a macOS floor ({line}), but minimumSystemVersion {text:?} is not newer than Homebrew's oldest macOS ({oldest_name}, {}.{}): brew style refuses that as redundant, the line must be depends_on :macos",
+                oldest.0, oldest.1
+            ));
+        }
+        if bare > 1 || (bare == 0 && named.is_empty()) {
+            problems.push(format!(
+                "the formula has {bare} depends_on :macos lines, not 1"
+            ));
+        }
     } else {
-        vec![format!(
+        if bare > 0 {
+            problems.push(format!(
+                "the formula has a bare depends_on :macos, but minimumSystemVersion {text:?} is newer than Homebrew's oldest macOS ({oldest_name}): name it with depends_on macos: :<name>"
+            ));
+        }
+        match named.as_slice() {
+            // Only the bare line, already reported.
+            [] if bare > 0 => {}
+            [line] => problems.extend(named_floor_problem(line, config_floor, text)),
+            many => problems.push(format!(
+                "the formula has {} depends_on macos: lines, not 1",
+                many.len()
+            )),
+        }
+    }
+    problems
+}
+
+/// The problem with one `depends_on macos: :<name>` line, if it is not the
+/// name of `config_floor`.
+fn named_floor_problem(line: &str, config_floor: (u32, u32), text: &str) -> Option<String> {
+    let known = line
+        .strip_prefix("depends_on macos: :")
+        .and_then(|name| MACOS_NAMES.iter().find(|(known, _)| *known == name));
+    let Some(&(name, formula_floor)) = known else {
+        return Some(format!("{line} is not a macOS name this check knows"));
+    };
+    (formula_floor != config_floor).then(|| {
+        format!(
             "the formula's floor :{name} is macOS {}.{}, minimumSystemVersion is {text:?}",
             formula_floor.0, formula_floor.1
-        )]
-    }
+        )
+    })
 }
 
 // ---- the requirements ----
@@ -519,34 +577,114 @@ fn requirement_problems(formula: &str) -> Vec<String> {
 
 // ---- the app build ----
 
-/// The words of every `cargo tauri build` call of the formula.
-fn tauri_build_calls(formula: &str) -> Vec<Vec<String>> {
-    system_calls(formula)
+/// A `system` call of the formula: the statement as written (white space
+/// collapsed) and its quoted words.
+struct SystemCall {
+    statement: String,
+    words: Vec<String>,
+}
+
+/// Every `system` call of the formula.
+fn system_statements(formula: &str) -> Vec<SystemCall> {
+    statements(&read_ruby(formula))
         .into_iter()
-        .filter(|words| position_of(words, ["cargo", "tauri", "build"]).is_some())
+        .filter(|s| is_stanza(s, "system"))
+        .map(|statement| SystemCall {
+            words: quoted_words(&statement),
+            statement,
+        })
         .collect()
 }
 
-/// Every `cargo tauri build` passes `--bundles app` and `--config
+/// Whether the words are a call of the Tauri command line's binary, not of
+/// `cargo`: the first word is `cargo-tauri` or a path that ends in
+/// `/cargo-tauri` (the formula writes `tauri/"bin/cargo-tauri"`, so the quoted
+/// word is `bin/cargo-tauri`), and the second is `build`. A `cargo tauri
+/// build` is not one: `cargo_build_problems` names it.
+fn is_cargo_tauri_build(words: &[String]) -> bool {
+    let binary = words
+        .first()
+        .is_some_and(|word| word == "cargo-tauri" || word.ends_with("/cargo-tauri"));
+    binary && words.get(1).is_some_and(|word| word == "build")
+}
+
+/// Every `cargo-tauri build` call of the formula.
+fn tauri_build_calls(formula: &str) -> Vec<SystemCall> {
+    system_statements(formula)
+        .into_iter()
+        .filter(|call| is_cargo_tauri_build(&call.words))
+        .collect()
+}
+
+/// The variable a `cargo install tauri-cli` call passes as its root: the
+/// unquoted word after `"--root",` (`"--root", tauri` is `tauri`). `--root=...`,
+/// a quoted path or an expression (`tauri/"x"`, `tauri.to_s`) is not a
+/// variable and is not read, so a check on it fails, never passes.
+fn root_variable(statement: &str) -> Option<String> {
+    let (_, after) = statement.split_once("\"--root\",")?;
+    let after = after.trim_start();
+    let name: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    let rest = after[name.len()..].trim_start();
+    let first = name.chars().next()?;
+    ((first.is_ascii_lowercase() || first == '_') && (rest.is_empty() || rest.starts_with(',')))
+        .then_some(name)
+}
+
+/// The install roots (variable names) of the formula's `cargo install
+/// tauri-cli` calls.
+fn tauri_install_roots(formula: &str) -> Vec<String> {
+    system_statements(formula)
+        .iter()
+        .filter(|call| tauri_install(&call.words).is_some())
+        .filter_map(|call| root_variable(&call.statement))
+        .collect()
+}
+
+/// The app is built by calling the pinned binary directly: `system
+/// <root>/"bin/cargo-tauri", "build", ...`, where `<root>` is the variable the
+/// formula's `cargo install tauri-cli` passes as `--root`. So the binary is the
+/// one installed by the pinned install, never one found through PATH.
+/// Every such call passes `--bundles app` and `--config
 /// src-tauri/tauri.bundle.conf.json` (the Mac workflow's build, without the
-/// disk image), there is one, and the app is kept as built: `skip_clean
-/// "Lunaepix.app"`.
+/// disk image), and the app is kept as built: `skip_clean "Lunaepix.app"`.
+/// Other spellings of the call are not read: a leftover `cargo tauri build` is
+/// "no cargo-tauri build" here, and `cargo_build_problems` names it.
 fn app_build_problems(formula: &str) -> Vec<String> {
     let mut problems = Vec::new();
     let calls = tauri_build_calls(formula);
+    let roots = tauri_install_roots(formula);
     if calls.is_empty() {
-        problems.push("the formula has no cargo tauri build".to_owned());
+        problems.push("the formula has no cargo-tauri build".to_owned());
+    } else if roots.is_empty() {
+        problems.push(
+            "the tauri-cli install has no --root variable, so the build's binary cannot be tied to it"
+                .to_owned(),
+        );
     }
-    for words in &calls {
-        let shown = words.join(" ");
-        if flag_value(words, "--bundles").as_deref() != Some("app") {
+    for call in &calls {
+        let shown = call.words.join(" ");
+        if flag_value(&call.words, "--bundles").as_deref() != Some("app") {
             problems.push(format!(
-                "a cargo tauri build without --bundles app: {shown}"
+                "a cargo-tauri build without --bundles app: {shown}"
             ));
         }
-        if flag_value(words, "--config").as_deref() != Some(BUNDLE_CONFIG) {
+        if flag_value(&call.words, "--config").as_deref() != Some(BUNDLE_CONFIG) {
             problems.push(format!(
-                "a cargo tauri build without --config {BUNDLE_CONFIG}: {shown}"
+                "a cargo-tauri build without --config {BUNDLE_CONFIG}: {shown}"
+            ));
+        }
+        let from_root = roots.iter().any(|root| {
+            call.statement
+                .starts_with(&format!("system {root}/\"bin/cargo-tauri\","))
+        });
+        if !roots.is_empty() && !from_root {
+            problems.push(format!(
+                "a cargo-tauri build that is not run from the install root ({}/\"bin/cargo-tauri\"): {}",
+                roots.join(" or "),
+                call.statement
             ));
         }
     }
@@ -557,6 +695,33 @@ fn app_build_problems(formula: &str) -> Vec<String> {
         problems.push("the formula lacks skip_clean \"Lunaepix.app\"".to_owned());
     }
     problems
+}
+
+// ---- no cargo build call ----
+
+/// Whether the words of a call hold both `cargo` and `build`, in any
+/// positions.
+fn has_cargo_and_build(words: &[String]) -> bool {
+    words.iter().any(|word| word == "cargo") && words.iter().any(|word| word == "build")
+}
+
+/// No `system` call of the formula has both a `cargo` word and a `build`
+/// word. This mirrors the text rule of Homebrew's `brew style`
+/// (`FormulaAudit/Text` in `Library/Homebrew/rubocops/text.rb`: "Use
+/// `"cargo", "install", *std_cargo_args`"), which only runs on the Mac, in the
+/// Formula job. It is stricter: brew style spares a call that passes
+/// `--lib`, this check does not, because the formula has no use for one.
+fn cargo_build_problems(formula: &str) -> Vec<String> {
+    system_statements(formula)
+        .iter()
+        .filter(|call| has_cargo_and_build(&call.words))
+        .map(|call| {
+            format!(
+                "a system call with both \"cargo\" and \"build\": {}",
+                call.words.join(" ")
+            )
+        })
+        .collect()
 }
 
 // ---- the note after the install ----
@@ -623,6 +788,7 @@ fn every_formula_check(
         ),
         ("requirement_problems", requirement_problems(formula)),
         ("app_build_problems", app_build_problems(formula)),
+        ("cargo_build_problems", cargo_build_problems(formula)),
         ("caveat_problems", caveat_problems(formula)),
     ]
 }
@@ -664,7 +830,7 @@ const GOOD_FORMULA: &str = r##"class Lunaepix < Formula
 
   depends_on "rust" => :build
   depends_on arch: :arm64
-  depends_on macos: :big_sur
+  depends_on :macos
 
   # Any change inside the app breaks its seal.
   skip_clean "Lunaepix.app"
@@ -674,9 +840,8 @@ const GOOD_FORMULA: &str = r##"class Lunaepix < Formula
 
     tauri = buildpath/"tauri-cli"
     system "cargo", "install", "tauri-cli", "--locked", "--version", "2.12.4", "--root", tauri
-    ENV.prepend_path "PATH", tauri/"bin"
 
-    system "cargo", "tauri", "build", "--bundles", "app",
+    system tauri/"bin/cargo-tauri", "build", "--bundles", "app",
            "--config", "src-tauri/tauri.bundle.conf.json"
     prefix.install "target/release/bundle/macos/Lunaepix.app"
   end
@@ -767,6 +932,19 @@ fn the_formula_checks_are_not_vacuous() {
         .count();
     assert_eq!(installs, 1);
     assert!(stanzas(&formula, "depends_on").len() >= 3);
+    // One floor line, and it is the bare one (the config says 11.0, Homebrew's oldest).
+    let floors: Vec<String> = stanzas(&formula, "depends_on")
+        .into_iter()
+        .filter(|line| line.contains("macos"))
+        .collect();
+    assert_eq!(floors, ["depends_on :macos"]);
+    // The install root the build runs from, and no `cargo`+`build` call.
+    assert_eq!(tauri_install_roots(&formula).len(), 1);
+    assert!(
+        system_calls(&formula)
+            .iter()
+            .all(|words| !has_cargo_and_build(words))
+    );
     assert_eq!(read_ruby(&formula).heredocs.len(), 1, "the caveats");
     for name in ["macos.yml", "windows.yml"] {
         let text = repo_file(&format!(".github/workflows/{name}"));
@@ -1123,71 +1301,147 @@ fn a_missing_or_repeated_checksum_is_caught_in_a_fixture() {
 
 // ---- the macOS floor ----
 
+/// The good fixture's floor line, and a formula with it replaced.
+const BARE_FLOOR: &str = "depends_on :macos";
+
+fn with_floor_line(line: &str) -> String {
+    formula_with(BARE_FLOOR, line)
+}
+
+/// The good config with another `minimumSystemVersion`.
+fn config_with_floor(version: &str) -> String {
+    GOOD_JSON.replace("11.0", version)
+}
+
 #[test]
 fn a_floor_that_matches_the_config_passes_in_a_fixture() {
     assert_clean(macos_floor_problems(GOOD_FORMULA, GOOD_JSON));
-    // The table is read, not hard-coded to one name.
-    for (name, version) in [("monterey", "12.0"), ("tahoe", "26.0"), ("sequoia", "15")] {
-        let formula = formula_with(":big_sur", &format!(":{name}"));
-        let json = GOOD_JSON.replace("11.0", version);
-        assert_clean(macos_floor_problems(&formula, &json));
+    // Not newer than Homebrew's oldest: the bare line, also for "11" and for
+    // an older floor.
+    for version in ["11", "10.15"] {
+        assert_clean(macos_floor_problems(
+            GOOD_FORMULA,
+            &config_with_floor(version),
+        ));
     }
+    // Newer: the name is read from the table, not hard-coded to one.
+    for (name, version) in [("monterey", "12.0"), ("tahoe", "26.0"), ("sequoia", "15")] {
+        let formula = with_floor_line(&format!("depends_on macos: :{name}"));
+        assert_clean(macos_floor_problems(&formula, &config_with_floor(version)));
+    }
+}
+
+#[test]
+fn homebrews_oldest_macos_is_the_lowest_name_in_the_table() {
+    // No negative test: two constants of this file that agree or do not.
+    assert!(MACOS_NAMES.contains(&HOMEBREW_OLDEST_MACOS));
+    assert!(
+        MACOS_NAMES
+            .iter()
+            .all(|(_, version)| *version >= HOMEBREW_OLDEST_MACOS.1)
+    );
+}
+
+#[test]
+fn a_named_floor_that_is_not_newer_than_homebrews_oldest_is_caught_in_a_fixture() {
+    let start = "the formula names a macOS floor";
+    // The rc2 formula, which brew style refused, and other spellings.
+    for line in [
+        "depends_on macos: :big_sur",
+        "depends_on macos: :monterey",
+        "depends_on macos: \"big_sur\"",
+        "depends_on :macos\n  depends_on macos: :big_sur",
+    ] {
+        let formula = with_floor_line(line);
+        assert_one_problem(&macos_floor_problems(&formula, GOOD_JSON), start, line);
+        let older = config_with_floor("10.15");
+        assert_one_problem(&macos_floor_problems(&formula, &older), start, line);
+    }
+}
+
+#[test]
+fn a_bare_floor_when_the_config_is_newer_is_caught_in_a_fixture() {
+    let start = "the formula has a bare depends_on :macos";
+    for version in ["12.0", "26.0", "11.1"] {
+        let json = config_with_floor(version);
+        assert_one_problem(&macos_floor_problems(GOOD_FORMULA, &json), start, version);
+    }
+    // The bare line next to the right name is still the bare line's problem.
+    let formula = with_floor_line("depends_on :macos\n  depends_on macos: :monterey");
+    let json = config_with_floor("12.0");
+    assert_one_problem(&macos_floor_problems(&formula, &json), start, "both");
 }
 
 #[test]
 fn a_floor_that_differs_from_the_config_is_caught_in_a_fixture() {
     let start = "the formula's floor";
-    let monterey = formula_with(":big_sur", ":monterey");
-    assert_one_problem(
-        &macos_floor_problems(&monterey, GOOD_JSON),
-        start,
-        "monterey",
-    );
-    let json = GOOD_JSON.replace("11.0", "12.0");
-    assert_one_problem(
-        &macos_floor_problems(GOOD_FORMULA, &json),
-        start,
-        "config 12.0",
-    );
-    let json = GOOD_JSON.replace("11.0", "11.1");
-    assert_one_problem(
-        &macos_floor_problems(GOOD_FORMULA, &json),
-        start,
-        "config 11.1",
-    );
+    for (name, version) in [
+        ("big_sur", "12.0"),
+        ("big_sur", "11.1"),
+        ("monterey", "13.0"),
+        ("monterey", "12.1"),
+    ] {
+        let formula = with_floor_line(&format!("depends_on macos: :{name}"));
+        let json = config_with_floor(version);
+        assert_one_problem(
+            &macos_floor_problems(&formula, &json),
+            start,
+            &format!("{name} {version}"),
+        );
+    }
 }
 
 #[test]
-fn a_missing_floor_or_an_unreadable_config_is_caught_in_a_fixture() {
-    let line = "depends_on macos: :big_sur";
-    // No floor, a commented one, and two.
+fn a_missing_or_repeated_floor_is_caught_in_a_fixture() {
+    // Not newer: no bare line, a commented one, and two.
+    let start = "the formula has 0 depends_on :macos lines";
     for formula in [
-        formula_with(line, ""),
-        formula_with(line, &format!("# {line}")),
+        with_floor_line(""),
+        with_floor_line(&format!("# {BARE_FLOOR}")),
     ] {
         let problems = macos_floor_problems(&formula, GOOD_JSON);
+        assert_one_problem(&problems, start, &formula);
+    }
+    let twice = with_floor_line(&format!("{BARE_FLOOR}\n  {BARE_FLOOR}"));
+    assert_one_problem(
+        &macos_floor_problems(&twice, GOOD_JSON),
+        "the formula has 2 depends_on :macos lines",
+        "twice",
+    );
+    // Newer: no named floor, a commented one, two, a name the table does not
+    // know, and a floor that is not a symbol.
+    let newer = config_with_floor("12.0");
+    let named = "depends_on macos: :monterey";
+    for formula in [with_floor_line(""), with_floor_line(&format!("# {named}"))] {
         assert_one_problem(
-            &problems,
+            &macos_floor_problems(&formula, &newer),
             "the formula has 0 depends_on macos: lines",
             &formula,
         );
     }
-    let twice = formula_with(line, &format!("{line}\n  depends_on macos: :monterey"));
-    let problems = macos_floor_problems(&twice, GOOD_JSON);
+    let twice = with_floor_line(&format!("{named}\n  {named}"));
     assert_one_problem(
-        &problems,
+        &macos_floor_problems(&twice, &newer),
         "the formula has 2 depends_on macos: lines",
-        "twice",
+        "two names",
     );
-    // A name the table does not know.
-    let formula = formula_with(":big_sur", ":hollywood");
-    let problems = macos_floor_problems(&formula, GOOD_JSON);
-    assert_one_problem(
-        &problems,
-        "depends_on macos: :hollywood is not a macOS name",
-        "unknown",
-    );
-    // A config that is not JSON, lacks the key, or has it as another type.
+    for line in [
+        "depends_on macos: :hollywood",
+        "depends_on macos: \"monterey\"",
+    ] {
+        let formula = with_floor_line(line);
+        assert_one_problem(
+            &macos_floor_problems(&formula, &newer),
+            &format!("{line} is not a macOS name"),
+            line,
+        );
+    }
+}
+
+#[test]
+fn an_unreadable_config_is_caught_in_a_fixture() {
+    // Whatever the formula says, the config is read first. Not JSON, a
+    // missing key, the key as another type.
     let problems = macos_floor_problems(GOOD_FORMULA, "{not json");
     assert_one_problem(
         &problems,
@@ -1204,10 +1458,17 @@ fn a_missing_floor_or_an_unreadable_config_is_caught_in_a_fixture() {
     }
     // A version that is not numbers.
     for version in ["eleven", "11.x", "11.0.1", ""] {
-        let json = GOOD_JSON.replace("11.0", version);
+        let json = config_with_floor(version);
         let problems = macos_floor_problems(GOOD_FORMULA, &json);
         assert_one_problem(&problems, "minimumSystemVersion", version);
     }
+    // A formula with no floor at all does not hide a config problem.
+    let problems = macos_floor_problems(&with_floor_line(""), "{not json");
+    assert_one_problem(
+        &problems,
+        "tauri.macos.conf.json does not parse",
+        "no floor",
+    );
 }
 
 // ---- the requirements ----
@@ -1274,6 +1535,15 @@ fn a_nasm_or_node_requirement_is_caught_in_a_fixture() {
 
 // ---- the app build ----
 
+/// The good formula with the tauri-cli install root named `root` instead of
+/// `tauri`, in the variable, the install and the build.
+fn formula_with_root_named(root: &str) -> String {
+    GOOD_FORMULA
+        .replace("tauri = buildpath", &format!("{root} = buildpath"))
+        .replace("\"--root\", tauri", &format!("\"--root\", {root}"))
+        .replace("system tauri/", &format!("system {root}/"))
+}
+
 #[test]
 fn a_build_with_the_app_bundle_and_the_config_passes_in_a_fixture() {
     assert_clean(app_build_problems(GOOD_FORMULA));
@@ -1287,6 +1557,9 @@ fn a_build_with_the_app_bundle_and_the_config_passes_in_a_fixture() {
     ] {
         assert_clean(app_build_problems(&formula_with(build, to)));
     }
+    // The install root is a variable of any name, the same in the install and
+    // the build.
+    assert_clean(app_build_problems(&formula_with_root_named("cli_root")));
 }
 
 #[test]
@@ -1304,7 +1577,7 @@ fn a_build_without_the_app_bundle_or_the_config_is_caught_in_a_fixture() {
     ] {
         let formula = formula_with(bundles, &to);
         let problems = app_build_problems(&formula);
-        assert_problem(&problems, "a cargo tauri build without --bundles app", &to);
+        assert_problem(&problems, "a cargo-tauri build without --bundles app", &to);
     }
     for to in [
         "".to_owned(),
@@ -1314,29 +1587,70 @@ fn a_build_without_the_app_bundle_or_the_config_is_caught_in_a_fixture() {
     ] {
         let formula = formula_with(config, &to);
         let problems = app_build_problems(&formula);
-        assert_problem(&problems, "a cargo tauri build without --config", &to);
+        assert_problem(&problems, "a cargo-tauri build without --config", &to);
     }
     // One missing flag is one problem, not two.
     let formula = formula_with(bundles, "\"--bundles\", \"dmg\"");
     assert_one_problem(
         &app_build_problems(&formula),
-        "a cargo tauri build without --bundles app",
+        "a cargo-tauri build without --bundles app",
         "dmg",
     );
 }
 
 #[test]
-fn a_formula_without_a_tauri_build_is_caught_in_a_fixture() {
-    let call = "system \"cargo\", \"tauri\", \"build\", \"--bundles\", \"app\",\n           \"--config\", \"src-tauri/tauri.bundle.conf.json\"";
+fn a_formula_without_a_cargo_tauri_build_is_caught_in_a_fixture() {
+    let call = "system tauri/\"bin/cargo-tauri\", \"build\", \"--bundles\", \"app\",\n           \"--config\", \"src-tauri/tauri.bundle.conf.json\"";
     for to in [
         "".to_owned(),
         "system \"cargo\", \"build\", \"--release\"".to_owned(),
+        // The rc2 call: `cargo tauri build` is not a cargo-tauri call. It is
+        // left to `cargo_build_problems`, which names it.
+        "system \"cargo\", \"tauri\", \"build\", \"--bundles\", \"app\",\n           \"--config\", \"src-tauri/tauri.bundle.conf.json\"".to_owned(),
+        // Another subcommand of the binary.
+        "system tauri/\"bin/cargo-tauri\", \"dev\"".to_owned(),
         // Commented out, both lines.
-        "# system \"cargo\", \"tauri\", \"build\", \"--bundles\", \"app\",\n    # \"--config\", \"src-tauri/tauri.bundle.conf.json\"".to_owned(),
+        "# system tauri/\"bin/cargo-tauri\", \"build\", \"--bundles\", \"app\",\n    # \"--config\", \"src-tauri/tauri.bundle.conf.json\"".to_owned(),
     ] {
         let formula = formula_with(call, &to);
         let problems = app_build_problems(&formula);
-        assert_one_problem(&problems, "the formula has no cargo tauri build", &to);
+        assert_one_problem(&problems, "the formula has no cargo-tauri build", &to);
+    }
+}
+
+#[test]
+fn a_build_that_is_not_run_from_the_install_root_is_caught_in_a_fixture() {
+    let start = "a cargo-tauri build that is not run from the install root";
+    let binary = "system tauri/\"bin/cargo-tauri\",";
+    // Found through PATH, from another variable, from the root but not its
+    // `bin`, from an absolute path, written with parentheses.
+    for to in [
+        "system \"cargo-tauri\",",
+        "system other/\"bin/cargo-tauri\",",
+        "system tauri/\"cargo-tauri\",",
+        "system \"/opt/x/bin/cargo-tauri\",",
+        "system(tauri/\"bin/cargo-tauri\",",
+    ] {
+        let formula = formula_with(binary, to);
+        assert_one_problem(&app_build_problems(&formula), start, to);
+    }
+    // The install writes to another root than the build runs from.
+    let formula = formula_with("\"--root\", tauri", "\"--root\", other");
+    assert_one_problem(&app_build_problems(&formula), start, "root");
+}
+
+#[test]
+fn a_tauri_install_without_a_root_variable_is_caught_in_a_fixture() {
+    let start = "the tauri-cli install has no --root variable";
+    for to in [
+        "",
+        ", \"--root=/tmp/x\"",
+        ", \"--root\", \"/tmp/x\"",
+        ", \"--root\", tauri/\"x\"",
+        ", \"--root\", tauri.to_s",
+    ] {
+        let formula = formula_with(", \"--root\", tauri", to);
+        assert_one_problem(&app_build_problems(&formula), start, to);
     }
 }
 
@@ -1353,6 +1667,72 @@ fn a_formula_without_skip_clean_for_the_app_is_caught_in_a_fixture() {
         let problems = app_build_problems(&formula);
         assert_one_problem(&problems, "the formula lacks skip_clean", &to);
     }
+}
+
+// ---- no cargo build call ----
+
+#[test]
+fn a_system_call_without_both_cargo_and_build_passes_in_a_fixture() {
+    // The good formula has two `cargo install` calls and the direct binary.
+    assert_clean(cargo_build_problems(GOOD_FORMULA));
+    // Only one of the two words, or neither.
+    for call in [
+        "system \"cargo\", \"test\"",
+        "system \"make\", \"build\"",
+        "system \"cargo build\"",
+    ] {
+        let formula = formula_with(
+            "    prefix.install",
+            &format!("    {call}\n    prefix.install"),
+        );
+        assert_clean(cargo_build_problems(&formula));
+    }
+    // Only in a comment, or in the text of the caveats: not a call.
+    let call = "system \"cargo\", \"build\", \"--release\"";
+    let commented = formula_with(
+        "    prefix.install",
+        &format!("    # {call}\n    prefix.install"),
+    );
+    assert_clean(cargo_build_problems(&commented));
+    let in_text = formula_with(
+        "      Lunaepix.app is installed in:",
+        &format!("      {call}\n      Lunaepix.app is installed in:"),
+    );
+    assert_clean(cargo_build_problems(&in_text));
+}
+
+#[test]
+fn a_system_call_with_cargo_and_build_is_caught_in_a_fixture() {
+    let start = "a system call with both \"cargo\" and \"build\"";
+    // The rc2 formula's call, and the plain build.
+    let rc2 = formula_with(
+        "system tauri/\"bin/cargo-tauri\", \"build\",",
+        "system \"cargo\", \"tauri\", \"build\",",
+    );
+    assert_one_problem(&cargo_build_problems(&rc2), start, "rc2");
+    for call in [
+        "system \"cargo\", \"build\", \"--release\"",
+        // Any position, any order.
+        "system \"build\", \"--release\", \"cargo\"",
+        "system \"cargo\", \"--release\", \"x\", \"build\"",
+        // Brew style spares `--lib`; this check does not.
+        "system \"cargo\", \"build\", \"--lib\"",
+        // Over two lines, and with parentheses.
+        "system \"cargo\",\n           \"build\"",
+        "system(\"cargo\", \"build\")",
+    ] {
+        let formula = formula_with(
+            "    prefix.install",
+            &format!("    {call}\n    prefix.install"),
+        );
+        assert_one_problem(&cargo_build_problems(&formula), start, call);
+    }
+    // Two such calls are two problems.
+    let formula = formula_with(
+        "    prefix.install",
+        "    system \"cargo\", \"build\"\n    system \"cargo\", \"build\", \"--lib\"\n    prefix.install",
+    );
+    assert_eq!(cargo_build_problems(&formula).len(), 2);
 }
 
 // ---- the note after the install ----

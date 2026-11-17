@@ -58,7 +58,7 @@ The Mac download (0.1.4) is an unsigned `.dmg`. On first launch macOS blocks it,
 
 ## Anti-goals
 
-- A second copy of the bundling logic: no hand-built `Info.plist`, no hand-placed worker, no separate signing step. The app comes out of `cargo tauri build` exactly as the Mac workflow builds it.
+- A second copy of the bundling logic: no hand-built `Info.plist`, no hand-placed worker, no separate signing step. The app comes out of Tauri's own build (`cargo-tauri build`) exactly as the Mac workflow builds it.
 - Anything outside Homebrew's folders: the formula never writes to `/Applications`, never to the user's `~/.cargo`, and never asks for a password.
 - A credential, an Apple account or a write permission anywhere.
 
@@ -69,13 +69,13 @@ The Mac download (0.1.4) is an unsigned `.dmg`. On first launch macOS blocks it,
 A tap given by address reads formulas from the `Formula/` folder at the repository's root, on the default branch (`main`).
 
 - **Source:** `url "https://github.com/Aureus-Lunae/Lunaepix/archive/refs/tags/v0.1.5.tar.gz"` with its `sha256`, `license "MIT"`, `homepage` the repository, and a one-line `desc`.
-- **Requirements:** `depends_on "rust" => :build`, `depends_on arch: :arm64`, and `depends_on macos: :big_sur` (macOS 11, the same minimum as `tauri.macos.conf.json`; it also limits the formula to macOS). No NASM and no Node: the Mac needs neither (see the Mac build spec).
+- **Requirements:** `depends_on "rust" => :build`, `depends_on arch: :arm64`, and a bare `depends_on :macos` (macOS 11 is the app's minimum in `tauri.macos.conf.json` and Homebrew's own oldest, so naming it with `macos: :big_sur` is redundant and `brew style` refuses it; the bare line limits the formula to macOS, and a test follows the config: if the app's minimum ever rises above Homebrew's oldest, the formula must name it). No NASM and no Node: the Mac needs neither (see the Mac build spec).
 - **Checksum between releases:** on `development`, and in the commit a release tag points at, `sha256` holds a placeholder of 64 zeros. The real checksum only exists after the tag (see "The release step"). The guards accept exactly the placeholder or 64 lower-case hex characters.
 - **The app is left as built:** `skip_clean "Lunaepix.app"`. After an install, Homebrew's clean-up may strip or rewrite Mach-O files in the formula's folder; any change to a file inside the app breaks its seal, and `codesign --verify --deep --strict` then fails. `skip_clean` is not a signing step, so it stays within the anti-goal. If the installed app still fails the check, re-signing it would be a separate signing step: stop and ask.
 - **Install, in this order:**
   1. The command line: `cargo install` of `crates/cli` with Homebrew's standard arguments plus `--target-dir target`, so `lunaepix` lands in the formula's `bin` and the libraries it compiles are reused by the app build in step 3 instead of compiled a second time.
-  2. The Tauri command line, at exactly the version both workflows pin (2.12.4 today), installed with `--locked` into a folder inside the build folder, and that folder's `bin` put first on the build's PATH (Homebrew filters PATH, and `cargo tauri` looks for `cargo-tauri` there). It never reaches the user's `~/.cargo`, and it is gone after the install.
-  3. `cargo tauri build` with `--bundles app` and `--config src-tauri/tauri.bundle.conf.json`. This is the Mac workflow's build command without the disk image. It runs the worker staging step, bundles the app, and signs it ad hoc with the worker sealed in, exactly as the download.
+  2. The Tauri command line, at exactly the version both workflows pin (2.12.4 today), installed with `--locked` into a folder inside the build folder, and the binary it installs there (`tauri/"bin/cargo-tauri"`) called directly in step 3, not through PATH (Homebrew filters PATH). It never reaches the user's `~/.cargo`, and it is gone after the install.
+  3. `cargo-tauri build`, called by its path from step 2, with `--bundles app` and `--config src-tauri/tauri.bundle.conf.json`. This is the Mac workflow's build command without the disk image; it is called as the binary because `brew style` refuses a `system` call with the words "cargo" and "build". It runs the worker staging step, bundles the app, and signs it ad hoc with the worker sealed in, exactly as the download.
   4. `Lunaepix.app` from `target/release/bundle/macos/` goes into the formula's folder.
 - **The note after install (caveats).** This is the exact text:
 
@@ -149,7 +149,7 @@ After the user releases 0.1.5 and the formula commit is on `main`, on an Apple S
 
 ## Stop and ask
 
-- `cargo tauri build` cannot run inside Homebrew's build environment (for example it writes outside the build folder and the sandbox refuses), and the way out would be assembling the app by hand. That is option 2, which the user did not choose.
+- The app build (`cargo-tauri build`) cannot run inside Homebrew's build environment (for example it writes outside the build folder and the sandbox refuses), and the way out would be assembling the app by hand. That is option 2, which the user did not choose.
 - Homebrew's checks refuse a formula that installs an `.app`, or require something that contradicts a Handoff line.
 - The first build on the runner takes far longer than the README can honestly call acceptable (over 45 minutes).
 

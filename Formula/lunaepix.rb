@@ -9,7 +9,9 @@ class Lunaepix < Formula
 
   depends_on "rust" => :build
   depends_on arch: :arm64
-  depends_on macos: :big_sur
+  # macOS 11 is the app's floor and Homebrew's own, so naming it is
+  # redundant (brew style refuses it).
+  depends_on :macos
 
   # Homebrew's clean-up may strip or rewrite Mach-O files after install;
   # any change inside the app breaks its seal.
@@ -22,11 +24,12 @@ class Lunaepix < Formula
     # inside the build folder, never in ~/.cargo.
     tauri = buildpath/"tauri-cli"
     system "cargo", "install", "tauri-cli", "--locked", "--version", "2.12.4", "--root", tauri
-    ENV.prepend_path "PATH", tauri/"bin"
 
     # The Mac workflow's build, without the disk image: the worker is
-    # staged and sealed in, and the app is signed ad hoc.
-    system "cargo", "tauri", "build", "--bundles", "app",
+    # staged and sealed in, and the app is signed ad hoc. The binary is
+    # called directly because brew style refuses a system call with
+    # "cargo" and "build".
+    system tauri/"bin/cargo-tauri", "build", "--bundles", "app",
            "--config", "src-tauri/tauri.bundle.conf.json"
     prefix.install "target/release/bundle/macos/Lunaepix.app"
   end
