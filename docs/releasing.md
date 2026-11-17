@@ -13,6 +13,15 @@ Before you start, `development` has the version `X.Y.Z` in the workspace
 `Cargo.toml`, and the formula's `url` names `vX.Y.Z` (a test checks that they
 match). The formula's `sha256` is still 64 zeros.
 
+Also check that `HOMEBREW_OLDEST_MACOS` in `src-tauri/tests/formula.rs` is
+still the oldest name in Homebrew's `MacOSVersion::SYMBOLS`
+(`Library/Homebrew/macos_version.rb`, on GitHub in Homebrew/brew). Homebrew is
+due to drop Big Sur support around 2027-09. If the oldest name has changed,
+change the constant to it (name and version) and remove the older names from
+`MACOS_NAMES` beside it. The test then holds the formula's macOS line to the
+new oldest: `brew style` refuses a `depends_on macos:` line for a version that
+is not newer than it.
+
 ## Checklist
 
 Do not bump the version on `development` until step 6 is pushed. Otherwise
