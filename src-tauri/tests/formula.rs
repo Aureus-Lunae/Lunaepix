@@ -35,10 +35,14 @@
 //! - The body of a heredoc (`<<~EOS`, `<<-EOS`, `<<EOS`, up to its terminator
 //!   line) is text, not code: the caveats are read from it, with its `#`
 //!   characters kept, and nothing else is read from it.
-//! - A statement that ends its line in `,` or `\` goes on in the next line,
-//!   so a call over two lines is one statement. Other ways to break a line
-//!   (an open parenthesis, `%w[]`, a trailing operator) are not read and make
-//!   a check fail, never pass.
+//! - A statement that ends its line in `,`, `\` or `(` goes on in the next
+//!   line, so a call over two lines is one statement. Other ways to break a
+//!   line (`%w[]`, a trailing operator) are not read. A check that looks for
+//!   something present then fails on them; `cargo_build_problems`, which looks
+//!   for something absent, does not see them, and its doc lists the forms it
+//!   does not read.
+//! - A `system` call is read from the word `system` to the end of its
+//!   statement, so `x = system "a", "b"` is read like `system "a", "b"`.
 //! - A call is read as its quoted words: `system "cargo", "install",
 //!   "tauri-cli", "--version", "2.12.4"` is the words `cargo`, `install`,
 //!   `tauri-cli`, `--version`, `2.12.4`. Words that are not quoted (a splat,
@@ -174,9 +178,11 @@ fn read_ruby(text: &str) -> Ruby {
     ruby
 }
 
-/// The statements of the code: a line that ends in `,` or `\` is joined with
-/// the next one. White space inside a statement is collapsed to single
-/// spaces.
+/// The statements of the code: a line that ends in `,`, `\` or `(` is joined
+/// with the next one. White space inside a statement is collapsed to single
+/// spaces. A call over several lines in parentheses is read up to its last
+/// line that ends in a comma; its closing `)` line, if alone, is a statement
+/// of its own, which no check reads.
 fn statements(ruby: &Ruby) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut continued = false;
@@ -190,7 +196,7 @@ fn statements(ruby: &Ruby) -> Vec<String> {
             }
             _ => out.push(text.to_owned()),
         }
-        continued = line.ends_with(',') || line.ends_with('\\');
+        continued = line.ends_with([',', '\\', '(']);
     }
     out.iter()
         .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -229,10 +235,9 @@ fn is_stanza(statement: &str, name: &str) -> bool {
 
 /// The words of every `system` call of the formula, one list per call.
 fn system_calls(formula: &str) -> Vec<Vec<String>> {
-    statements(&read_ruby(formula))
-        .iter()
-        .filter(|s| is_stanza(s, "system"))
-        .map(|s| quoted_words(s))
+    system_statements(formula)
+        .into_iter()
+        .map(|call| call.words)
         .collect()
 }
 
@@ -584,14 +589,42 @@ struct SystemCall {
     words: Vec<String>,
 }
 
-/// Every `system` call of the formula.
+/// Where a `system` call starts in a statement: the word `system` (not the end
+/// of another name such as `subsystem` or `safe_system`, not a method of
+/// something, not inside a string) followed by a space or a parenthesis. The
+/// statement may start with it, or have it after an assignment, `if`, `&&` and
+/// the like.
+fn system_call_start(statement: &str) -> Option<usize> {
+    let bytes = statement.as_bytes();
+    statement
+        .match_indices("system")
+        .map(|(at, _)| at)
+        .find(|&at| {
+            let before = statement[..at].chars().next_back();
+            let after = statement[at + "system".len()..].chars().next();
+            let word_start = before.is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '.'));
+            let call = after.is_some_and(|c| c == ' ' || c == '(');
+            let outside_string = ['"', '\'']
+                .iter()
+                .all(|&q| bytes[..at].iter().filter(|&&b| b == q as u8).count() % 2 == 0);
+            word_start && call && outside_string
+        })
+}
+
+/// Every `system` call of the formula: from the word `system` to the end of
+/// its statement, whatever comes before it (`x = system ...`). A statement
+/// with two calls (`system "a" && system "b"`) is one call that holds the
+/// words of both, which makes a lint for something's absence stricter, not
+/// weaker.
 fn system_statements(formula: &str) -> Vec<SystemCall> {
     statements(&read_ruby(formula))
         .into_iter()
-        .filter(|s| is_stanza(s, "system"))
-        .map(|statement| SystemCall {
-            words: quoted_words(&statement),
-            statement,
+        .filter_map(|statement| {
+            let call = statement[system_call_start(&statement)?..].to_owned();
+            Some(SystemCall {
+                words: quoted_words(&call),
+                statement: call,
+            })
         })
         .collect()
 }
@@ -711,6 +744,17 @@ fn has_cargo_and_build(words: &[String]) -> bool {
 /// `"cargo", "install", *std_cargo_args`"), which only runs on the Mac, in the
 /// Formula job. It is stricter: brew style spares a call that passes
 /// `--lib`, this check does not, because the formula has no use for one.
+///
+/// It reads a `system` call written as a statement, after an assignment or
+/// `if`/`&&`, with its arguments on the same line or after an opening
+/// parenthesis at the end of the line (see `statements`). It does not read,
+/// and so does not catch: a command in one string (`system "cargo build"`,
+/// which brew style does not flag either), arguments in a `%w[]` or a
+/// variable, a line broken after an operator (`+`, `&&`), `safe_system` and
+/// `quiet_system`, and a call inside a heredoc or a comment. A check that
+/// looks for something present fails on these forms; this one, which looks
+/// for something absent, passes, so the Formula job's `brew style` stays the
+/// backstop.
 fn cargo_build_problems(formula: &str) -> Vec<String> {
     system_statements(formula)
         .iter()
@@ -1029,6 +1073,25 @@ fn a_call_continued_on_the_next_line_is_one_call_in_a_fixture() {
     );
 }
 
+#[test]
+fn a_call_broken_after_its_open_parenthesis_is_one_call_in_a_fixture() {
+    // The arguments on the next line, and one per line.
+    let ruby = read_ruby("system(\n  \"a\", \"b\")\nsystem(\n  \"c\",\n  \"d\"\n)\nx(\ny 1\nz 2\n");
+    assert_eq!(
+        statements(&ruby),
+        [
+            "system( \"a\", \"b\")",
+            "system( \"c\", \"d\"",
+            ")",
+            "x( y 1",
+            "z 2"
+        ]
+    );
+    // A `(` that is not at the end of the line joins nothing.
+    let ruby = read_ruby("system(\"a\")\nb\n");
+    assert_eq!(statements(&ruby), ["system(\"a\")", "b"]);
+}
+
 // ---- the Tauri version ----
 
 #[test]
@@ -1216,6 +1279,9 @@ fn a_url_for_another_version_repository_branch_or_format_is_caught_in_a_fixture(
         format!("url(\"{url}\")"),
         format!("url '{url}'"),
         format!("url \"{url}\", using: :curl"),
+        // Broken after the parenthesis: read as one statement, still not the
+        // one form.
+        format!("url(\n    \"{url}\")"),
     ] {
         let formula = GOOD_FORMULA.replace(&format!("url \"{url}\""), &line);
         assert_one_problem(&url_problems(&formula, "0.1.5"), start, &line);
@@ -1699,6 +1765,85 @@ fn a_system_call_without_both_cargo_and_build_passes_in_a_fixture() {
         &format!("      {call}\n      Lunaepix.app is installed in:"),
     );
     assert_clean(cargo_build_problems(&in_text));
+}
+
+/// The good formula with `call` added before the app is installed.
+fn formula_with_call(call: &str) -> String {
+    formula_with(
+        "    prefix.install",
+        &format!("    {call}\n    prefix.install"),
+    )
+}
+
+#[test]
+fn a_cargo_build_call_broken_after_its_parenthesis_or_assigned_is_caught_in_a_fixture() {
+    let start = "a system call with both \"cargo\" and \"build\"";
+    for call in [
+        // The arguments on the next line, and one per line.
+        "system(\n      \"cargo\", \"build\")",
+        "system(\n      \"cargo\",\n      \"build\"\n    )",
+        // The call as the value of an assignment, a condition or a chain.
+        "x = system \"cargo\", \"build\"",
+        "ok = system(\"cargo\", \"build\")",
+        "ok = system(\n      \"cargo\", \"build\")",
+        "if system \"cargo\", \"build\"\n    end",
+        "system \"make\" && system \"cargo\", \"build\"",
+    ] {
+        let formula = formula_with_call(call);
+        assert_one_problem(&cargo_build_problems(&formula), start, call);
+    }
+}
+
+#[test]
+fn a_call_that_is_not_a_cargo_build_stays_clean_in_those_forms_in_a_fixture() {
+    for call in [
+        "x = system \"cargo\", \"test\"",
+        "system(\n      \"cargo\", \"test\")",
+        "ok = system(\"make\", \"build\")",
+        // `system` in a string is not a call.
+        "ohai \"system cargo build\"",
+        "ohai 'system \"cargo\", \"build\"'",
+        // A word that only ends in `system` is another method.
+        "ok = subsystem \"cargo\", \"build\"",
+    ] {
+        let formula = formula_with_call(call);
+        assert_clean(cargo_build_problems(&formula));
+    }
+}
+
+#[test]
+fn the_forms_the_cargo_build_lint_does_not_read_are_unread_in_a_fixture() {
+    // Documented in the lint's doc: these are not caught. If one is made
+    // readable later, move it to the caught test.
+    for call in [
+        "system \"cargo build\"",
+        "system(*%w[cargo build])",
+        "safe_system \"cargo\", \"build\"",
+        "quiet_system \"cargo\", \"build\"",
+        "system \"cargo\" +\n      \"build\"",
+    ] {
+        let formula = formula_with_call(call);
+        assert_clean(cargo_build_problems(&formula));
+    }
+}
+
+#[test]
+fn an_assigned_cargo_tauri_build_is_read_as_the_build_in_a_fixture() {
+    let formula = formula_with(
+        "system tauri/\"bin/cargo-tauri\", \"build\"",
+        "built = system tauri/\"bin/cargo-tauri\", \"build\"",
+    );
+    assert_clean(app_build_problems(&formula));
+    // And is still tied to the install root.
+    let formula = formula_with(
+        "system tauri/\"bin/cargo-tauri\", \"build\"",
+        "built = system \"cargo-tauri\", \"build\"",
+    );
+    assert_one_problem(
+        &app_build_problems(&formula),
+        "a cargo-tauri build that is not run from the install root",
+        "assigned, PATH",
+    );
 }
 
 #[test]
