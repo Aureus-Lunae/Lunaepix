@@ -295,9 +295,10 @@ brew install aureus-lunae/lunaepix/lunaepix
 ```
 
 Every install, and every `brew upgrade lunaepix`, builds Lunaepix from source
-on your Mac, including the Tauri command line it needs. Only the first install
-also installs Rust. A build takes about TODO-MINUTES minutes on an Apple
-Silicon Mac. It reaches users from the 0.1.5 release on.
+on your Mac, including the Tauri command line it needs. Homebrew installs Rust
+for the build when it is not there; its clean-up may remove Rust again
+afterwards, as nothing else needs it. A build takes about 20 minutes on an
+Apple Silicon Mac. It reaches users from the 0.1.5 release on.
 
 Homebrew 6 asks you to trust a third-party tap. Installing by the full name
 `aureus-lunae/lunaepix/lunaepix`, as above, trusts only this formula, so no
