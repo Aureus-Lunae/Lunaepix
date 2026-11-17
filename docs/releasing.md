@@ -18,9 +18,11 @@ still the oldest name in Homebrew's `MacOSVersion::SYMBOLS`
 (`Library/Homebrew/macos_version.rb`, on GitHub in Homebrew/brew). Homebrew is
 due to drop Big Sur support around 2027-09. If the oldest name has changed,
 change the constant to it (name and version) and remove the older names from
-`MACOS_NAMES` beside it. The test then holds the formula's macOS line to the
-new oldest: `brew style` refuses a `depends_on macos:` line for a version that
-is not newer than it.
+`MACOS_NAMES` beside it. Then run `cargo test -p lunaepix-app --test formula`
+and update the fixtures in that file that name the dropped release (they use
+`big_sur` today). The test then holds the formula's macOS line to the new
+oldest: `brew style` refuses a `depends_on macos:` line for a version that is
+not newer than it.
 
 ## Checklist
 

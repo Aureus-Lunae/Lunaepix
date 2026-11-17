@@ -182,7 +182,10 @@ fn read_ruby(text: &str) -> Ruby {
 /// with the next one. White space inside a statement is collapsed to single
 /// spaces. A call over several lines in parentheses is read up to its last
 /// line that ends in a comma; its closing `)` line, if alone, is a statement
-/// of its own, which no check reads.
+/// of its own, which no check reads. A line ending in `(` swallows the next
+/// line, so a statement on that next line (`foo(` then `depends_on "nasm"`) is
+/// read as part of the first one, which a lint for something absent does not
+/// see.
 fn statements(ruby: &Ruby) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut continued = false;
@@ -460,7 +463,8 @@ const MACOS_NAMES: &[(&str, (u32, u32))] = &[
 
 /// Homebrew's oldest macOS: the first entry of `MacOSVersion::SYMBOLS` in
 /// Homebrew's `Library/Homebrew/macos_version.rb`. It is a copy of Homebrew's
-/// own table and must follow it: when Homebrew drops big_sur, change this.
+/// own table and must follow it: when Homebrew drops big_sur, change this, as
+/// `docs/releasing.md` ("Before you start") says.
 const HOMEBREW_OLDEST_MACOS: (&str, (u32, u32)) = ("big_sur", (11, 0));
 
 /// `"11.0"` or `"11"` as major and minor.
@@ -745,16 +749,23 @@ fn has_cargo_and_build(words: &[String]) -> bool {
 /// Formula job. It is stricter: brew style spares a call that passes
 /// `--lib`, this check does not, because the formula has no use for one.
 ///
+/// This is a text lint that reads only plain `system` calls. `brew style` in
+/// the Formula job on the Mac is the authority; this check is here so the
+/// common mistake fails the tests on any machine, and it does not chase other
+/// spellings.
+///
 /// It reads a `system` call written as a statement, after an assignment or
 /// `if`/`&&`, with its arguments on the same line or after an opening
 /// parenthesis at the end of the line (see `statements`). It does not read,
 /// and so does not catch: a command in one string (`system "cargo build"`,
 /// which brew style does not flag either), arguments in a `%w[]` or a
 /// variable, a line broken after an operator (`+`, `&&`), `safe_system` and
-/// `quiet_system`, and a call inside a heredoc or a comment. A check that
-/// looks for something present fails on these forms; this one, which looks
-/// for something absent, passes, so the Formula job's `brew style` stays the
-/// backstop.
+/// `quiet_system`, `Kernel.system ...`, a `system` call that follows an odd
+/// quote earlier in the same statement (an apostrophe in a double-quoted
+/// string, or an escaped quote: `ohai "it's"; system "cargo", "build"`), and
+/// a call inside a heredoc or a comment. A check that looks for something
+/// present fails on these forms; this one, which looks for something absent,
+/// passes.
 fn cargo_build_problems(formula: &str) -> Vec<String> {
     system_statements(formula)
         .iter()
@@ -1821,6 +1832,11 @@ fn the_forms_the_cargo_build_lint_does_not_read_are_unread_in_a_fixture() {
         "safe_system \"cargo\", \"build\"",
         "quiet_system \"cargo\", \"build\"",
         "system \"cargo\" +\n      \"build\"",
+        "Kernel.system \"cargo\", \"build\"",
+        // An odd quote earlier in the statement (an apostrophe in a double
+        // quoted string, an escaped quote) hides the call from the reader.
+        "ohai \"it's\"; system \"cargo\", \"build\"",
+        "ohai \"a\\\"b\"; system \"cargo\", \"build\"",
     ] {
         let formula = formula_with_call(call);
         assert_clean(cargo_build_problems(&formula));
